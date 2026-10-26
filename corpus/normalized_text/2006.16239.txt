@@ -1,0 +1,419 @@
+evan zheran liu  $^{1,2}$  milad hashemi  $^{2}$  kevin swersky  $^{2}$  parthasarathy ranganathan  $^{2}$  junwhan ahn  $^{2}$
+
+# abstract
+
+program execution speed critically depends on increasing cache hits, as cache hits are orders of magnitude faster than misses. to increase cache hits, we focus on the problem of cache replacement: choosing which cache line to evict upon inserting a new line. this is challenging because it requires planning far ahead and currently there is no known practical solution. as a result, current replacement policies typically resort to heuristics designed for specific common access patterns, which fail on more diverse and complex access patterns. in contrast, we propose an imitation learning approach to automatically learn cache access patterns by leveraging belady's, an oracle policy that computes the optimal eviction decision given the future cache accesses. while directly applying belady's is infeasible since the future is unknown, we train a policy conditioned only on past accesses that accurately approximates belady's even on diverse and complex access patterns, and call this approach parrot. when evaluated on 13 of the most memory-intensive spec applications, parrot increases cache miss rates by  $20\%$  over the current state of the art. in addition, on a large-scale web search benchmark, parrot increases cache hit rates by  $61\%$  over a conventional lru policy. we release a gym environment to facilitate research in this area, as data is plentiful, and further advancements can have significant real-world impact.
+
+# 1. introduction
+
+caching is a universal concept in computer systems that bridges the performance gap between different levels of data storage hierarchies, found everywhere from databases to operating systems to cpus (jouppi, 1990; harty & cheriton,
+
+$^{1}$ department of computer science, stanford university, california, usa  $^{2}$ google research, sunnyvale, california, usa. correspondence to: evan z. liu <evanliu@cs.stanford.edu>.
+
+proceedings of the  $37^{th}$  international conference on machine learning, vienna, austria, pmlr 119, 2020. copyright 2020 by the author(s).
+
+![](images/41677ab440cde5af24141a6b5cc1f8ea8ce7bee19d27be5c295e786450117842.jpg)  
+figure 1. cache replacement. at  $t = 0$ , line d is accessed, causing a cache miss. the replacement policy chooses between lines a, b, and c in the cache and in this case evicts c. at  $t = 1$ , line a is accessed and is already in the cache, causing a cache hit. no action from the replacement policy is needed. at  $t = 2$ , line c is accessed, causing another cache miss. the replacement policy could have avoided this miss by evicting a different line at  $t = 0$ .
+
+1992; xu et al., 2013; cidon et al., 2016). correctly selecting what data is stored in caches is critical for latency, as accessing the data directly from the cache (a cache hit) is orders of magnitude faster than retrieving the data from a lower level in the storage hierarchy (a cache miss). for example, cidon et al. (2016) show that improving cache hit rates of web-scale applications by just  $1\%$  can decrease total latency by as much as  $35\%$ .
+
+thus, general techniques for increasing cache hit rates would significantly improve performance at all levels of the software stack. broadly, two main avenues for increasing cache hit rates exist: (i) avoiding future cache misses by proactively prefetching the appropriate data into the cache beforehand; and (ii) strategically selecting which data to evict from the cache when making space for new data (cache replacement). simply increasing cache sizes is a tempting third avenue, but is generally prohibitively expensive.
+
+this work focuses on single-level cache replacement (figure 1). when a new block of data (referred to as a line) is added to the cache (i.e., due to a cache miss), an existing cache line must be evicted from the cache to make space for the new line. to do this, during cache misses, a cache replacement policy takes as inputs the currently accessed line and the lines in the cache and outputs which of the cache lines to evict.
+
+prior work frequently relies on manually-engineered heuristics to capture the most common cache access patterns, such as evicting the most recently used (mru) or least recently used (lru) cache lines, or trying to identify the cache lines
+
+that are frequently reused vs. those that are not (qureshi et al., 2007; jaleel et al., 2010; jain & lin, 2016; shi et al., 2019). these heuristics perform well on the specific simple access patterns they target, but they only target a small fraction of all possible access patterns, and consequently they perform poorly on programs with more diverse and complex access patterns. current cache replacement policies resort to heuristics as practical theoretical foundations have not yet been developed (beckmann & sanchez, 2017).
+
+we propose a new approach for learning cache replacement policies by leveraging belady's optimal policy (belady, 1966) in the framework of imitation learning (il), and name this approach parrot. belady's optimal policy (belady's for short) is an oracle policy that computes the theoretically optimal cache eviction decision based on knowledge of future cache accesses, which we propose to approximate with a policy that only conditions on the past accesses. while our main goal is to establish (imitation) learned replacement policies as a proof-of-concept, we note that deploying such learned policies requires solving practical challenges, e.g., model latency may overshadow gains due to better cache replacement. we address some of these challenges in section 4.5 and highlight promising future directions in section 7.
+
+hawkeye (jain & lin, 2016) and glider (shi et al., 2019) were the first to propose learning from belady's. they train a binary classifier to predict if a cache line will soon be reused (cache-friendly) or not (cache-averse), evicting the cache-averse lines before the cache-friendly ones and relying on a traditional heuristic to determine which lines are evicted first within the cache-friendly and cache-averse groups. training such a binary classifier avoids the challenges (e.g., compounding errors) of directly learning a policy, but relying on the traditional heuristic heavily limits the expressivity of the policy class that these methods optimize over, which prevents them from accurately approximating belady's. in contrast, our work is the first to propose cache replacement as an il problem, which allows us to directly train a replacement policy end-to-end over a much more expressive policy class to approximate belady's. this represents a novel way of leveraging belady's and provides a new framework for learning end-to-end replacement policies.
+
+concretely, this paper makes the following contributions:
+
+- we cast cache replacement as an imitation learning problem, leveraging belady's in a new way (section 3).  
+- we develop a neural architecture for end-to-end cache replacement and several supervised tasks that further improve its performance over standard il (section 4).  
+- our proposed approach, parrot, exceeds the state-of-the-art replacement policy's hit rates by over  $20\%$  on
+
+memory-intensive cpu benchmarks. on an industrial-scale web search workload, parrot improves cache hit rates by  $61\%$  over a commonly implemented lru policy (section 5).
+
+- we propose cache replacement as a challenging new il/rl (reinforcement learning) benchmark involving dynamically changing action spaces, delayed rewards, and significant real-world impact. to that end, we release an associated gym environment (section 7).
+
+# 2. cache preliminaries
+
+we begin with cache preliminaries before formulating cache replacement as learning a policy over a markov decision process in section 3. we describe the details relevant to cpu caches, which we evaluate our approach on, but as caching is a general concept, our approach can be extended towards other cache structures as well.
+
+a cache is a memory structure that maintains a portion of the data from a larger memory. if the desired data is located in the cache when it is required, this is advantageous, as smaller memories are faster to access than larger memories. provided a memory structure, there is a question of how to best organize it into a cache. in cpus, caches operate in terms of atomic blocks of memory or cache lines (typically 64-bytes large). this is the minimum granularity of data that can be accessed from the cache.
+
+during a memory access, the cache must be searched for the requested data. fully-associative caches layout all data in a single flat structure, but this is generally prohibitively expensive, as locating the requested data requires searching through all data in the cache. instead, cpu caches are often  $w$ -way set-associative caches of size  $n \times w$ , consisting of  $n$  cache sets, where each cache set holds  $w$  cache lines  $\{l_1, \ldots, l_w\}$ . each line maps to a particular cache set (typically determined by the lower order bits of line's address), so only the  $w$  lines within that set must be searched.
+
+during execution, programs read from and write to memory addresses by executing load or store instructions. these load/store instructions have unique identifiers known as program counters (pcs). if the address is located in the cache, this is called a cache hit. otherwise, this is a cache miss, and the data at that address must be retrieved from a larger memory. once the data is retrieved, it is generally added to the appropriate cache set (as recently accessed lines could be accessed again). since each cache set can only hold  $w$  lines, if a new line is added to a cache set already containing  $w$  lines, the cache replacement policy must choose an existing line to replace. this is called a cache eviction and selecting the optimal line to evict is the cache replacement problem.
+
+belady's optimal policy. given knowledge of future cache accesses, belady's computes the optimal cache eviction decision. specifically, at each timestep  $t$ , belady's computes the reuse distance  $d_{t}(l_{w})$  for each line  $l_{w}$  in the cache set, which is defined as the number of total cache accesses until the next access to  $l_{w}$ . then, belady's chooses to evict the line with the highest reuse distance, effectively the line used furthest in the future, i.e.,  $\arg \max_{w = 1,\dots ,w}d_t(l_w)$ .
+
+# 3. casting cache replacement as imitation learning
+
+we cast cache replacement as learning a policy on an episodic markov decision process  $\langle s, \mathcal{a}_s, r, p \rangle$  in order to leverage techniques from imitation learning. specifically, the state at the  $t$ -th timestep  $s_t = (s_t^c, s_t^a, s_t^h) \in s$  consists of three components, where:
+
+-  $s_t^a = (m_t, pc_t)$  is the current cache access, consisting of the currently accessed cache line address  $m_t$  and the unique program counter  $pc_t$  of the access.  
+-  $s_t^c = \{l_1, \dots, l_w\}$  is the cache state consisting of the  $w$  cache line addresses currently in the cache set accessed by  $s_t^a$  (the replacement policy does not require the whole cache state including other cache sets to make a decision).<sup>2</sup>  
+-  $s_t^h = (\{m_1, \ldots, m_{t-1}\}, \{pc_1, \ldots, pc_{t-1}\})$  is the history of all past cache accesses. in practice, we effectively only condition on the past  $h$  accesses.
+
+the action set  $\mathcal{a}_{s_t}$  available at a state  $s_t = (s_t^c, s_t^a, s_t^h)$  is defined as follows: during cache misses, i.e.,  $m_t \notin s_t^c$ , the action set  $\mathcal{a}_{s_t}$  consists of the integers  $\{1, \ldots, w\}$ , where action  $w$  corresponds to evicting line  $l_w$ . otherwise, during cache hits, the action set  $\mathcal{a}_{s_t}$  consists of a single no-op action  $a_{\text{no-op}}$ , since no line must be evicted.
+
+the transition dynamics  $p(s_{t + 1} \mid a_t, s_t)$  are given by the dynamics of the three parts of the state. the dynamics of the next cache access  $s_{t + 1}^a$  and the cache access history  $s_{t + 1}^h$  are independent of the action  $a_t$  and are defined by the program being executed. specifically, the next access  $s_{t + 1}^a = (m_{t + 1}, pc_{t + 1})$  is simply the next memory address the program accesses and its associated pc. the  $t$ -th access is appended to  $s_{t + 1}^h$ , i.e.,  $s_{t + 1}^h = (\{m_1, \ldots, m_{t - 1}, m_t\}, \{pc_1, \ldots, pc_{t - 1}, pc_t\})$ .
+
+the dynamics of the cache state are determined by the actions taken by the replacement policy. at state  $s_t$  with  $s_t^c = \{l_1, \dots, l_w\}$  and  $s_t^a = (m_t, pc_t)$ : a cache hit does not change the cache state, i.e.,  $s_{t+1}^c = s_t^c$ , as the accessed line is already available in the cache. a cache miss re
+
+![](images/5d818755c92d3db544b5e0edf389a290af7cc2680483c63fb1700548396cb304.jpg)  
+figure 2. normalized cache hit rates of belady's vs. the number of accesses it looks into the future. achieving  $80\%$  the performance of belady's with an infinite window size requires accurately computing reuse distances for lines 2600 accesses into the future.
+
+places the selected line with the newly accessed line, i.e.,  $s_{t + 1}^{c} = \{l_{1},\ldots ,l_{w - 1},l_{w + 1},\ldots ,l_{w},m_{t}\}$  where  $a_{t} = w$ .
+
+the reward  $r(s_{t})$  is 0 for a cache miss (i.e.,  $m_t \notin s_t^c$ ) and is 1 otherwise for a cache hit. the goal is to learn a policy  $\pi_{\theta}(a_t \mid s_t)$  that maximizes the undiscounted total number of cache hits (the reward),  $\sum_{t=0}^{t} r(s_t)$ , for a sequence of  $t$  cache accesses  $(m_1, pc_1), \ldots, (m_t, pc_t)$ .
+
+in this paper, we formulate this task as an imitation learning problem. during training, we can compute the optimal policy (belady's)  $\pi^{*}(a_{t} \mid s_{t}, (m_{t+1}, pc_{t+1}), \ldots, (m_{t}, pc_{t}))$ , by leveraging that the future accesses are fixed. then, our approach learns a policy  $\pi_{\theta}(a_{t} \mid s_{t})$  to approximate the optimal policy without using the future accesses, as future accesses are unknown during test time.
+
+to demonstrate the difficulty of the problem, figure 2 shows the amount of future information required to match the performance of belady's on a common computer architecture benchmark (omnetpp, section 5). we compute this by imposing a future window of size  $x$  on belady's, which we call  $\mathrm{belady}_x$ , within the window (reuse distances  $\leq x$ ),  $\mathrm{belady}_x$  observes exact reuse distances, and sets the reuse distances of the remaining cache lines (with reuse distance  $> x$ ) to  $\infty$ . then,  $\mathrm{belady}_x$  evicts the line with the highest reuse distance, breaking ties randomly. the cache hit rate of  $\mathrm{belady}_x$  is plotted on the y-axis, normalized so that 0 and 1 correspond to the cache hit rate of lru and  $\mathrm{belady}_\infty$  (the normal unconstrained version of belady's), respectively. as the figure shows, a significant amount of future information is required to fully match belady's performance.
+
+# 4. parrot: learning to imitate belady's
+
+# 4.1. model and training overview
+
+model. below, we overview the basic architecture of the parrot policy  $\pi_{\theta}(a_t\mid s_t)$  (figure 3), which draws on the
+
+![](images/fb93b895d9a577d3b5d7e625cc3d00919a989d2cffc9cb174b798891c8678408.jpg)  
+figure 3. neural architecture of parrot.
+
+transformer (vaswani et al., 2017) and bidaf (seo et al., 2016) architectures. see appendix a for the full details.
+
+1. embed the current cache access  $s_t^a = (m_t, pc_t)$  to obtain memory address embedding  $e(m_t)$  and pc embedding  $e(pc_t)$  and pass them through an lstm to obtain cell state  $c_t$  and hidden state  $h_t$ :
+
+$$
+c _ {t}, h _ {t} = \operatorname {l s t m} ([ e (m _ {t}); e (p c _ {t}) ], c _ {t - 1}, h _ {t - 1})
+$$
+
+2. keep the past  $h$  hidden states,  $[h_{t - h + 1},\dots ,h_t]$ , representing an embedding of the cache access history  $s_t^h$  and current cache access  $s_t^a$ .  
+3. form a context  $g_{w}$  for each cache line  $l_{w}$  in the cache state  $s_t^c$  by embedding each line as  $e(l_w)$  and attending over the past  $h$  hidden states with  $e(l_w)$ :
+
+$$
+g _ {w} = \operatorname {a t t e n t i o n} (q, k)
+$$
+
+where query  $q = e(l_w)$ , keys  $k = [h_{t - h + 1},\dots ,h_t]$
+
+4. apply a final dense layer and softmax on top of these line contexts to obtain the policy:
+
+$$
+\pi_ {\theta} \left(a _ {t} = w \mid s _ {t}\right) = \operatorname {s o f t m a x} \left(\operatorname {d e n s e} \left(g _ {w}\right)\right)
+$$
+
+5. choose  $\arg \max_{a\in \mathcal{a}_{s_t}}\pi_\theta (a\mid s_t)$  as the replacement action to take at timestep  $t$
+
+training. algorithm 1 summarizes the training algorithm for the parrot policy  $\pi_{\theta}$ . the high-level strategy is to visit a set of states  $b$  and then update the parameters  $\theta$  to make the same eviction decision as the optimal policy  $\pi^{*}$  on each state  $s \in b$  via the loss function  $\mathcal{l}_{\theta}(s, \pi^{*})$ .
+
+first, we convert a given sequence of consecutive cache accesses  $(m_1, pc_1), \ldots, (m_t, pc_t)$  into states  $s_0, \ldots, s_t$  (section 4.2), on which we can compute the optimal action with belady's (lines 3-5). given the states, we train parrot with truncated backpropagation through time (lines 6-9). we sample batches of consecutive states  $s_{l-h}, \ldots, s_{l+h}$  and initialize the lstm hidden state of our policy on the cache accesses of  $s_{l-h}$  to  $s_{l-1}$ . then, we apply our replacement policy  $\pi_\theta$  to each of the remaining states
+
+# algorithm 1 parrot training algorithm
+
+1: initialize policy  $\pi_{\theta}$  
+2: for step  $= 0$  to  $k$  do  
+3: if step  $\equiv 0$  (mod 5000) then  
+4: collect data set of visited states  $b = \{s_t\}_{t=0}^t$  by following  $\pi_\theta$  on all accesses  $(m_1, pc_1), \ldots, (m_t, pc_t)$ .  
+5: end if  
+6: sample contiguous accesses  $\{s_t\}_{t = l + h}^{l + h}$  from  $b$  
+7: warm up policy  $\pi_{\theta}$  on initial  $h$  accesses  $(m_{l - h}, p c_{l - h}), \ldots, (m_{l}, p c_{l})$  
+8: compute loss  $\mathcal{l} = \sum_{t = l}^{l + h}\mathcal{l}_{\theta}(s_t,\pi^*)$  
+9: update policy parameters  $\theta$  based on loss  $\mathcal{l}$
+
+10: end for
+
+$s_l, \ldots, s_{l + h - 1}$  in order to compute the loss  $\mathcal{l}_{\theta}(s_t, \pi^*)$  (sections 4.3 and 4.4), which encourages the learned replacement policy to make the same decisions as belady's.
+
+# 4.2. avoiding compounding errors
+
+since we are only given the cache accesses and not the states, we must determine which replacement policy to follow on these cache accesses to obtain the states  $b$ . naively, one natural policy to follow is the optimal policy  $\pi^{*}$ . however, this leads to compounding errors (ross et al., 2011; daumé et al., 2009; bengio et al., 2015), where the distribution of states seen during test time (when following the learned policy) differs from the distribution of states seen during training (when following the oracle policy). at test time, since parrot learns an imperfect approximation of the oracle policy, it will eventually make a mistake and evict a suboptimal cache line. this leads to cache states that are different from those seen during training, which the learned policy has not trained on, leading to further mistakes.
+
+to address this problem, we leverage the dagger algorithm (ross et al., 2011). dagger avoids compounding errors by also following the current learned policy  $\pi_{\theta}$  instead of the oracle policy  $\pi^{*}$  to collect  $b$  during training, which forces the distribution of training states to match that of test states. as parrot updates the policy, the current policy becomes increasingly different from the policy used to collect  $b$ , causing the training state distribution  $b$  to drift from the test state distribution. to mitigate this, we periodically update  $b$  every 5000 parameter updates by recollecting  $b$  again under the current policy. based on the recommendation in (ross et al., 2011), we follow the oracle policy the first time we collect  $b$ , since at that point, the policy  $\pi_{\theta}$  is still random and likely to make poor eviction decisions.
+
+notably, this approach is possible because we can compute our oracle policy (belady's) at any state during training, as long as the future accesses are known. this differs from many il tasks (hosu & rebedea, 2016; vecerik et al., 2017), where querying the expert is expensive and limited.
+
+# 4.3. ranking loss
+
+once the states  $b$  are collected, we update our policy  $\pi_{\theta}$  to better approximate belady's  $\pi^{*}$  on these states via the loss function  $\mathcal{l}_{\theta}(s,\pi^{*})$ . a simple log-likelihood (ll) behavior cloning loss (pomerleau, 1989)  $\mathcal{l}_{\theta}(s,\pi^{*}) = \log \pi_{\theta}(\pi^{*}(s)\mid s)$  encourages the learned policy to place probability mass on the optimal action  $\pi^{*}(s)$ . however, in the setting where the distribution  $\pi^{*}(a\mid s)$  is known, instead of just the optimal action  $\pi^{*}(s)$ , optimizing to match this distribution can provide more supervision, similar to the intuition of distillation (hinton et al., 2015). thus, we propose an alternate ranking loss to leverage this additional supervision.
+
+concretely, parrot uses a differentiable approximation (qin et al., 2010) of normalized discounted cumulative gain (ndcg) with reuse distance as the relevancy metric:
+
+$$
+\begin{array}{l} \mathcal {l} _ {\theta} ^ {\text {r a n k}} \left(s _ {t}, \pi^ {*}\right) = - \frac {\text {d c g}}{\text {i d c g}} \\ \text {w h e r e} \mathrm {d c g} = \sum_ {w = 1} ^ {w} \frac {d _ {t} \left(l _ {w}\right) - 1}{\log \left(\operatorname {p o s} \left(l _ {w}\right) + 1\right)} \\ \operatorname {p o s} \left(l _ {w}\right) = \sum_ {i \neq w} \sigma \left(- \alpha \left(\pi_ {\theta} (i \mid s _ {t}) - \pi_ {\theta} (w \mid s _ {t})\right). \right. \\ \end{array}
+$$
+
+here,  $\mathrm{pos}(l_w)$  is a differentiable approximation of the rank of line  $l_w$ , ranked by how much probability the policy  $\pi_{\theta}$  places on evicting  $l_w$ , where  $\alpha = 10$  is a hyperparameter and  $\sigma$  is the sigmoid function. idcg is a normalization constant set so that  $-1 \leq \mathcal{l}_{\theta}^{\mathrm{rank}} \leq 0$ , equal to the value of dcg when the policy  $\pi_{\theta}$  correctly places probability mass on the lines in descending order of reuse distance. this loss function improves cache hit rates by heavily penalizing  $\pi_{\theta}$  for placing probability on lines with low reuse distance, which will likely lead to cache misses, and only lightly penalizing  $\pi_{\theta}$  for placing probability on lines with higher reuse distance, which are closer to being optimal and are less likely to lead to cache misses.
+
+optimizing our loss function is similar to optimizing the kullback-liebler (kl) divergence (kullback & leibler, 1951) between a smoothed version of belady's, which evicts line  $l_{w}$  with probability proportional to its exponentiated reuse distance  $e^{d_t(l_w)}$ , and our policy  $\pi_{\theta}$ . directly optimizing the kl between the non-smoothed oracle policy and our policy just recovers the normal ll loss, since belady's actually places all of its probability on a single line.
+
+# 4.4. predicting reuse distance
+
+to add further supervision during training, we propose to predict the reuse distances of each cache line as an auxiliary task (jaderberg et al., 2016; mirowski et al., 2016; lample & chaplot, 2017). concretely, we add a second fully-connected head on parrot's network that takes as inputs the per-line context embeddings  $g_{w}$  and outputs predictions
+
+![](images/2a1c515e2307023ac4fa527662a94678d33803471bbd213c2e90c33cac65dd80.jpg)  
+figure 4. byte embedder, taking only a few kilobytes of memory.
+
+of the log-reuse distance  $\hat{d}(g_w)$ . we train this head with a mean-squared error loss  $\mathcal{l}_{\theta}^{\mathrm{reuse}}(s, \pi^*) = \frac{1}{w} \sum_{w=1}^{w} (\hat{d}(g_w) - \log d_t(l_w))^2$ . intuitively, since the reuse distance predicting head shares the same body as the policy head  $\pi_\theta$ , learning to predict reuse distances helps learn better representations in the rest of the network. overall, we train our policy with loss  $\mathcal{l}_{\theta}(s, \pi^*) = \mathcal{l}_{\theta}^{\mathrm{rank}}(s, \pi^*) + \mathcal{l}_{\theta}^{\mathrm{reuse}}(s, \pi^*)$ .
+
+# 4.5. towards practicality
+
+the goal of this work is to establish directly imitating belady's as a proof-of-concept. applying approaches like par-rot to real-world systems requires reducing model size and latency to prevent overshadowing improved cache replacement. we leave these challenges to future work, but highlight one way to reduce model size in this section, and discuss further promising directions in section 7.
+
+in the full-sized parrot model, we learn a separate embedding for each pc and memory address, akin to word vectors (mikolov et al., 2013) in natural language processing. while this approach performs well, these embeddings can require tens of megabytes to store for real-world programs that access hundreds of thousands of unique memory addresses.
+
+to reduce model size, we propose learning a byte embedder shared across all memory addresses, only requiring several kilobytes of storage. this byte embedder embeds each memory address (or pc) by embedding each byte separately and then passing a small linear layer over their concatenated outputs (figure 4). in principle, this can learn a hierarchical representation, that separately represents large memory regions (upper bytes of an address) and finer-grained objects (lower bytes).
+
+# 5. experiments
+
+# 5.1. experimental setup
+
+following shi et al. (2019), we evaluate our approach on a three-level cache hierarchy with a 4-way 32 kb l1 cache, a 8-way 256 kb l2 cache, and a 16-way 2 mb last-level cache. we apply our approach to the last-level cache while using the lru replacement policy for l1/l2 caches.
+
+for benchmark workloads, we evaluate on the memory-intensive spec cpu2006 (henning, 2006) applications used by shi et al. (2019). in addition, we evaluate on google web search, an industrial-scale application that serves billions of queries per day, to further evaluate the effectiveness of parrot on real-world applications with complex access patterns and large working sets.
+
+for each of these programs, we run them and collect raw memory access traces over a 50 second interval using dynamic binary instrumentation tools (bruening et al., 2003). this produces the sequence of all memory accesses that the program makes during that interval. last-level cache access traces are obtained from this sequence by passing the raw memory accesses through the l1 and l2 caches using an lru replacement policy.
+
+as this produces a large amount of data, we then sample the resultant trace for our training data (qureshi et al., 2007). we randomly choose 64 sets and collect the accesses to those sets on the last-level cache, totaling an average of about 5m accesses per program. concretely, this yields a sequence of accesses  $(m_{1}, pc_{1}), \ldots, (m_{t}, pc_{t})$ . we train replacement policies on the first  $80\%$  of this sequence, validate on the next  $10\%$ , and report test results on the final  $10\%$ .
+
+our evaluation focuses on two key metrics representing the efficiency of cache replacement policies. first, as increasing cache hit rates is highly correlated to decreasing program latency (qureshi et al., 2007; shi et al., 2019; jain & lin, 2016), we evaluate our policies using raw cache hit rates. second, we report normalized cache hit rates, representing the gap between lru (the most common replacement policy) and belady's (the optimal replacement policy). for a policy with hit rate  $r$ , we define the normalized cache hit rate as  $\frac{(r - r_{\mathrm{lru}})}{(r_{\mathrm{opt}} - r_{\mathrm{lru}})}$ , where  $r_{\mathrm{lru}}$  and  $r_{\mathrm{opt}}$  are the hit rates of lru and belady's, respectively. the normalized hit rate represents the effectiveness of a given policy with respect to the two baselines, lru (normalized hit rate of 0) and belady's (normalized hit rate of 1).
+
+we compare the following four approaches:
+
+1. parrot: trained with the full-sized model, learning a separate embedding for each pc and address.  
+2. parrot (byte): trained with the much smaller byte embedder (section 4.5).  
+3. glider (shi et al., 2019): the state-of-the-art cache replacement policy, based on the results reported in their paper.  
+4. nearest neighbor: a nearest neighbors version of belady's, which finds the longest matching pc and memory address suffix in the training data and follows the belady's decision of that.
+
+the spec2006 program accesses we evaluate on may
+
+slightly differ from those used by shi et al. (2019) in evaluating glider, as the latter is not publicly available. however, to ensure a fair comparison, we verified that the measured hit rates for lru and belady's on our cache accesses are close to the numbers reported by shi et al. (2019), and we only compare on normalized cache hit rates. since glider's hit rates are not available on web search, we compare parrot against lru, the policy frequently used in production cpu caches. the reported hit rates for parrot, lru, belady's, and nearest neighbors are measured on the test sets. we apply early stopping on parrot, based on the cache hit rate on the validation set. for parrot, we report results averaged over 3 random seeds, using the same minimally-tuned hyperparameters in all domains. these hyperparameters were tuned exclusively on the validation set of omnetpp (full details in appendix b).
+
+# 5.2. main results
+
+table 1 compares the raw cache hit rate of parrot with that of belady's and lru. parrot achieves significantly higher cache hit rates than lru on every program, ranging from  $2\%$  to  $30\%$ . averaged over all programs, parrot achieves  $16\%$  higher cache hit rates than lru. according to prior study on cache sensitivity of spec2006 workloads (jaleel, 2010), achieving the same level of cache hit rates as parrot with lru would require increasing the cache capacity by  $2 - 3x$  (e.g., omnetpp and mcf) to  $16x$  (e.g., libquantum).
+
+on the web search benchmark, parrot achieves a  $61\%$  higher normalized cache hit rate and  $13.5\%$  higher raw cache hit rate than lru, demonstrating parrot's practical ability to scale to the complex memory access patterns found in datacenter-scale workloads.
+
+figure 5 compares the normalized cache hit rates of parrot and glider. with the full-sized model, parrot outperforms glider on 10 of the 13 spec2006 programs, achieving a  $20\%$  higher normalized cache hit rate averaged over all programs; on the remaining 3 programs (bzip, bwaves, and mcf), glider performs marginally better. additionally, parrot achieves consistent performance with low variance across seeds.
+
+reducing model size. though learning parrot from scratch with the byte embedder does not perform as well as the full-sized model, the byte embedder model is significantly smaller and still achieves an average of  $8\%$  higher normalized cache hit rate than glider (figure 5). in section 7, we highlight promising future directions to reduce the performance gap and further reduce model size and latency.
+
+generalization. an effective cache replacement policy must be able to generalize to unseen code paths (i.e., sequences of accesses) from the same program, as there are exponentially many code paths and encountering them all
+
+table 1. raw cache hit rates. optimal is the hit rate of belady's. averaged over all programs, parrot (3 seeds) outperforms lru by  ${16}\%$  .  
+
+<table><tr><td></td><td>aster</td><td>bwaves</td><td>bzip</td><td>cactusadm</td><td>gems</td><td>lbm</td><td>leslie3d</td><td>libq</td><td>mcf</td><td>milc</td><td>omnetpp</td><td>sphinx3</td><td>xalanc</td><td>web search</td></tr><tr><td>optimal</td><td>43.5%</td><td>8.7%</td><td>78.4%</td><td>38.8%</td><td>26.5%</td><td>31.3%</td><td>31.9%</td><td>5.8%</td><td>46.8%</td><td>2.4%</td><td>45.1%</td><td>38.2%</td><td>33.3%</td><td>67.5%</td></tr><tr><td>lru</td><td>20.0%</td><td>4.5%</td><td>56.1%</td><td>7.4%</td><td>9.9%</td><td>0.0%</td><td>12.7%</td><td>0.0%</td><td>25.3%</td><td>0.1%</td><td>26.1%</td><td>9.5%</td><td>6.6%</td><td>45.5%</td></tr><tr><td>parrot</td><td>34.4%</td><td>7.8%</td><td>64.5%</td><td>38.6%</td><td>26.0%</td><td>30.8%</td><td>31.7%</td><td>5.4%</td><td>41.4%</td><td>2.1%</td><td>41.4%</td><td>36.7%</td><td>30.4%</td><td>59.0%</td></tr></table>
+
+![](images/0921151557a775e48bff4cd30d6031a7e57a467aac3a1329f6276a08b5510cbb.jpg)  
+figure 5. comparison of parrot with the state-of-the-art replacement policy, glider. we evaluate two versions of parrot, the full-sized model (parrot) and the byte embedder model (parrot (byte)), and report the mean performance over 3 seeds with 1-standard deviation error bars. on the spec2006 programs (left), parrot with the full-sized model improves hit rates over glider by  $20\%$  on average.
+
+during training is infeasible. we test parrot's ability to generalize to new code paths by comparing it to the nearest neighbors baseline (figure 5). the performance of the nearest neighbors baseline shows that merely memorizing training code paths seen achieves near-optimal cache hit rates on simpler programs (e.g., gems, lbm), which just repeatedly execute the same code paths, but fails for more complex programs (e.g., mcf, web search), which exhibit highly varied code paths. in contrast, parrot maintains high cache hit rates even on these more complex programs, showing that it can generalize to new code paths not seen during training.
+
+additionally, some of the programs require generalizing to new memory addresses and program counters at test time. in mcf,  $21.6\%$  of the test-time memory addresses did not appear in the training data, and in web search,  $5.3\%$  of the test-time memory addresses and  $6\%$  of the test-time pcs did not appear in the training data (full details in appendix b), but parrot performs well despite this.
+
+# 5.3. ablations
+
+below, we ablate each of the following from parrot: predicting reuse distance, on-policy training (dagger), and ranking loss. we evaluate on four of the most memory-intensive spec2006 applications (lbm, libq, mcf, and omnetpp) and web search and compare each ablation with glider, belady's, and two versions of parrot. parrot is the full-sized model with no ablations. parrot (base) is parrot's neural architecture, with all three additions ablated. comparing parrot (base) to glider (e.g., figure 6) shows that in some programs (e.g., omnetpp and lbm), simply casting cache replacement as an il problem with parrot's neural architecture is sufficient to obtain competitive performance, while in other programs, our additions are required to achieve state-of-the-art cache hit rates.
+
+![](images/bdb6d907cc7f4c398caf39a6390c04c2fe4e44d1b154f168b0420a002948e4b6.jpg)  
+figure 6. comparison between different mechanisms of incorporating reuse distance into parrot. including reuse distance prediction in our full model (parrot) achieves  $16.8\%$  higher normalized cache hit rates than ablating reuse distance prediction (parrot (no reuse dist.)).
+
+predicting reuse distance. figure 6 compares the following three configurations to show the effect of incorporating reuse distance information: (i) parrot (no reuse dist.), where reuse distance prediction is ablated, (ii) parrot (evict highest reuse dist.), where our fully ablated model (parrot (base)) predicts reuse distance and directly evicts the line with the highest predicted reuse distance, and (iii) parrot (reuse dist. aux loss), where our fully ablated model learns to predict reuse distance as an auxiliary task.
+
+comparing parrot (no reuse dist.) to parrot shows that incorporating reuse distance greatly improves cache hit rates. between different ways to incorporate reuse distance into parrot, using reuse distance prediction indirectly as an auxiliary loss function (parrot (reuse dist. aux loss)) leads to higher cache hit rates than using the reuse distance predictor directly to choose which cache line to evict (parrot (evict highest reuse dist.)). we hypothesize that in some cache states, accurately predicting the reuse distance for each line may be challenging, but ranking the lines may be relatively easy. since our reuse distance predictor predicts log reuse distances, small errors may drastically affect which line is evicted when the reuse distance predictor is used directly.
+
+![](images/c80656312f0f0e8cdfc19c5e8d44b6096cd394360bfe381fbe968a7e4ac1cc27.jpg)  
+figure 7. ablation study for training with dagger. training with dagger achieves  $9.8\%$  higher normalized cache hit rates than training off-policy on the states visited by the oracle policy.
+
+![](images/10e0201977f0a864dbfd66fdae2a3a0ddd1827cedcb8939adcd0e8ea90eccdd6.jpg)  
+figure 8. ablation study for our ranking loss. using our ranking loss improves normalized cache hit rate by  $3.5\%$  over a ll loss.
+
+training with dagger. figure 7 summarizes the results when ablating training on-policy with dagger. in theory, training off-policy on roll-outs of belady's should lead to compounding errors, as the states visited during training under belady's differ from those visited during test time. empirically, we observe that this is highly program-dependent. in some programs, like mcf or web search, training off-policy performs as well or better than training on-policy, but in other programs, training on-policy is crucial. overall, training on-policy leads to an average  $9.8\%$  normalized cache hit rate improvement over off-policy training.
+
+ranking loss. figure 8 summarizes the results when ab- lating our ranking loss. using our ranking loss over a log- likelihood (ll) loss introduces some bias, as the true optimal policy places all its probability on the line with the highest reuse distance. however, our ranking loss better optimizes cache hit rates, as it more heavily penalizes evicting lines with lower reuse distances, which lead to misses. in addition, a distillation perspective of our loss, where the teacher network is an exponentially-smoothed version of belady's with the probability of evicting a line set as proportional to  $\exp (\mathrm{reuse}$  distance), suggests that our ranking loss provides greater supervision than ll. tuning a temperature on the exponential smoothing of belady's could interpolate between less bias and greater supervision. empirically, we observe that our ranking loss leads to an average  $3.5\%$  normalized cache hit rate improvement over ll.
+
+# 5.4. history length
+
+one key question is: how much past information is needed to accurately approximate belady's? we study this by varying the number of past accesses that parrot attends over
+
+![](images/22a41b24cf93c228512c9363d4613fca54447f7fe33563b25597ff4ca3729c77.jpg)  
+figure 9. performance of parrot trained with different numbers of past accesses  $(h)$ . as the number of past accesses increases, normalized cache hit rates improve, until reaching a history length of 80. at that point, additional past accesses have little impact.
+
+$(h)$  from 20 to 140. in theory, parrot's lstm hidden state could contain information about all past accesses, but the lstm's memory is limited in practice.
+
+the results are summarized in figure 9. we observe that the past accesses become an increasingly better predictor of the future as the number past accesses increase, until about 80. after that point, more past information doesn't appear to help approximate belady's. interestingly, shi et al. (2019) show that glider experiences a similar saturation in improvement from additional past accesses, but at around 30 past accesses. this suggests that learning a replacement policy end-to-end with parrot can effectively leverage more past information than simply predicting whether a cache line is cache-friendly or cache-averse.
+
+# 6. related work
+
+cache replacement. traditional approaches to cache replacement rely on heuristics built upon intuition for cache access behavior. lru is based on the assumption that most recently used lines are more likely to be reused. more sophisticated policies target a handful of manually classified access patterns based on simple counters (qureshi et al., 2007; jaleel et al., 2010) or try to predict instructions that tend to load zero-reuse lines based on a table of saturating counters (wu et al., 2011; khan et al., 2010).
+
+several recent approaches instead focus on learning cache replacement policies. wang et al. (2019) also cast cache replacement as learning over a markov decision process, but apply reinforcement learning instead of imitation learning, which results in lower performance. more closely related to ours are hawkeye (jain & lin, 2016) and glider (shi et al., 2019), which also learn from belady's. they train a binary classification model based on belady's to predict if a line is cache-friendly or cache-averse, but rely on a traditional replacement heuristic to determine which line to evict when several lines are cache-averse. relying on the traditional heuristic to produce the final eviction decisions heavily constrains the expressivity of the policy class they learn over, so that even the best policy within their class of learnable policies may not accurately approximate belady's, yielding high cache miss rates for some access patterns.
+
+in contrast, our work is the first to propose learning a cache replacement policy end-to-end with imitation learning. framing cache replacement in this principled framework is important as much prior research has resorted to heuristics for hill climbing specific benchmarks. in addition, learning end-to-end enables us to optimize over a highly expressive policy class, achieving high cache hit rates even on complex and diverse access patterns.
+
+imitation learning. our work builds on imitation learning (il) techniques (ross & bagnell, 2014; sun et al., 2017), where the goal is to approximate an expert policy. our setting exhibits two distinctive properties: first, in our setting, the expert policy (belady's) can be queried at any state during training. the oracle policy (belady's) can be cheaply queried at any state during training, which differs from a body of il work (vecerik et al., 2017; hosu & rebedea, 2016; hester et al., 2018) focusing on learning with limited samples from an expensive expert (e.g., a human). the ability to arbitrarily query the oracle enables us to avoid compounding errors with dagger (ross et al., 2011). second, the distribution over actions of the oracle policy is available, enabling more sophisticated loss functions. prior work (sabour et al., 2018; choudhury et al., 2017) also studies settings with these two properties, although in different domains. sabour et al. (2018) shows that an approximate oracle can be computed in some natural-language sequence generation tasks; choudhury et al. (2017) learns to imitate an oracle computed from data only available during training, similar to belady's, which requires future information.
+
+# 7. conclusion and future directions
+
+we develop a foundation for learning end-to-end cache replacement policies with imitation learning, which significantly bridges the gap between prior work and belady's optimal replacement policy. although we evaluate our approach on cpu caches, due to the popularity of spec2006 as a caching benchmark, we emphasize that our approach applies to other caches as well, such as software caches, databases, and operating systems. software caches may be an especially promising area for applying our approach, as they tolerate higher latency in the replacement policy and implementing more complex replacement policies is easier in software. we highlight two promising future directions:
+
+first, this work focuses on the ml challenges of training a replacement to approximate belady's and does not explore the practicality of deploying the learned policy in production, where the two primary concerns are the memory and latency overheads of the policy. to address these concerns, future work could investigate model-size reduction techniques, such as distillation (hinton et al., 2015), pruning (janowsky, 1989; han et al., 2015; sze et al., 2017), and quantization, as well as domains tolerating greater latency and memory
+
+use, such as software caches. additionally, cache replacement decisions can be made at any time between misses to the same set, which provides a reasonably long latency window (e.g., on the order of seconds for software caches) for our replacement policy to make a decision. furthermore, the overall goal of cache replacement is to minimize latency. while minimizing cache misses minimizes latency to a first approximation, cache misses incur variable amounts of latency (qureshi et al., 2006), which could be addressed by fine-tuning learned policies to directly minimize latency via reinforcement learning.
+
+second, while belady's algorithm provides an optimal replacement policy for a single-level cache, there is no known optimal policy for multiple levels of caches (as is common in cpus and web services). this hierarchical cache replacement policy is a ripe area for deep learning and rl research, as is exploring the connection between cache replacement and prefetching, as they both involve selecting the optimal set of lines to be present in the cache. cache replacement is backward looking (based on the accesses so far) while prefetching is forward looking (predicting future accesses directly (hashemi et al., 2018; shi et al., 2020)).
+
+to facilitate further research in this area, we release a gym environment for cache replacement, which easily extends to the hierarchical cache replacement setting, where rl is required as the optimal policy is unknown. we find cache replacement an attractive problem for the rl/il communities, as it has significant real-world impact and data is highly available, in contrast to many current benchmarks that only have one of these two properties. in addition, cache replacement features several interesting challenges: rewards are highly delayed, as evicting a particular line may not lead to a cache hit/miss until thousands of timesteps later; the semantics of the action space dynamically changes, as the replacement policy chooses between differing cache lines at different states; the state space is large (e.g., 100,000s of unique addresses) and some programs require generalizing to new memory addresses at test time, not seen during training, similar to the rare words problem (luong et al., 2014) in nlp; and as our ablations show, different programs exhibit wildly different cache access patterns, which can require different techniques to address. in general, we observe that computer systems exhibit many interesting machine learning (ml) problems, but have been relatively inaccessible to the ml community because they require sophisticated systems tools. we take steps to avoid this by releasing our cache replacement environment.
+
+reproducibility. code for parrot and our cache replacement gym environment is available at https://github.com/google-research/google-research/tree/master/cache_replacement.
+
+# acknowledgements
+
+we thank zhan shi for insightful discussions and for providing the results for glider, which we compare against. we also thank chelsea finn, lisa lee, and amir yazdanbakhsh for their comments on a draft of this paper. finally, we thank the anonymous icml reviewers for their useful feedback, which helped improve this paper.
+
+this material is based upon work supported by the national science foundation graduate research fellowship under grant no. dge-1656518.
+
+# references
+
+beckmann, n. and sanchez, d. maximizing cache performance under uncertainty. in proceedings of the international symposium on high performance computer architecture, 2017.  
+belady, l. a. a study of replacement algorithms for a virtual-storage computer. ibm systems journal, 1966.  
+bengio, s., vinyals, o., jaitly, n., and shazeer, n. scheduled sampling for sequence prediction with recurrent neural networks. in advances in neural information processing systems, pp. 1171-1179, 2015.  
+bruening, d., garnett, t., and amarasinghe, s. an infrastructure for adaptive dynamic optimization. in proceedings of the international symposium on code generation and optimization, 2003.  
+choudhury, s., kapoor, a., ranade, g., scherer, s., and dey, d. adaptive information gathering via imitation learning. arxiv preprint arxiv:1705.07834, 2017.  
+cidon, a., eisenman, a., alizadeh, m., and katti, s. cliffhanger: scaling performance cliffs in web memory caches. in proceedings of the usenix symposium on networked systems design and implementation, 2016.  
+daumé, h., langford, j., and marcu, d. search-based structured prediction. machine learning, 75(3):297-325, 2009.  
+glorot, x. and bengio, y. understanding the difficulty of training deep feedforward neural networks. in proceedings of the thirteenth international conference on artificial intelligence and statistics, pp. 249-256, 2010.  
+han, s., mao, h., and dally, w. j. deep compression: compressing deep neural networks with pruning, trained quantization and huffman coding. arxiv preprint arxiv:1510.00149, 2015.  
+harty, k. and cheriton, d. r. application-controlled physical memory using external page-cache management. in
+
+proceedings of the international conference on architectural support for programming languages and operating systems, 1992.  
+hashemi, m., swersky, k., smith, j. a., ayers, g., litz, h., chang, j., kozyrakis, c., and ranganathan, p. learning memory access patterns. in proceedings of the international conference on machine learning, 2018.  
+henning, j. l. spec cpu2006 benchmark descriptions. acm sigarch computer architecture news, 34(4):1-17, 2006.  
+hester, t., vecerik, m., pietquin, o., lanctot, m., schaul, t., piot, b., horgan, d., quan, j., sendonaris, a., osband, i., et al. deep q-learning from demonstrations. in proceedings of the aaai conference on artificial intelligence, 2018.  
+hinton, g., vinyals, o., and dean, j. distilling the knowledge in a neural network. arxiv preprint arxiv:1503.02531, 2015.  
+hosu, i.-a. and rebedea, t. playing atari games with deep reinforcement learning and human checkpoint replay. arxiv preprint arxiv:1607.05077, 2016.  
+jaderberg, m., mnih, v., czarnecki, w. m., schaul, t., leibo, j. z., silver, d., and kavukcuoglu, k. reinforcement learning with unsupervised auxiliary tasks. arxiv preprint arxiv:1611.05397, 2016.  
+jain, a. and lin, c. back to the future: leveraging belady's algorithm for improved cache replacement. in proceedings of the international symposium on computer architecture, 2016.  
+jaleel, a. memory characterization of workloads using instrumentation-driven simulation. web copy: http://www.flue.umd.edu/ajaleel/workload, 2010.  
+jaleel, a., theobald, k. b., steely, s. c., and emer, j. high performance cache replacement using re-reference interval prediction (rrip). in proceedings of the international symposium on computer architecture, 2010.  
+janowsky, s. a. pruning versus clipping in neural networks. physical review a, 39(12):6600, 1989.  
+jouppi, n. p. improving direct-mapped cache performance by the addition of a small fully-associative cache and prefetch buffers. acm sigarch computer architecture news, 1990.  
+khan, s. m., tian, y., and jimenez, d. a. sampling dead block prediction for last-level caches. in proceedings of the international symposium on microarchitecture, 2010.
+
+kingma, d. p. and ba, j. adam: a method for stochastic optimization. arxiv preprint arxiv:1412.6980, 2014.  
+kullback, s. and leibler, r. a. on information and sufficiency. the annals of mathematical statistics, 22(1):79-86, 1951.  
+lample, g. and chaplot, d. s. playing fps games with deep reinforcement learning. in proceedings of the aaai conference on artificial intelligence, 2017.  
+luong, m.-t., sutskever, i., le, q. v., vinyals, o., and zaremba, w. addressing the rare word problem in neural machine translation. arxiv preprint arxiv:1410.8206, 2014.  
+luong, m.-t., pham, h., and manning, c. d. effective approaches to attention-based neural machine translation. arxiv preprint arxiv:1508.04025, 2015.  
+mikolov, t., sutskever, i., chen, k., corrado, g. s., and dean, j. distributed representations of words and phrases and their compositionality. in advances in neural information processing systems, pp. 3111-3119, 2013.  
+mirowski, p., pascanu, r., viola, f., soyer, h., ballard, a. j., banino, a., denil, m., goroshin, r., sifre, l., kavukcuoglu, k., et al. learning to navigate in complex environments. arxiv preprint arxiv:1611.03673, 2016.  
+paszke, a., gross, s., massa, f., lerer, a., bradbury, j., chanan, g., killeen, t., lin, z., gimelshein, n., antiga, l., desmaison, a., kopf, a., yang, e., devito, z., raison, m., tejani, a., chilamkurthy, s., steiner, b., fang, l., bai, j., and chintala, s. pytorch: an imperative style, high-performance deep learning library. in advances in neural information processing systems, pp. 8024-8035, 2019.  
+pomerleau, d. a. alvinn: an autonomous land vehicle in a neural network. in advances in neural information processing systems, pp. 305-313, 1989.  
+qin, t., liu, t.-y., and li, h. a general approximation framework for direct optimization of information retrieval measures. information retrieval, 13(4):375-397, 2010.  
+qureshi, m. k., lynch, d. n., mutlu, o., and patt, y. n. a case for mlp-aware cache replacement. in 33rd international symposium on computer architecture (isca'06), pp. 167-178. ieee, 2006.  
+qureshi, m. k., jaleel, a., patt, y. n., steely, s. c., and emer, j. adaptive insertion policies for high performance caching. in proceedings of the international symposium on computer architecture, 2007.
+
+ross, s. and bagnell, j. a. reinforcement and imitation learning via interactive no-regret learning. arxiv preprint arxiv:1406.5979, 2014.  
+ross, s., gordon, g., and bagnell, d. a reduction of imitation learning and structured prediction to no-regret online learning. in proceedings of the international conference on artificial intelligence and statistics, 2011.  
+sabour, s., chan, w., and norouzi, m. optimal completion distillation for sequence learning. arxiv preprint arxiv:1810.01398, 2018.  
+seo, m., kembhavi, a., farhadi, a., and hajishirzi, h. bidirectional attention flow for machine comprehension. arxiv preprint arxiv:1611.01603, 2016.  
+shi, z., huang, x., jain, a., and lin, c. applying deep learning to the cache replacement problem. in proceedings of the international symposium on microarchitecture, 2019.  
+shi, z., swersky, k., tarlow, d., ranganathan, p., and hashemi, m. learning execution through neural code fusion. in proceedings of the international conference on learning representations, 2020.  
+sun, w., venkatraman, a., gordon, g. j., boots, b., and bagnell, j. a. deeply aggravated: differentiable imitation learning for sequential prediction. in proceedings of the international conference on machine learning, pp. 3309-3318, 2017.  
+sze, v., chen, y.-h., yang, t.-j., and emer, j. s. efficient processing of deep neural networks: a tutorial and survey. proceedings of the ieee, 105(12):2295-2329, 2017.  
+vaswani, a., shazeer, n., parmar, n., uszkoreit, j., jones, l., gomez, a. n., kaiser, l., and polosukhin, i. attention is all you need. in advances in neural information processing systems, 2017.  
+vecerik, m., hester, t., scholz, j., wang, f., pietquin, o., piot, b., heess, n., rothörl, t., lampe, t., and riedmiller, m. leveraging demonstrations for deep reinforcement learning on robotics problems with sparse rewards. arxiv preprint arxiv:1707.08817, 2017.  
+wang, h., he, h., alizadeh, m., and mao, h. learning caching policies with subsampling. 2019.  
+wu, c.-j., jaleel, a., hasenplaugh, w., martonosi, m., steely jr, s. c., and emer, j. ship: signature-based hit predictor for high performance caching. in proceedings of the international symposium on microarchitecture, 2011.  
+xu, y., frachtenberg, e., jiang, s., and paleczny, m. characterizing facebook's memcached workload. ieee internet computing, 18(2):41-49, 2013.
+
+# a. architecture details
+
+our model is implemented in pytorch (paszke et al., 2019) and is optimized with the adam optimizer (kingma & ba, 2014).
+
+embeddings. in the full-sized model, to embed memory addresses and cache lines, we train a unique embedding for each unique memory address observed during training, sharing the same embedder across memory addresses and cache lines. we similarly embed pcs.
+
+concretely, we initialize an embedding matrix  $w^{m} \in \mathbb{r}^{(n_{m} + 1) \times d_{m}}$  via glorot uniform initialization (glorot & bengio, 2010), where  $n_{m}$  is set to the number of unique memory addresses in the training set and  $d_{m}$  is the dimension of the embedding. then, each unique memory address  $m$  is dynamically assigned a unique id 1 to  $n_{m}$ , and its embedding  $e(m)$  is set to the  $i$ -th row of the embedding matrix  $w^{m}$ . at test time, all memory addresses unseen during training are mapped to a special unk embedding, equal to the last row of  $w^{m}$ . we embed pcs with a similar embedding matrix  $w^{p} \in \mathbb{r}^{(n_{p} + 1) \times d_{p}}$ .
+
+attention. after computing embeddings (with either the full-sized model or the byte embedder)  $e(l_1), \ldots, e(l_w)$  for each line in the cache state and hidden states  $[h_{t-h+1}, \ldots, h_t]$  representing the past  $h$  accesses, we compute a context  $g_w$  for each cache line by attending over the hidden states with the line embeddings as queries as follows:
+
+1. following vaswani et al. (2017), we compute positional embeddings  $e(-h + 1), \ldots, e(0)$ , where  $e(\mathrm{pos}) \in \mathbb{r}^{d_{\mathrm{pos}}}$  and:
+
+$$
+e (\mathrm {p o s}) _ {2 i} = \sin \left(\frac {\mathrm {p o s}}{1 0 0 0 0 ^ {2 i / d _ {\mathrm {p o s}}}}\right)
+$$
+
+$$
+e (\mathrm {p o s}) _ {2 i + 1} = \cos \left(\frac {\mathrm {p o s}}{1 0 0 0 0 ^ {2 i / d _ {\mathrm {p o s}}}}\right).
+$$
+
+we concatenate these positional embeddings with the hidden states to encode how far in the past each access is:  $\left[(h_{t-h+1}; e(-h+1)), \ldots, (h_t; e(0))\right]$ . although in theory, the lstm hidden states can encode positions, we found that explicitly concatenating a positional embedding helped optimization.
+
+2. we apply general attention (luong et al., 2015) with each cache line embedding as the query and the concatenated hidden states and positional embeddings as keys:
+
+$$
+\alpha_ {i} = \operatorname {s o f t m a x} \left(e \left(l _ {w}\right) ^ {t} w _ {e} h _ {t - h + i}\right)
+$$
+
+$$
+g _ {w} = \sum_ {i = 1} ^ {h} \alpha_ {i} h _ {t - h + i}.
+$$
+
+the matrix  $w_{e} \in \mathbb{r}^{d_{m} \times (d_{\mathrm{lstm}} + d_{\mathrm{pos}})}$  is learned and  $g_{1}, \ldots, g_{w}$  can be computed in parallel (vaswani et al., 2017).
+
+# b. experimental details
+
+# b.1. detailed results
+
+to provide further insight into our learned policy, we also report results on two additional metrics:
+
+- top-k accuracy: the percentage of the time that the optimal line to evict according to belady's is in the top-k lines with highest probability of eviction under our learned policy. this indicates how frequently our learned policy is outputting decisions like those of belady's. we report top-1 and top-5 accuracy. note that since each cache set in the last-level cache can only hold 16 lines, the top-16 accuracy is  $100\%$ .
+
+- reuse distance gap: the average difference between the reuse distance of the optimal line to evict  $l^*$  and the reuse distance of the line evicted by parrot, i.e.,  $d_t(l^*) - d_t(l_w)$ , where  $w = \arg \max_i \pi(i \mid s_t)$ . this metric roughly captures how sub-optimal the decision made by parrot is at each timestep, as evicting a line with a smaller reuse distance is more likely to lead to a cache miss. a policy with a reuse distance gap of 0 is optimal, while a high reuse distance gap leads to more cache misses.
+
+we report results with of our full model with this metric in table 2. in mcf, libquantum, and lbm, our replacement policy frequently chooses to evict the same cache line as belady's with a top-1 accuracy of over  $75\%$  and a top-5 accuracy close to  $100\%$ . in other programs (e.g., omnetpp, web search), our replacement policy's top-1 and top-5 accuracies are significantly lower, even though its normalized cache hit rate in these programs is similar to its normalized cache hit rate in mcf. intuitively, this can occur when several cache lines have similar reuse distances to the reuse distance of the optimal cache line, so evicting any of them is roughly equivalent. thus top- $k$  accuracy is an interesting, but imperfect metric. note that this is the same intuition behind our ranking loss, which roughly measures the relative suboptimality of a line as a function of the suboptimality of its reuse distance.
+
+the differences in the reuse distance gaps between the programs emphasize the differences in the program behaviors and roughly indicate how frequently cache lines are reused in each program. for example, parrot achieves wildly different average reuse distance gaps, while maintaining similar normalized and raw cache hit rates (table 1) in omnetpp and mcf, due to differences in their access patterns. in omnetpp, evicting a line with a reuse distance 100's of accesses smaller than the reuse distance of the optimal line some
+
+table 2. mean top-1/5 accuracy and reuse distance gap of parrot, averaged over 3 seeds with single standard deviation intervals.  
+
+<table><tr><td>program</td><td>top-1 acc. (%)</td><td>top-5 acc. (%)</td><td>reuse dist. gap</td></tr><tr><td>astar</td><td>17.2 ± 1.1</td><td>50.8 ± 1.8</td><td>20065.8 ± 6433.1</td></tr><tr><td>bwaves</td><td>20.9 ± 3.2</td><td>49.1 ± 3.0</td><td>1356.9 ± 653.5</td></tr><tr><td>bzip</td><td>21.2 ± 0.9</td><td>44.3 ± 2.5</td><td>478.1 ± 39.5</td></tr><tr><td>cactusadm</td><td>91.3 ± 1.7</td><td>98.3 ± 0.2</td><td>2.0 ± 0.1</td></tr><tr><td>gems</td><td>15.0 ± 0.6</td><td>45.5 ± 2.4</td><td>46.4 ± 3.8</td></tr><tr><td>lbm</td><td>83.6 ± 2.4</td><td>98.0 ± 0.4</td><td>2.1 ± 0.3</td></tr><tr><td>leslie3d</td><td>88.5 ± 0.2</td><td>98.1 ± 0.2</td><td>1.9 ± 0.0</td></tr><tr><td>libquantum</td><td>83.2 ± 3.9</td><td>97.3 ± 0.2</td><td>2.2 ± 0.6</td></tr><tr><td>mcf</td><td>75.2 ± 0.5</td><td>87.6 ± 0.3</td><td>6.4 ± 0.4</td></tr><tr><td>milk</td><td>45.2 ± 2.2</td><td>65.6 ± 2.3</td><td>39.8 ± 5.1</td></tr><tr><td>omnetpp</td><td>35.0 ± 0.4</td><td>65.1 ± 0.4</td><td>533.4 ± 8.0</td></tr><tr><td>sphinx3</td><td>67.0 ± 2.0</td><td>88.4 ± 1.9</td><td>39.0 ± 8.5</td></tr><tr><td>xalanc</td><td>40.4 ± 2.2</td><td>93.4 ± 0.7</td><td>34805.1 ± 14760.2</td></tr><tr><td>web search</td><td>31.8 ± 0.8</td><td>77.5 ± 3.6</td><td>4012.5 ± 413.9</td></tr></table>
+
+times does not lead to a cache miss, as both lines may eventually be evicted before being reused anyway. on the other hand, in mcf, evicting a line that is used only slightly earlier than the optimal line more frequently leads to cache misses.
+
+# b.2. hyperparameters
+
+the following shows the values of all the hyperparameters we used in all our final experiments. we ran our final experiments with the bolded values and tuned over the non-bolded values. these values were used in all of our final experiments, including the ablations, except the history length experiments (section 5.4), where we varied the history length  $h$ .
+
+- learning rate: (0.001, 0.003)  
+- address embedding dimension  $(d_m)$ : 64  
+- pc embedding dimension  $(d_p)$ : 64  
+- pc embedding vocab size  $(n_p)$ : 5000  
+- position embedding dimension  $(d_{\mathrm{pos}})$ : 128  
+lstm hidden size  $(d_{\mathrm{lstm}})$  : 128  
+- frequency of recollecting  $b$ : (5000, 10000)  
+history length  $(h)$  : (20, 40, 60, 80, 100, 120, 140)
+
+we used the same hyperparameter values in all 5 programs (omnetpp, mcf, libq, lbm, and web search) we evaluated on, where the address embedding vocab size  $n_m$  was set to the number of unique addresses seen in the train set of each program (see table 3). for most hyperparameters, we selected a reasonable value and never changed it. we tuned the rest of the hyperparameters exclusively on the validation set of omnetpp.
+
+# b.3. program details
+
+table 3 reports the number of unique addresses and pcs contained in the train/test splits of each program, including the number of unique addresses and pcs in the test split
+
+that were not in the train split. notably, in some programs, new addresses and pcs appear at test time, that are not seen during training, requiring the replacement policy to generalize.
+
+in table 3, we also report the total number of last-level cache accesses collected for each of the five programs in our 50s collection interval. these accesses were split into the  $80\%$  train,  $10\%$  validation, and  $10\%$  test sets. since different programs exhibited varying levels of cacheability at the l1 and l2 cache levels, different numbers of last-level cache accesses resulted for each program. these varying numbers also indicate how different programs exhibit highly different behavior.
+
+# b.4. randomly chosen cache sets
+
+we randomly chose 64 sets and collected accesses to those sets on the last-level cache. the 64 randomly chosen sets were: 6, 35, 38, 53, 67, 70, 113, 143, 157, 196, 287, 324, 332, 348, 362, 398, 406, 456, 458, 488, 497, 499, 558, 611, 718, 725, 754, 775, 793, 822, 862, 895, 928, 1062, 1086, 1101, 1102, 1137, 1144, 1175, 1210, 1211, 1223, 1237, 1268, 1308, 1342, 1348, 1353, 1424, 1437, 1456, 1574, 1599, 1604, 1662, 1683, 1782, 1789, 1812, 1905, 1940, 1967, and 1973.
+
+table 3. program details in terms of the number of last-level cache accesses and unique addresses/pcs. 'train' and 'test' show the number of unique addresses and pcs appearing in each domain at train and test time, whereas 'unseen test' indicates the number of addresses and pcs appearing at test time, but not train time. the given percentages indicate what portion of all test accesses had unseen addresses or pcs.  
+
+<table><tr><td rowspan="2">program</td><td rowspan="2">cache accesses</td><td colspan="2">train</td><td colspan="2">test</td><td colspan="2">unseen test</td></tr><tr><td>addresses</td><td>pcs</td><td>addresses</td><td>pcs</td><td>addresses</td><td>pcs</td></tr><tr><td>astar</td><td>879,040</td><td>13,047</td><td>25</td><td>8,235</td><td>9</td><td>46 (0.6%)</td><td>0 (0%)</td></tr><tr><td>bwaves</td><td>2,785,280</td><td>443,662</td><td>436</td><td>209,231</td><td>155</td><td>12 (0.1%)</td><td>38 (5.8%)</td></tr><tr><td>bzip</td><td>3,899,840</td><td>6,086</td><td>415</td><td>3,571</td><td>28</td><td>0 (0%)</td><td>0 (0%)</td></tr><tr><td>cactusadm</td><td>1,759,040</td><td>298,213</td><td>243</td><td>83,046</td><td>191</td><td>0 (0%)</td><td>0 (0%)</td></tr><tr><td>gems</td><td>7,298,880</td><td>423,706</td><td>5,305</td><td>363,313</td><td>1,395</td><td>1 (0%)</td><td>0 (0%)</td></tr><tr><td>lbm</td><td>10,224,960</td><td>206,271</td><td>44</td><td>206,265</td><td>34</td><td>0 (0%)</td><td>0 (0%)</td></tr><tr><td>leslie3d</td><td>6,956,160</td><td>38,507</td><td>1,705</td><td>38,487</td><td>1,663</td><td>0 (0%)</td><td>0 (0%)</td></tr><tr><td>libquantum</td><td>4,507,200</td><td>16,394</td><td>14</td><td>16,386</td><td>5</td><td>0 (0%)</td><td>0 (0%)</td></tr><tr><td>mcf</td><td>4,143,360</td><td>622,142</td><td>73</td><td>81,666</td><td>67</td><td>77,608 (21.6%)</td><td>0 (0%)</td></tr><tr><td>milc</td><td>3,048,000</td><td>203,504</td><td>254</td><td>90,933</td><td>82</td><td>0 (0%)</td><td>2 (0.5%)</td></tr><tr><td>omnetpp</td><td>3,414,720</td><td>16,912</td><td>402</td><td>14,079</td><td>315</td><td>275 (0.6%)</td><td>3 (1.0%)</td></tr><tr><td>sphinx3</td><td>2,372,800</td><td>20,629</td><td>528</td><td>4,586</td><td>199</td><td>0 (0%)</td><td>1 (0%)</td></tr><tr><td>xalanc</td><td>4,714,240</td><td>15,515</td><td>217</td><td>11,600</td><td>161</td><td>507 (1%)</td><td>5 (0%)</td></tr><tr><td>web search</td><td>3,636,800</td><td>241,164</td><td>32,468</td><td>66,645</td><td>15,893</td><td>10,334 (5.3%)</td><td>948 (6%)</td></tr></table>

@@ -1,0 +1,283 @@
+# lift, splat, shoot: encoding images from arbitrary camera rigs by implicitly unprojecting to 3d
+
+jonah philion sanja fidler
+
+nvidia university of toronto vector institute
+
+![](images/2af833f2c86888c7bc055ffd9ea4b891c7cc48b9137b1c8bd004690ca302c496.jpg)  
+fig. 1: we propose a model that, given multi-view camera data (left), infers semantics directly in the bird's-eye-view (bev) coordinate frame (right). we show vehicle segmentation (blue), drivable area (orange), and lane segmentation (green). these bev predictions are then projected back onto input images (dots on the left).
+
+abstract. the goal of perception for autonomous vehicles is to extract semantic representations from multiple sensors and fuse these representations into a single "bird's-eye-view" coordinate frame for consumption by motion planning. we propose a new end-to-end architecture that directly extracts a bird's-eye-view representation of a scene given image data from an arbitrary number of cameras. the core idea behind our approach is to "lift" each image individually into a frustum of features for each camera, then "splat" all frustums into a rasterized bird's-eye-view grid. by training on the entire camera rig, we provide evidence that our model is able to learn not only how to represent images but how to fuse predictions from all cameras into a single cohesive representation of the scene while being robust to calibration error. on standard bird's-eye-view tasks such as object segmentation and map segmentation, our model outperforms all baselines and prior work. in pursuit of the goal of learning dense representations for motion planning, we show that the representations inferred by our model enable interpretable end-to-end motion planning by "shooting" template trajectories into a bird's-eye-view cost map output by our network. we benchmark our approach against models that use oracle depth from lidar. project page with code: https://nv-tlabs.github.io/lift-splat-shoot.
+
+# 1 introduction
+
+computer vision algorithms generally take as input an image and output either a prediction that is coordinate-frame agnostic – such as in classification [19,30,16,17] – or a prediction in the same coordinate frame as the input image – such as in object detection, semantic segmentation, or panoptic segmentation [7,1,15,36].
+
+this paradigm does not match the setting for perception in self-driving out-of-the-box. in self-driving, multiple sensors are given as input, each with a different coordinate frame, and perception models are ultimately tasked with producing predictions in a new coordinate frame - the frame of the ego car - for consumption by the downstream planner, as shown in fig. 2.
+
+there are many simple, practical strategies for extending the single-image paradigm to the multi-view setting. for instance, for the problem of 3d object detection from  $n$  cameras, one can apply a single-image detector to all input images individually, then rotate and translate each detection into the ego frame according to the intrinsics and extrinsics of the camera in which the object was detected. this extension of the single-view paradigm to the multi-view setting has three valuable symmetries baked into it:
+
+1. translation equivariance - if pixel coordinates within an image are all shifted, the output will shift by the same amount. fully convolutional single-image object detectors roughly have this property and the multi-view extension inherits this property from them [11] [6].  
+2. permutation invariance - the final output does not depend on a specific ordering of the  $n$  cameras.  
+3. ego-frame isometry equivariance - the same objects will be detected in a given image no matter where the camera that captured the image was located relative to the ego car. an equivalent way to state this property is that the definition of the ego-frame can be rotated/translated and the output will rotate/translate with it.
+
+the downside of the simple approach above is that using post-processed detections from the single-image detector prevents one from differentiating from predictions made in the ego frame all the way back to the sensor inputs. as a result, the model cannot learn in a data-driven way what the best way is to fuse information across cameras. it also means backpropagation cannot be used to automatically improve the perception system using feedback from the downstream planner.
+
+we propose a model named "lift-splat" that preserves the 3 symmetries identified above by design while also being end-to-end differentiable. in section 3, we explain how our model "lifts" images into 3d by generating a frustum-shaped point cloud of contextual features, "splats" all frustums onto a reference plane as is convenient for the downstream task of motion planning. in section 3.3, we propose a method for "shooting" proposal trajectories into this reference plane for interpretable end-to-end motion planning. in section 4, we identify implementation details for training lift-splat models efficiently on full camera
+
+![](images/4ee65b4cb1403944f3ba93c52432b8c2a01de80be36b403dc00c9bdbdd8645e5.jpg)  
+fig. 2: (left, from segnet [1]) traditionally, computer vision tasks such as semantic segmentation involve making predictions in the same coordinate frame as the input image. (right, from neural motion planner [41]) in contrast, planning for self-driving generally operates in the bird's-eye-view frame. our model directly makes predictions in a given bird's-eye-view frame for end-to-end planning from multi-view images.
+
+rigs. we present empirical evidence in sec 5 that our model learns an effective mechanism for fusing information from a distribution of possible inputs.
+
+# 2 related work
+
+our approach for learning cohesive representations from image data from multiple cameras builds on recent work in sensor fusion and monocular object detection. large scale multi-modal datasets from nutonomy [2], lyft [13], waymo [35], and argo [3], have recently made full representation learning of the entire  $360^{\circ}$  scene local to the ego vehicle conditioned exclusively on camera input a possibility. we explore that possibility with our lift-splat architecture.
+
+# 2.1 monocular object detection
+
+monocular object detectors are defined by how they model the transformation from the image plane to a given 3-dimensional reference frame. a standard technique is to apply a mature 2d object detector in the image plane and then train a second network to regress 2d boxes into 3d boxes [12,26,31,27]. the current state-of-the-art 3d object detector on the nuscenes benchmark [31] uses an architecture that trains a standard 2d detector to also predict depth using a loss that seeks to disentangle error due to incorrect depth from error due to incorrect bounding boxes. these approaches achieve great performance on 3d object detection benchmarks because detection in the image plane factors out the fundamental cloud of ambiguity that shrouds monocular depth prediction.
+
+an approach with recent empirical success is to separately train one network to do monocular depth prediction and another to do bird's-eye-view detection separately [39] [40]. these approaches go by the name of "pseudolidar". the intuitive reason for the empirical success of pseudolidar is that pseudolidar enables training a bird's-eye-view network that operates in the coordinate frame where the detections are ultimately evaluated and where, relative to the image plane, euclidean distance is more meaningful.
+
+![](images/ea242ff618d8afcb97c08cce45326e01fe723a654b9e7363e9916723975209f0.jpg)  
+fig. 3: we visualize the "lift" step of our model. for each pixel, we predict a categorical distribution over depth  $\alpha \in \triangle^{d-1}$  (left) and a context vector  $\mathbf{c} \in \mathbb{r}^c$  (top left). features at each point along the ray are determined by the outer product of  $\alpha$  and  $\mathbf{c}$  (right).
+
+a third category of monocular object detectors uses 3-dimensional object primitives that acquire features based on their projection onto all available cameras. mono3d [4] achieved state of the art monocular object detection on kitti by generating 3-dimensional proposals on a ground plane that are scored by projecting onto available images. orthographic feature transform [29] builds on mono3d by projecting a fixed cube of voxels onto images to collect features and then training a second "bev" cnn to detect in 3d conditioned on the features in the voxels. a potential performance bottleneck of these models that our model addresses is that a pixel contributes the same feature to every voxel independent of the depth of the object at that pixel.
+
+# 2.2 inference in the bird's-eye-view frame
+
+models that use extrinsic and intrinsic in order to perform inference directly in the bird's-eye-view frame have received a large amount of interest recently. monolayout [21] performs bird's-eye-view inference from a single image and uses an adversarial loss to encourage the model to inpaint plausible hidden objects. in concurrent work, pyramid occupancy networks [28] proposes a transformer architecture that converts image representations into bird's-eye-view representations. fishing net [9] - also concurrent work - proposes a multi-view architecture that both segments objects in the current timestep and performs future prediction. we show that our model outperforms prior work empirically in section 5. these architectures, as well as ours, use data structures similar to "multi-plane" images from the machine learning graphics community [34,32,38,20].
+
+# 3 method
+
+in this section, we present our approach for learning bird's-eye-view representations of scenes from image data captured by an arbitrary camera rig. we design our model such that it respects the symmetries identified in section 1.
+
+formally, we are given  $n$  images  $\{\mathbf{x}_k\in \mathbb{r}^{3\times h\times w}\}_{n}$  each with an extrinsic matrix  $\mathbf{e}_k\in \mathbb{r}^{3\times 4}$  and an intrinsic matrix  $\mathbf{i}_k\in \mathbb{r}^{3\times 3}$ , and we seek to find a
+
+rasterized representation of the scene in the bev coordinate frame  $\mathbf{y} \in \mathbb{r}^{c \times x \times y}$ . the extrinsic and intrinsic matrices together define the mapping from reference coordinates  $(x, y, z)$  to local pixel coordinates  $(h, w, d)$  for each of the  $n$  cameras. we do not require access to any depth sensor during training or testing.
+
+# 3.1 lift: latent depth distribution
+
+the first stage of our model operates on each image in the camera rig in isolation. the purpose of this stage is to "lift" each image from a local 2-dimensional coordinate system to a 3-dimensional frame that is shared across all cameras.
+
+the challenge of monocular sensor fusion is that we require depth to transform into reference frame coordinates but the "depth" associated to each pixel is inherently ambiguous. our proposed solution is to generate representations at all possible depths for each pixel.
+
+let  $\mathbf{x} \in \mathbb{r}^{3 \times h \times w}$  be an image with extrinsics  $\mathbf{e}$  and intrinsics  $\mathbf{i}$ , and let  $p$  be a pixel in the image with image coordinates  $(h, w)$ . we associate  $|d|$  points  $\{(h, w, d) \in \mathbb{r}^3 \mid d \in d\}$  to each pixel where  $d$  is a set of discrete depths, for instance defined by  $\{d_0 + \delta, \dots, d_0 + |d| \delta\}$ . note that there are no learnable parameters in this transformation. we simply create a large point cloud for a given image of size  $d \cdot h \cdot w$ . this structure is equivalent to what the multi-view synthesis community [38,32] has called a multi-plane image except in our case the features in each plane are abstract vectors instead of  $(r, g, b, \alpha)$  values.
+
+the context vector for each point in the point cloud is parameterized to match a notion of attention and discrete depth inference. at pixel  $p$ , the network predicts a context  $\mathbf{c} \in \mathbb{r}^c$  and a distribution over depth  $\alpha \in \triangle^{|d|-1}$  for every pixel. the feature  $\mathbf{c}_d \in \mathbb{r}^c$  associated to point  $p_d$  is then defined as the context vector for pixel  $p$  scaled by  $\alpha_d$ :
+
+$$
+\mathbf {c} _ {d} = \alpha_ {d} \mathbf {c}. \tag {1}
+$$
+
+note that if our network were to predict a one-hot vector for  $\alpha$ , context at the point  $p_d$  would be non-zero exclusively for a single depth  $d^*$  as in pseudolidar [39]. if the network predicts a uniform distribution over depth, the network would predict the same representation for each point  $p_d$  assigned to pixel  $p$  independent of depth as in oft [29]. our network is therefore in theory capable of choosing between placing context from the image in a specific location of the bird's-eye-view representation versus spreading the context across the entire ray of space, for instance if the depth is ambiguous.
+
+in summary, ideally, we would like to generate a function  $g_{c}:(x,y,z)\in \mathbb{r}^{3}\to c\in \mathbb{r}^{c}$  for each image that can be queried at any spatial location and return a context vector. to take advantage of discrete convolutions, we choose to discretize space. for cameras, the volume of space visible to the camera corresponds to a frustum. a visual is provided in figure 3.
+
+# 3.2 splat: pillar pooling
+
+we follow the pointpillars [18] architecture to convert the large point cloud output by the "lift" step. "pillars" are voxels with infinite height. we assign
+
+![](images/815c4e81e1c94e99ff9f73b31aa2058b56e872da03b2e860960ad9789cf088f7.jpg)  
+fig. 4: lift-splat-shoot outline our model takes as input  $n$  images (left) and their corresponding extrinsic and intrinsic parameters. in the "lift" step, a frustum-shaped point cloud is generated for each individual image (center-left). the extrinsics and intrinsics are then used to splat each frustum onto the bird's-eye-view plane (center-right). finally, a bird's-eye-view cnn processes the bird's-eye-view representation for bev semantic segmentation or planning (right).
+
+every point to its nearest pillar and perform sum pooling to create a  $c \times h \times w$  tensor that can be processed by a standard cnn for bird's-eye-view inference. the overall lift-splat architecture is outlined in figure 4.
+
+just as oft [29] uses integral images to speed up their pooling step, we apply an analogous technique to speed up sum pooling. efficiency is crucial for training our model given the size of the point clouds generated. instead of padding each pillar then performing sum pooling, we avoid padding by using packing and leveraging a "cumsum trick" for sum pooling. this operation has an analytic gradient that can be calculated efficiently to speed up autograd as explained in subsection 4.2.
+
+# 3.3 shoot: motion planning
+
+key aspect of our lift-splat model is that it enables end-to-end cost map learning for motion planning from camera-only input. at test time, planning using the inferred cost map can be achieved by "shooting" different trajectories, scoring their cost, then acting according to lowest cost trajectory [25]. in sec 5.6, we probe the ability of our model to enable end-to-end interpretable motion planning and compare its performance to lidar-based end-to-end neural motion planners.
+
+we frame "planning" as predicting a distribution over  $k$  template trajectories for the ego vehicle
+
+$$
+\mathcal {t} = \{\tau_ {i} \} _ {k} = \{\{x _ {j}, y _ {j}, t _ {j} \} _ {t} \} _ {k}
+$$
+
+conditioned on sensor observations  $p(\tau | o)$ . our approach is inspired by the recently proposed neural motion planner (nmp) [41], an architecture that conditions on point clouds and high-definition maps to generate a cost-volume that can be used to score proposed trajectories.
+
+![](images/1b2fcbd1223b08490b767f473336c9027101c77eedbd0ddb3a48e34e81b53609.jpg)  
+fig. 5: we visualize the 1k trajectory templates that we "shoot" onto our cost map during training and testing. during training, the cost of each template trajectory is computed and interpreted as a 1k-dimensional boltzmann distribution over the templates. during testing, we choose the argmax of this distribution and act according to the chosen template.
+
+instead of the hard-margin loss proposed in nmp, we frame planning as classification over a set of  $k$  template trajectories. to leverage the cost-volume nature of the planning problem, we enforce the distribution over  $k$  template trajectories to take the following form
+
+$$
+p \left(\tau_ {i} \mid o\right) = \frac {\exp \left(- \sum_ {x _ {i} , y _ {i} \in \tau_ {i}} c _ {o} \left(x _ {i} , y _ {i}\right)\right)}{\sum_ {\tau \in \mathcal {t}} \exp \left(- \sum_ {x _ {i} , y _ {i} \in \tau} c _ {o} \left(x _ {i} , y _ {i}\right)\right)} \tag {2}
+$$
+
+where  $c_{o}(x,y)$  is defined by indexing into the cost map predicted given observations  $o$  at location  $x,y$  and can therefore be trained end-to-end from data by optimizing for the log probability of expert trajectories. for labels, given a ground-truth trajectory, we compute the nearest neighbor in l2 distance to the template trajectories  $\mathcal{t}$  then train with the cross entropy loss. this definition of  $p(\tau_i|o)$  enables us to learn an interpretable spatial cost function without defining a hard-margin loss as in nmp [41].
+
+in practice, we determine the set of template trajectories by running k-means on a large number of expert trajectories. the set of template trajectories used for "shooting" onto the cost map that we use in our experiments are visualized in figure 5.
+
+# 4 implementation
+
+# 4.1 architecture details
+
+the neural architecture of our model is similar to oft [29]. as in oft, our model has two large network backbones. one of the backbones operates on each image individually in order to featurize the point cloud generated from each image. the other backbone operates on the point cloud once it is splatted into pillars in the reference frame. the two networks are joined by our lift-splat layer as defined in section 3 and visualize in figure 4.
+
+for the network that operates on each image in isolation, we leverage layers from an efficientnet-b0 [37] pretrained onimagenet [30] in all experiments for all
+
+models including baselines. efficientnets are network architectures found by exhaustive architecture search in a resource limited regime with depth, width, and resolution scaled up proportionally. we find that they enable higher performance relative to resnet-18/34/50 [8] across all models with a minor inconvenience of requiring more optimization steps to converge.
+
+for our bird's-eye-view network, we use a combination of resnet blocks similar to pointpillars [18]. specifically, after a convolution with kernel 7 and stride 2 followed by batchnorm [10] and relu [22], we pass through the first 3 metalayers of resnet-18 to get 3 bird's-eye-view representations at different resolutions  $x_{1}, x_{2}, x_{3}$ . we then upsample  $x_{3}$  by a scale factor of 4, concatenate with  $x_{1}$ , apply a resnet block, and finally upsample by 2 to return to the resolution of the original input bird's-eye-view pseudo image. we count 14.3m trainable parameters in our final network.
+
+there are several hyper-parameters that determine the "resolution" of our model. first, there is the size of the input images  $h \times w$ . in all experiments below, we resize and crop input images to size  $128 \times 352$  and adjust extrinsics and intrinsics accordingly. another important hyperparameter of network is the size the resolution of the bird's-eye-view grid  $x \times y$ . in our experiments, we set bins in both  $x$  and  $y$  from -50 meters to 50 meters with cells of size 0.5 meters × 0.5 meters. the resultant grid is therefore  $200 \times 200$ . finally, there's the choice of  $d$  that determines the resolution of depth predicted by the network. we restrict  $d$  between 4.0 meters and 45.0 meters spaced by 1.0 meters. with these hyperparameters and architectural design choices, the forward pass of the model runs at 35 hz on a titan v gpu.
+
+# 4.2 frustum pooling cumulative sum trick
+
+training efficiency is critical for learning from data from an entire sensor rig. we choose sum pooling across pillars in section 3 as opposed to max pooling because our "cumulative sum" trick saves us from excessive memory usage due to padding. the "cumulative sum trick" is the observation that sum pooling can be performed by sorting all points according to bin id, performing a cumulative sum over all features, then subtracting the cumulative sum values at the boundaries of the bin sections. instead of relying on autograd to backprop through all three steps, the analytic gradient for the module as a whole can be derived, speeding up training by  $2\mathrm{x}$ . we call the layer "frustumpooling" because it handles converting the frustums produced by  $n$  images into a fixed dimensional  $c\times h\times w$  tensor independent of the number of cameras  $n$ . code can be found on our project page.
+
+# 5 experiments and results
+
+we use the nuscenes [2] and lyft level 5 [13] datasets to evaluate our approach. nuscenes is a large dataset of point cloud data and image data from 1k scenes, each of 20 seconds in length. the camera rig in both datasets is comprised
+
+of 6 cameras which roughly point in the forward, front-left, front-right, back-left, back-right, and back directions. in all datasets, there is a small overlap between the fields-of-view of the cameras. the extrinsic and intrinsic parameters of the cameras shift throughout both datasets. since our model conditions on the camera calibration, it is able to handle these shifts.
+
+we define two object-based segmentation tasks and two map-based tasks. for the object segmentation tasks, we obtain ground truth bird's-eye-view targets by projecting 3d bounding boxes into the bird's-eye-view plane. car segmentation on nuscenes refers to all bounding boxes of class vehicle.car and vehicle segmentation on nuscenes refers to all bounding boxes of meta-category vehicle. car segmentation on lyft refers to all bounding boxes of class car and vehicle segmentation on nuscenes refers to all bounding boxes with class  $\in$  {car, truck, other_vehicle, bus, bicycle}. for mapping, we use transform map layers from the nuscenes map into the ego frame using the provided 6 dof localization and rasterize.
+
+for all object segmentation tasks, we train with binary cross entropy with positive weight 1.0. for the lane segmentation, we set positive weight to 5.0 and for road segmentation we use positive weight 1.0 [24]. in all cases, we train for  $300\mathrm{k}$  steps using adam [14] with learning rate  $1e - 3$  and weight decay  $1e - 7$ . we use the pytorch framework [23].
+
+the lyft dataset does not come with a canonical train/val split. we separate 48 of the lyft scenes for validation to get a validation set of roughly the same size as nuscenes (6048 samples for lyft, 6019 samples for nuscenes).
+
+# 5.1 description of baselines
+
+unlike vanilla cnns, our model comes equipped with 3-dimensional structure at initialization. we show that this structure is crucial for good performance by comparing against a cnn composed of standard modules. we follow an architecture similar to monolayout [21] which also trains a cnn to output bird's-eye-view labels from images only but does not leverage inductive bias in designing the architecture and trains on single cameras only. the architecture has an efficientnet-b0 backbone that extracts features independently across all images. we concatenate the representations and perform bilinear interpolation to upsample into a  $\mathbb{r}^{x\times y}$  tensor as is output by our model. we design the network such that it has roughly the same number of parameters as our model. the weak performance of this baseline demonstrates how important it is to explicitly bake symmetry 3 from sec 1 into the model in the multi-view setting.
+
+to show that our model is predicting a useful implicit depth, we compare against our model where the weights of the pretrained cnn are frozen as well as to oft [29]. we outperform these baselines on all tasks, as shown in tables 1 and 2. we also outperform concurrent work that benchmarks on the same segmentation tasks [9] [28]. as a result, the architecture is learning both an effective depth distribution as well as effective contextual representations for the downstream task.
+
+<table><tr><td rowspan="2"></td><td colspan="2">nuscenes</td><td colspan="2">lyft</td></tr><tr><td>car</td><td>vehicles</td><td>car</td><td>vehicles</td></tr><tr><td>cnn</td><td>22.78</td><td>24.25</td><td>30.71</td><td>31.91</td></tr><tr><td>frozen encoder</td><td>25.51</td><td>26.83</td><td>35.28</td><td>32.42</td></tr><tr><td>oft</td><td>29.72</td><td>30.05</td><td>39.48</td><td>40.43</td></tr><tr><td>lift-splat (us)</td><td>32.06</td><td>32.07</td><td>43.09</td><td>44.64</td></tr><tr><td>pon* [28]</td><td>24.7</td><td>-</td><td>-</td><td>-</td></tr><tr><td>fishing* [9]</td><td>-</td><td>30.0</td><td>-</td><td>56.0</td></tr></table>
+
+table 1: segment. iou in bev frame  
+
+<table><tr><td></td><td>drivable area</td><td>lane boundary</td></tr><tr><td>cnn</td><td>68.96</td><td>16.51</td></tr><tr><td>frozen encoder</td><td>61.62</td><td>16.95</td></tr><tr><td>oft</td><td>71.69</td><td>18.07</td></tr><tr><td>lift-splat (us)</td><td>72.94</td><td>19.96</td></tr><tr><td>pon* [28]</td><td>60.4</td><td>-</td></tr></table>
+
+table 2: map iou in bev frame
+
+# 5.2 segmentation
+
+we demonstrate that our lift-splat model is able to learn semantic 3d representations given supervision in the bird's-eye-view frame. results on the object segmentation tasks are shown in table 1, while results on the map segmentation tasks are in table 2. on all benchmarks, we outperform our baselines. we believe the extent of these gains in performance from implicitly unprojecting into 3d are substantial, especially for object segmentation. we also include reported iou scores for two concurrent works [9] [28] although both of these papers use different definitions of the bird's-eye-view grid and a different validation split for the lyft dataset so a true comparison is not yet possible.
+
+# 5.3 robustness
+
+because the bird's-eye-view cnn learns from data how to fuse information across cameras, we can train the model to be robust to simple noise models that occur in self-driving such as extrinsics being biased or cameras dying. in figure 6, we verify that by dropping cameras during training, our model handles dropped cameras at better at test time. in fact, the best performing model when all 6 cameras are present is the model that is trained with 1 camera being randomly dropped from every sample during training. we reason that sensor dropout forces the model to learn the correlation between images on different cameras, similar to other variants of dropout [33] [5]. we show on the left of figure 6 that training the model with noisy extrinsics can lead to better test-time performance. for low amounts of noise at test-time, models that are trained without any noise in the extrinsics perform the best because the bev cnn can trust the location of the splats with more confidence. for high amounts of extrinsic noise, our model sustains its good performance.
+
+in figure 7, we measure the "importance" of each camera for the performance of car segmentation on nuscenes. note that losing cameras on nuscenes implies that certain regions of the region local to the car have no sensor measurements and as a result performance strictly upper bounded by performance with the full sensor rig. qualitative examples in which the network inpaints due to missing cameras are shown in figure 8. in this way, we measure the importance of each camera, suggesting where sensor redundancy is more important for safety.
+
+![](images/8e48fa35b9bc9f5cd18119d1ba9d9afaa763de98e7604600ef20670f156735bb.jpg)  
+(a) test time extrinsic noise
+
+![](images/cddc6524464ded634f71d2d728eb0fbc863daccde90fc4f22939746cb7e58dda.jpg)  
+(b) test time camera dropout
+
+![](images/2db7898056504b15f1c5607eeeedf640fe281615552dfe9af78182c38408a0c5.jpg)  
+fig. 6: we show that it is possible to train our network such that it is resilient to common sources of sensor error. on the left, we show that by training with a large amount of noise in the extrinsics (blue), the network becomes more robust to extrinsic noise at test time. on the right, we show that randomly dropping cameras from each batch during training (red) increases robustness to sensor dropout at test time.  
+fig. 7: we measure intersection-over-union of car segmentation when each of the cameras is missing. the backwards camera on the nuscenes camera rig has a wider field of view so it is intuitive that losing this camera causes the biggest decrease in performance relative to performance given the full camera rig (labeled "full" on the right).
+
+<table><tr><td></td><td>iou</td></tr><tr><td>4</td><td>26.53</td></tr><tr><td>4 + 1fl</td><td>27.35</td></tr><tr><td>4 + 1bl</td><td>27.27</td></tr><tr><td>4 + 1bl + 1fl</td><td>27.94</td></tr></table>
+
+table 3: we train on images from only 4 of the 6 cameras in the nuscenes dataset. we then evaluate with the new cameras ( $1_{bl}$  corresponds to the "back left" camera and  $1_{fl}$  corresponds to the "front left" camera) and find that the performance of the model strictly increases as we add more sensors unseen during training.
+
+# 5.4 zero-shot camera rig transfer
+
+we now probe the generalization capabilities of lift-splat. in our first experiment, we measure performance of our model when only trained on images from a subset of cameras from the nuscenes camera rig but at test time has access to images from the remaining two cameras. in table 3, we show that the performance of our model for car segmentation improves when additional cameras are available at test time without any retraining.
+
+we take the above experiment a step farther and probe how well our model generalizes to the lyft camera rig if it was only trained on nuscenes data. qualitative results of the transfer are shown in figure 9 and the benchmark against the generalization of our baselines is shown in table 4.
+
+![](images/ca87b1fdd259749913b690e543cf07e59404ae7c5a1632f49f51089e3eeec64a.jpg)  
+fig. 8: for a single time stamp, we remove each of the cameras and visualize how the loss the cameras effects the prediction of the network. region covered by the missing camera becomes fuzzier in every case. when the front camera is removed (top middle), the network extrapolates the lane and drivable area in front of the ego and extrapolates the body of a car for which only a corner can be seen in the top right camera.
+
+table 4: we train the model on nuscenes then evaluate it on lyft. the lyft cameras are entirely different from the nuscenes cameras but the model succeeds in generalizing far better than the baselines. note that our model has widened the gap from the standard benchmark in tables 1 and 2.  
+
+<table><tr><td></td><td>lyft car</td><td>lyft vehicle</td></tr><tr><td>cnn</td><td>7.00</td><td>8.06</td></tr><tr><td>frozen encoder</td><td>15.08</td><td>15.82</td></tr><tr><td>oft</td><td>16.25</td><td>16.27</td></tr><tr><td>lift-splat (us)</td><td>21.35</td><td>22.59</td></tr></table>
+
+# 5.5 benchmarking against oracle depth
+
+we benchmark our model against the pointpillars [18] architecture which uses ground truth depth from lidar point clouds. as shown in table 5, across all tasks, our architecture performs slightly worse than pointpillars trained with a single scan of lidar. however, at least on drivable area segmentation, we note that we approach the performance of lidar. in the world in general, not all lanes are visible in a lidar scan. we would like to measure performance in a wider range of environments in the future.
+
+to gain insight into how our model differs from lidar, we plot how performance of car segmentation varies with two control variates: distance to the ego vehicle and weather conditions. we determine the weather of a scene from the description string that accompanies every scene token in the nuscenes dataset. the results are shown in figure 10. we find that performance of our model is much worse than pointpillars on scenes that occur at night as expected. we also find that both models experience roughly linear performance decrease with increased depth.
+
+# 5.6 motion planning
+
+finally, we evaluate the capability of our model to perform planning by training the representation output by lift-splat to be a cost function. the trajectories that we generate are 5 seconds long spaced by 0.25 seconds. to acquire templates, we fit k-means for  $k = 1000$  to all ego trajectories in the training set of nuscenes. at test time, we measure how well the network is able to predict the
+
+![](images/b5f06718d2e2d2f19b7305197ff76de08c1b075bab8782f5a58f2023cca3cb52.jpg)  
+fig. 9: we qualitatively show how our model performs given an entirely new camera rig at test time. road segmentation is shown in orange, lane segmentation is shown in green, and vehicle segmentation is shown in blue.
+
+<table><tr><td rowspan="2" colspan="3"></td><td colspan="2">nuscenes</td><td colspan="2">lyft</td></tr><tr><td>car</td><td>vehicle</td><td>car</td><td>vehicle</td></tr><tr><td>oracle depth (1 scan)</td><td>74.91</td><td>25.12</td><td>40.26</td><td>44.48</td><td>74.96</td><td>76.16</td></tr><tr><td>oracle depth (&gt;1 scan)</td><td>76.96</td><td>26.80</td><td>45.36</td><td>49.51</td><td>75.42</td><td>76.49</td></tr><tr><td>lift-splat (us)</td><td>70.81</td><td>19.58</td><td>32.06</td><td>32.07</td><td>43.09</td><td>44.64</td></tr></table>
+
+table 5: when compared to models that use oracle depth from lidar, there is still room for improvement. video inference from camera rigs is likely necessary to acquire the depth estimates necessary to surpass lidar.
+
+template that is closest to the ground truth trajectory under the l2 norm. this task is an important experiment for self-driving because the ground truth targets for this experiment are orders of magnitude less expensive to acquire than ground truth 3d bounding boxes. this task is also important for benchmarking the performance of camera-based approaches versus lidar-based approaches because although the ceiling for 3d object detection from camera-only is certainly upper bounded by lidar-only, the optimal planner using camera-only should in principle upper bound the performance of an optimal planner trained from lidar-only.
+
+qualitative results of the planning experiment are shown in figure 11. the empirical results benchmarked against pointpillars are shown in table 6. the output trajectories exhibit desirable behavior such as following road boundaries and stopping at crosswalks or behind braking vehicles.
+
+# 6 conclusion
+
+in this work, we present an architecture designed to infer bird's-eye-view representations from arbitrary camera rigs. our model outperforms baselines on a suite of benchmark segmentation tasks designed to probe the model's abl-
+
+![](images/5d1e8245b81de65bbffb30dde23950d460f4163c0b15bcc6d88b961852f1fc9f.jpg)  
+(a) iou versus distance
+
+![](images/2bec0d291b95b6bdfeaba4dd712246779e12624e5a282f6eff860862dbf34e9a.jpg)  
+(b) iou versus weather
+
+![](images/bdc76534ab1737e4a73f9aa5f0d09b1ae669cba937e2fba65822d8bfce8145f4.jpg)  
+fig. 10: we compare how our model's performance varies over depth and weather. as expected, our model drops in performance relative to pointpillars at nighttime.
+
+![](images/18d8aac57cebc60416c10d31e96785bd8b10a5490feeb1fdacfb1ada1e6eb0aa.jpg)  
+fig.11: we display the top 10 ranked trajectories out of the 1k templates. video sequences are provided on our project page. our model predicts bimodal distributions and curves from observations from a single timestamp. our model does not have access to the speed of the car so it is compelling that the model predicts low-speed trajectories near crosswalks and brake lights.
+
+<table><tr><td></td><td>top 5</td><td>top 10</td><td>top 20</td></tr><tr><td>lidar (1 scan)</td><td>19.27</td><td>28.88</td><td>41.93</td></tr><tr><td>lidar (10 scans)</td><td>24.99</td><td>35.39</td><td>49.84</td></tr><tr><td>lift-splat (us)</td><td>15.52</td><td>19.94</td><td>27.99</td></tr></table>
+
+table 6: since planning is framed as classification among a set of 1k template trajectories, we measure top-5, top-10, and top-20 accuracy. we find that our model is still lagging behind lidar-based approaches in generalization. qualitative examples of the trajectories output by our model are shown in fig. 11.
+
+ity to represent semantics in the bird's-eye-view frame without any access to ground truth depth data at training or test time. we present methods for training our model that make the network robust to simple models of calibration noise. lastly, we show that the model enables end-to-end motion planning that follows the trajectory shooting paradigm. in order to meet and possibly surpass the performance of similar networks that exclusively use ground truth depth data from point clouds, future work will need to condition on multiple time steps of images instead of a single time step as we consider in this work.
+
+# references
+
+1. badrinarayanan, v., kendall, a., cipolla, r.: segnet: a deep convolutional encoder-decoder architecture for image segmentation. corr abs/1511.00561 (2015), http://arxiv.org/abs/1511.00561  
+2. caesar, h., bankiti, v., lang, a.h., vora, s., liong, v.e., xu, q., krishnan, a., pan, y., baldan, g., beijbom, o.: nuscenes: a multimodal dataset for autonomous driving. corr abs/1903.11027 (2019), http://arxiv.org/abs/1903.11027  
+3. chang, m.f., ramanan, d., hays, j., lambert, j., sangkloy, p., singh, j., bak, s., hartnett, a., wang, d., carr, p., et al.: argoverse: 3d tracking and forecasting with rich maps. ieee/cvf conference on computer vision and pattern recognition (cvpr) (jun 2019)  
+4. chen, x., kundu, k., zhang, z., ma, h., fidler, s., urtasun, r.: monocular 3d object detection for autonomous driving. in: ieee/cvf conference on computer vision and pattern recognition (cvpr). pp. 2147-2156 (06 2016)  
+5. ghiasi, g., lin, t., le, q.v.: dropout block: a regularization method for convolutional networks. corr abs/1810.12890 (2018), http://arxiv.org/abs/1810.12890  
+6. goodfellow, i., bengio, y., courville, a.: deep learning. mit press (2016), http://www.deeplearningbook.org  
+7. he, k., gkioxari, g., dólár, p., girshick, r.b.: mask r-cnn. corr abs/1703.06870 (2017), http://arxiv.org/abs/1703.06870  
+8. he, k., zhang, x., ren, s., sun, j.: deep residual learning for image recognition. corr abs/1512.03385 (2015), http://arxiv.org/abs/1512.03385  
+9. hendy, n., sloan, c., tian, f., duan, p., charchut, n., xie, y., wang, c., philbin, j.: fishing net: future inference of semantic heatmaps in grids (2020)  
+10. ioffe, s., szegedy, c.: batch normalization: accelerating deep network training by reducing internal covariate shift. corr abs/1502.03167 (2015), http://arxiv.org/abs/1502.03167  
+11. kayhan, o.s., gemert, j.c.v.: on translation invariance in cnns: convolutional layers can exploit absolute spatial location. in: proceedings of the ieee/cvf conference on computer vision and pattern recognition (cvpr) (june 2020)  
+12. kehl, w., manhardt, f., tombari, f., ilic, s., navab, n.: ssd-6d: making rgb-based 3d detection and 6d pose estimation great again. corr abs/1711.10006 (2017)  
+13. kesten, r., usman, m., houston, j., pandya, t., nadhamuni, k., ferreira, a., yuan, m., low, b., jain, a., ondruska, p., omari, s., shah, s., kulkarni, a., kazakova, a., tao, c., platinsky, l., jiang, w., shet, v.: lyft level 5 av dataset 2019. urlhttps://level5.lyft.com/dataset/ (2019)  
+14. kingma, d.p., ba, j.: adam: a method for stochastic optimization. corr abs/1412.6980 (2014)  
+15. kirillov, a., he, k., girshick, r.b., rother, c., dollar, p.: panoptic segmentation. corr abs/1801.00868 (2018), http://arxiv.org/abs/1801.00868  
+16. krizhevsky, a.: learning multiple layers of features from tiny images (2009)  
+17. krizhevsky, a., sutskever, i., hinton, g.e.: imagenet classification with deep convolutional neural networks. in: pereira, f., burges, c.j.c., bottou, l., weinberger, k.q. (eds.) advances in neural information processing systems 25, pp. 1097-1105. curran associates, inc. (2012), http://papers.nips.cc/paper/4824-imagenet-classification-with-deep-convolutional-neural-networks.pdf
+
+18. lang, a.h., vora, s., caesar, h., zhou, l., yang, j., beijbom, o.: pointpillars: fast encoders for object detection from point clouds. corr abs/1812.05784 (2018)  
+19. lecun, y., bottou, l., bengio, y., haffner, p.: gradient-based learning applied to document recognition. in: proceedings of the ieee. pp. 2278-2324 (1998)  
+20. lombardi, s., simon, t., saragih, j., schwartz, g., lehrmann, a., sheikh, y.: neural volumes. acm transactions on graphics 38(4), 114 (jul 2019). https://doi.org/10.1145/3306346.3323020, http://dx.doi.org/10.1145/3306346.3323020  
+21. mani, k., daga, s., garg, s., shankar, n.s., jatavallabhula, k.m., krishna, k.m.: monolayout: amodal scene layout from a single image. arxiv abs/2002.08394 (2020)  
+22. nair, v., hinton, g.e.: rectified linear units improve restricted boltzmann machines. in: icml (2010)  
+23. paszke, a., gross, s., massa, f., lerer, a., bradbury, j., chanan, g., killeen, t., lin, z., gimelshein, n., antiga, l., desmaison, a., köpf, a., yang, e., devito, z., raison, m., tejani, a., chilamkurthy, s., steiner, b., fang, l., bai, j., chintala, s.: pytorch: an imperative style, high-performance deep learning library. in: neurips (2019)  
+24. philion, j.: fastdraw: addressing the long tail of lane detection by adapting a sequential prediction network. in: proceedings of the ieee/cvf conference on computer vision and pattern recognition (cvpr) (june 2019)  
+25. philion, j., kar, a., fidler, s.: learning to evaluate perception models using planner-centric metrics. in: proceedings of the ieee/cvf conference on computer vision and pattern recognition (cvpr) (june 2020)  
+26. poirson, p., ammirato, p., fu, c., liu, w., kosecka, j., berg, a.c.: fast single shot detection and pose estimation. corr abs/1609.05590 (2016)  
+27. qin, z., wang, j., lu, y.: monogrnet: a geometric reasoning network for monocular 3d object localization. proceedings of the aaai conference on artificial intelligence 33, 8851-8858 (07 2019). https://doi.org/10.1609/aaai.v33i01.33018851  
+28. roddick, t., cipolla, r.: predicting semantic map representations from images using pyramid occupancy networks. in: proceedings of the ieee/cvf conference on computer vision and pattern recognition (cvpr) (june 2020)  
+29. roddick, t., kendall, a., cipolla, r.: orthographic feature transform for monocular 3d object detection. corr abs/1811.08188 (2018)  
+30. russakovsky, o., deng, j., su, h., krause, j., satheesh, s., ma, s., huang, z., karpathy, a., khosla, a., bernstein, m., berg, a.c., fei-fei, l.: imagenet large scale visual recognition challenge (2014)  
+31. simonelli, a., bulò, s.r., porzi, l., lópez-antequera, m., kontschieder, p.: disentangling monocular 3d object detection. corr abs/1905.12365 (2019)  
+32. srinivasan, p.p., mildenhall, b., tancik, m., barron, j.t., tucker, r., snavely, n.: lighthouse: predicting lighting volumes for spatially-coherent illumination (2020)  
+33. srivastava, n., hinton, g., krizhevsky, a., sutskever, i., salakhutdinov, r.: dropout: a simple way to prevent neural networks from overfitting. journal of machine learning research 15, 1929-1958 (2014)  
+34. su, h., jampani, v., sun, d., maji, s., kalogerakis, e., yang, m., kautz, j.: splat-net: sparse lattice networks for point cloud processing. corr abs/1802.08275 (2018), http://arxiv.org/abs/1802.08275  
+35. sun, p., kretzschmar, h., dotiwalla, x., chouard, a., patnaik, v., tsui, p., guo, j., zhou, y., chai, y., caine, b., vasudevan, v., han, w., ngiam, j., zhao, h., timofeev, a., ettinger, s., krivokon, m., gao, a., joshi, a., zhang, y., shlens, j.,
+
+chen, z., anguelov, d.: scalability in perception for autonomous driving: waymo open dataset (2019)  
+36. takikawa, t., acuna, d., jampani, v., fidler, s.: gated-scnn: gated shape cnns for semantic segmentation. in: proceedings of the ieee/cvf international conference on computer vision (iccv) (october 2019)  
+37. tan, m., le, q.v.: efficientnet: rethinking model scaling for convolutional neural networks. corr abs/1905.11946 (2019), http://arxiv.org/abs/1905.11946  
+38. tucker, r., snavely, n.: single-view view synthesis with multiplane images (2020)  
+39. wang, y., chao, w., garg, d., hariharan, b., campbell, m., weinberger, k.q.: pseudo-lidar from visual depth estimation: bridging the gap in 3d object detection for autonomous driving. corr abs/1812.07179 (2018)  
+40. you, y., wang, y., chao, w., garg, d., pleiss, g., hariharan, b., campbell, m., weinberger, k.q.: pseudo-lidar++: accurate depth for 3d object detection in autonomous driving. corr abs/1906.06310 (2019)  
+41. zeng, w., luo, w., suo, s., sadat, a., yang, b., casas, s., urtasun, r.: end-to-end interpretable neural motion planner. ieee/cvf conference on computer vision and pattern recognition (cvpr) pp. 8652-8661 (2019)

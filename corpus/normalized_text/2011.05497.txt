@@ -1,0 +1,362 @@
+# understanding training efficiency of deep learning recommendation models at scale
+
+bilge acun, matthew murphy, xiaodong wang, jade nie, carole-jean wu, kim hazelwood
+
+facebook acun@fb.com
+
+abstract—the use of gpus has proliferated for machine learning workflows and is now considered mainstream for many deep learning models. meanwhile, when training state-of-the-art personal recommendation models, which consume the highest number of compute cycles at our large-scale datacenters, the use of gpus came with various challenges due to having both compute-intensive and memory-intensive components. gpu performance and efficiency of these recommendation models are largely affected by model architecture configurations such as dense and sparse features, mlp dimensions. furthermore, these models often contain large embedding tables that do not fit into limited gpu memory. the goal of this paper is to explain the intricacies of using gpus for training recommendation models, factors affecting hardware efficiency at scale, and learnings from a new scale-up gpu server design, zion.
+
+# i. introduction
+
+deep learning recommendation algorithms have recently gained significant adoption to power a wide variety of products. for example, google utilizes deep candidate generation and ranking models to produce video suggestions in youtube [9], and designs deep learning recommendation models to personalize mobile app suggestions for google play [8]. microsoft leverages deep learning recommendation models for news suggestions [16], netflix for personalized entertainment [47], alibaba for product recommendations [59]. at facebook, personalization and ranking use cases are powered by deep learning recommendation models: instagram stories are ranked with multi-stage deep neural networks (dnns) [40]; newsfeed ranking and search tasks are also built upon dnns [20]–[22], [42], [50]. over the last 18-month period, we have witnessed the compute capacity for recommendation model training quadrupling at facebook's datacenter fleet [41]. among the total ai training cycles at facebook, more than  $50\%$  has been devoted to training deep learning recommendation models.
+
+as described in a recent work [22], while language and vision models are trained on 8-gpu systems, the majority of deep learning recommendation models are trained on cpu servers. this is because of the large memory capacity and bandwidth requirement of embedding tables in these models. the memory capacity of embedding tables have increased dramatically from tens of gbs to tbs throughout the industry [36], [56], [58]–[60]. at the same time, memory bandwidth
+
+![](images/3e7402bad7064a855744e6861339413b9ad4b747303f3029ccd51ad4e894edc4.jpg)  
+fig. 1: throughput of three production models with different hardware and embedding table (emb) placement strategies.
+
+usage also increased quickly with the increasing number of embedding tables and the associated lookups.
+
+in order to leverage data and model-level parallelism in gpu training [18], [43], we have devoted significant development efforts at facebook to enable production-scale recommendation models to train on existing 8-gpu training systems (big basin). at the same time, we started to prototype facebook's next generation training systems (zion) [32]. we enabled high performance training on these systems by designing and implementing different placement strategies for embedding tables. we then characterized the interplay between model parameter configurations and the underlying training system architectures to develop a better understanding of gpu-training performance.
+
+figure 1 depicts the relative throughput of three different production recommendation models ( $m1_{prod}$ ,  $m2_{prod}$ ,  $m3_{prod}$ ) trained on facebook's systems. overall, the training throughput increases as we go from dual-socket cpu servers to big basin gpu server to zion gpu server. the degree of throughput improvement varies depending on the specific model parameters. for example,  $\mathrm{m3}_{\mathrm{prod}}$  shows weaker performance scaling as compared to  $\mathrm{m1}_{\mathrm{prod}}$  and  $\mathrm{m2}_{\mathrm{prod}}$  because of the significantly higher memory requirement of its embedding tables. furthermore, placement strategies for embedding tables can influence the model training throughput significantly. for example, on the big basin gpu server,  $\mathrm{m1}_{\mathrm{prod}}$  and  $\mathrm{m2}_{\mathrm{prod}}$  training achieves the highest throughput when embedding
+
+tables are hosted on the gpu memory. whereas for  $\mathrm{m3}_{\mathrm{prod}}$ , the optimal embedding placement strategy shifts to the remote cpu, as tables do not fit on the gpu memory of a single big basin server. on zion gpu server, optimal embedding placement is on system memory due to its large memory capacity and high memory bandwidth.
+
+despite having similar overall structure and components, recommendation models can have diverse characteristics based on model architecture and input configurations. this can cause large variations in system resource utilization across training runs with different configurations. by analyzing over five hundred training runs, we show that there is a large variety of recommendation models being trained in facebook datacenters, leading to different levels of utilization in cpus, memory capacity, memory bandwidth and network bandwidth. moreover, the most efficient choice of a hardware system depends on the model parameters such as number of dense and sparse features, embedding table sizes, feature interaction types, dimensions of the multi-layer perceptron (mlp) stack.
+
+to select the optimal hardware system in a heterogeneous data-center with a mix of cpu and gpu servers, there are methods to predict the performance of code, such as predicting gpu performance using cpu code [5], using a roofline model [52], or using a binary predictor approach [7]. however, such methods may not be directly applicable to recommendation models, since the large memory capacity requirement of embedding tables requires different software infrastructure to handle the placement of the embedding tables due to the limited memory of gpus.
+
+performance characterization results presented in this paper sheds light on the effects of model architecture configurations of deep learning recommendation models on training efficiency at scale, pinpointing system performance optimization opportunities. key contributions of this paper are as follows:
+
+- we present the massive parameter design space for training production-scale deep learning recommendation models. the large variety of training experiments in the production environment contributes to a wide range of cpu, memory, and networking utilization levels, exposing ample performance optimization opportunities.  
+- we pinpoint the development and system design challenges faced when training embedding tables using the cpu, big basin, and zion training platforms.  
+- in addition to the large memory capacity demand for embedding tables, training throughput can become limited by the often irregular vector accesses. this is the first time detailed embedding table characterization results on industry-scale recommendation model training is presented.  
+- training efficiency, i.e. throughput per watt, on big basin improves by  $4.3\mathrm{x}$ ,  $2.8\mathrm{x}$  for  $\mathrm{m1}_{\mathrm{prod}}$  and  $\mathrm{m2}_{\mathrm{prod}}$  respectively as compared to the baseline production cpu systems. meanwhile, embedding-dominant recommendation models such as  $\mathrm{m3}_{\mathrm{prod}}$  (with large embedding tables and more frequent embedding vector lookups) scales poorly on facebook's big basin training systems.
+
+- when embedding tables do not fit onto a single big basin, training efficiency scaling of facebook's zion shines – with its 2 tb of system memory and 1 tb/s memory bandwidth – for embedding acceleration. as model sizes continue to grow into multiple tbs, it calls for novel solutions in order to achieve better performance and efficiency scaling across the entire system and infrastructure stack – compute, networking, and storage.
+
+# ii. background on ml training at facebook
+
+# a. machine learning training at facebook
+
+there are three primary execution phases for facebook's machine learning (ml) pipeline: first, in the data preprocessing phase, we take unstructured data from persistent storage and manipulate it, in order to feed into a machine learning model. second is the training phase, where we use important features from the data manipulation phase to build and train models. as the third and final step, the trained model is deployed for making real-time predictions in the inference phase [22].
+
+not all training workflows are equal. depending on the workload, model training duration and training frequencies vary. figure 2 depicts the training duration and frequency characteristics for various workloads: news feed, search, language translation, and facer (for face detection). among the use cases, deep learning recommendation models, i.e. news feed and search ranking [22], [50], are the most frequently-trained models while language translation uses recurrent neural network (rnn) variants [14], [28], [45], and image classification and object detection/tracking use convolutional neural network (cnn) variants [23], [27], [35], [53]. furthermore, over the past eighteen months, the number of training workflow runs for deep learning recommendation models have increased by 7 times. it is evident that deep learning recommendation is one of the fastest growing training workloads at facebook, demanding custom-built training systems to deliver high computation performance and optimized performance-cost efficiency.
+
+![](images/cf7ad9a72b4e084cc95bced0795b0b0d0758501234e35f7a573dfee8f287e77b.jpg)  
+fig. 2: frequency and duration of various machine learning training workloads at facebook.
+
+![](images/760f1f2628b0ee0e311131cd325972db73d89edd1ca919733ee411d111d084d6.jpg)  
+training personalized recommendation model
+
+![](images/4c80cdbcb22a4a6b9008a396212d0c0406ebaedf0e40ee662e6ba58138212d57.jpg)  
+fig. 3: general architecture of training personalized recommendation models. red components highlight different model configurations that affect efficiency.
+
+![](images/cd8d1b2668edd70c91900627e36baf4965382065f62129e1f63e8340f3831eeb.jpg)
+
+# b. training systems for deep learning recommendation
+
+recommendation model architectures. figure 3 illustrates the high-level architecture of training deep learning recommendation models. the two primary components are the multi layer perceptron (mlp) layer modules and the embedding tables (emb), which are used to learn latent space representations of dense and sparse information, respectively. the mlp layers are used to process continuous features while the embs process categorical features by transforming sparse, high-dimensional inputs to dense vectors. the configurations of these model components highly affect training throughput and efficiency. we further elaborate on the components of model training in section iii & iv.
+
+distributed training system overview. ever-increasing sizes of deep learning recommendation models, particularly embedding tables, introduce significant system design challenges. this large memory capacity requirement, coupled with high throughput training performance demand, motivate at-scale distributed training system solutions. figure 4 gives an overview for the distributed training system used for deep learning recommendation models in facebook's production environment on cpu servers.
+
+training recommendation models exhibit both data parallelism and model parallelism. to exploit data parallelism, in production, each trainer server holds a copy of the mlp model parameters, read its own mini-batches from reader servers and perform elastic-averaging sgd (easgd) [57] update with the center, dense parameter server. within a trainer, hogwild! [48] threads perform asynchronous updates on the model parameters. as aforementioned, the large memory capacity requirement of embedding tables prevents direct model parameter replication. thus, for embedding table training, we exploit model parallelism by partitioning embedding tables across multiple nodes, referred as sparse parameter servers.
+
+while training deep learning recommendation models on cpus offer memory capacity advantage, a large degree of parallelism in the training process, which could be unlocked by utilizing accelerators, is left unexploited. an alternative
+
+![](images/2a6159eb39c35f0261e46dc2c0827ff54a35613cc53d2de7b98be6e25db9e150.jpg)  
+fig. 4: facebook's ml training pipeline for deep learning recommendation models.
+
+is to train recommendation models on facebook's big basin gpu servers, originally designed for non-recommendation ai workloads [31]. big basin architecture features eight nvidia tesla gpus, similar to nvidia's dgx-1 system [3]. as presented in section iv, training facebook-scale recommendation models on the big basin system is not straightforward – optimization techniques tailored for the placement of embedding tables are needed to overcome the capacity requirement while addressing the potential increase in the embedding vector access latency.
+
+# iii. overview of training recommendation model architectures and parameters
+
+diverse configurations of recommendation models affect the hardware resource utilization at scale. utilization distribution of the cpu, memory and network resources resemble a wide gaussian distribution which we may partly attribute to different model configurations. figure 5 shows this distribution when running different instances of a particular model training over a week period at facebook datacenters. in this figure, we only include workflows that have the same model type and system configurations i.e. same number of servers and hardware type. overall, trainer servers have high cpu and memory bandwidth utilization with relatively small variation. on the other hand, utilization distribution is wider for parameter servers with a lower mean value and a longer tail. this
+
+![](images/2ca24eac2886357a6a5e3b290cdbe4173347064bc3d097dbd39264c2c5c7ef5f.jpg)  
+(a) trainer servers
+
+![](images/e9fdbdc5bb97d83003196cd356af7d749ad0859caf54b4721f59589f8d2a0343.jpg)  
+(b) parameter servers  
+fig. 5: utilization distribution of a ranking model on a fixed scale (same number of trainer and parameter servers). figure shows there is significant resource utilization variability from run to run training of a model type. the variability could be due to different model configurations and due to other system level variability.
+
+variability could be partly due to system or hardware level variability [11], however wider distribution of the parameter servers implies that the model architecture configuration does have a significant effect on the hardware resource utilization.
+
+ml engineers set up and tune different configurations of a model through an internal recommendation model framework built for ease of experimentation. in this section, we give an overview commonly configured model architecture components that affect hardware efficiency. some hyper-parameters, such as learning-rate, number of warm-up iterations and optimizer algorithm have significant effect on model quality while having minor or no effect on performance. therefore, we exclude those parameters in this paper.
+
+# a. model architecture configurations
+
+1) feature selection: feature selection is the process of selecting a subset of the most useful features to use in a specific ranking model. there are thousands of features to choose from as an input, which are categorized into two distinct types: dense and sparse. dense features are scalar inputs, whereas sparse features often encode categorical traits or relevant ids.
+
+dense features. in a typical recommendation model, preprocessed dense features are concatenated to a dense feature vector and passed through a dense architecture, such as a sequence of linear layers and activations. computational cost of each dense feature is roughly the same.
+
+sparse features. for each sparse feature  $x_{i}$ , we map all possible indices of  $x_{i}$  to a randomly-initialized embedding of dimension  $d$ . since the cardinality of any sparse feature's set of indices,  $s_{x_i}$ , may be arbitrarily large, we apply a hash function  $h_{m_i}:s_{x_i}\to \{0,1,\dots m - 1\}$  over sparse feature indices. consequently, the total parameters learned for all embedding for such a sparse feature is in the order of  $d\times m_{i}$ . it's worth noting that while we use a fixed embedding size  $d$  for all sparse features, the hash size  $m_{i}$  can vary for each sparse feature.
+
+2) embedding tables: categorical input features, i.e. sparse features, determine how many embedding tables there will be. given the large size and sparsity of these tables, sparse features can be configured to share embedding tables to reduce the overall size of the model. since this requires a shared hash sizing for sharing the same embedding lookup table, this is generally useful for semantically similar sparse features. we expect similar sparse features should have similar dense representations (e.g. current item id, and last  $n$  interacted item ids).
+
+**embedding table hash size.** various methods can be used to limit the size of large embedding tables [17], and hashing is a common method for this. hash size is a customizable parameter per sparse feature. the hash size  $m_i$  varies depending on the semantics of  $x_i$ . for example, we would set a small  $m_i$  if  $x_i$  is indexed on towns within a given county, but set a much larger  $m_i$  if  $x_i$  is indexed on all known plant species. figure 6 shows the hash sizes of the three different production models at facebook. hash sizes for these models range from 30 being smallest, to 20 million the largest. average hash size for these models are 5.7 million, 7.3 million and 3.7 million respectively.
+
+due to collisions hashing algorithms create, lower hash sizes might cause accuracy degradation, while providing the benefit of reducing the embedding table sizes. in an earlier work, no hashing mechanism was used in order to avoid any model quality regression that was caused by compressing the embedding tables [58]. this results in tables in the order of terabytes. therefore, hash sizes of the features effect the embedding table placement strategy, which we elaborate later.
+
+embedding table access and number of look-ups per table. for a given input example in the training set, every sparse feature is a one-hot or multi-hot vector that has some arbitrary  $n$  number of activated indices with non-zero values. for each activated index, we perform an embedding table lookup, resulting in fetching of  $n$  embedding vectors.
+
+![](images/a59f6be4f2bc0efe6257a878825eece8c4a802eb898aa964ffe33494c9db3718.jpg)  
+fig. 6: hash size vs mean feature length of embedding tables in m1,2,3prod (from left to right).
+
+![](images/1d662fda2688cb16b3cf3bf9b6ca61c37a2d6c8777db15e7050f1b69eddb4f33.jpg)
+
+![](images/656ab3974288b5587d58a1b88d7c66c581b9bdd3c549c3a282f3f81c7752eba7.jpg)
+
+![](images/519ef7c2fd7ea763767651be058edb93964c5ed8ac66d769eca32e905b39b9d5.jpg)  
+fig. 7: mean sparse feature length distributions of m1,2,3prod (from left to right) with lines showing the kernel density estimates (kde) that represents continuous probability density curve.
+
+![](images/4e35b79a6c0340a6749722220112e331337b61a200a7146fc419223686642ce7.jpg)
+
+![](images/374310f99b74a325fba6646f5f24a6a68b2461f2bc95c0c9e910ed62a244d9b8.jpg)
+
+the  $n$  embedding vectors are aggregated or pooled for the example's embedding representation for the specific sparse feature. while the average cost of the embedding operations increase linearly with the average number of activated indices for each sparse feature, we may bound this operation with an optional truncation size to limit the outliers.
+
+we characterize feature length distributions (mean lookup operations per feature) of three production models in figure 7. furthermore, we illustrate the correlation between feature length distributions and embedding table hash sizes in figure 6. feature length distribution resembles a power-law distribution for each of the three models, i.e. there exists a small number of tables that are accessed much more frequently than others. differences in access ratios might create imbalances among servers if not carefully partitioned. furthermore, the access frequency does not always correlate with the embedding table size - some of the most accessed tables are relatively small. the characterization results on the embedding tables open up new optimization opportunities as well, such as caching [58] and compression for these large embedding tables using quantization [17].
+
+3) feature interaction: outputs of dense and sparse feature embedding operations are combined using functions, such as, concatenation or pairwise dot product. in the case of concatenation, pooled embeddings of each sparse feature is concatenated to the output of the dense mlp layer. alternatively, a pairwise dot product combiner helps in capturing feature interactions between dense and sparse features, and also among sparse features. here, we can project the dense mlp output layer to a set of embeddings of dimension  $d$  and compute the dot product between pairs of dense projections
+
+and sparse embeddings to enable sparse-dense interactions. we can also compute the dot product between pairs of sparse embeddings to capture sparse-sparse interactions. these resulting dot products may be concatenated with the original dense mlp output layer and used as the input for the top mlp stack of the recommendation model.
+
+4) mlp dimensions: there are two major mlp stacks in deep learning recommendation models: the dense feature mlp stack at the bottom of the recommendation model and the top mlp stack at the end. the dense feature mlp stack is applied on top of the dense input in order to reduce the thousands of input features into a much denser vector (e.g. 64 or 128 elements). the top mlp stack is applied after the feature interaction. both depth and width of the mlp stacks can be tuned across different model training runs.  
+5) batch size: batch size is a critical hyper-parameter that affects training performance and model quality [19]. we usually scale the batch size as a function of the training system's capacity for parallelization. typically, distributed training on cpus uses a much smaller batch size per cpu, i.e. minibatch size, relative to gpus. on the other hand, gpus require higher mini-batch sizes to fully utilize the gpu compute capacity. training throughput increases roughly linearly with the increasing batch size, up to a limit. we discuss the batch-size throughput scaling further in section v.  
+6) gradient synchronization method: for distributed training, model parameters need to be synchronized across trainers and/or parameter servers. gradient synchronization method is an important factor affecting both the model quality as well as scaling the performance. there are two main approaches for synchronizing gradients: synchronous [4], [19], [25], [33] and asynchronous [12], [26], [34]. most
+
+<table><tr><td></td><td>cpu system</td><td>big basin gpu system</td><td>prototype zion gpu system</td></tr><tr><td>accelerators</td><td>-</td><td>8 nvidia v100</td><td>8 nvidia v100</td></tr><tr><td>accelerator memory</td><td>-</td><td>16/32 gb</td><td>32 gb</td></tr><tr><td>system memory</td><td>256 gb</td><td>256 gb</td><td>~2 tb</td></tr><tr><td>cpu</td><td>2 sockets</td><td>2 socket, 20 cores</td><td>8 socket cpu</td></tr><tr><td>interconnect</td><td>25 gbps ethernet</td><td>100 gbps ethernet</td><td>4x infiniband 100 gbps</td></tr></table>
+
+table i: hardware platform details.
+
+commonly-used asynchronous algorithms in deep learning recommendation model training include elastic-averaging sgd (easgd) [57], hogwild! [48] and facebook's shadowsync algorithm [?].
+
+# iv. hardware and system configurations
+
+after model input and architecture configurations are made, next step is to decide on hardware and system configurations. there is often a de-facto hardware type to go for each workflow. however, as model configurations change, most efficient hardware choice and system configurations could also change over time. here we give details on some of the hardware platforms in our heterogeneous datacenters and explain the major system configurations.
+
+# a. hardware platforms
+
+training workflows at facebook leverage a large fleet of cpu and gpu platforms to serve necessary training frequencies at required service latency. three of these platforms, which are used in this paper, are summarized in table i. designs for each of these platforms have been publicly released through the open compute project.
+
+dual-socket cpu platforms house two intel skylake cpus with 256 gb of dram [22].
+
+big basin gpu platform has two intel cpus (various generations) and eight nvidia gpus [31]. the tesla v100 gpu accelerators are connected using nvidia nvlink to form an eight-gpu hybrid cube mesh. the v100 platform enables 15.7 teraflops of single precision floating-point arithmetic per gpu. it also has high-bandwidth memory (hbm2) providing 900gb/s bandwidth. the gpus are equipped with either 16 or 32 gb of memory where as the cpus are with 256 gb dram and are connected via 100 gbps ethernet.
+
+zion gpu platform has 8 cpu sockets interconnecting with the 8 gpu accelerators to provide the high compute and memory capacity [32], [41]. compared with the big basin gpu platform, accelerators are the same but the system memory capacity, bandwidth and cpu compute capacity of zion is much larger, with  $\sim 2$  tb system memory and  $\sim 1$  tb/s memory bandwidth.
+
+# b. system configurations
+
+each hardware requires different system configurations and these configurations affect the underlying software framework. two of the major configurations we discuss in this section are embedding table placement and selection of number of servers. other system configuration options include tuning number of worker threads, data loading threads.
+
+![](images/66663588c3df8a5625d57a919a0fb4e411a20097a17b303b1ef28cc0a97c2b35.jpg)  
+fig. 8: embedding table placement options.
+
+1) **embedding table placement:** for training on cpu-only servers, embedding tables can be simply placed on system memory. for accelerated systems, the optimal embedding placement strategy might differ given the hardware properties. we discuss four strategies for storing embedding tables for gpu platforms: gpu memory, system memory of the gpu server, system memory of remote cpu servers, hybrid system and gpu memory. these are visualized in figure 8. other alternative placement options studied in the literature include storing the embedding tables in non-volatile memory [15] and ssds [58].
+
+on the gpu memory. embedding tables are distributed among gpus, different partitioning strategies can be used such as table-wise or row-wise partitioning. for gpu servers that have high-bandwidth inter-gpu communication, like big basin, storing embedding tables on the gpus enables offloading all model operations to be done on the gpu, minimizing the cpu usage and cpu-gpu copy operations. big basin design includes eight nvidia gpus connected using high-speed interconnect nvlink and contains 128/256 gb total available gpu memory per node to store the embedding tables. for models that do not fit on a single server, internode communication (i.e. interconnect) becomes an important factor affecting performance.
+
+system memory of the gpu server. storing the embedding tables on the system memory of the cpus of the gpu server would be a good option for servers with large system memory and high memory bandwidth. for example, a training platform like zion contains, 8 socket cpus, 2 tb memory with 1 tb/s memory bandwidth as shown in table i. in contrast, a platform like big basin contains 2 socket cpus for 8 accelerators with 256 gb system memory. for this setup, cpus are likely to become a bottleneck. this option also makes it more difficult to use the gpus effectively for all operators since the data is
+
+![](images/a6d216abdfdb4727d2ba38f07079666acaa78de85781ad9aae6bf93c2710d1b1.jpg)  
+fig. 9: histogram of number of trainer and parameter servers used for training ranking models over a month period.
+
+not located on the gpu memory.
+
+system memory of remote cpu servers. on a platform like big basin, storing the embedding tables in the remote cpu system memory enables scaling out the number of cpus used for embedding table storage and might remove the cpu bottleneck mentioned in option 2. however, this increases the latency of the sparse lookup operations since they have to go through the network. this setup also creates additional work for the cpus on the gpu server to do the remote send/receive operations and cpu to gpu data movement.
+
+mixed system and gpu memory. this is a hybrid placement strategy where some of the embedding tables are stored on the gpus and some are stored on the system memory. this can be an alternative strategy when the embedding tables do not fit on the gpu, placing as much as tables as it can fit could reduce the pressure on the cpu.
+
+2) number of servers: numbers of three types of servers need to be configured for each workflow: number of trainer servers, number of parameter servers (if used) and number of reader servers. selection of number of servers is made based on the throughput requirement for training and the memory capacity requirement of the embedding tables. further the numbers can vary significantly from run-to-run.
+
+trainer servers. trainer servers dictate the data parallelism with which we train. generally, we see an approximately linear increase in training speedup when we increase the number of trainer servers, up to a certain degree. however extra trainers can introduce model quality loss during model parameter synchronization in training. figure 9 shows the distribution of number of trainers used in the datacenter over a month long period for the cpu training workflows. as the training throughput requirement does not change very often, this leads to over  $40\%$  of the workflows using same number of trainers.
+
+parameter servers. parameter servers hold the model parameters in memory. these are partitioned between dense and sparse servers, wherein mlp layers are stored on dense servers and embedding tables for sparse feature are stored on sparse servers. distribution of number of parameter servers used for
+
+the training workflows that run on cpus is shown in figure 9. in contrast to number of trainers, number of parameter servers vary greatly. as the ml engineers experiment with different features, memory capacity requirement changes frequently which results in a wide-range of number of parameter servers.
+
+reader servers. readers access model training data in parallel from remote storage hive, facebook's exabyte-scale data warehouse [51]. reader servers are decoupled from trainers to be scaled-up independently and not to stall training. we typically scale up reader servers such that data reading is not a bottleneck. consequently, for more performant training hardware, we may utilize more readers.
+
+# v. efficiency of model setup configurations
+
+the parameter space of all the possible model and system architecture combinations is exponential and therefore challenging to study. we study a subset of the most important model configurations in a parameterized manner to understand their effects on throughput and to compare their behavior on cpu and gpu systems. with this goal, we created a test suite where we can customize major model configurations in a systematic way.
+
+design space exploration: to explore the design space of training model configurations, we created a model containing basic components of recommendation models as shown earlier in figure 3. we configure our test suite setups to train over a variety of numbers of dense features between 64 and 4096. like dense features, we configure sparse features in our model training setups by testing counts of sparse features ranging between 4 and 128, which is representative of the typical bounds of the total number of sparse features used in recommendation models at facebook. we fix a constant hash size for all sparse features in our model to remove potential noise added by training over sparse features with varying indexing. we truncate number of look-ups per table to 32, to limit outliers in our study.
+
+a. number of sparse and dense features: as the number of dense and sparse features increase, training throughput reduces because of the increasing memory overhead from embedding operations. big basin provides higher training throughput despite, in a few cases, with lower performance-per-watt energy efficiency.
+
+the number of features used in production models may vary heavily. this degree of variability can lead to very large discrepancies in model complexity, size, and time to train over some fixed set of examples. increasing the number of dense features leads to increases in the computational complexity of the first layer within the model's dense architecture. on the other hand, increasing sparse features leads to additional embedding lookup operations, pooling and interactions among large embeddings, all of which are computationally expensive and can lead to significant model size increases due to additional embedding tables. not only does this increase the computational cost, but can also strain system memory.
+
+![](images/59fed7874a808fbcf8cd671ed0f9492e4b360bfc9184430fe01d9d2b8a1c217c.jpg)  
+fig. 10: varying the number of sparse/dense features on cpu (left), gpu (middle) and system efficiency comparison (right). fixed mlp dimensions of  $512^{3}$ , hash size of 100000 and batch sizes of 200 (for cpu), 1600 (for gpu) are used.
+
+![](images/53f85db6a3b6441f725728d99528cf8b913b7c0dc26740187fbfef5696916e0c.jpg)
+
+<table><tr><td colspan="5">gpu/cpu throughput</td></tr><tr><td></td><td>4</td><td>16</td><td>64</td><td>128</td></tr><tr><td>64</td><td>1.92</td><td>2.42</td><td>3.58</td><td>2.53</td></tr><tr><td>256</td><td>3.5</td><td>3.42</td><td>3.5</td><td>3.06</td></tr><tr><td>1024</td><td>4.38</td><td>5.62</td><td>3.53</td><td>3.03</td></tr><tr><td>4096</td><td>4.5</td><td>5.45</td><td>3.64</td><td>4.44</td></tr><tr><td colspan="5">gpu/cpu power efficiency</td></tr><tr><td></td><td>4</td><td>16</td><td>64</td><td>128</td></tr><tr><td>64</td><td>0.79</td><td>0.99</td><td>1.47</td><td>1.04</td></tr><tr><td>256</td><td>1.44</td><td>1.4</td><td>1.44</td><td>1.26</td></tr><tr><td>1024</td><td>1.8</td><td>2.31</td><td>1.45</td><td>1.25</td></tr><tr><td>4096</td><td>1.85</td><td>2.24</td><td>1.49</td><td>1.83</td></tr></table>
+
+![](images/e6751722af4e5b53091d312c364762a7dbb911d39e8c7f79e089988111a9573a.jpg)  
+fig. 11: batch size scaling on cpu (left) and gpu (right). fixed mlp dimensions of  $512^{3}$  and hash size of 100000 are used.
+
+![](images/53e1795c2f4a053ee2c48e1586bf8d235ad0f07cf342ac28bbd57f6cdaa3da72.jpg)
+
+figure 10 shows the throughput under cpu and gpu with varying dense and sparse feature combinations. in the cpu setup, we use a single trainer, dense and sparse parameter server. in the gpu setup, we use a single big basin gpu server where sparse and dense features are placed in gpu memory. power capacity requirement of a big basin server is 7.3 times higher than the dual-socket cpu server. we see that the throughput of the gpu setup is higher than the cpu setup in all configurations. however, in terms of power efficiency gpu does not always provide the best results. gpu efficiency is the highest for models with more dense features. note that in this setup, we use fixed batch sizes of 200 (for cpu), 1600 (for gpu), a hash size of 100000 (which is smaller compared to the average hash size of the production models) and mlp dimensions of  $512^{3}$ . later in this section, we show the effect of scaling each of these parameters on throughput.
+
+b. batch size: there exists a different throughput-optimal batch sizes for cpu and gpu training. the optimal batch size varies based on the sparse and dense configurations of the model.
+
+the batch size of the model dictates the number of examples processed through a forward/backward pass during model training. increasing the batch size can lead to a better training stability due to more accurate estimates of the loss gradient.
+
+however, it can also lead to worse model generalization. increasing batch size can have varying effects on training throughput too. higher batch sizes can be detrimental to the training speed over cpu hardware. in contrast, gpu hardware with significantly greater parallel compute capacity can better leverage greater batch sizes. we often see an approximately linear increase in training throughput, until a certain point.
+
+figure 11 shows the throughput under cpu and gpu as we scale the batch size. as the batch size increase, communication per iteration increases since the number of embedding lookup operations per iteration also increase. for gpu training, large batch size reduces the overhead from cuda api calls such as kernel launches, as well as allowing better use of gpu compute capacity. when communication overhead becomes larger than the gpu compute benefit, throughput starts to saturate. even if increasing the batch size beyond the first saturation point does not affect the throughput significantly, it impacts the model quality. as we discuss later, given the importance of model quality in recommendation models, batch size needs to be carefully selected for each model configuration.
+
+![](images/54760aa1d72dd0959f5890c2b274d625b663c2b3e5633531eb1157ce10d8498e.jpg)  
+fig. 12: hash size scaling on cpu (left) and gpu (right).
+
+![](images/8abd21c287e71febf09f01bcd3ca3c6bb46cb563506e6fb1ff257dbd03e999c7.jpg)
+
+c. embedding table hash size: as the effective size of embedding tables grows with an increasing hash size, the training throughput of big basin reduces significantly due to the increasing communication overhead between the gpus.
+
+each sparse feature's hash size denotes the number of entries of that feature's embedding lookup table, wherein each entry is a  $d$ -dimensional embedding. increasing this parameter yields a linear increase in the embedding table size and the total model size, but does not significantly affect embedding lookup time or overall model throughput on cpu. for gpu training, due to the limited hbm2 memory of the gpu compared with the system memory of the cpu, more gpus need to be used in order to store the embeddings.
+
+figure 12 shows the throughput with varying hash size on cpu and gpu. we use a single cpu parameter server with 256 gb memory and a single big basin server with 256 gb gpu memory for a fair comparison. during cpu training, all tables are stored in the same single server as the hash size increase. during gpu training, as the hash size increases more gpus within the single server need to be used to fit the increasing size of the embedding tables and this increases the communication cost between gpus. therefore, throughput drops significantly as we scale hash size.
+
+d. mlp dimensions: increasing the width of the mlp layers and the number of sequential layers reduces cpu training throughput higher than the gpu throughput.
+
+figure 13 shows the training throughput under varying mlp dimensions on cpu and gpu. we denote the mlp width and layers as  $width^{num\_layers}$ , e.g.  $64^2$  means 2 layers of size 64. for smaller mlp dimensions, the relatively high number of sparse features in the model resulted in disproportionately more expensive embedding lookup, pooling and interaction. therefore, we do not see the throughput decrease significantly until the mlp dimension grows larger than  $(256^3)$  for both cpu and gpu training. when the mlp dimensions grow, the drop in normalized relative throughput is higher for cpu training compared with gpu training due to the higher compute capacity of the gpu.
+
+![](images/9a5bf1d716fc3ef4a188f639535d62195092dd2eeb03d8f43ae22504b89b691d.jpg)
+
+fig. 13: throughput under varying mlp dimensions.  
+
+<table><tr><td></td><td>m1prod</td><td>m2prod</td><td>m3prod</td></tr><tr><td># sparse features</td><td>30</td><td>13</td><td>127</td></tr><tr><td># dense features</td><td>800</td><td>504</td><td>809</td></tr><tr><td>embedding size [gb]</td><td>tens</td><td>tens</td><td>hundreds</td></tr><tr><td>embedding lookups</td><td>28</td><td>17</td><td>49</td></tr><tr><td>bottom mlp dimensions</td><td>512</td><td>1024</td><td>512</td></tr><tr><td>top mlp dimensions</td><td>512-512-512</td><td>1024-1024-512</td><td>512-256-512 -256-512</td></tr></table>
+
+table ii: descriptions of three production models.
+
+# vi. case study with production-scale models
+
+we present case studies for three production recommendation models (m1prod, m2prod, and m3prod) to compare cpu and gpu efficiency in real-life scenarios. these models are written in the caffe2 framework, which is now a part of pytorch [1], and use fp32 (single precision floating point) precision. table ii summarizes the main properties of the three models evaluated here. the first two models (m1prod & 2) have lower number of sparse features than the third one. in terms of dense features, m2prod has lower number of dense features than the others. moreover, in respect of embedding sizes, m1prod & 2 have embedding tables in the order of tens of gbs, and m3prod has in the order of hundreds. two important properties captured by the production models that were not captured by the test suite are: the varying number of lookups per table and the diverse hash sizes for the individual embedding tables as we presented earlier in figure 6 and 7.
+
+<table><tr><td></td><td>m1prod</td><td>m2prod</td><td>m3prod</td></tr><tr><td>cpu setup</td><td>6 trainers8 parameter servers</td><td>20 trainers16 parameter servers</td><td>8 trainer8 parameter servers</td></tr><tr><td>gpu setup</td><td>1 big basin gpu</td><td>1 big basin gpu</td><td>1 big basin gpu</td></tr><tr><td>embedding placement</td><td>gpu memory</td><td>gpu memory</td><td>remote cpu memory</td></tr><tr><td>sync mode</td><td>easgd, 1 hogwild</td><td>easgd, 1 hogwild</td><td>easgd, 4 hogwild</td></tr><tr><td>optimal batch size per gpu</td><td>1600</td><td>3200</td><td>800</td></tr><tr><td>gpu/cpu relative throughput</td><td>2.25x</td><td>0.85x</td><td>0.67x</td></tr><tr><td>gpu/cpu power efficiency</td><td>4.3x</td><td>2.8x</td><td>0.43x</td></tr></table>
+
+table iii: cpu-gpu optimal setup comparison.
+
+a. cpu vs big basin gpu performance: when embedding tables fit on the gpu memory, as compared to cpus, big basin provided higher throughput and power efficiency.
+
+we compare the relative throughput and power efficiency between the cpu and big basin gpu training systems. table iii shows the original production cpu setups and our prototype on big basin. when we port these models into gpu, the first step is finding the optimal batch size as we discussed in the previous section. we found the throughput started to saturate after batch size of 1600, 3200 and 800 for m1,2,3prod respectively. we evaluated  $\mathrm{m1}_{\mathrm{prod}}$  &  $\mathrm{m2}_{\mathrm{prod}}$  on a single big basin gpu and stored the embedding tables on gpu memory.
+
+$\mathrm{m1}_{\mathrm{prod}}$  achieved 2.25 times higher throughput on gpu compared to its production cpu setup and is 4.3 times more power efficient.  $\mathrm{m2}_{\mathrm{prod}}$  achieved close performance to its production cpu setup (i.e. 0.85 times) and achieved 2.8 times higher power efficiency on big basin gpus. as we showed in the previous section, when embedding tables are placed on gpu memory, throughput and efficiency exceeds the cpu setup in most cases. on the other hand, when embedding tables do not fit on the limited gpu memory, it is harder to achieve the same level of efficiency. for  $\mathrm{m3}_{\mathrm{prod}}$ , when embedding tables do not fit on the high-bandwidth memory of the big basin gpus, we use remote cpu servers to serve as parameter servers and a single big basin gpu server to serve as a trainer. we scaled-up the number of parameter servers and yet the throughput on big basin only reached  $0.67\mathrm{x}$  of the throughput of the production setup on 8 cpu trainers. we found that cpu resources on the big basin server and data copies from the parameter servers became the performance bottleneck.
+
+when the embedding tables do not fit on a single gpu server, another option is to distribute the tables on the gpu memory of multiple big-basins. to be performance efficient, this mode requires fast inter-node gpu-gpu communication for embedding look-ups. due to the lack of this capability, we were not able to test this model setup on multiple big basins.
+
+b. big basin vs zion gpu performance: zion's large memory capacity, bandwidth and cpu compute resources provide several orders of magnitude efficiency improvement over big basin, when the embedding tables do not fit on gpu memory.
+
+as model size and complexity increase, improving the training throughput efficiently becomes a challenge. zion is facebook's large-memory training platform trying to address this challenge. we compare the training throughput with different placement options on big basin and zion using one of the models  $(\mathrm{m2}_{\mathrm{prod}})$  on figure 14. with gpu memory
+
+![](images/04a8b05312c05cf3a4eddc8d1e5b3d382f873d879143a3cd571d5fd05cc9366c.jpg)  
+fig. 14: embedding placements on big basin vs. zion for  $\mathbf{m2}_{\mathrm{prod}}$
+
+placement, big basin showed the best performance. zion's performance was much lower because there was no gpu-gpu direct communication in our prototype zion server, hence all communication across gpus went through cpus. this shows the importance of the gpu-to-gpu interconnect when placing the embedding tables on gpus. with system memory placement, zion performed the best as expected due to its high cpu memory bandwidth. for big basin, throughput was four times lower than the first placement option due to slower memory bandwidth and low cpu resources. with remote system memory placement, performance could not exceed other approaches on both big basin and zion despite scaling up the number of remote parameter servers to store the embedding tables. we found that lookup latency and the cpu resources on the gpu server becomes a bottleneck. the performance of zion was only slightly better than big basin due to its higher memory bandwidth and more cpu resources.
+
+zion's main advantage over big basin comes into play when embedding tables do not fit on the gpu memory of a single gpu-server. its  $\sim 2$  tb system memory and  $\sim 1$  tb/s memory bandwidth provide large capacity to store the embedding tables and fast look-up operations. our analytical model showed that for rm-3, training on zion is several orders of magnitude more efficient than using multiple big basins with embedding tables placed on the gpu memory. the challenge remaining for zion is the case where model sizes grow into multiple terabytes which requires scaling out on multiple zion servers.
+
+![](images/574f9af17d27ed327d85933d522f5dbccddb706e960ae7a9dc1d3ddbdd268216.jpg)  
+fig. 15: accuracy gap on gpus compared with cpu runs increase with the batch size when the model is tuned manually.
+
+c. accuracy: for applications requiring very well-calibrated predictions, model accuracy loss in the orders of  $\sim 0.1\%$  may not be tolerable for recommendation models to achieve a higher training throughput. in order to test and improve the model prediction quality, high volumes of data are used. this also increases the length of the process of hyper-parameter tuning, which is an important part of training given the accuracy requirement.
+
+different model and system configurations result in different optimal hyper-parameters, impacting the model quality, measured by the convergence of traditional model loss metrics, such as normalized entropy or mean squared error. to achieve optimal model convergence, hyper-parameters such as the learning rate needs to be re-tuned as the batch size and the number of servers change [19]. figure 15 shows the model loss on gpu as the batch size is scaled after manual hyperparameter tuning. despite the tuning, accuracy gap grows as we scale the batch size. model loss regression in the order of  $0.1 - 0.2\%$  might be considered small in certain machine learning use cases, however for recommendation models, such model accuracy trade-off may not be tolerable. this makes an automated approach for hyper-parameter tuning necessary to achieve a similar or higher model quality.
+
+fblearner, a suite of ml tools at facebook [13], supports a parameter sweep feature with different search strategies such as grid-based, random, and bayesian optimization. users can select a search strategy to find optimal parameters automatically - a process often known as automl. we use a bayesian optimization based strategy [6] to re-tune the hyperparameters in our gpu setup from scratch. for both  $\mathrm{m1}_{\mathrm{prod}}$  and  $\mathrm{m2}_{\mathrm{prod}}$  gpu setup showed higher accuracy, i.e. lower negative entropy (ne)  $(-0.2\%, -0.1\%)$  respectively). using less number of trainers and higher synchronization rate are possible reasons for achieving higher model quality.
+
+the process of hyper-parameter tuning to minimize model loss took around a week to complete as we used high volumes of data to train to ensure the quality of the new model setup. due the model's low throughput and the cost of running a hyper-parameter search sweep, accuracy was not evaluated for  $\mathrm{m3}_{\mathrm{prod}}$ .
+
+# vii. related work
+
+using accelerators for recommendation models have started to gain momentum in the industry. for example, as compared to cpus, google's search and ranking recommendation model training performs 14 times better on tpus [10]. baidu showed a hierarchical gpu parameter server approach to train a 10 tb recommendation model that is two times faster than cpu training [58]. alibaba's advertisement recommendation models use gpus, at least, for inference [59].
+
+most recently, in 2020, google scored the first place in the mlperf benchmark competition [39] for training facebook's open source deep learning recommendation model (dlrm) [42] on tpuv4 in just 1.21 minutes [2]. furthermore, nvidia's dgx-a100 with its own merlin hugectr software stack won the second place, finishing dlrm training in 3.33 minutes [18]. nvidia's optimized software library enables more than  $30\%$  performance speedup for the dgx-a100 systems (and more than  $70\%$  speedup for dgx2-v100).
+
+despite the importance of deep learning recommendation models, this class of deep learning workloads is under studied, especially by the system and architecture's community [54]. thus far, industry-scale recommendation models are represented in the mlperf training and inference benchmark suites [38], [39], [49], [55]. however, the mlperf-dlrm benchmark represents a medium-scale recommendation model for click-through-rate prediction. as what we presented in this paper, there is a diverse collection of recommendation models deployed at facebook's production environment. depending on the specific recommendation use cases, model architectures and parameters used for training can vary. in particular, efficient training for the large embedding tables with varying memory access patterns imposes significant system design and optimization challenges. in addition, recent studies have started analyzing the system- and architecture-level implications of neural recommendation inference [20], [21], [24]. recent works also examine near memory processing architectures, such as recnmp [29], tensordimm [30]. however, neither recnmp nor tensordimm is optimized for gradient aggregation. the benefits do not translate well into training performance improvement. finally, making training infrastructures reliable has a profound impact in the training workflow efficiency as well [37], [44], [46].
+
+this paper is the first to describe the unique properties of industry-scale recommendation models trained at facebook's production environment. the key characteristics of the model architecture with mlp stacks and a collection of large embedding tables underpin the design of facebook's next-generation zion systems [32]. the goal of this paper is to advance the state-of-the-art understanding of facebook's deep learning recommendation models, the wide variety of model parameters and architectures and the complexity of the hardware/software co-design space for facebook's production scale. we also present in-depth training throughput and model quality characterization analysis for three production-representative models. we describe the optimization techniques necessary to
+
+enable recommendation training on facebook's existing big basin and next-generation zion training systems.
+
+# viii. conclusion
+
+deep learning recommendation models have diverse set of characteristics based on their model architectures and parameter configurations, leading to different levels of cpus, memory capacity, memory and network bandwidth requirements. we share insights from facebook's production workflows by characterizing the effects of dense and sparse features, batch sizes, embedding table hash sizes, and mlp dimensions, on training throughput.
+
+important challenges continue to loom for training deep learning recommendation models as the memory capacity requirement for embedding tables grow into multiple terabytes. furthermore, training requires high volumes of data to ensure the model quality. the need for high throughput coupled with high accuracy is driving the industry to design and customize specialized hardware architectures for training. we present the next-generation scale-out zion platform to address this need. the design space characterization and analysis presented in this paper with facebook's production-scale deep learning recommendation models can be used to guide the design of training infrastructures. we hope the insights will enable further research across the entire system stack, from the design of training algorithms to next-generation training infrastructure development and optimization.
+
+# ix. acknowledgements
+
+we would like to thank facebook colleagues, especially shunting zhang, hassan eslami, chenguang xi, manoj krishnan, jiyan yang for the discussions and feedback on this work.
+
+# references
+
+[1] "caffe2 framework," https://caffe2.ai/.  
+[2] "google breaks ai performance records in mlperf with world's fastest training supercomputer," https://cloud.google.com/blog/products/ai-machine-learning/google-breaks-ai-performance-record-in-mlperf-with-worlds-fastest-training-supercomputer.  
+[3] "nvidia dgx," https://www.nvidia.com/content/dam/en-zz/solutions/data-center/dgx-1/dgx-1-print-infographic-738238-nvidia-web.pdf, 2018.  
+[4] t. akiba, s. suzuki, and k. fukuda, "extremely large minibatch sgd: training resnet-50 onimagenet in 15 minutes," arxiv preprint arxiv:1711.04325, 2017.  
+[5] n. ardalani, c. lestourgeon, k. sankaralingam, and x. zhu, "crossarchitecture performance prediction (xapp) using cpu code to predict gpu performance," in international symposium on microarchitecture, 2015, pp. 725-737.  
+[6] e. bakshy, l. dworkin, b. karrer, k. kashin, b. letham, a. murthy, and s. singh, "ae: a domain-agnostic platform for adaptive experimentation," 2018.  
+[7] i. baldini, s. j. fink, and e. altman, "predicting gpu performance from cpu runs using machine learning," in ieee international symposium on computer architecture and high performance computing, 2014, pp. 254-261.  
+[8] h.-t. cheng, l. koc, j. harmsen, t. shaked, t. chandra, h. aradhye, g. anderson, g. corrado, w. chai, m. ispir, r. anil, z. haque, l. hong, v. jain, x. liu, and h. shah, "wide & deep learning for recommender systems," in workshop on deep learning for recommender systems, 2016.
+
+[9] p. covington, j. adams, and e. sargin, “deep neural networks for youtube recommendations,” in acm recommender systems conference, 2016.  
+[10] j. dean, "machine learning for systems and systems for machine learning," in *presentation at the conference on neural information processing systems*, 2017.  
+[11] j. dean and l. a. barroso, “the tail at scale,” communications of the acm, vol. 56, no. 2, pp. 74–80, 2013.  
+[12] j. dean, g. s. corrado, r. monga, k. chen, m. devin, q. v. le, m. z. mao, m. ranzato, a. senior, p. tucker, k. yang, and a. y. ng, “large scale distributed deep networks,” in international conference on neural information processing systems - volume 1, 2012, p. 1223-1231.  
+[13] j. dunn, "introducing fblearner flow: facebook's ai backbone," 2016.  
+[14] s. edunov, m. ott, m. auli, and d. grangier, "understanding back-translation at scale," arxiv preprint arxiv:1808.09381, 2018.  
+[15] a. eisenman, m. naumov, d. gardner, m. smelyanskiy, s. pupyrev, k. hazelwood, a. cidon, and s. katti, "bandana: using non-volatile memory for storing deep learning models," arxiv preprint arxiv:1811.05922, 2018.  
+[16] a. m. elkahky, y. song, and x. he, “a multi-view deep learning approach for cross domain user modeling in recommendation systems,” in international conference on world wide web, 2015, p. 278-288.  
+[17] a. ginart, m. naumov, d. mudigere, j. yang, and j. zou, "mixed dimension embeddings with application to memory-efficient recommendation systems," arxiv preprint arxiv:1909.11810, 2019.  
+[18] i. goldwasser, "optimizing nvidia ai performance for mlperf v0.7 training," https://developer.nvidia.com/blog/optimizing-ai-performance-for-mlperf-v0-7-training/, 2020, last accessed july 29, 2020.  
+[19] p. goyal, p. dólar, r. girshick, p. noordhuis, l. wesolowski, a. kyrola, a. tulloch, y. jia, and k. he, "accurate, large minibatch sgd: trainingimagenet in 1 hour," arxiv preprint arxiv:1706.02677, 2017.  
+[20] u. gupta, s. hsia, v. saraph, x. wang, b. reagen, g.-y. wei, h.-h. s. lee, d. brooks, and c.-j. wu, "deeprecsys: a system for optimizing end-to-end at-scale neural recommendation inference," 2020.  
+[21] u. gupta, c.-j. wu, x. wang, m. naumov, b. reagen, d. brooks, b. cottel, k. hazelwood, m. hempstead, b. jia et al., "the architectural implications of facebook's dnn-based personalized recommendation," in international symposium on high performance computer architecture, 2020, pp. 488-501.  
+[22] k. hazelwood, s. bird, d. brooks, s. chintala, u. diril, d. dzhulgakov, m. fawzy, b. jia, y. jia, a. kalro, j. law, k. lee, j. lu, p. noordhuis, m. smelyanskiy, l. xiong, and x. wang, "applied machine learning at facebook: a datacenter infrastructure perspective," in ieee international symposium on high performance computer architecture, feb 2018, pp. 620-629.  
+[23] k. he, g. gkioxari, p. dollar, and r. girshick, “mask r-cnn,” in ieee international conference on computer vision, oct 2017.  
+[24] s. hsia, u. gupta, m. wilkening, c.-j. wu, g.-y. wei, and d. brooks, "cross-stack workload characterization of deep recommendation systems," in ieee international symposium on workload characterization, 2020.  
+[25] z. jiang, a. balu, c. hegde, and s. sarkar, "collaborative deep learning in fixed topology networks," arxiv preprint arxiv:1706.07880, 2017.  
+[26] p. h. jin, q. yuan, f. iandola, and k. keutzer, "how to scale distributed deep learning?" arxiv preprint arxiv:1611.04581, 2016.  
+[27] j. johnson, m. douze, and h. jégou, “billion-scale similarity search with gpus,” arxiv preprint arxiv:1702.08734, 2017.  
+[28] a. joulin, p. bojanowski, t. mikolov, h. jegou, and e. grave, “loss in translation: learning bilingual word mapping with a retrieval criterion,” arxiv preprint arxiv:1804.07745, 2018.  
+[29] l. ke, u. gupta, b. y. cho, d. brooks, v. chandra, u. diril, a. firoozshahian, k. hazelwood, b. jia, h.-h. s. lee et al., "recnmp: accelerating personalized recommendation with near-memory processing," in acm/ieee international symposium on computer architecture, 2020, pp. 790-803.  
+[30] y. kwon, y. lee, and m. rhu, "tensordimm: a practical near-memory processing architecture for embeddings and tensor operations in deep learning," arxiv preprint arxiv:1908.03072, 2019.  
+[31] k. lee, "introducing big basin: our next-generation ai hardware," https://fb.me/lee_2017, 2017, last accessed april 17, 2020.  
+[32] k. lee and v. rao, "accelerating facebook's infrastructure with application-specific hardware," https://engineering.fb.com/data-center-engineering/accelerating-infrastructure/, march 2019.
+
+[33] x. lian, c. zhang, h. zhang, c.-j. hsieh, w. zhang, and j. liu, "can decentralized algorithms outperform centralized algorithms? a case study for decentralized parallel stochastic gradient descent," arxiv preprint arxiv:1705.09056, 2017.  
+[34] x. lian, w. zhang, c. zhang, and j. liu, "asynchronous decentralized parallel stochastic gradient descent," arxiv preprint arxiv:1710.06952, 2017.  
+[35] t.-y. lin, p. goyal, r. girshick, k. he, and p. dollar, "focal loss for dense object detection," arxiv preprint arxiv:1708.02002, 2017.  
+[36] m. lui, y. yetim, özgür özkan, z. zhao, s.-y. tsai, c.-j. wu, and m. hempstead, “understanding capacity-driven scale-out neural recommendation inference,” arxiv preprint arxiv:2011.02084, 2020.  
+[37] k. maeng, s. bharuka, i. gao, m. c. jeffrey, v. saraph, b.-y. su, c. trippel, j. yang, m. rabbat, b. lucia, and c.-j. wu, “cpr: understanding and improving failure tolerant training for deep learning recommendation with partial recovery,” arxiv preprint arxiv:2011.02999, 2020.  
+[38] p. mattson, c. cheng, c. coleman, g. diamos, p. micikevicius, d. patterson, h. tang, g.-y. wei, p. bailis, v. bittorf, d. brooks, d. chen, d. dutta, u. gupta, k. hazelwood, a. hock, x. huang, b. jia, d. kang, d. kanter, n. kumar, j. liao, d. narayanan, t. oguntebi, g. pekhimenko, l. pentecost, v. j. reddi, t. robie, t. s. john, c.-j. wu, l. xu, c. young, and m. zaharia, "mlperf training benchmark," arxiv preprint arxiv:1910.01500, 2019.  
+[39] p. mattson, v. j. reddi, c. cheng, c. coleman, g. diamos, d. kanter, p. micikevicius, d. patterson, g. schmuelling, h. tang et al., "mlperf: an industry standard benchmark suite for machine learning performance," ieee micro, vol. 40, no. 2, pp. 8-16, 2020.  
+[40] i. medvedev, h. wu, and t. gordon, "powered by ai: instagram's explore recommender system," https://ai.facebook.com/blog/powered-by-ai-instagrams-explore-recommender-system/, november 2019.  
+[41] m. naumov, j. kim, d. mudigere, s. sridharan, x. wang, w. zhao, s. yilmaz, c. kim, h. yuen, m. ozdal, k. nair, i. gao, b.-y. su, j. yang, and m. smelyanskiy, "deep learning training in facebook data centers: design of scale-up and scale-out systems," arxiv preprint arxiv:2003.09518, 2020.  
+[42] m. naumov, d. mudigere, h.-j. m. shi, j. huang, n. sundaraman, j. park, x. wang, u. gupta, c.-j. wu, a. g. azzolini et al., "deep learning recommendation model for personalization and recommendation systems," arxiv preprint arxiv:1906.00091, 2019.  
+[43] v. nguyen, e. oldridge, and m. lee, "announcing nvidia merlin: an application framework for deep recommender systems," https://developer.nvidia.com/blog/announcing-nvidia-merlin-application-framework-for-deep-recommender-systems/, 2020, last accessed may 14, 2020.  
+[44] b. nicolae, j. li, j. m. wozniak, g. bosilca, m. dorier, and f. cappello, "deepfreeze: towards scalable asynchronous checkpointing of deep learning models," in ieee/acm international symposium on cluster, cloud and internet computing, 2020. [online]. available: https://hal.inria.fr/hal-02543977  
+[45] m. ott, s. edunov, a. baevski, a. fan, s. gross, n. ng, d. grangier, and m. auli, "fairseq: a fast, extensible toolkit for sequence modeling," arxiv preprint arxiv:1904.01038, 2019.  
+[46] a. qiao, b. aragam, b. zhang, and e. xing, "fault tolerance in iterative-convergent machine learning," in international conference on machine learning, 2019, pp. 5220-5230.  
+[47] y. raimond and j. basilico, "deep learning for recommender systems," https://www.slideshare.net/moustaki/deep-learning-for-recommender-systems-86752234, january 2018.  
+[48] b. recht, c. re, s. wright, and f. niu, "hogwild: a lock-free approach to parallelizing stochastic gradient descent," in advances in neural information processing systems 24, j. shawe-taylor, r. s. zemel, p. l. bartlett, f. pereira, and k. q. weinberger, eds., 2011, pp. 693-701.  
+[49] v. j. reddi, c. cheng, d. kanter, p. mattson, g. schmuelling, c.-j. wu, b. anderson, m. breughe, m. charlebois, w. chou, r. chukka, c. coleman, s. davis, p. deng, g. diamos, j. duke, d. fick, j. s. gardner, i. hubara, s. idgunji, t. b. jablin, j. jiao, t. s. john, p. kanwar, d. lee, j. liao, a. lokhmotov, f. massa, p. meng, p. micikevicius, c. osborne, g. pekhimenko, a. t. r. rajan, d. sequeira, a. sirasao, f. sun, h. tang, m. thomson, f. wei, e. wu, l. xu, k. yamada, b. yu, g. yuan, a. zhong, p. zhang, and y. zhou, "mlperf inference benchmark," arxiv preprint arxiv:1911.02549, 2019.  
+[50] q. song, d. cheng, h. zhou, j. yang, y. tian, and x. hu, "towards
+
+automated neural interaction discovery for click-through rate prediction," arxiv preprint arxiv:2007.06434, 2020.  
+[51] a. thusoo, z. shao, s. anthony, d. borthakur, n. jain, j. sen sarma, r. murthy, and h. liu, "data warehousing and analytics infrastructure at facebook," in acm international conference on management of data, 2010, pp. 1013-1020.  
+[52] s. williams, a. waterman, and d. patterson, “roofline: an insightful visual performance model for multicore architectures,” communications of the acm, vol. 52, no. 4, pp. 65–76, 2009.  
+[53] b. wu, x. dai, p. zhang, y. wang, f. sun, y. wu, y. tian, p. vajda, y. jia, and k. keutzer, "fbnet: hardware-aware efficient convnet design via differentiable neural architecture search," arxiv preprint arxiv:1812.03443, 2018.  
+[54] c.-j. wu, d. brooks, u. gupta, h.-h. lee, and k. hazelwood, "deep learning: it's not all about recognizing cats and dogs," https://www.sigarch.org/deep-learning-its-not-all-about-recognizing-cats-and-dogs/, 2019.  
+[55] c.-j. wu, r. burke, e. h. chi, j. konstan, j. mcauley, y. raimond, and h. zhang, “developing a recommendation benchmark for mlperf training and inference,” arxiv preprint arxiv:2003.07336, 2020.  
+[56] x. yi, y.-f. chen, s. ramesh, v. rajashekhar, l. hong, n. fiedel, n. seśadri, l. heldt, x. wu, and e. h. chi, “factorized deep retrieval and distributed tensorflow serving,” ser. conference on machine learning and systems, 2018.  
+[57] s. zhang, a. e. choromanska, and y. lecun, “deep learning with elastic averaging sgd,” in advances in neural information processing systems, 2015, pp. 685–693.  
+[58] w. zhao, d. xie, r. jia, y. qian, r. ding, m. sun, and p. li, "distributed hierarchicalgpu parameter server for massive scale deep learning ads systems," arxiv preprint arxiv:2003.05622, 2020.  
+[59] g. zhou, n. mou, y. fan, q. pi, w. bian, c. zhou, x. zhu, and k. gai, "deep interest evolution network for click-through rate prediction," in aaai conference on artificial intelligence, vol. 33, 2019, pp. 5941-5948.  
+[60] g. zhou, c. song, x. zhu, y. fan, h. zhu, x. ma, y. yan, j. jin, h. li, and k. gai, "deep interest network for click-through rate prediction," arxiv preprint arxiv:1706.06978, 2017.

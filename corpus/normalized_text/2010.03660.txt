@@ -1,0 +1,583 @@
+# fast stencil-code computation on a wafer-scale processor
+
+kamil rocki*, dirk van essendelft†, ilya sharapov*, robert schreiber*, michael morrison*, vladimir kibardin*, andrey portnoy*, jean francois dietiker†‡, madhava syamlal† and michael james*
+
+* cerebras systems inc., los altos, california, usa email: {kamil,michael} @cerebras.net
+
+† national energy technology laboratory, morgantown, west virginia, usa email: dirk.vanessendelft@netl.doe.gov
+
+‡ leidos research support team, pittsburgh, pennsylvania, usa  
+email: jean.dietiker@netl.doe.gov
+
+abstract—the performance of cpu-based and gpu-based systems is often low for pde codes, where large, sparse, and often structured systems of linear equations must be solved. iterative solvers are limited by data movement, both between caches and memory and between nodes. here we describe the solution of such systems of equations on the cerebras systems cs-1, a wafer-scale processor that has the memory bandwidth and communication latency to perform well. we achieve 0.86 pflops on a single wafer-scale system for the solution by bicgstab of a linear system arising from a 7-point finite difference stencil on a  $600 \times 595 \times 1536$  mesh, achieving about one third of the machine's peak performance. we explain the system, its architecture and programming, and its performance on this problem and related problems. we discuss issues of memory capacity and floating point precision. we outline plans to extend this work towards full applications.
+
+index terms—algorithms for numerical methods and algebraic systems, computational fluid dynamics and mechanics, multi-processor architecture and microarchitecture
+
+# i. introduction
+
+the need for high memory bandwidth is captured by a problem's arithmetic intensity, the number of operations performed on each datum loaded from memory. solvers of partial differential equations by finite difference, element, or volume methods have low intensity, as they make repeated sweeps over meshes. performance for them on cpu or gpu based systems suffers due to insufficient bandwidths. for example, on the high-performance conjugate gradient (hpcg) benchmark, the top 20 performing supercomputers achieve only  $0.5\%$  -  $3.1\%$  of their peak floating point performance [1]. for hpcg as for many hpc kernels and real applications,
+
+limited memory bandwidth and high communication latency are primary performance limiters.
+
+hpc memory and communication systems struggle to keep up with processing performance. in 2016 the flops to words ratios for both memory and interconnect bandwidth were in the hundreds, and the flops needed to cover the memory or network latencies were in the 10,000 to 100,000 range, with the trend going higher; see figure 1.
+
+![](images/d02ac1c3ed7e106a9a8656a7f4b914acbfcb7ede97c0e93715c69ea0aaafdb72.jpg)  
+fig. 1. the growing gulf in flops per word (memory, interconnect) of conventional cpus and clusters, and the impact of wafer-scale integration. (figure courtesy of john mccalpin [2], used with permission. cs-1 data point added by us.)
+
+the recent introduction of wafer-scale processors promises to change this situation. the cerebras systems cs-1, a system whose compute and memory resources are all fabricated in a single  $462~\mathrm{cm}^2$  silicon wafer, can move three bytes to and from memory for every flop. this is achieved in a highly parallel, distributed memory
+
+architecture in which all memory is on the same silicon wafer as the processing, providing orders of magnitude more memory bandwidth, single cycle memory latency, and lower energy cost for memory access. there are 18 gb of on-wafer memory. the memory on the wafer is fast, static random-access memory (sram). processing elements are interconnected by an on-the-wafer network with injection bandwidth one fourth of the peak floating point compute bandwidth and with nanosecond per hop message latencies. thus, on the cs-1, memory bandwidth matches the peak compute rate, and communication bandwidth is only slightly lower. the cs-1, as shown in figure 1, sits at the desirable bottom on the flops per access scale, a region that becomes ever farther away as single chip systems are pushed towards greater on chip capability with the hard limits of off-chip communication.
+
+here we demonstrate the potential for wafer-scale systems to achieve breakthrough performance on regular mesh finite difference (stencil) problems that can fit in the on-wafer memory, by giving some examples of the implementation and performance of model problems on the cs-1. we have implemented a bicgstab solver for a linear system arising from the 7-point discretization of a pde on a 3d mesh. the solver achieves performance of 0.86 pflops in mixed precision floating point that uses 16-bit for all arithmetic except the inner products and a mixed precision inner product with 16-bit multiply and 32-bit add. the achieved performance per watt (at  $20\mathrm{kw}$ ) and for the size of the machine (1/3 rack) are beyond what has been reported for conventional machines on comparable problems.
+
+we describe the system, the processing core architecture, the programming model, and our implementation of bicgstab in that model. we discuss the implementation of the global reductions required for, among other things, the inner products common to all krylov subspace linear solvers that are often a bottleneck in large-scale message-passing implementations. because on-wafer communication has low latency, our allreduce (to use the mpi term) for scalars takes under 1.5 microseconds for a system of about 380,000 independent, interconnected processors. we then present and validate a simple performance model, and use it to predict the effect of changing mesh size and shape and of an implementation for a problem arising from a large two-dimensional mesh.
+
+then we talk about the limitations of this experiment and potential extensions to more complex and realistic applications. we sketch a proposed implementation of the  $\mathrm{netl}^1$  code, mfix, for modeling combustion or chemical reactions of solid particles (e.g., fuels, sorbents) transported in a fluid. the performance projections for
+
+mfix indicate that real-time, highly resolved simulation will be possible, opening many opportunities for practical applications that demand both high fidelity and speed.
+
+we then consider issues of floating point arithmetic precision and show the accuracy achieved with mixed (16/32) and higher precision for this problem.
+
+finally, we discuss the limitation of the single-wafer solution (a limited amount of memory), pointing out situations where the speed is critical and the size is adequate, and indicating the evolution of the technology towards greater capacity.
+
+# ii. the cs-1 wafer scale engine
+
+cerebras systems, formed in 2016, has designed and brought to market the industry's first wafer-scale system [3]. all compute and memory resources of the cs-1 are contained on the wafer-scale engine, a  $462~\mathrm{cm}^2$  silicon wafer. the wafer also contains a powerful communication network; see figure 2. the system comprises 380,000 processor cores, each with 48 kb of dedicated sram memory (for a total of 18gb); up to eight 16-bit floating point operations per cycle; 16 bytes of read and 8 bytes of write bandwidth to the memory per cycle; a 2d mesh interconnection fabric with 16 bytes of injection bandwidth per core per cycle; and a total system power of  $20\mathrm{kw}$ .
+
+# a. architecture
+
+the cs-1 wafer is an mimd, distributed-memory machine with a 2d-mesh interconnection fabric. the repeated element of the architecture is called a tile. the tile contains one processor core, its memory, and the router that it connects to. the routers link to the routers of the four neighboring tiles. figure 2 illustrates the layout.
+
+the wafer contains a  $7 \times 12$  array of 84 identical "die." a die holds thousands of tiles. ordinary chips are made by cutting the wafer into individual die; in the wse, the die are instead connected by extending the interconnect across the "scribe lines", the spaces between die.
+
+the memory, functional units, and instruction set are designed for high throughput numerical computation. the roughly 380,000 tiles each have their own fast sram memory. there is no shared memory. local memory is  $48\mathrm{kb}$ , which totals 18 gb across the wafer. the load-to-use latency is one cycle.
+
+the instruction set supports operations on 16-bit integer, 16-bit (ieee fp16), and 32-bit (ieee fp32) floating point types. floating point adds, multiplies, and fused multiply-accumulate (or fmac, with no rounding of the product prior to the add) can occur in a 4-way simd manner for 16-bit operands. the instruction set supports simd operations across subtensors of four dimensional
+
+![](images/2fa3502c72b2d64edd13e59205b7e03d110e6ae450207a72c30ce267b261c480.jpg)  
+fig. 2. cs-1 wafer scale engine (wse). a single wafer (rightmost) contains one cs-1 processor. each processor is a collection of dies arranged in a 2d fashion (middle). dies are then further subdivided into a grid of tiles. one die hosts thousands of computational cores, memory and routers (leftmost). there is no logical discontinuity between adjacent dies and there is no additional bandwidth penalty for crossing the die-die barrier. in total, there are 1.2 trillion transistors in an area of  $462.25~cm^2$ .
+
+tensors, making use of tensor address generation hardware to efficiently access tensor data in memory. these play the role of nested loops and eliminate any loop overhead. there are enough memory banks to provide the bandwidth needed to fetch eight 16-bit words from memory and store four such words per cycle, enough to support simd-4, axpy operations  $\mathbf{y} = \mathbf{y} + a \times \mathbf{x}$ , where the operand  $a$  is a scalar held in a register and  $x$  and  $y$  are tensors that stream to and from memory. such an operation can be launched with a single instruction. the tensor operands can have more than four elements, so the instruction executes for multiple cycles.
+
+in mixed precision with multiplications in fp16 and additions performed in fp32, the throughput is two fmacs per core per cycle. purely 32-bit floating point computations run one fmac per core per cycle. the theoretical peak performance of the system varies depending on the number of cores configured on the wafer, clock rate and power settings.
+
+the core connects to a local router that has five bidirectional links, one to each of its four nearest neighbors and one to its own core. the router can move data into and out of these five links, in parallel, on every cycle. even with scalar granularity, communication is efficient. the router has hardware queues for its connection to the core and for each of a set of virtual channels, avoiding deadlock. communication between potentially distant processors occurs along predetermined routes. routing is configured offline, as part of compilation; data travel along virtual channels that can be programmatically reconfigured at run time. the fanout of data to multiple destinations is done through the routing; the router can forward an input word to any subset of its
+
+five output ports. there is no runtime software involved with communication. arriving data are deposited by the hardware directly into memory or registers or routed to functional units as specified by the program.
+
+an instruction with tensor operands can run synchronously or, at the discretion of the programmer, as a background thread that shares the datapath with other threads including the main one. a background thread runs a single tensor operation, as a single asynchronously running instruction. there is no context switch overhead. the registers and memory used by an asynchronous thread are those assigned by the programmer or compiler in the instruction, and these may not be overwritten until the thread terminates. subsequent computation can be delayed until the thread terminates. the core supports nine concurrent threads of execution.
+
+a stream of data to or from the fabric may be used as an input to a tensor operation, or as the destination for one. the hardware directly implements scheduling activities that would normally be performed by an operating system. this allows compact and efficient software implementations. for example, one core can be sending data from its local memory to another core; simultaneously it can receive data from another core while adding it to values stored in its local memory. all of this is accomplished using only two machine instructions that run as independent threads.
+
+code consists of tasks that react to events. tasks are triggered by other tasks, or by arriving data words. the channel of the arriving word determines the code that is triggered. there is little delay between the completion of a task and the start of a subsequent task, as this is handled in hardware. together with the simd operations
+
+of the instruction set, this efficient scalar-data-triggered method of operation allows us to implement distributed linear algebra kernels, such as those used in machine learning and the iterative linear solver discussed here, with minimal performance impact from message latency and bandwidth. special purpose data structure registers (dsrs) generate tensor access addresses in hardware eliminating overheads of nested loops.
+
+# iii. the bicgstab method
+
+discretized partial differential equations lead to systems of linear equations
+
+$$
+a x = b \tag {1}
+$$
+
+that are commonly solved using krylov subspace iterative methods such as the conjugate gradient (cg) method. the biconjugate gradient method [4] extends cg to nonsymmetric systems. the stabilized version of the method, bicgstab [5] (algorithm 1), makes it numerically stable (and uses four dot products per iteration instead of two). the kernel operations in the algorithm are sparse matrix - dense vector multiply (spmv), axpy ( $y = y + ax$  for vectors  $x$  and  $y$  and scalar  $a$ ), and inner product. in spmv, each matrix element is involved in only one multiply-add operation; thus the arithmetic intensity is low.
+
+algorithm 1 standard bicgstab  
+1: function bicgstab(a,b,x0)  
+2:  $r_0 := b, p_0 := r_0$   
+3: for i = 0,1,2, ... do  
+4:  $s_i := a p_i$   
+5:  $\alpha_i := \frac{(r_0, r_i)}{(r_0, s_i)}$   
+6:  $q_i := r_i - \alpha_i s_i$   
+7:  $y_i := a q_i$   
+8:  $\omega_i := \frac{(q_i, y_i)}{(y_i, y_i)}$   
+9:  $x_i := x_i + \alpha_i p_i + \omega_i q_i$   
+10:  $r_{i+1} := q_i - \omega_i y_i$   
+11:  $\beta_i := \frac{\alpha_i}{\omega_i} \frac{(r_0, r_{i+1})}{(r_0, r_i)}$   
+12:  $p_{i+1} := r_{i+1} + \beta_i (p_i - \omega_i s_i)$   
+13: end for  
+14: end function
+
+# iv. mapping bicgstab to the cs-1
+
+the cs-1 architecture provides a good match to the compute, memory, and communication needs of krylov subspace methods, especially on a regular mesh. we map our test case's regular 3d mesh to the 2d machine in a straightforward domain decomposition manner. let the mesh be  $x \times y \times z$ . then map  $x$  and  $y$  across the two axes of the fabric, with each core handling all of the  $z$  dimension (figure 3). the mesh mapping dictates the mapping of the vectors in the bicgstab method as each
+
+vector element is associated with one meshpoint. as to the matrix  $a$ , we map the needed portion of its nonzero diagonals to each core.  $a$  has seven nonzero diagonals; but with diagonal preconditioning the main diagonal is all ones. therefore, we only store six other diagonals. in addition to the elements of  $a$ , local portions of four vectors must be stored to implement the bicgstab iteration. the vectors  $q_{i}$  and  $r_{i + 1}$  reuse the storage of  $s_i$  and  $y_{i}$ , leading to a storage requirement per core of  $10z$  words. thus, with  $z = 1536$  we are using about 31kb out of 48kb for the matrix and vector data.
+
+1)  $spmv$  (3d): the spmv implementation uses architectural concepts that may be unfamiliar. to convey how it works we provide a pseudocode listing (linsting 1) and a coordinated diagram showing the data flow (figure 4). the code allocates memory for vectors, specifies the communication connectivity between tiles, defines tensor descriptors, and specifies tasks and threads that constitute a specification of data flow that is illustrated in the figure.
+
+with the iterate vector  $v(x,y,z)$  mapped as shown in figure 3, each core stores a local iterate vector in an array of  $v$  of length  $z$ . the local result of the spmv is an array  $u$  of length  $z$  computed as the sum of seven vectors. six of these are elementwise products of a vector of matrix elements and a vector of iterate elements. four of the iterate vectors stream in from the neighboring cores. two are shifted-by-one (in the  $z$  direction) copies of the local iterate. thus, to perform an spmv we use eight memory vectors.
+
+![](images/da719dd213fdddd0d80b4800d55c71d157efc0c67f3d3be226cf0bd451b90b50.jpg)  
+fig. 3. three dimensional problem mapping to two dimensional fabric of processing elements
+
+the eight memory vectors, shown in gray, are declared with the float16 keyword in the code. there are the local iterate (v), the result vector (u), and six vectors of matrix elements, denoted by coordinate directions (x, y, z) and p or m to indicate plus or minus, according to their role in the 7-point stencil. in order to make an asynchronous
+
+listing 1. spmv listing  
+```txt
+/* cs-1 code that computes matrix-vector multiplication  $y = a x$  with a seven-point stencil matrix a preconditioned to have ones on the main diagonal. */
+```
+
+```javascript
+/\* allocate storage for the various matrix and tensor elements. the z-dimensions and y-result are padded with zeros to avoid bounds checks in the code that follows. \*/
+```
+
+```txt
+float16 xp[z], xm[z], yp[z], ym[z], zp[z], zm[z+1];  
+float16 v[z+1], u[z+2];
+```
+
+float16 term[5][20];  
+```txt
+/* allocate storage for fifos that store intermediate vector product components prior to reduction by summation. we used a fifo depth of 20. */
+```
+
+```css
+/* initialize dsrs with tensor descriptors for the access pattern. we use a consecutive access pattern with an outer dimension stride of zero to return the dsr to its initial position when the operation is complete. */
+```
+
+```javascript
+tensor xp_a = {.base=xp, .shape={1,z}, .stride={0,1}};
+```
+
+```javascript
+tensor xm_a = {.base=xm, .shape={1,z}, .stride={0,1}};
+```
+
+```javascript
+tensor yp_a = {.base=yp, .shape={1,z}, .stride={0,1}};
+```
+
+```javascript
+tensorym_a= {.base=ym，.shape={1,z}，.stride={0,1}};
+```
+
+```javascript
+tensor  $\text{zp\_a} = \{ .\text{base} = \text{zp}, .\text{shape} = \{ 1, z \} , .\text{stride} = \{ 0, 1 \} \}$ ;
+```
+
+```javascript
+tensor  $zm\_a = \{.base =zm, .shape = \{1,z + 1\}, .stride = \{0,1\}\}$ ;
+```
+
+```css
+/* initialize (more) dsrs with fifo descriptors to store intermediate products. the fifos are configured to activate certain tasks automatically when data is pushed. */
+```
+
+```javascript
+fifo xp_fifo={start=term[0], .end=term[1], .onpush=sumtask};
+```
+
+```txt
+fifo xm_fifo  $=$  {.start  $\equiv$  term[1]，.end  $\equiv$  term[2]，.onpush  $\equiv$  sumtask};
+```
+
+```txt
+fifo yp_fifo  $=$  {.start  $\equiv$  term[2]，.end  $\equiv$  term[3]，.onpush  $\equiv$  sumtask};
+```
+
+```javascript
+fifo ym_fifo={.start=term[3], .end=term[4], .onpush=sumtask};
+```
+
+```javascript
+fifo_fifo  $=$  {.start  $\equiv$  term[4]，.end  $\equiv$  term[5]，.onpush  $\equiv$  sumtask};
+```
+
+```txt
+/* initialize (yet more) dsrs with descriptors that all alias the same output y vector. during the course of execution, they will advance asynchronously. notice: accumulators for zp and zm contributions are shifted by one. */
+```
+
+```javascript
+tensor xp_acc = {.base=u+1, .shape={1,z}, .stride={0,1}};
+```
+
+```javascript
+tensor xm_acc = {.base=u+1, .shape={1,z}, .stride={0,1}};
+```
+
+```javascript
+tensor yp_acc = {.base=u+1, .shape={1,z}, .stride={0,1}};
+```
+
+```javascript
+tensorym_acc  $=$  {.base  $\equiv$  u+1，.shape  $\equiv$  {1,z}，.stride  $\equiv$  {0,1}；
+```
+
+```javascript
+tensor  $\text{zp\_acc} = \{ .\text{base} = u + 2, .\text{shape} = \{ 1, z \}, .\text{stride} = \{ 0, 1 \} \}$ ;
+```
+
+```javascript
+tensor  $zm\_acc = \{.base = u + \theta ,.shape = \{1,z\} ,.stride = \{0,1\}\}$
+```
+
+```javascript
+tensor c_acc = {.base=u+1, .shape={1,z}, .stride={0,1}};
+```
+
+```txt
+/* initialize dsrs to traverse the local x vector. we use two descriptors because we make two traversals from separate threads concurrently. */
+```
+
+```txt
+tensor  $\mathsf{v}\theta = \{$  .base  $= \mathbb{v}$  ，.shape  $= \{1,2 + 1\}$  ，.stride  $= \{0,1\}$  ；
+```
+
+```javascript
+tensor v1 = {.base=v, .shape={1,z}, .stride={0,1}};
+```
+
+```javascript
+/* hardware will schedule a task when it is activated and not blocked. initially we block spmv completion tasks. special instructions block(), unblock(), activate() and machine events such as completion of a background thread can manipulate these task states. */
+```
+
+```javascript
+taskset sched_block = { xdone, ydone, cdone, xydone, xycdone };
+```
+
+```javascript
+taskset sched activate = { };
+```
+
+task spmv {  
+```javascript
+/* initialize dsrs as fabric i/o descriptors. instructions that use these descriptors are run by the hardware as background threads in the specified thread slot. when the operation is completed it can trigger a change in a task's scheduling status. these are initialized in spmv task because at the end of the threads' execution, the descriptors no longer have their initial values. */
+```
+
+```txt
+fabric  $x p\_ r x = \{ . t h r = 0 , . l e n = z , . t r i g = x d o n e , . a c t = a c t i v a t e \}$
+```
+
+```javascript
+fabric xm_rx= {thr=1, .len=z, .trig=xdone, .act=unblock };
+```
+
+```javascript
+fabric yp_rx= { .thr=2, .len=z, .trig=ydone, .act=activate};
+```
+
+```txt
+fabricym_rx={.thr=3，.len=z，.trig=ydone，.act=unblock}；
+```
+
+```javascript
+fabric  $\text{zp\_rx} = \{ .\text{thr} = 4, .\text{len} = z, .\text{trig} = \text{cdone}, .\text{act} = \text{activate} \}$ ;
+```
+
+```txt
+fabric c_tx = {.thr=5, .len=z};
+```
+
+```txt
+fabric c_rx = {.thr=6, .len=z, .trig=cdone, .act=unblock};
+```
+
+```txt
+/* finally, we see the first executable code. it is often the case that most of the code specifies dsr setup and task dependencies; the executable code itself is just the arithmetic that operates over the above structure. */
+```
+
+```css
+/* launch thread to send local vector to four neighbors and mirror to ourselves. */
+```
+
+```txt
+c_tx[] = v1[ ];
+```
+
+```javascript
+/* initialize the output vector with x*zm. this runs in the main thread and completes before any subsequent lines are executed */
+```
+
+```c
+zm_acc[] = vθ[ ] *zm_a[ ];
+```
+
+```c
+/* launch five threads write to fifos of vector length z. */
+```
+
+```txt
+xp_fifo[]  $=$  xp_rx[]  $\ast$  xp_a[;
+```
+
+```txt
+xm_fifo[] = xm_rx[] * xm_a[ ];
+```
+
+```javascript
+yp_fifo[]  $=$  yp_rx[] \*yp_a[;]
+```
+
+```c
+ym_fifo[] = ym_rx[] * ym_a[ ];
+```
+
+```txt
+zp_fifo[] = zp_rx[] * zp_a[ ];
+```
+
+```txt
+/* launch a thread to handle the main diagonal. because the diagonal is all ones there is no fifo and no multiplication. */
+```
+
+```javascript
+c_acc[] = c_acc[] + c_rx[ ];
+```
+
+```txt
+}
+```
+
+```txt
+/* the fifo write threads run asynchronously. when they push data into a fifo, they also activate a summation task. the summation task reads all available data from the fifos sequentially, adding the values to the result vector y. it is marked as higher priority to avoid a race condition with the synchronization task tree. the production code used two distinct summation tasks to improve performance. */
+```
+
+```txt
+task sumtask __priority__ {
+```
+
+```javascript
+xp_acc[] = xp_acc[] + xp_fifo[ ];
+```
+
+```txt
+xm_acc[] = xm_acc[] + xm_fifo[];
+```
+
+```txt
+zp_acc[] = zp_acc[] + zp_fifo[];
+```
+
+```txt
+yp_acc[] = yp_acc[] + yp_fifo[ ];
+```
+
+```txt
+ym_acc[] = ym_acc[] + ym_fifo[ ];
+```
+
+```txt
+}
+```
+
+```txt
+/* a small tree of completion tasks is used to make sure that all threads of spmv execution have completed before passing control back to the bicg solver. */
+```
+
+```txt
+task xdone { block(xdone), unblock(xydone); }
+```
+
+```txt
+task ydone { block(ydone), activate(xydone); }
+```
+
+```txt
+task xydone { block(xydone), unblock(xycdone); }
+```
+
+```txt
+task cdone { block(cdone), activate(xycdone); }
+```
+
+```txt
+task xycdone{block(xycdone)，activate(bicg); }
+```
+
+![](images/c85fb8ced0371a8ce3d881eac561463b645e85f5007539057fe86671e8fb1a8f.jpg)  
+fig. 4. implementation of spmv ( $u = av$ ). shaded regions represent memory objects, annotated arrows are tensor descriptors, and white boxes are tasks that perform computations. the diagram uses the names of objects in the code of listing 1.
+
+connection from multiplication threads to addition threads, the code allocates five in-memory fifos to forward the elementwise products of streaming vectors. the instruction set supports hardware-managed, in-memory fifos that use memory regions as circular buffers. the core has special hardware registers to manage the state (head and tail location, for example) of each fifo. these are the boxes labeled term[0] to term[4] in the figure and the objects of fifo type in the listing.
+
+each core exchanges its local iterate vector  $\mathbf{v}$  with its four neighbors. the broadcast is performed using a single communication channel that fans out to its four neighbors. but the core receives vector segments on four distinct channels, one corresponding to each of its four neighbors, each consumed by a different background thread handling the four incoming streams.
+
+we allocate channel numbers to make all five of these channels different at every tile. the assignment we used is shown with color as a representative of channel in figure 5. note that at every tile, the outgoing color (in four directions) differs from each of the four incoming colors.
+
+tensor descriptors are used in code to specify the geometry of data and the stepping though it during execution of vector instructions. in figure 4 these de
+
+scriptors are annotations, such as xp_rx (meaning a descriptor of a vector received from the neighbor in the  $+x$  direction) next to the arrows between blocks. some, like xp_rx, are fabric tensor descriptors that indicate the channel used to communicate this tensor as well as a vector length or tensor shape; they are declared with the fabric keyword in the code. a memory tensor descriptor such as (xp_a in the figure and declared with the tensor keyword) can point to a memory address and indicate a length of  $z$  and unit stride for tensors that reside in memory.
+
+so how does it work? there is one outgoing stream (the arrow coming out of  $\mathbf{v}$ , into the router, the dashed box above), and five incoming streams:  $\mathtt{x m\_rx}$ ,  $\mathtt{x p\_rx}$ ,  $\mathtt{y m\_rx}$ ,  $\mathtt{y p\_rx}$ , and  $\mathtt{c\_rx}$ , which is the  $\mathbf{v}$  data looped back. (we loop back the outgoing local data and route it in for processing the  $z$  dimension, as this saves memory bandwidth, saving time.) the assignment statement  $\mathtt{c\_t}\mathtt{x}[] = \mathtt{v1}[]$  launches a thread because in the declaration of the fabric tensor  $\mathtt{c\_t}\mathtt{x}$ , there is a thread resource assigned (.thr = 5).
+
+the job is started by a task, called spmv, that first sends the local iterate to the fabric with the assignment mentioned above. it then initializes the result as the product of the  $\text{zm\_a}$  memory vector and a shift-by-one,
+
+$\mathsf{v}\theta$  , of the in-memory local iterate. this is done by a tensor multiply instruction (denotedspmvtask in the white box on top) specified by the statement  $\mathtt{zm\_acc}[$ $= \mathsf{v}\theta []\ast \mathsf{z}\mathsf{m\_a}[$  . since none of the tensor descriptors has a thread assignment, this runs to completion before spmv proceeds.
+
+the task, spmv, then launches the six background threads (in white boxes, denoted thread_0 through thread_5) that do elementwise vector multiplication as single simd instructions. these threads pull inputs from the fabric; two of them, 4 and 5, pull the loopback local data. they send results to fifos (except for thread 5).
+
+after the main task has launched these background threads, it may safely terminate. the threads it launched continue to multiply and push elements of product vectors into fifos.
+
+thread 5 simply adds its input to the result vector. it doesn't need to multiply, because it is working on the main diagonal of the matrix, which is all ones.
+
+the cerebras hardware fifos have a distinctive feature. they are able to activate tasks, in this case sumtask, whenever they aren't empty. this they do. the hardware task scheduler runs sumtask (while the threads continue to fill the fifos). it executes five vector add instructions (as shown in the white box) that each has one fifo input. each add pulls as much data as it can from its input fifo, finishing when empty. their destination tensor descriptors track their progress, so that they add once to each of the result tensor. so sumtask is invoked repeatedly, pulling from the fifos, allowing the upstream threads to continue to push data into them.
+
+the six add operations that increment elements of the result run in a temporally interleaved way. there is no race condition. the additions occur in a nondeterministic order. but there is no danger of a data race, and no locks need be acquired, as the hardware handles the interleaving, working on only one thread at a time.
+
+in order to return control to the invoking task (called bicyg here in the code), we need to ascertain that all five adds are done. this is done with a small tree of two-way barriers implemented by unblock and activate actions.
+
+2)  $spmv$  (2d): we sketch an implementation of spmv ( $u = av$  as above) for a 9-point stencil in 2d.
+
+for the 2d problem we map a rectangular region of the mesh of  $v$  to each core, and store all elements of the corresponding columns of  $a$ . after multiplication of the local  $v$  with the local  $a$  we have generated products in an output halo that must be sent to neighboring tiles. we accomplish this output-halo exchange with sends of fabric tensors in threads that arrive and feed data into addition threads. we complete a round of send and add in one direction, then a round for the other direction, and
+
+![](images/d55e7abce3247e6293937bdf0183c1394f8d3308f2317e48e3b65d7a78262a4d.jpg)  
+fig. 5. tessellation routing pattern for spmv: a single core pushes its content into adjacent cores' fabric router using a single communication channel. messages from the four neighbors arrive on four distinct channels and are processed by corresponding threads. this allows us to achieve high fabric utilization due to the fact that we can send the data in 4 directions in a single cycle. wse allows the fabric to be dynamically reconfigured. such adaptive topology plays a significant role in offloading routing logic from cores, which can be used primarily for computation.
+
+in this way avoid communication along diagonals of the tile grid.
+
+the efficiency of this approach is approximately the same as for the 3d mapping discussed above. on one hand, because all 9 multiplies and adds for a given element of the vector  $x$  are performed on the same core, we are able to use the fused multiply-accumulate instruction. the 18 flops performed take place in three machine cycles which increases utilization over the 3d mapping which performed only adds or only multiplies on any given cycle. however, the summation work for the halos are redundant operations that offset this efficiency. furthermore, although we perform multiplication along the main diagonal, we should not receive performance credit for this operation because most problems will precondition the main diagonal to unity.
+
+the local memory in each core is sufficient to store a matrix, halo, and vector (as well as all terms needed for bicg) to hold a sub-block up-to  $38\mathrm{x}38$  in size, corresponding to geometries of 22800x22800. efficiency remains high for smaller problems. when a core holds only an 8x8 region in local memory (4800x4800 meshpoints), the overhead remains less than  $20\%$ .
+
+3) allreduce: bicgstab requires inner products of vectors distributed across the whole fabric. this requires an allreduce operation: the results of local dot products need to be summed across all cores and then the result broadcast back to all cores. because we did not use a communication-hiding variant of bicgstab, this collective operation is blocking, so we minimized latency.
+
+the routing configuration for this task is illustrated in
+
+![](images/017d81ccf25c5bb4ae4eb4639ec1106529fce8a058fa594c36f73ff73d9e047a.jpg)
+
+![](images/7314165a360328975c4974822131e84763558642dda560b8f3efe4e5b0e59ed0.jpg)  
+fig. 6. (a) the allreduce operation routing rules for  $\mathrm{x} = 8$ ,  $\mathrm{y} = 8$ . blue: horizontal reduction. green: vertical reduction. yellow/cyan/purple: 4:1 reduction to a single core. red: broadcast result to entire array. (b) route construction. the code builds a dag of geometry operations (rotation, mirror image flip, and horizontal/vertical stacking) whose leaves are single-tile router configurations, and the dag is compiled into the fabric routing tables.
+
+figure 6. the reduction is performed in parallel along fabric rows, then along two central columns. when the reduction starts, each core sends its value toward the center of its row. on each successive cycle the two central cores of that row receive a datum and accumulate it into a local sum. we use two cores in the center, each receiving input from one direction at the rate of one datum per cycle. similarly, the partial sums are reduced along two columns towards the central four cores that finally reduce their content to a single core. the reason for the use of pairs of cores is core-to-fabric injection/extraction bandwidth: a core can add two 32-bit quantities per cycle but can receive only one from the fabric. the broadcast is done in reverse, sending the result along two central columns and then across all rows. the single cycle-per-hop latency of the interconnect allows us to implement the allreduce operation in a cycle count only about  $10\%$  greater than the diameter of the system.
+
+to control the growth of roundoff error, we use a hardware inner product instruction that employs mixed 16-bit multiply/32-bit add precision, and we do the
+
+allreduce at 32-bit precision.
+
+<table><tr><td rowspan="2">operation (x count)</td><td colspan="2">single precision</td><td colspan="3">half/single mixed</td></tr><tr><td>sp +</td><td>sp ×</td><td>hp +</td><td>hp ×</td><td>sp +</td></tr><tr><td>matvec (x2)</td><td>12</td><td>12</td><td>12</td><td>12</td><td>0</td></tr><tr><td>dot (x4)</td><td>4</td><td>4</td><td>0</td><td>4</td><td>4</td></tr><tr><td>axpy (x6)</td><td>6</td><td>6</td><td>6</td><td>6</td><td>0</td></tr><tr><td>total</td><td>22</td><td>22</td><td>18</td><td>22</td><td>4</td></tr></table>
+
+tablei operations per meshpoint per iteration
+
+4) axpy: these operate on core-local fp16 data and use the four-way simd capability.
+
+# v. measured results
+
+we implemented bicgstab for a  $600 \times 595 \times 1536$  mesh on a cs-1 machine available to us for experiments that has a  $602 \times 595$  compute fabric. we measured the wall clock time between consecutive bicgstab iterations; the mean differences across 171 iterations was 28.1 microseconds. the standard deviation is about  $0.2\%$  of the mean.
+
+per table i, there are 44 operations per meshpoint per bicgstab iteration. thus, we perform  $44 \times 600 \times 595 \times 1536$  operations per iteration floating-point, which works out to an achieved performance of 0.86 pflops. as pointed out in table ii, we are using 16-bit floating point for 40 operations per iteration per meshpoint, and 32-bit floating point for the remaining 4 operations.
+
+# a. a strong scaling comparison
+
+to make a comparison to cpu-based clusters, we solved a comparable problem, the bicgstab solution of a nonsymmetric linear system arising from a 7-point stencil finite volume approximation; this was done within the netl mfix code while computing a lid-driven cavity flow. we have data for two problem sizes, both  $370^{3}$  and  $600^{3}$ . for the larger mesh, the performance for systems with numbers of cores ranging from 1024 to 16384 is shown in figure 8. these are 64-bit floating point results obtained on joule 2.0, the netl supercomputer, which is based on hpe proliant servers, intel xeon gold 6148, 20-core, 2.4ghz processors, using the intel omni-path interconnect. (in a navier-stokes solver like mfix, four linear systems are solved at every time step, one for each of the solution variables, three velocity components  $u, v, w$  and pressure  $p$ .) there are some differences between the behavior for the pressure and the momentum equations, but these differences do not change the main points.
+
+the failure to scale beyond 8k cores on the smaller mesh highlights the difficulty of achieving strong scaling on a cluster.
+
+for the larger mesh, time per bicgstab iteration on joule ranges from 75 ms on 1024 cores, and scales down to about 6 ms on 16k cores. this is about 214
+
+![](images/c262e9e48ad4f648f25a57192414c670b019149c236131e6d34717d0b4bb39cb.jpg)
+
+![](images/20b6651dfb087ba3f634cb942b316636fc6a40ca770de72ddc7107331fbb647c.jpg)  
+fig. 7. scaling of solve time on a cluster,  $370^{3}$  mesh lid driven cavity,  $600\times 600\times 600$  mesh no preconditioner  
+fig. 8. scaling of solve time on a cluster,  $600^{3}$  mesh
+
+times more than the 28.1 microseconds per iteration that we measured on the cs-1, on a problem with more than twice as many meshpoints. (on the other hand, the arithmetic is four times wider on joule.)
+
+it is interesting to try to understand why this striking difference arises. a first explanation is that there are a lot more cores on the cs-1. the cores are not equal in their performance, however, and the peak performance of 16k cores on joule at 64-bit is about 40 percent of the cs-1 peak at 16-bit. this explains some of the difference, but there is still a large performance gap per core.
+
+the difference in memory technology is clearly important. a single 20-core xeon 6148 socket has  $27.5\mathrm{mb}$  of last-level (l3) cache, and at 16k cores the aggregate cache is  $22.5\mathrm{gb}$ , substantially more than the memory of the cs-1. but the xeon caches seem to be less effective at deriving performance from the available sram. we suspect that this may be because the l3 cache is shared by the 20 cores on the socket, and does not have enough port bandwidth to satisfy all of their needs when, as in this case, there will be little temporal data reuse in the l1 and l2 caches. the cs-1 sram is not shared, and each core has access to an array of small sram banks that deliver 16 bytes (read) and 8 bytes (write) per clock to the single core, which is enough to support the full
+
+compute rate for an operation like an axpy that streams two vectors from memory and streams the result vector back.
+
+# vi. cfd on the cs-1
+
+real world applications exhibit complexity not found in simple incompressible euler flow in rectangular geometry; they feature complex geometries with heat, mass, compressibility, stretched meshes, and even structure interactions. these all complicate the steps to form the matrices of the linear systems. they account for 30 to 50 percent of the operation count. and they add to the memory requirement—memory will limit the maximum problem size that can be solved on cs-1. thus, we have to look at what happens outside the linear solver. we analyze next the work and memory required in a realistic case.
+
+algorithm 2 simple in mfix  
+1: initialization (calculate shear and time dependant source)  
+2: for i = 0,1,2, ... do  
+3: for ii = u,v,w do  
+4: form momentum  
+5: bicgstab solve  
+6: end for  
+7: form continuity  
+8: bicgstab solve continuity  
+9: field update (u, v, w, p)  
+10: calculate residual  
+11: end for
+
+as a case study, we examine the multiphase flow with interphase exchanges (mfix) cfd code from the national energy technology laboratory. in particular, we examine the newest variation on the code mfix-tf, which is a fully vectorized formulation. mfix is a general purpose, cartesian mesh, multi-phase cfd code. the code solves the fully compressible navier-stokes equations using an adapted version of the semi-implicit method for pressure linked equations (simple). in order to show that a significant problem can be solved, we discuss a single phase, compressible, viscous fluid problem without energy and species equations. it is straightforward to extrapolate the allowable size and arithmetic intensity at any level of complexity following the methodology outlined below.
+
+# a. performance and accuracy of cfd on the cs-1
+
+the operations needed to construct the coefficient matrix and source vector depend on the discretization scheme. first order upwinding is the most common scheme and was used to determine operation types and counts. the necessary operations can be grouped
+
+into vector merge operations, floating point (flop) operations (multiply, add, subtract), square root, divide, and neighbor transport operations. the cycle counts for each operation have been estimated and the operations counted for all steps outside of the linear solver in the simple algorithm per  $z$  meshpoint. the residual calculations were ignored because they involve dot products and a few scalar calculations. the analysis revealed that they could be overlapped with other computations.
+
+<table><tr><td>simple step</td><td>merge</td><td>flop</td><td>√</td><td>÷</td><td>xt</td><td>total</td></tr><tr><td>initialization</td><td>2 - 9</td><td>35-47</td><td>0</td><td>0</td><td>8</td><td>45-64</td></tr><tr><td>momentum</td><td>25-153</td><td>18-25</td><td>13</td><td>15-16</td><td>6</td><td>79-213</td></tr><tr><td>continuity</td><td>8-45</td><td>13-18</td><td>0</td><td>15-16</td><td>2</td><td>37-81</td></tr><tr><td>field update</td><td>0</td><td>3-5</td><td>0</td><td>0</td><td>1</td><td>4-6</td></tr></table>
+
+table ii cycles per meshpoint for simple, excluding the solver.
+
+for typical flow problems, the number of simple iterations ranges from 5-20 per time step, the linear solver is limited to 5 iterations for transport equations and 20 for continuity equation. based on the performance estimates, the wall time per time step was estimated to be roughly two microseconds per  $z$  meshpoint. assuming a problem size of  $600 \times 600 \times 600$  and 15 simple iterations per time step, and we expect to achieve between 80 and 125 timesteps per second. this places the likely performance of cs-1 above 200 times faster than for mfix runs on a 16,384-core partition of the netl joule cluster. furthermore, our experiments indicate that little more performance can be gained by scaling the cluster with fixed mesh size.
+
+# b. accuracy achieved with mixed precision arithmetic
+
+there is already extensive work on the use of lower precision in linear algebra and other areas. ongoing research has explored how full precision can be maintained while doing most work in lower precisions [6]-[8]. for linear systems, variants of iterative refinement have been successful.
+
+we have assessed the quality of solution we obtain using mixed 16 and 32-bit precision. we took a linear system from the timestep discretization (in the netl code mfix) of the momentum equation for a velocity component on a  $100 \times 400 \times 100$  mesh. the measured normwise relative residuals with mixed and 32-bit are shown in figure 9. up to iteration 7 the mixed precision implementation tracks the 32-bit, but then fails to reduce the residual further. with this precision, machine precision is about  $10^{-3}$ . we have observed this accuracy for very well conditioned systems. here, the growth of rounding errors during the iterative solve explains the loss of an additional factor of 10, leading to a plateau at a relative residual of  $10^{-2}$ . we have not yet tested whether this accuracy is acceptable in the mfix code.
+
+![](images/e390bcef162703c62c1ed073357d4fd1eabc87222617ce71e989695a2c9d148a.jpg)  
+fig. 9. normwise relative residual in mixed and 32-bit arithmetic. mixed precision plateaus as expected near its machine precision.
+
+we expect that for some realistic situations, mixed precision solvers are usable as is; in others they may need to be coupled with a correction scheme such as an iterative refinement or an outer iteration that solves a nonlinear system; and in other situations one may need to use higher precision arithmetic. there is interest in finding the limits. in a 2018 gordon bell finalist the authors demonstrate a nonlinear finite-element solver in which linear systems are solved using mixed-precision implementations based on fp16 arithmetic [9]. a large-scale example is nasa's fun3d code. nasa is using fun3d to simulate the powered supersonic entry of manned space vehicles in the martian atmosphere. to reduce runtimes, nasa has implemented cast in place kernels to convert fp32 values to fp16 so that they can run the red-black gauss-seidel linear solver in fp16 and transition to using tensor cores. they reported no ill effects on convergence or stability [10].
+
+# vii. related work
+
+in contrast to this work, there has been extensive work on specialized machine aimed at particular use cases. examples include anton [11] and the mdgrape systems [12]. this work stands in stark contrast to ours. we explain that a new approach at the hardware layer provides a breakthrough in memory bandwidth that make a fully general purpose system, the cs-1, capable across the spectrum of arithmetic intensity. the efforts we cite provide specialized machines that are ordinary at the hardware level and that draw their advantages from architectural specialization, and that are aimed at molecular dynamics, which lives at the high end of the intensity spectrum.
+
+the issue of memory and fabric communication in pde and krylov subspace solvers remains unresolved for conventional systems. indeed it has spawned research
+
+on communication avoiding methods [13], [14]. these can produce incremental improvements, but memory bandwidth remains a performance limiting issue.
+
+# viii. discussion and open questions
+
+# a. applications
+
+we have shown here that the approach of keeping all the processing, data, and communication on one silicon wafer can, when a problem fits on the wafer, eliminate memory bandwidth and greatly reduce communication as performance limits, yielding dramatic speedup and allowing accurate real-time simulation. before now, practitioners have had to choose between very fast reduced order/fidelity models which often lack the resolution needed to be really useful and high-resolution simulations which lack the speed to be practical.
+
+to our knowledge, this is the first ever system capable of faster-than real-time simulation of millions of cells in realistic fluid-dynamics models. in real-time applications, memory footprints are normally tractable in order to achieve the mandatory real-time performance. to take one example, it is quite difficult and potentially dangerous to land a helicopter on the windy flight deck of an aircraft carrier, due to the complexity and speed of the air flow. in his 2017 phd thesis [15], oruc noted that "especially, when the aircraft flies in the near vicinity of the superstructure of the ship, the pilot workload increases seriously." he examines the potential for semi-automatic flight control with in the loop cfd. he found that modest meshes of in the neighborhood of one million cells can provide adequate accuracy, but that the necessary real-time performance is hard to achieve on a cluster of multicore cpu systems. we give other examples of compact applications in the section below.
+
+cheap simulations mean that they could be treated as an input to a neural network residing in cs-1 as well and train a model approximating them. it has been shown that combining machine learning with traditional simulation accelerates scientific experiments [16]. another implication is that we could simulate an event on demand instead of storing previous experiments. this solution makes interactive fluid dynamics a reality.
+
+in netl's application domain, real-time simulation can enable physics-based online equipment monitoring, cyber-physical security, equipment failure prediction, dynamic baseload power following, fixed asset turn down, and renewable integration. it may become less expensive to rerun simulations than to save and retrieve information from storage. and, since high efficiency operation of energy systems often depends on operating near failure points, the advent of faster than real time, high resolution simulations may make it safe to achieve unprecedented levels of efficiency.
+
+# b. memory capacity
+
+there are compelling hpc use cases for the cs-1, notwithstanding its modest memory capacity. in the helicopter example of the last section and in three examples below, extraordinary performance in a limited memory footprint is of great value. in these examples a great many spatially compact problems must be solved, for purposes that span uncertainly quantification, to long time duration simulations involving perhaps millions of timesteps, to real-time deployments with in-the-loop models. none of these use cases can be addressed using systems based on low-performance, low cost-per-byte memory.
+
+the first use case is in automated exploration of design spaces. in the work of madsen et al [17], the first attempt at 3d simulation-based shape optimization of whole wind turbine rotors, the wind turbine scale was 10mw. richardson extrapolation showed that the number of cells needed is in the 14-50m range to get estimates within  $0.5\%$  to  $2\%$ . in the optimization setting, simulations have to be done sequentially, as the optimizer depends on gradients around simulation runs. there can be hundreds to thousands of simulations to complete a shape optimization. this type and scale of problem is also common in aircraft and automotive design optimization. today these optimizations are not routinely done due to the compute times.
+
+second, as computational models play a growing role in industrial and societal decision-making, the confidence worthiness of these models has to be quantified. uncertainty quantification (uq) relies on the assessment of the effect of model and parameter uncertainty, usually requiring hundreds or thousands of simulations to sweep relevant ranges of parameters. for example, to predict the performance uncertainty of a 1mw pilot scale carbon capture system providing  $90\%$  capture efficiency with  $95\%$  confidence [18], a total of 1,505 simulations were run, each needing about 600 seconds of simulation to reach steady state. this kind of simulation campaign is currently achievable only by simplifying the geometry (two-dimensional geometry), and using filter models to account for the coarse meshes.
+
+finally, consider a study by jasak et al [19] of commercial ship modeling in which speed rather than capacity is the issue. the solution time on a moderately sized computer system typical in engineering was as much 83 hours for a test case involving 11.7 million finite volume cells. such a turnaround time is clearly a burden in design optimization and design space exploration.
+
+our goal is not to tout the cs-1 specifically; rather we want to illuminate the benefits of the wafer-scale approach. recall that the cs-1 is the first of its kind; we expect that memory limits will recede over time with
+
+ongoing technological and engineering developments. a technology shrink from the  $16\mathrm{~nm}$  to  $7\mathrm{~nm}$  technology node will provide about 40 gb of sram on the wafer and further increases (to  $50\mathrm{~gb}$  at  $5\mathrm{~nm}$ ) will follow. these changes will help, and while they don't produce petabyte capacities, there are new directions that the hardware can take, involving systems that go beyond a single wafer and a single wafer type, that can add much more. solutions involving the clustering, with sufficient bandwidth, of several wafer-scale systems is certainly a possibility.
+
+# acknowledgement
+
+the authors would like to thank natalia vassilieva for initiating the collaboration between cerebras systems and netl and for her subsequent help with the project.
+
+# references
+
+[1] m. a. heroux and j. dongarra, “toward a new metric for ranking high performance computing systems.” sandia national laboratory technical report, no. sand2013-4744-456352, 2013.  
+[2] j. d. mccalpin, "sc16 invited talk: memory bandwidth and system balance in hpc systems," http://sc16.supercomputing.org/2016/10/07/sc16-invited-talk-spotlight-dr-john-d-mccalpin-presents-memory index.html, 2016.  
+[3] cerebras systems, "wafer-scale deep learning, presentation at hotchips 2019," https://www.youtube.com/watch?v=qf9oobzmbpu&t=3715.  
+[4] r. barrett, m. berry, t. f. chan, j. demmel, j. donato, j. dongarra, v. eijkhout, r. pozo, c. romine, and h. v. der vorst, templates for the solution of linear systems: building blocks for iterative methods, 2nd edition. philadelphia, pa: siam, 1994.  
+[5] h. a. van der vorst, "bi-cgstab: a fast and smoothly converging variant of bi-cg for the solution of nonsymmetric linear systems," siam journal on scientific and statistical computing, vol. 13, no. 2, pp. 631-644, mar. 1992. [online]. available: https://doi.org/10.1137/0913035  
+[6] e. carson and n. j. higham, "accelerating the solution of linear systems by iterative refinement in three precisions," siam j. sci. comput., vol. 40, no. 2, p. a817-a847, 2018.  
+[7] c. rubio-gonzález, cuong nguyen, hong diep nguyen, j. demmel, w. kahan, k. sen, d. h. bailey, c. iancu, and d. hough, "precimonious: tuning assistant for floating-point precision," in sc '13: proceedings of the international conference on high performance computing, networking, storage and analysis, 2013, pp. 1-12.  
+[8] a. haidar, a. abdelfattah, m. zounon, p. wu, s. pranesh, s. tomov, and j. dongarra, "the design of fast and energy-efficient linear solvers: on the potential of half-precision arithmetic and iterative refinement techniques," in computational science - iccs 2018, y. shi, h. fu, y. tian, v. v. krzhizhanovskaya, m. h. lees, j. dongarra, and p. m. a. soot, eds. cham: springer international publishing, 2018, pp. 586-600.  
+[9] t. ichimura, k. fujita, t. yamaguchi, a. naruse, j. c. wells, t. c. schulthess, t. p. straatsma, c. j. zimmer, m. martinasso, k. nakajima, m. hori, and l. maddegedara, “a fast scalable implicit solver for nonlinear time-evolution earthquake city problem on low-ordered unstructured finite elements with artificial intelligence and transprecision computing,” in sc'18 proceedings of the international conference for high performance computing, networking, storage, and analysis, ser. sc '18. ieee press, 2018. [online]. available: https://doi.org/10.1109/sc.2018.00052
+
+[10] a. korzun, e. nielsen, a. walden, b. jones, j. carlson, p. moran, c. henze, t. sandstrom, m. zubair, and j. luitjens, "landing on mars: petascale unstructured computational fluid dynamics on summit," nvidia gtc. https://developer.nvidia.com/gtc-dc/2019/video/dc91220, 2019.  
+[11] d. e. shaw, j. grossman, j. a. bank, b. batson, j. a. butts, j. c. chao, m. m. deneroff, r. o. dror, a. even, c. h. fenton, a. forte, j. gagliardo, g. gill, b. greskamp, c. r. ho, d. j. ierardi, l. iserovich, j. s. kuskin, r. h. larson, t. layman, l.-s. lee, a. k. lerer, c. li, d. killebrew, k. m. mackenzie, s. y.-h. mok, m. a. moraes, r. mueller, l. j. nociolo, j. l. peticolas, t. quan, d. ramot, j. k. salmon, d. p. scarpazza, u. b. schafer, n. siddique, c. w. snyder, j. spengler, p. t. p. tang, m. theobald, h. toma, b. towles, b. vitale, s. c. wang, and c. young, “anton 2: raising the bar for performance and programmability in a special-purpose molecular dynamics supercomputer,” in proceedings of the international conference for high performance computing, networking, storage and analysis (sc14). ieee, 2014, p. 41-53.  
+[12] i. ohmura, g. morimoto, y. ohno, a. hasegawa, and m. taiji, "mdgrape-4: a special-purpose computer system for molecular dynamics simulations," philosophical transactions a: mathematical, physical, and engineering sciences, vol. 372, no. 2021, 2014.  
+[13] m. hoemmen, "communication-avoiding krylov subspace methods," ph.d. dissertation, the university of california, berkeley, 2010.  
+[14] e. c. carson, "communication-avoiding krylov subspace methods in theory and practice," ph.d. dissertation, the university of california, berkeley, 2015.  
+[15] i. oruc, “towards real-time pilot-in-the-loop cfd simulations of helicopter/ship dynamic interface,” ph.d. dissertation, the landwide research institute, university of sydney, 2017.  
+[16] c. huntingford, e. s. jeffers, m. b. bonsall, h. m. christensen, t. lees, and h. yang, "machine learning and artificial intelligence to aid climate change research and preparedness," environmental research letters, vol. 14, no. 12, p. 124007, nov 2019. [online]. available: https://doi.org/10.1088%2f1748-9326%2fab4e55  
+[17] m. h. a. madsen, f. zahle, n. n. sørensen, and j. r. r. a. martins, "multipoint high-fidelity cfd-based aerodynamic shape optimization of a 10 mw wind turbine," wind energy science, vol. 4, no. 2, pp. 163-192, 2019. [online]. available: https://doi.org/10.5194/wes-4-163-2019  
+[18] z. xu, c. lai, p. w. marcy, j.-f. dietiker, t. li, a. sarkar, and x. sun, "predicting the performance uncertainty of a 1-mw pilot-scale carbon capture system after hierarchical laboratory-scale calibration and validation," powder technology, vol. 312, pp. 58-66, 2017. [online]. available: https://doi.org/10.1016/j.powtec.2017.02.027  
+[19] h. jasak, v. vukcevic, i. gatin, and i. lalovic, "cfd validation and grid sensitivity studies of full scale ship self propulsion," international journal of naval architecture and ocean engineering, vol. 11, no. 1, pp. 33-43, 2019. [online]. available: https://doi.org/10.1016/j.ijnaoe.2017.12.004

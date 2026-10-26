@@ -1,0 +1,495 @@
+# degree-quant: quantization-aware training for graph neural networks
+
+shyam a. tailor*
+
+department of computer science & technology  
+university of cambridge
+
+javier fernandez-marques*
+
+department of computer science  
+university of oxford
+
+nicholas d. lane
+
+department of computer science and technology  
+university of cambridge  
+& samsung ai center
+
+# abstract
+
+graph neural networks (gnns) have demonstrated strong performance on a wide variety of tasks due to their ability to model non-uniform structured data. despite their promise, there exists little research exploring methods to make them more efficient at inference time. in this work, we explore the viability of training quantized gnns, enabling the usage of low precision integer arithmetic during inference. for gnns seemingly unimportant choices in quantization implementation cause dramatic changes in performance. we identify the sources of error that uniquely arise when attempting to quantize gnns, and propose an architecturally-agnostic and stable method, degree-quant, to improve performance over existing quantization-aware training baselines commonly used on other architectures, such as cnns. we validate our method on six datasets and show, unlike previous attempts, that models generalize to unseen graphs. models trained with degree-quant for int8 quantization perform as well as fp32 models in most cases; for int4 models, we obtain up to  $26\%$  gains over the baselines. our work enables up to  $4.7\times$  speedups on cpu when using int8 arithmetic.
+
+# 1 introduction
+
+gnns have received substantial attention in recent years due to their ability to model irregularly structured data. as a result, they are extensively used for applications as diverse as molecular interactions (duvenaud et al., 2015; wu et al., 2017), social networks (hamilton et al., 2017), recommendation systems (van den berg et al., 2017) or program understanding (allamanis et al., 2018). recent advancements have centered around building more sophisticated models including new types of layers (kipf & welling, 2017; velickovic et al., 2018; xu et al., 2019) and better aggregation functions (corso et al., 2020). however, despite gnns having few model parameters, the compute required for each application remains tightly coupled to the input graph size. a 2-layer graph convolutional network (gcn) model with 32 hidden units would result in a model size of just 81kb but requires 19 gigaops to process the entire reddit graph. we illustrate this growth in fig. 1.
+
+one major challenge with graph architectures is therefore performing inference efficiently, which limits the applications they can be deployed for. for example, gnns have been combined with cnns for slam feature matching (sarlin et al., 2019), however it is not trivial to deploy this technique on smartphones, or even smaller devices, whose neural network accelerators often do not implement floating point arithmetic, and instead favour more efficient integer arithmetic. integer quantization is one way to lower the compute, memory and energy budget required to perform inference, without requiring modifications to the model architecture; this is also useful for model serving in data centers.
+
+although quantization has been well studied for cnns and language models (jacob et al., 2017; wang et al., 2018; zafrir et al., 2019; prato et al., 2019), there remains relatively little work addressing
+
+![](images/71a6cbb71443f991f01872efc4d68bf86ca5f1fc37431c197d8f1a82b6e5c8cf.jpg)  
+figure 1: despite gnn model sizes rarely exceeding 1mb, the ops needed for inference grows at least linearly with the size of the dataset and node features. gnns with models sizes  $100 \times$  smaller than popular cnns require many more ops to process large graphs.
+
+![](images/3ab62a7651233c1d6a451290dcfa86effc18010c70f9c24772ce09f9fa0d0e23.jpg)  
+figure 2: while cnns operate on regular grids, gnns operate on graphs with varying topology. a node's neighborhood size and ordering varies for gnns. both architectures use weight sharing.
+
+gnn efficiency (mukkara et al., 2018; jia et al., 2020; zeng & prasanna, 2020; yan et al., 2020). to the best of our knowledge, there is no work explicitly characterising the issues that arise when quantizing gnns or showing latency benefits of using low-precision arithmetic. the recent work of wang et al. (2020) explores only binarized embeddings of a single graph type (citation networks). in feng et al. (2020) a heterogeneous quantization framework assigns different bits to embedding and attention coefficients in each layer while maintaining the weights at full precision (fp32). due to the mismatch in operands' bit-width the majority of the operations are performed at fp32 after data casting, making it impractical to use in general purpose hardware such as cpus or gpus. in addition they do not demonstrate how to train networks which generalize to unseen input graphs. our framework relies upon uniform quantization applied to all elements in the network and uses bit-widths (8-bit and 4-bit) that are supported by off-the-shelf hardware such as cpus and gpu for which efficient low-level operators for common operations found in gnns exist.
+
+this work considers the motivations and problems associated with quantization of graph architectures, and provides the following contributions:
+
+- the explanation of the sources of degradation in gnns when using lower precision arithmetic. we show how the choice of straight-through estimator (ste) implementation, node degree, and method for tracking quantization statistics significantly impacts performance.  
+- an architecture-agnostic method for quantization-aware training on graphs, degree-quant (dq), which results in int8 models often performing as well as their fp32 counterparts. at int4, models trained with dq typically outperform quantized baselines by over  $20\%$ . we show, unlike previous work, that models trained with dq generalize to unseen graphs. we provide code at this url: https://github.com/camlsys/degree-quant.  
+- we show that quantized networks achieve up to  $4.7 \times$  speedups on cpu with int8 arithmetic, relative to full precision floating point, with  $4 - 8 \times$  reductions in runtime memory usage.
+
+# 2 background
+
+# 2.1message passing neural networks (mpnns)
+
+many popular gnn architectures may be viewed as generalizations of cnn architectures to an irregular domain: at a high level, graph architectures attempt to build representations based on a node's neighborhood (see fig. 2). unlike cnns, however, this neighborhood does not have a fixed ordering or size. this work considers gnn architectures conforming to the mpnn paradigm (gilmer et al., 2017). a graph  $\mathcal{g} = (v,e)$  has node features  $\mathbf{x}\in \mathbb{r}^{n\times f}$ , an incidence matrix  $\mathbf{i}\in \mathbb{n}^{2\times e}$ , and optionally  $d$ -dimensional edge features  $\mathbf{e}\in \mathbb{r}^{e\times d}$ . the forward pass through an mpnn layer consists of message passing, aggregation and update phases:  $\mathbf{h}_{l + 1}^{(i)} = \gamma (\mathbf{h}_l^{(i)},\bigwedge_{j\in \mathcal{n}(i)}[\phi (\mathbf{h}_l^{(j)},\mathbf{h}_l^{(i)},\mathbf{e}_{ij})])$ . messages from
+
+node  $u$  to node  $v$  are calculated using function  $\phi$ , and are aggregated using a permutation-invariant function  $\bigwedge$ . the features at  $v$  are subsequently updated using  $\gamma$ .
+
+we focus on three architectures with corresponding update rules:
+
+1. graph convolution network (gcn):  $\mathbf{h}_{l + 1}^{(i)} = \sum_{j\in \mathcal{n}(i)\cup \{i\}}\left(\frac{1}{\sqrt{d_id_j}}\mathbf{wh}_l^{(j)}\right)$  (kipf & welling, 2017), where  $d_{i}$  refers to the degree of node  $i$  
+2. graph attention network (gat):  $\mathbf{h}_{l + 1}^{(i)} = \alpha_{i,i}\mathbf{wh}_l^{(i)} + \sum_{j\in \mathcal{n}(i)}(\alpha_{i,j}\mathbf{wh}_l^{(j)})$ , where  $\alpha$  represent attention coefficients (velickovic et al., 2018).  
+3. graph isomorphism network (gin):  $\mathbf{h}_{l + 1}^{(i)} = f_{\theta}[(1 + \epsilon)\mathbf{h}_l^{(i)} + \sum_{j\in \mathcal{n}(i)}\mathbf{h}_l^{(j)}]$ , where  $f$  is a learnable function (e.g. a mlp) and  $\epsilon$  is a learnable constant (xu et al., 2019).
+
+# 2.2 quantization for non-graph neural networks
+
+quantization allows for model size reduction and inference speedup without changing the model architecture. while there exists extensive studies of the impact of quantization at different bit-widths (courbariaux et al., 2015; han et al., 2015; louizos et al., 2017) and data formats (micikevicius et al., 2017; carmichael et al., 2018; kalamkar et al., 2019), it is 8-bit integer (int8) quantization that has attracted the most attention. this is due to int8 models reaching comparable accuracy levels to fp32 models (krishnamoorthi, 2018; jacob et al., 2017), offer a  $4 \times$  model compression, and result in inference speedups on off-the-shelf hardware as 8-bit arithmetic is widely supported.
+
+quantization-aware training (qat) has become the de facto approach towards designing robust quantized models with low error (wang et al., 2018; zafrir et al., 2019; wang et al., 2018). in their simplest forms, qat schemes involve exposing the numerical errors introduced by quantization by simulating it on the forward pass jacob et al. (2017) and make use of ste (bengio et al., 2013) to compute the gradients—as if no quantization had been applied. for integer qat, the quantization of a tensor  $x$  during the forward pass is often implemented as:  $x_{q} = \min(q_{\max}, \max(q_{\min}, \lfloor x / s + z \rfloor))$ , where  $q_{\min}$  and  $q_{\max}$  are the minimum and maximum representable values at a given bit-width and signedness,  $s$  is the scaling factor making  $x$  span the  $[q_{\min}, q_{\max}]$  range and,  $z$  is the zero-point, which allows for the real value 0 to be representable in  $x_{q}$ . both  $s$  and  $z$  are scalars obtained at training time. hen, the tensor is dequantized as:  $\hat{x} = (x_{q} - z)s$ , where the resulting tensor  $\hat{x} \sim x$  for a high enough bit-width. this similarity degrades at lower bit-widths. other variants of integer qat are presented in jacob et al. (2017) and krishnamoorthi (2018).
+
+to reach performance comparable to fp32 models, qat schemes often rely on other techniques such as gradient clipping, to mask gradient updates based on the largest representable value at a given bit-width; stochastic, or noisy, qat, which stochastically applies qat to a portion of the weights at each training step (fan et al., 2020; dong et al., 2017); or the re-ordering of layers (sheng et al., 2018; alizadeh et al., 2019).
+
+# 3 quantization for gnns
+
+in this section, we build an intuition for why gnns would fail with low precision arithmetic by identifying the sources of error that will disproportionately affect the accuracy of a low precision model. using this insight, we propose our technique for qat with gnns, degree-quant. our analysis focuses on three models: gcn, gat and gin. this choice was made as we believe that these are among the most popular graph architectures, with strong performance on a variety of tasks (dwivedi et al., 2020), while also being representative of different trends in the literature.
+
+# 3.1 sources of error
+
+qat relies upon the ste to make an estimate of the gradient despite the non-differentiable rounding operation in the forward pass. if this approximation is inaccurate, however, then poor performance will be obtained. in gnn layers, we identify the aggregation phase, where nodes combine messages from a varying number of neighbors in a permutation-invariant fashion, as a source of substantial numerical error, especially at nodes with high in-degree. outputs from aggregation have magnitudes
+
+![](images/987e8ee0f058cfa6bc40a8fe6161760a167ae721dbfe7b3eeeb8bd7dd78aa3b3.jpg)  
+figure 3: analysis of values collected immediately after aggregation at the final layer of fp32 gnns trained on cora. generated using channel data collected from 100 runs for each architecture. as in-degree grows, so does the mean and variance of channel values after aggregation.
+
+![](images/20744320a63eb5b17ea911567fb73a071962a028d599e2a3af545258177e7e0b.jpg)
+
+that vary significantly depending on a node's in-degree: as it increases, the variance of aggregation values will increase. $^{1}$  over the course of training  $q_{\mathrm{min}}$  and  $q_{\mathrm{max}}$ , the quantization range statistics, become severely distorted by infrequent outliers, reducing the resolution for the vast majority of values observed. this reults in increased rounding error for nodes with smaller in-degrees. controlling  $q_{\mathrm{min}}$  and  $q_{\mathrm{max}}$  hence becomes a trade-off balancing truncation error and rounding error.
+
+we can derive how the mean and variance of the aggregation output values vary as node in-degree,  $n$ , increases for each of the three gnn layers. suppose we model incoming message values for a single output dimension with random variables  $x_{i}$ , without making assumptions on their exact distribution or independence. further, we use  $y_{n}$  as the random variable representing the value of node output after the aggregation step. with gin layers, we have  $y_{n} = (1 + \epsilon)x_{0} + \sum_{i = 1}^{n}x_{i}$ . it is trivial to prove that  $\mathbb{e}(y_n) = \mathcal{o}(n)$ . the variance of the aggregation output is also  $\mathcal{o}(n)$  in the case that  $\sum_{i\neq j}\mathrm{cov}(x_i,x_j)\ll \sum_i\mathrm{var}(x_i)$ . we note that if  $\sum_{i\neq j}\mathrm{cov}(x_i,x_j)$  is large then it implies that the network has learned highly redundant features, and may be a sign of over-fitting. similar arguments can be made for gcn and gat layers; we would expect gcn aggregation values to grow like  $\mathcal{o}(\sqrt{n})$ , and gat aggregation values to remain constant  $(\mathcal{o}(1))$  due to the attention coefficients.
+
+we empirically validate these predictions on gnns trained on cora; results are plotted in fig. 3. we see that the aggregation values do follow the trends predicted, and that for the values of in-degree in the plot (up to 168) the covariance terms can be neglected. as expected, the variance and mean of the aggregated output grow fastest for gin, and are roughly constant for gat as in-degree increases. from this empirical evidence, it would be expected that gin layers are most affected by quantization.
+
+by using gin and gcn as examples, we can see how aggregation error causes error in weight updates. suppose we consider a gin layer incorporating one weight matrix in the update function i.e.  $\mathbf{h}_{l + 1}^{(i)} = f(\mathbf{w}\mathbf{y}_{\mathrm{gin}}^{(i)})$ , where  $f$  is an activation function,  $\mathbf{y}_{\mathrm{gin}}^{(i)} = (1 + \epsilon)\mathbf{h}_l^{(i)} + \sum_{j\in \mathcal{n}(i)}\mathbf{h}_l^{(j)}$ , and  $\mathcal{n}(i)$  denotes the in-neighbors of node  $i$ . writing  $\mathbf{y}_{\mathrm{gcn}}^{(i)} = \sum_{k\in \mathcal{n}(i)}(\frac{1}{\sqrt{d_id_k}}\mathbf{wh}_l^{(j)})$ , we see that the derivatives of the loss with respect to the weights for gcn and gin are:
+
+# gin
+
+$$
+\frac {\partial \mathcal {l}}{\partial \mathbf {w}} = \sum_ {i = 1} ^ {| v |} \left(\frac {\partial \mathcal {l}}{\partial \mathbf {h} _ {l + 1} ^ {(i)}} \circ f ^ {\prime} (\mathbf {w} \mathbf {y} _ {\mathrm {g i n}} ^ {(i)})\right) \mathbf {y} _ {\mathrm {g i n}} ^ {(i) ^ {\top}}
+$$
+
+# gcn
+
+$$
+\frac {\partial \mathcal {l}}{\partial \mathbf {w}} = \sum_ {i = 1} ^ {| v |} \sum_ {j \in \mathcal {n} (i)} \frac {1}{\sqrt {d _ {i} d _ {j}}} \left(\frac {\partial \mathcal {l}}{\partial \mathbf {h} _ {l + 1} ^ {(i)}} \circ f ^ {\prime} (\mathbf {y} _ {\mathrm {g c n}} ^ {(i)})\right) \mathbf {h} _ {l} ^ {(j) ^ {\top}}
+$$
+
+the larger the error in  $\mathbf{y}_{\mathrm{gin}}^{(i)}$  caused by aggregation error—the greater the error in the weight gradients for gin, which results in poorly performing models being obtained. the same argument applies to gcn, with the  $\mathbf{h}_l^{(j)}^\top$  and  $\mathbf{y}_{\mathrm{gcn}}^{(i)}$  terms introducing aggregation error into the weight updates.
+
+# 3.2 our method: degree-quant
+
+to address these sources of error we propose degree-quant (dq), a method for qat with gnns. we consider both inaccurate weight updates and unrepresentative quantization ranges.
+
+![](images/524569620ccaedc9c14a5785e7f09046e8ce8ed319d57188daccc6596320d8e9.jpg)  
+figure 4: high-level view of the stochastic element of degree-quant. protected (high in-degree) nodes, in blue, operate at full precision, while unprotected nodes (red) operate at reduced precision. high in-degree nodes contribute most to poor gradient estimates, hence they are stochastically protected from quantization more often.
+
+algorithm 1 degree-quant (dq). functions accepting a protective mask  $\mathbf{m}$  perform only the masked computations at full precision: intermediate tensors are not quantized. at test time protective masking is disabled. in fig. 11 (in the appendix) we show with a diagram how a gcn layers makes use of dq.
+
+1: procedure trainforwardpass(g, p)  
+2:  $\triangleright$  calculate mask and quantized weights,  $\theta^{\prime}$ , which all operations share  
+3:  $\mathbf{m} \gets \text{bernoulli}(\mathbf{p})$  
+4:  $\theta^{\prime}\gets \mathrm{quantize}(\theta)$  
+5:  $\triangleright$  messages with masked sources are at full precision (excluding weights)  
+6:  $\mathcal{m}\gets$ messagecalculate  $(\mathcal{g},\theta^{\prime},\mathbf{m})$  
+7:  $x\gets \mathrm{quantize(aggregate}(\mathcal{m},\theta^{\prime},\mathbf{m}),\mathbf{m})$  
+8: return update(x, θ', m)  
+9: end procedure
+
+no quantization for masked nodes
+
+quantized weights always used
+
+stochastic protection from quantization to improve weight update accuracy. dq aims to encourage more accurate weight updates by stochastically protecting nodes in the network from quantization. at each layer a protective node mask is generated; all masked nodes have the phases of the message passing, aggregation and update performed at full precision. this includes messages sent by protected nodes to other nodes, as shown in fig. 4 (a detailed diagram is shown in fig. 11). it is also important to note that the weights used at all nodes are the same quantized weights; this is motivated by the fact that our method is used to encourage more accurate gradients to flow back to the weights through high in-degree nodes. at test time protection is disabled: all nodes operate at low precision.
+
+to generate the mask, we pre-process each graph before training and create a vector of probabilities  $\mathbf{p}$  with length equal to the number of nodes. at training time, mask  $\mathbf{m}$  is generated by sampling using the bernoulli distribution:  $\mathbf{m} \sim \mathrm{bernoulli}(\mathbf{p})$ . in our scheme  $p_i$  is higher if the in-degree of node  $i$  is large, as we find empirically that high in-degree nodes contribute most towards error in weight updates. we use a scheme with two hyperparameters,  $p_{\min}$  and  $p_{\max}$ ; nodes with the maximum in-degree are assigned  $p_{\max}$  as their masking probability, with all other nodes assigned a probability calculated by interpolating between  $p_{\min}$  and  $p_{\max}$  based on their in-degree ranking in the graph.
+
+percentile tracking of quantization ranges. figure 3 demonstrates large fluctuations in the variance of the aggregation output as in-degree increases. since these can disproportionately affect the ranges found by using min-max or momentum-based quantization, we propose using percentiles. while percentiles have been used for post-training quantization (wu et al., 2020), we are the first (to the best of our knowledge) to propose making it a core part of qat; we find it to be a key contributor to achieving consistent results with graphs. using percentiles involves ordering the values in the tensor and clipping a fraction of the values at both ends of the distribution. the fraction to clip is a hyperparameter. we are more aggressive than existing literature on the quantity we discard: we clip the top and bottom  $0.1\%$ , rather than  $0.01\%$ , as we observe the fluctuations to be a larger issue with gnns than with cnns or dnns. quantization ranges are more representative of the vast majority of values in this scheme, resulting in less rounding error.
+
+we emphasize that a core contribution of dq is that it is architecture-agnostic. our method enables a wide variety of architectures to use low precision arithmetic at inference time. our method is also orthogonal—and complementary—to other techniques for decreasing gnn computation requirements, such as sampling based methods which are used to reduce memory consumption (zeng et al., 2020), or weight pruning (blalock et al., 2020) approaches to achieve further model compression.
+
+<table><tr><td rowspan="3">dataset</td><td rowspan="3">model arch.</td><td colspan="4">vanilla ste</td><td colspan="4">ste with gradient clipping</td></tr><tr><td colspan="2">min/max</td><td colspan="2">momentum</td><td colspan="2">min/max</td><td colspan="2">momentum</td></tr><tr><td>w8a8</td><td>w4a4</td><td>w8a8</td><td>w4a4</td><td>w8a8</td><td>w4a4</td><td>w8a8</td><td>w4a4</td></tr><tr><td rowspan="3">cora (acc. %)↑</td><td>gcn</td><td>81.0 ± 0.7</td><td>65.3 ± 4.9</td><td>42.3 ± 11.1</td><td>49.4 ± 8.8</td><td>80.8 ± 0.8</td><td>62.3 ± 5.2</td><td>66.9 ± 18.2</td><td>77.2 ± 2.5</td></tr><tr><td>gat</td><td>76.0 ± 2.2</td><td>16.8 ± 8.5</td><td>81.7 ± 1.3</td><td>51.7 ± 5.8</td><td>76.4 ± 2.6</td><td>15.4 ± 8.1</td><td>81.9 ± 0.7</td><td>47.4 ± 5.0</td></tr><tr><td>gin</td><td>69.9 ± 1.9</td><td>25.9 ± 2.6</td><td>49.2 ± 10.2</td><td>42.8 ± 4.0</td><td>69.2 ± 2.3</td><td>29.5 ± 3.5</td><td>75.1 ± 1.1</td><td>40.5 ± 5.0</td></tr><tr><td rowspan="3">mnist (acc. %)↑</td><td>gcn</td><td>90.4 ± 0.2</td><td>51.3 ± 7.5</td><td>90.1 ± 0.5</td><td>70.6 ± 2.4</td><td>90.4 ± 0.3</td><td>54.8 ± 1.5</td><td>90.2 ± 0.4</td><td>10.3 ± 0.0</td></tr><tr><td>gat</td><td>95.8 ± 0.1</td><td>20.1 ± 3.3</td><td>95.7 ± 0.3</td><td>67.4 ± 3.2</td><td>95.7 ± 0.1</td><td>30.2 ± 7.4</td><td>95.7 ± 0.3</td><td>76.3 ± 1.2</td></tr><tr><td>gin</td><td>96.5 ± 0.3</td><td>62.4 ± 21.8</td><td>96.7 ± 0.2</td><td>91.0 ± 0.6</td><td>96.4 ± 0.4</td><td>19.5 ± 2.1</td><td>75.3 ± 18.1</td><td>10.8 ± 0.9</td></tr><tr><td rowspan="3">zinc (loss)↓</td><td>gcn</td><td>0.486 ± 0.01</td><td>0.747 ± 0.02</td><td>0.509 ± 0.01</td><td>0.710 ± 0.05</td><td>0.495 ± 0.01</td><td>0.766 ± 0.02</td><td>0.483 ± 0.01</td><td>0.692 ± 0.01</td></tr><tr><td>gat</td><td>0.471 ± 0.01</td><td>0.740 ± 0.02</td><td>0.571 ± 0.03</td><td>0.692 ± 0.06</td><td>0.466 ± 0.01</td><td>0.759 ± 0.04</td><td>0.463 ± 0.01</td><td>0.717 ± 0.03</td></tr><tr><td>gin</td><td>0.393 ± 0.02</td><td>1.206 ± 0.27</td><td>0.386 ± 0.03</td><td>0.572 ± 0.02</td><td>0.390 ± 0.02</td><td>1.669 ± 0.10</td><td>0.388 ± 0.02</td><td>0.973 ± 0.24</td></tr></table>
+
+table 1: impact on performance of four typical quantization implementations for int8 and int4. the configuration that resulted in best performing models for each dataset-model pair is bolded. hyperparameters for each experiment were fine-tuned independently. as expected, adding clipping does not change performance with min/max but does with momentum. a major contribution of this work is identifying that seemingly unimportant choices in quantization implementation cause dramatic changes in performance.
+
+# 4 experiments
+
+in this section we first analyse how the choice of quantization implementation affects performance of gnns. we subsequently evaluate degree-quant against the strong baselines of: fp32, int8-qat and, int8-qat with stochastic masking of weights (fan et al., 2020). we refer to this last approach as noisy qat or nqat. to make explicit that we are quantizing both weights and activations, we use the notation w8a8. we repeat the experiments at int4. our study evaluates performance on six datasets and includes both node-level and graph-level tasks. the datasets used were cora, citeseer, zinc, mnist and cifar10 superpixels, and reddit-binary. across all datasets int8 models trained with degree-quant manage to recover most of the accuracy lost as a result of quantization. in some instances, dq-int8 outperform the extensively tuned fp32 baselines. for int4, dq outperforms all qat baselines and results in double digits improvements over qat-int4 in some settings. details about each dataset and our experimental setup can be found in appendix a.1.
+
+# 4.1 impact of quantization gradient estimator on convergence
+
+the ste is a workaround for when the forward pass contains non-differentiable operations (e.g. rounding in qat) that has been widely adopted in practice. while the choice of ste implementation generally results in marginal differences for cnns—even for binary networks (alizadeh et al., 2019)—it is unclear whether only marginal differences will also be observed for gnns. motivated by this, we study the impact of four off-the-shelve quantization procedures on the three architectures evaluated for each type of dataset; the implementation details of each one is described in appendix a.3. we perform this experiment to ensure that we have the strongest possible qat baselines. results are shown in table 1. we found the choice quantization implementation to be highly dependent on the model architecture and type of problem to be solved: we see a much larger variance than is observed with cnns; this is an important discovery for future work building on our study.
+
+we observe a general trend in all int4 experiments benefiting from momentum as it helps smoothing out the quantization statistics for the inherently noisy training stage at low bitwidths. this trend applies as well for the majority of int8 experiments, while exhibiting little impact on mnist. for int8 cora-gcn, large gradient norm values in the early stages of training (see fig. 5) mean that these models not benefit from momentum as quantization ranges fail to keep up with the rate of changes in tensor values; higher momentum can help but also leads to instability. in contrast, gat has stable initial training dynamics, and hence obtains better results with momentum. for the molecules dataset zinc, we consistently obtained lower regression loss when using momentum. we note that gin models often suffer from higher performance degradation (as was first noted in fig. 3), specially at w4a4. this is not the case however for image datasets using superpixels. we believe that datasets with gaussian-like node degree distributions (see fig. 9) are more tolerant of the imprecision introduced by quantization, compared to datasets with tailed distributions. we leave more in-depth analysis of how graph topology affects quantization as future work.
+
+<table><tr><td rowspan="2">quant. 
+scheme</td><td rowspan="2">model 
+arch.</td><td colspan="2">node classification (accuracy %)</td><td colspan="2">graph classification (accuracy %)</td><td>graph regression (loss)</td></tr><tr><td>cora ↑</td><td>citeseer ↑</td><td>mnist ↑</td><td>cifar-10 ↑</td><td>zinc ↓</td></tr><tr><td rowspan="3">ref. 
+(fp32)</td><td>gcn</td><td>81.4 ± 0.7</td><td>71.1 ± 0.7</td><td>90.0 ± 0.2</td><td>54.5 ± 0.1</td><td>0.469 ± 0.002</td></tr><tr><td>gat</td><td>83.1 ± 0.4</td><td>72.5 ± 0.7</td><td>95.6 ± 0.1</td><td>65.4 ± 0.4</td><td>0.463 ± 0.002</td></tr><tr><td>gin</td><td>77.6 ± 1.1</td><td>66.1 ± 0.9</td><td>93.9 ± 0.6</td><td>53.3 ± 3.7</td><td>0.414 ± 0.009</td></tr><tr><td rowspan="3">ours 
+(fp32)</td><td>gcn</td><td>81.2 ± 0.6</td><td>71.4 ± 0.9</td><td>90.9 ± 0.4</td><td>58.4 ± 0.5</td><td>0.450 ± 0.008</td></tr><tr><td>gat</td><td>83.2 ± 0.3</td><td>72.4 ± 0.8</td><td>95.8 ± 0.4</td><td>65.1 ± 0.8</td><td>0.455 ± 0.006</td></tr><tr><td>gin</td><td>77.9 ± 1.1</td><td>65.8 ± 1.5</td><td>96.4 ± 0.4</td><td>57.4 ± 0.7</td><td>0.334 ± 0.024</td></tr><tr><td rowspan="3">qat 
+(w8a8)</td><td>gcn</td><td>81.0 ± 0.7</td><td>71.3 ± 1.0</td><td>90.9 ± 0.2</td><td>56.4 ± 0.5</td><td>0.481 ± 0.029</td></tr><tr><td>gat</td><td>81.9 ± 0.7</td><td>71.2 ± 1.0</td><td>95.8 ± 0.3</td><td>66.3 ± 0.4</td><td>0.460 ± 0.005</td></tr><tr><td>gin</td><td>75.6 ± 1.2</td><td>63.0 ± 2.6</td><td>96.7 ± 0.2</td><td>52.4 ± 1.2</td><td>0.386 ± 0.025</td></tr><tr><td rowspan="3">nqat 
+(w8a8)</td><td>gcn</td><td>81.0 ± 0.8</td><td>70.7 ± 0.8</td><td>91.1 ± 0.1</td><td>56.2 ± 0.5</td><td>0.472 ± 0.015</td></tr><tr><td>gat</td><td>82.5 ± 0.5</td><td>71.2 ± 0.7</td><td>96.0 ± 0.1</td><td>66.7 ± 0.2</td><td>0.459 ± 0.007</td></tr><tr><td>gin</td><td>77.4 ± 1.3</td><td>65.1 ± 1.4</td><td>96.4 ± 0.3</td><td>52.7 ± 1.4</td><td>0.405 ± 0.016</td></tr><tr><td rowspan="3">dq 
+(w8a8)</td><td>gcn</td><td>81.7 ± 0.7 (+0.7)</td><td>71.0 ± 0.9 (-0.3)</td><td>90.9 ± 0.2 (-0.2)</td><td>56.3 ± 0.1 (-0.1)</td><td>0.434 ± 0.009 (+9.8)</td></tr><tr><td>gat</td><td>82.7 ± 0.7 (+0.2)</td><td>71.6 ± 1.0 (+0.4)</td><td>95.8 ± 0.4 (-0.2)</td><td>67.7 ± 0.5 (+1.0)</td><td>0.456 ± 0.005 (+0.9)</td></tr><tr><td>gin</td><td>78.7 ± 1.4 (+1.3)</td><td>67.5 ± 1.4 (+2.4)</td><td>96.6 ± 0.1 (-0.1)</td><td>55.5 ± 0.6 (+2.8)</td><td>0.357 ± 0.014 (+7.5)</td></tr><tr><td rowspan="3">qat 
+(w4a4)</td><td>gcn</td><td>77.2 ± 2.5</td><td>64.1 ± 4.1</td><td>70.6 ± 2.4</td><td>38.1 ± 1.6</td><td>0.692 ± 0.013</td></tr><tr><td>gat</td><td>55.6 ± 5.4</td><td>65.3 ± 1.9</td><td>76.3 ± 1.2</td><td>41.0 ± 1.1</td><td>0.655 ± 0.032</td></tr><tr><td>gin</td><td>42.5 ± 4.5</td><td>18.6 ± 2.9</td><td>91.0 ± 0.6</td><td>45.6 ± 3.6</td><td>0.572 ± 0.02</td></tr><tr><td rowspan="3">nqat 
+(w4a4)</td><td>gcn</td><td>78.1 ± 1.5</td><td>65.8 ± 2.6</td><td>70.9 ± 1.5</td><td>40.1 ± 0.7</td><td>0.669 ± 0.128</td></tr><tr><td>gat</td><td>54.9 ± 5.6</td><td>65.5 ± 1.7</td><td>78.4 ± 1.5</td><td>41.0 ± 0.6</td><td>0.637 ± 0.012</td></tr><tr><td>gin</td><td>45.0 ± 5.0</td><td>34.6 ± 3.8</td><td>91.3 ± 0.5</td><td>48.7 ± 1.7</td><td>0.561 ± 0.068</td></tr><tr><td rowspan="3">dq 
+(w4a4)</td><td>gcn</td><td>78.3 ± 1.7 (+0.2)</td><td>66.9 ± 2.4 (+1.1)</td><td>84.4 ± 1.3 (+13.5)</td><td>51.1 ± 0.7 (+11.0)</td><td>0.536 ± 0.011 (+26.2)</td></tr><tr><td>gat</td><td>71.2 ± 2.9 (+16.3)</td><td>67.6 ± 1.5 (+2.1)</td><td>93.1 ± 0.3 (+14.7)</td><td>56.5 ± 0.6 (+15.5)</td><td>0.520 ± 0.021 (+20.6)</td></tr><tr><td>gin</td><td>69.9 ± 3.4 (+24.9)</td><td>60.8 ± 2.1 (+26.2)</td><td>95.5 ± 0.4 (+4.2)</td><td>50.7 ± 1.6 (+2.0)</td><td>0.431 ± 0.012 (+23.2)</td></tr></table>
+
+table 2: this table is divided into three sets of rows with fp32 baselines at the top. we provide two baselines for int8 and int4: standard qat and stochastic qat (nqat). both are informed by the analysis in 4.1, with nqat achieving better performance in some cases. models trained with degree-quant (dq) are always comparable to baselines, and usually substantially better, especially for int4. dq is a stable method which requires little tuning to obtain excellent results across a variety of architectures and datasets.
+
+# 4.2 obtaining quantization baselines
+
+our fp32 results, which we obtain after extensive hyperparameter tuning, and those from the baselines are shown at the top of table 2. we observed large gains on mnist, cifar10 and, zinc.
+
+for our qat-int8 and qat-int4 baselines, we use the quantization configurations informed by our analysis in section 4.1. for citeseer we use the best resulting setup analysed for cora, and for cifar-10 that from mnist. then, the hyperparameters for each experiment were fine tuned individually, including noise rate  $n \in [0.5, 0.95]$  for nqat experiments. qat-int8 and qat-int4 results in table 2 and qat-int4, with the exception of mnist (an easy to classify dataset), corroborate our hypothesis that gin layers are less resilient to quantization. this was first observed in fig. 3. in the case of zinc, while all models results in noticeable degradation, gin sees a more severe  $16\%$  increase of regression loss compared to our fp32 baseline. for qat w4a4 an accuracy drop of over  $35\%$  and  $47\%$  is observed for cora and citeseer respectively. the stochasticity induced by nqat helped in recovering some of the accuracy lost as a result of quantization for citation networks (both int8 and int4) but had little impact on other datasets and harmed performance in some cases.
+
+# 4.3 comparisons of degree-quant with existing quantization approaches
+
+degree-quant provides superior quantization for all gnn datasets and architectures. our results with dq are highlighted in gray in table 2 and table 3. citation networks trained with dq for w8a8 manage to recover most of the accuracy lost as a result of qat and outperform most of nqat baselines. in some instances dq-w8a8 models outperform the reference fp32 baselines. at 4-bits, dq results in even larger gains compared to w4a4 baselines. we see dq being more effective for gin layers, outperforming int4 baselines for cora (+24.9%), citeseer (+26.2%) and reddit-binary (+23.0%) by large margins. models trained with dq at w4a4 for graph classification and graph regression also exhibit large performance gains (of over 10%) in most cases. for zinc, all
+
+<table><tr><td>quantization</td><td>model</td><td>reddit-bin (acc. %) ↑</td></tr><tr><td>ref. (fp32)</td><td>gin</td><td>92.2 ± 2.3</td></tr><tr><td>ours (fp32)</td><td>gin</td><td>92.0 ± 1.5</td></tr><tr><td>qat-w8a8</td><td>gin</td><td>76.1 ± 7.5</td></tr><tr><td>nqat-w8a8</td><td>gin</td><td>77.5 ± 3.4</td></tr><tr><td>dq-w8a8</td><td>gin</td><td>91.8 ± 2.3 (+14.3)</td></tr><tr><td>qat-w4a4</td><td>gin</td><td>54.4 ± 6.6</td></tr><tr><td>nqat-w4a4</td><td>gin</td><td>58.0 ± 6.3</td></tr><tr><td>dq-w4a4</td><td>gin</td><td>81.3 ± 4.4 (+23.0)</td></tr></table>
+
+table 3: results for dq-int8 gin models perform nearly as well as at fp32. for int4, dq offers a significant increase in accuracy.  
+
+<table><tr><td rowspan="2">device</td><td rowspan="2">arch.</td><td colspan="3">zinc (batch=10k)</td><td rowspan="2">fp32</td><td rowspan="2">reddit w8a8</td><td rowspan="2">speedup</td></tr><tr><td>fp32</td><td>w8a8</td><td>speedup</td></tr><tr><td rowspan="3">cpu</td><td>gcn</td><td>181ms</td><td>42ms</td><td>4.3×</td><td>13.1s</td><td>3.1s</td><td>4.2×</td></tr><tr><td>gat</td><td>190ms</td><td>50ms</td><td>3.8×</td><td>13.1s</td><td>2.8s</td><td>4.7×</td></tr><tr><td>gin</td><td>182ms</td><td>43ms</td><td>4.2×</td><td>13.1s</td><td>3.1s</td><td>4.2×</td></tr><tr><td rowspan="3">gpu</td><td>gcn</td><td>39ms</td><td>31ms</td><td>1.3×</td><td>191ms</td><td>176ms</td><td>1.1×</td></tr><tr><td>gat</td><td>17ms</td><td>15ms</td><td>1.1×</td><td>oom</td><td>oom</td><td>-</td></tr><tr><td>gin</td><td>39ms</td><td>31ms</td><td>1.3×</td><td>191ms</td><td>176ms</td><td>1.1×</td></tr></table>
+
+table 4: int8 latency results run on a 22 core 2.1ghz intel xeon gold 6152 and, on a gtx 1080ti gpu. quantization provides large speedups on a variety of graphs for cpu and non-negligible speedups with unoptimized int8 gpu kernels.
+
+models achieve over  $20\%$  lower regression loss. among the top performing models using dq, ratios of  $p_{\mathrm{min}}$  and  $p_{\mathrm{max}}$  in  $[0.0, 0.2]$  were the most common. figure 10 in the appendix shows validation loss curves for gin models trained using different dq probabilities on the reddit-binary dataset.
+
+# 5 discussion
+
+latency and memory implications. in addition to offering significantly lower memory usage  $(4\times$  with int8), quantization can reduce latency—especially on cpus. we found that with int8 arithmetic we could accelerate inference by up to  $4.7\times$ . we note that the latency benefit depends on the graph topology and feature dimension, therefore we ran benchmarks on a variety of graph datasets, including reddit<sup>2</sup>, zinc, cora, citeseer, and cifar-10; zinc and reddit results are shown in table 4, with further results given in the appendix. for a gcn layer with in- and out-dimension of 128, we get speed-ups of:  $4.3\times$  on reddit,  $2.5\times$  on zinc,  $1.3\times$  on cora,  $1.3\times$  on citeseer and,  $2.1\times$  on cifar-10. it is also worth emphasizing that quantized networks are necessary to efficiently use accelerators deployed in smartphones and smaller devices as they primarily accelerate integer arithmetic, and that cpus remain a common choice for model serving on servers. the decrease in latency on cpus is due to improved cache performance for the sparse operations; gpus, however, see less benefit due to their massively-parallel nature which relies on mechanisms other than caching to hide slow random memory accesses, which are unavoidable in this application.
+
+![](images/0b50e05e5b42ce4a62e790477d2f037f5b58674bd693510dc8dfad82ce99e814.jpg)  
+figure 5:  $q_{\mathrm{max}}$  with absolute min/max and percentile ranges, applied to int8 gcn training on cora. we observe that the percentile max is half that of the absolute, doubling resolution for the majority of values.
+
+![](images/20495357698720b07f979e84586f504cd3f3f415c3b31622ae007666090cebf4.jpg)  
+figure 6: analysis of how int8 gat performance degrades on cora as individual elements are reduced to 4-bit precision without  $dq$ . for gat the message elements are crucial to classification performance.
+
+ablation study: benefits of percentile ranges. figure 5 shows the value of percentiles during training. we see that when using absolute min/max the upper range grows to over double the range required for  $99.9\%$  of values, effectively halving the resolution of the quantized values. dq is more stable, and we obtained strong results with an order of magnitude less tuning relative to the baselines.
+
+ablation study: source of degradation at int4. figure 6 assesses how int8 gat (without dq) degrades as single elements are converted to int4, in order to understand the precipitous drop in
+
+accuracy in the int4 baselines; further plots for gcn and gin are included in the appendix. we observe that most elements cause only modest performance losses relative to a full int8 model. dq is most important to apply to elements which are constrained by numerical precision, such as the aggregation and message elements in gat. weight elements, however, are consistently unaffected.
+
+ablation study: effect of stochastic element in degree-quant. we observe that the stochastic protective masking in dq alone often achieves most of the performance gain over the qat baseline; results are given in table 9 in the appendix. the benefit of the percentile-based quantization ranges is stability, although it can yield some performance gains. the full dq method provides consistently good results on all architectures and datasets, without requiring an extensive analysis as in 4.1.
+
+# 6 conclusion
+
+this work has presented degree-quant, an architecture-agnostic and stable method for training quantized gnn models that can be accelerated using off-the-shelf hardware. with 4-bit weights and activations we achieve  $8 \times$  compression while surpassing strong baselines by margins regularly exceeding  $20\%$ . at 8-bits, models trained with dq perform on par or better than the baselines while achieving up to  $4.7 \times$  lower latency than fp32 models. our work offers a comprehensive foundation for future work in this area and is a first step towards enabling gnns to be deployed more widely, including to resource constrained devices such as smartphones.
+
+# acknowledgements
+
+this work was supported by samsung ai and by the uk's engineering and physical sciences research council (epsrc) with grants ep/m50659x/1 and ep/s001530/1 (the moa project) and the european research council via the redial project.
+
+# references
+
+r. achanta, a. shaji, k. smith, a. lucchi, p. fua, and s. susstrunk. slic superpixels compared to state-of-the-art superpixel methods. ieee transactions on pattern analysis and machine intelligence, 34(11):2274-2282, 2012.  
+milad alizadeh, javier fernandez-marqués, nicholas d. lane, and yarin gal. a empirical study of binary neural networks' optimisation. in international conference on learning representations, 2019. url https://openreview.net/forum?id=rjfucor5kx.  
+milad alizadeh, arash behboodi, mart van baalen, christos louizos, tijmen blankevoort, and max welling. gradient  $\ell_{1}$  regularization for quantization robustness. arxiv preprint arxiv:2002.07520, 2020.  
+miltiadis allamanis, marc brockschmidt, and mahmoud khademi. learning to represent programs with graphs. in 6th international conference on learning representations, iclr 2018, vancouver, bc, canada, april 30 - may 3, 2018, conference track proceedings. openreview.net, 2018. url https://openreview.net/forum?id=bjofetxr-.  
+yoshua bengio, nicholas léonard, and aaron courville. estimating or propagating gradients through stochastic neurons for conditional computation, 2013.  
+davis blalock, jose javier gonzalez ortiz, jonathan frankle, and john guttag. what is the state of neural network pruning?, 2020.  
+zachariah carmichael, hamed f. langroudi, char khazanov, jeffrey lillie, john l. gustafson, and dhireesha kudithipudi. deep positron: a deep neural network using the posit number system, 2018.  
+gabriele corso, luca cavalleri, dominique beaini, pietro lio, and petar velickovic. principal neighbourhood aggregation for graph nets, 2020.  
+matthieu courbariaux, yoshua bengio, and jean-pierre david. binaryconnect: training deep neural networks with binary weights during propagations, 2015.  
+yinpeng dong, renkun ni, jianguo li, yurong chen, jun zhu, and hang su. learning accurate low-bit deep neural networks with stochastic quantization, 2017.
+
+david k duvenaud, dougal maclaurin, jorge iparraguirre, rafael bombarell, timothy hirzel, alán aspuru-guzik, and ryan p adams. convolutional networks on graphs for learning molecular fingerprints. in advances in neural information processing systems, pp. 2224-2232, 2015.  
+vijay prakash dwivedi, chaitanya k. joshi, thomas laurent, yoshua bengio, and xavier bresson. benchmarking graph neural networks, 2020.  
+steven k. esser, jeffrey l. mckinstry, deepika bablani, rathinakumar appuswamy, and dharmendra s. modha. learned step size quantization. in international conference on learning representations, 2020. url https://openreview.net/forum?id=rkgo66vkds.  
+angela fan, pierre stock, benjamin graham, edouard grave, remi gribonval, herve jegou, and armand joulin. training with quantization noise for extreme model compression, 2020.  
+boyuan feng, yuke wang, xu li, shu yang, xueqiao peng, and yufei ding. sgquant: squeezing the last bit on graph neural networks with specialized quantization, 2020.  
+matthias fey and jan eric lenssen. fast graph representation learning with pytorch geometric, 2019.  
+justin gilmer, samuel s. schoenholz, patrick f. riley, oriol vinyals, and george e. dahl. neural message passing for quantum chemistry. corr, abs/1704.01212, 2017. url http://arxiv.org/abs/1704.01212.  
+william l. hamilton, rex ying, and jure leskovec. inductive representation learning on large graphs, 2017.  
+song han, huizi mao, and william j. dally. deep compression: compressing deep neural networks with pruning, trained quantization and huffman coding, 2015.  
+sergey ioffe and christian szegedy. batch normalization: accelerating deep network training by reducing internal covariate shift, 2015.  
+benoit jacob, skirmantas kligys, bo chen, menglong zhu, matthew tang, andrew howard, hartwig adam, and dmitry kalenichenko. quantization and training of neural networks for efficient integer-arithmetic-only inference, 2017.  
+zhihao jia, sina lin, mingyu gao, matei zaharia, and alex aiken. improving the accuracy, scalability, and performance of graph neural networks with roc. in proceedings of machine learning and systems 2020, pp. 187-198. 2020.  
+wengong jin, regina barzilay, and tommi jaakkola. junction tree variational autoencoder for molecular graph generation, 2018.  
+dhiraj kalamkar, dheevatsa mudigere, naveen mellempudi, dipankar das, kunal banerjee, sasikanth avancha, dharma teja vooturi, nataraj jammalamadaka, jianyu huang, hector yuen, jiyan yang, jongsoo park, alexander heinecke, evangelos georganas, sudarshan srinivasan, abhisek kundu, misha smelyanskiy, bharat kaul, and pradeep dubey. a study of bfloat16 for deep learning training, 2019.  
+thomas n. kipf and max welling. semi-supervised classification with graph convolutional networks. in 5th international conference on learning representations, iclr 2017, toulon, france, april 24-26, 2017, conference track proceedings. openreview.net, 2017. url https://openreview.net/forum?id=sju4ayygl.  
+raghuraman krishnamoorthi. quantizing deep convolutional networks for efficient inference: a whitepaper, 2018.  
+liam li, kevin jamieson, afshin rostamizadeh, ekaterina gonina, jonathan ben-tzur, moritz hardt, benjamin recht, and ameet talwalkar. a system for massively parallel hyperparameter tuning. in proceedings of machine learning and systems 2020, pp. 230-246. 2020.  
+christos louizos, karen ullrich, and max welling. bayesian compression for deep learning, 2017.  
+paulius micikevicius, sharan narang, jonah alben, gregory diamos, erich elsen, david garcia, boris ginsburg, michael houston, oleksii kuchaiev, ganesh venkatesh, and hao wu. mixed precision training, 2017.  
+anurag mukkara, nathan beckmann, maleen abeydeera, xiaosong ma, and daniel sanchez. exploiting locality in graph analytics through hardware-accelerated traversal scheduling. in proceedings of the 51st annual ieee/acm international symposium on microarchitecture, micro-51, pp. 1-14.ieee press,2018. isbn 9781538662403.doi:10.1109/micro.2018.00010. url https://doi.org/10.1109/micro. 2018.00010.
+
+gabriele prato, ella charlaix, and mehdi rezagholizadeh. fully quantized transformer for machine translation, 2019.  
+yu rong, wenbing huang, tingyang xu, and junzhou huang. droppedge: towards deep graph convolutional networks on node classification. in international conference on learning representations, 2020. url https://openreview.net/forum?id=hkx1qkrkpr.  
+paul-edouard sarlin, daniel detone, tomasz malisiewicz, and andrew rabinovich. superglue: learning feature matching with graph neural networks. arxiv preprint arxiv:1911.11763, 2019.  
+tao sheng, chen feng, shaojie zhuo, xiaopeng zhang, liang shen, and mickey aleksic. a quantization-friendly separable convolution for mobilenets. 2018 1st workshop on energy efficient machine learning and cognitive computing for embedded applications (emc2), mar 2018. doi: 10.1109/emb2.2018.00011. url http://dx.doi.org/10.1109/emb2.2018.00011.  
+moran shkolnik, brian chmiel, ron banner, gil shomron, yuri nahshan, alex bronstein, and uri weiser. robust quantization: one model to rule them all. arxiv preprint arxiv:2002.07686, 2020.  
+nitish srivastava, geoffrey hinton, alex krizhevsky, ilya sutskever, and ruslan salakhutdinov. dropout: a simple way to prevent neural networks from overfitting. the journal of machine learning research, 15(1): 1929-1958, 2014.  
+rianne van den berg, thomas n. kipf, and max welling. graph convolutional matrix completion, 2017.  
+petar velickovic, guillem cucurull, arantxa casanova, adriana romero, pietro lio, and yoshua bengio. graph attention networks. in 6th international conference on learning representations, iclr 2018, vancouver, bc, canada, april 30 - may 3, 2018, conference track proceedings. openreview.net, 2018. url https://openreview.net/forum?id=rjxmpikcz.  
+hanchen wang, defu lian, ying zhang, lu qin, xiangjian he, yiguang lin, and xuemin lin. binarized graph neural network, 2020.  
+kuan wang, zhijian liu, yujun lin, ji lin, and song han. haq: hardware-aware automated quantization with mixed precision, 2018.  
+hao wu, patrick judd, xiaojie zhang, mikhail isaev, and paulius micikevicius. integer quantization for deep learning inference: principles and empirical evaluation, 2020.  
+zhenqin wu, bharath ramsundar, evan n. feinberg, joseph gomes, caleb geniesse, aneesh s. pappu, karl leswing, and vijay pande. moleculenet: a benchmark for molecular machine learning, 2017.  
+keyulu xu, weihua hu, jure leskovec, and stefanie jegelka. how powerful are graph neural networks? in 7th international conference on learning representations, iclr 2019, new orleans, la, usa, may 6-9, 2019. openreview.net, 2019. url https://openreview.net/forum?id=rygs6ia5km.  
+bencheng yan, chaokun wang, gaoyang guo, and yunkai lou. tinygnn: learning efficient graph neural networks. in proceedings of the 26th acm sigkdd international conference on knowledge discovery and data mining, kdd '20, pp. 1848-1856, new york, ny, usa, 2020. association for computing machinery. isbn 9781450379984. doi: 10.1145/3394486.3403236. url https://doi.org/10.1145/3394486.3403236.  
+ofir zafrir, guy boudoukh, peter izsak, and moshe wasserblat. q8bert: quantized 8bit bert, 2019.  
+hanqing zeng and viktor prasanna. graphact. the 2020 acm/sigda international symposium on field-programmable gate arrays, feb 2020. doi: 10.1145/3373087.3375312. url http://dx.doi.org/10.1145/3373087.3375312.  
+hanqing zeng, hongkuan zhou, ajitesh srivastava, rajgopal kannan, and viktor prasanna. graphsaint: graph sampling based inductive learning method, 2020.
+
+# a appendix
+
+readers seeking advice on implementation will find appendix a.5 especially useful. we provide significant advice surrounding best practices on quantization for gnns, along with techniques which we believe can boost our methods beyond the performance described in this paper, but for which we did not have time to fully evaluate.
+
+# a.1 experimental setup
+
+as baselines we use the architectures and results reported by fey & lenssen (2019) for citation networks, dwivedi et al. (2020) for mnist, cifar-10 and zinc and, xu et al. (2019) for reddit-binary. we re-implemented the architectures and datasets used in these publications and replicated the results reported at fp32. models using gin layers learn parameter  $\epsilon$ . these models are often referred to as gin- $\epsilon$ . the high-level description of these architectures is shown in table 5. the number of parameters for each architecture-dataset in this work are shown in table 6.
+
+our infrastructure was implemented using pytorch geometric (pyg) (fey & lenssen, 2019). we generate candidate hyperparameters using random search, and prune trials using the asynchronous hyperband algorithm (li et al., 2020). hyperparameters searched over were learning rate, weight decay, and dropout (srivastava et al., 2014) and drop-edge (rong et al., 2020) probabilities. the search ranges were initialized centered at the values used in the reference implementations of the baselines. degree-quant requires searching for two additional hyperparameters,  $p_{\mathrm{min}}$  and  $p_{\mathrm{max}}$ , these were tuned in a grid-search fashion. we report our results using the hyperparameters which achieved the best validation loss over 100 runs on the cora and citeseer datasets, 10 runs for mnist, cifar-10 and zinc, and 10-fold cross-validation for redmit-binary.
+
+we generally used fewer hyperparameter runs for our dq runs than we did for baselines—even ignoring the searches over the various ste config. as our method is more stable, finding a reasonable set of parameters was easier than before. as is usual with quantization experiments, we found it useful to decrease the learning rate relative to the fp32 baseline.
+
+our experiments ran on several machines in our slurm cluster using intel cpus and nvidia gpus. each machine was running ubuntu 18.04. the gpu models in our cluster were: v100, rtx 2080ti and gtx 1080ti.
+
+<table><tr><td rowspan="2">model arch.</td><td colspan="5"># layers</td><td colspan="5"># hidden units</td><td colspan="5">residual</td><td colspan="5">output mlp</td></tr><tr><td>cit</td><td>m</td><td>c</td><td>z</td><td>r</td><td>cit</td><td>m</td><td>c</td><td>z</td><td>r</td><td>cit</td><td>m</td><td>c</td><td>z</td><td>r</td><td>cit</td><td>m</td><td>c</td><td>z</td><td>r</td></tr><tr><td>gcn</td><td>2</td><td>4</td><td>4</td><td>4</td><td>-</td><td>16</td><td>146</td><td>146</td><td>145</td><td>-</td><td>×</td><td>✓</td><td>✓</td><td>✓</td><td>-</td><td>×</td><td>✓</td><td>✓</td><td>✓</td><td>-</td></tr><tr><td>gat</td><td>2</td><td>4</td><td>4</td><td>4</td><td>-</td><td>8</td><td>19</td><td>19</td><td>18</td><td>-</td><td>×</td><td>✓</td><td>✓</td><td>✓</td><td>-</td><td>×</td><td>✓</td><td>✓</td><td>✓</td><td>-</td></tr><tr><td>gin</td><td>2</td><td>4</td><td>4</td><td>4</td><td>5</td><td>16</td><td>110</td><td>110</td><td>110</td><td>64</td><td>×</td><td>✓</td><td>✓</td><td>✓</td><td>×</td><td>×</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr></table>
+
+table 5: high level description of the architectures evaluated for citation networks (cit), mnist (m), cifar-10 (c), zinc (z) and reddit-binary (r). we relied on adam optimizer for all experiments. for all batched experiments, we used 128 batch-sizes. all gat models used 8 attention heads. all gin architectures used 2-layer mlps, except those for citation networks which used a single linear layer.  
+
+<table><tr><td rowspan="2">model arch.</td><td colspan="2">node classification</td><td colspan="3">graph classification</td><td rowspan="2">graph regression zinc</td></tr><tr><td>cora</td><td>citeseer</td><td>mnist</td><td>cifar-10</td><td>reddit-bin</td></tr><tr><td>gcn</td><td>23063</td><td>59366</td><td>103889</td><td>104181</td><td>-</td><td>105454</td></tr><tr><td>gat</td><td>92373</td><td>237586</td><td>113706</td><td>114010</td><td>-</td><td>105044</td></tr><tr><td>gin</td><td>23216</td><td>59536</td><td>104554</td><td>104774</td><td>42503</td><td>102088</td></tr></table>
+
+table 6: number of parameters for each of the evaluated architectures
+
+for qat experiments, all elements of each network are quantized: inputs to each layer, the weights, the messages sent between nodes, the inputs to aggregation stage and its outputs and, the outputs of the update stage (which are the outputs of the gnn layer before activation). in this way, all intermediate tensors in gnns are quantized with the exception of the attention mechanism in gat; we do not quantize after the softmax calculation, due to the numerical precision required at this
+
+stage. with the exception of cora and citeseer, the models evaluated in this work make use of batch normalization (ioffe & szegedy, 2015). for deployments of quantized models, batch normalization layers are often folded with the weights (krishnamoorthi, 2018). this is to ensure the input to the next layer is within the expected  $[q_{\mathrm{min}}, q_{\mathrm{max}}]$  ranges. in this work, for both qat baselines and qat+dq, we left bn layers unfolded but ensure the inputs and outputs were quantized to the appropriate number of bits (i.e. int8 or int4) before getting multiplied with the layer weights. we leave as future work proposing a bn folding mechanism applicable for gnns and studying its impact for deployments of quantized gnns.
+
+the gin models evaluated on redbit-binary used qat for all layers with the exception of the input layer of the mlp in the first gin layer. this compromise was needed to overcome the severe degradation introduced by quantization when operating on nodes with a single scalar as feature.
+
+# a.2 datasets
+
+we show in table 7 the statistics for each dataset either used or referred to in this work. for cora and citeseer datasets, nodes correspond to documents and edges to citations between these. node features are a bag-of-words representation of the document. the task is to classify each node in the graph (i.e. each document) correctly. the mnist and cifar-10 datasets (commonly used for image classification) are transformed using slic (achanta et al., 2012) into graphs where each node represents a cluster of perceptually similar pixels or superpixels. the task is to classify each image using their superpixels graph representation. the zinc dataset contains graphs representing molecules, were each node is an atom. the task is to regress a molecular property (constrained solubility (jin et al., 2018)) given the graph representation of the molecule. nodes in graphs of the reddit-binary dataset represent users of a reddit thread with edges drawn between a pair of nodes if these interacted. this dataset contains graphs of two types of communities: question-answer threads and discussion threads. the task is to determine if a given graph is from a question-answer thread or a discussion thread.
+
+we use standard splits for mnist, cifar-10 and zinc. for citation datasets (cora and citeseer), we use the splits used by kipf & welling (2017). for reddit-binary we use 10-fold cross validation.
+
+<table><tr><td>dataset</td><td>graphs</td><td>nodes</td><td>edges</td><td>features</td><td>labels</td></tr><tr><td>cora</td><td>1</td><td>2,708</td><td>5,278</td><td>1,433</td><td>7</td></tr><tr><td>citeseer</td><td>1</td><td>3,327</td><td>4,552</td><td>3,703</td><td>6</td></tr><tr><td>pubmed</td><td>1</td><td>19,717</td><td>44,324</td><td>500</td><td>3</td></tr><tr><td>mnist</td><td>70k</td><td>40-75</td><td>564.53 (avg)</td><td>3</td><td>10</td></tr><tr><td>cifar10</td><td>60k</td><td>85-150</td><td>941.07 (avg)</td><td>5</td><td>10</td></tr><tr><td>zinc</td><td>12k</td><td>9-37</td><td>49.83 (avg)</td><td>28</td><td>1</td></tr><tr><td>reddit-binary</td><td>2k</td><td>429.63 (avg)</td><td>497.75 (avg)</td><td>1</td><td>2</td></tr><tr><td>reddit</td><td>1</td><td>232,965</td><td>114,848,857</td><td>602</td><td>41</td></tr><tr><td>amazon</td><td>1</td><td>9,430,088</td><td>231,594,310</td><td>300</td><td>24</td></tr></table>
+
+table 7: statistics for each dataset used in the paper. some datasets are only referred to in fig. 1
+
+# a.3 quantization implementations
+
+in section 4.1 we analyse different readily available quantization implementations and how they impact in qat results. first, vanilla ste, which is the reference ste (bengio et al., 2013) that lets the gradients pass unchanged; and gradient clipping (gc), which clips the gradients based on the maximum representable value for a given quantization level. or in other words, gc limits gradients if the tensor's magnitudes are outside the  $[q_{\mathrm{min}}, q_{\mathrm{max}}]$  range.
+
+$$
+x _ {\min } = \left\{ \begin{array}{l l} \min  (x) & \text {i f s t e p} = 0 \\ \min  \left(x _ {\min }, x\right) & \text {o t h e r w i s e} \end{array} \right. \tag {1}
+$$
+
+$$
+x _ {\min } = \left\{ \begin{array}{l l} \min  (x) & \text {i f s t e p} = 0 \\ (1 - c) x _ {\min } + c \min  (x) & \text {o t h e r w i s e} \end{array} \right. \tag {2}
+$$
+
+the quantization modules keep track of the input tensor's min and max values,  $x_{\mathrm{min}}$  and  $x_{\mathrm{max}}$ , which are then used to compute  $q_{\mathrm{min}}$ ,  $q_{\mathrm{max}}$ , zero-point and scale parameters. for both vanilla ste and gc, we study two popular ways of keeping track of these statistics: min/max, which tracks the min/max tensor values observed over the course of training; and momentum, which computes the moving averages of those statistic during training. the update rules for  $x_{\mathrm{min}}$  for ste min/max and ste momentum are presented in eq. (1) and eq. (2) respectively, where  $x$  is the tensor to be quantized and  $c$  is the momentum hyperparameter, which in all our experiments is set to its default 0.01. equivalent rules apply when updating  $x_{\mathrm{max}}$  (omitted).
+
+for stochastic qat we followed the implementation described in fan et al. (2020), where at each training step a binary mask sampled from a bernoulli distribution is used to specify which elements of the weight tensor will be quantized and which will be left at full precision. we experimented with block sizes larger than one (i.e. a single scalar) but often resulted in a sever drop in performance. all the reported results use block size of one.
+
+# a.4 degree-quant and graph level summarization
+
+the percentile operation in our quantization scheme remains important for summarizing the graph when doing graph-level tasks, such as graph regression (zinc) or graph classification (mnist, cifar-10 and reddit-binary). since the number of nodes in each input graph is not constant, this can cause the summarized representation produced from the final graph layer to have a more tailed distribution than would be seen with other types of architectures (e.g. cnn). adding the percentile operation reduces the impact of these extreme tails in the fully connected graph-summarization layers, thereby increasing overall performance. the arguments regarding weight update accuracy also still apply, as the  $\frac{\partial\mathcal{l}}{\partial\mathbf{h}_{l + 1}^{(i)}}$  term in the equations for the gcn and gin should be more accurate compared to when the activations are always quantized before the summarization. this phenomenon is also noted by fan et al. (2020).
+
+# a.5 implementation advice
+
+we provide details that will be useful for others working in the area, including suggestions that should boost the performance of our results and accelerate training. we release code on github; this code is a clean implementation of the paper, suitable for users in downstream works.
+
+# a.5.1 quantization setup
+
+as our work studies the pitfalls of quantization for gnns, we were more aggressive in our implementation than is absolutely necessary: everything (where reasonably possible) in our networks is quantized. in practice, this leaves low-hanging fruit for improvements in accuracy:
+
+- not quantizing the final layer (as is common practice for cnns and transformers) helps with accuracy, especially at int4. a similar practice at the first layer will also be useful.  
+- using higher precision for the "summmarization" stages of the model, which contributes little towards the runtime in most cases.  
+- taking advantage of mixed precision: since the benefits of quantization are primarily in the message passing phase (discussed below), one technique to boost accuracy is to only make the messages low precision.
+
+we advise choosing a more realistic (less aggressive) convention than used in this work. the first two items would be appropriate.
+
+# a.5.2 relative value of percentiles compared to protective masking
+
+there are two components to our proposed technique: stochastic, topology-aware, masking and percentile-based range observers for quantizers. we believe that percentiles provide more immediate value, especially at int4. we find that they are useful purely from the perspective of stabilizing the optimization and reducing the sensitivity to hyperparameters.
+
+however, adding the masking does improve performance further. this is evident from table 9. in fact, performance may be degraded slightly when percentiles are also applied: this can be observed by comparing table 9 to the main results in the paper, table 2.
+
+# a.5.3 percentiles
+
+the key downside with applying percentiles for range observers is that the operation can take significant time. training with dq is slower than before—however, since there is less sensitivity to hyperparameters, fewer runs end up being needed. we are confident that an effective way to speed up this operation is to use sampling. we expect  $10\%$  of the data should be adequate, however we believe that even  $1\%$  of the data may be sufficient (dataset and model dependent). however, we have not evaluated this setup in the paper; it is provided in the code release for experimentation.
+
+# a.5.4 improving on percentiles
+
+we believe that it is possible to significantly boost the performance of gnn quantization by employing a learned step size approach. although we used percentiles in this paper to illustrate the range-precision trade-off for gnns, we expect that learning the ranges will lead to better results. this approach, pioneered by works such as esser et al. (2020), has been highly effective on cnns even down to 2 bit quantization.
+
+another approach would be to use robust quantization: the ideas in these works are to reduce the impact of changing quantization ranges i.e. making the architecture more robust to quantization. works in this area include alizadeh et al. (2020) and shkolnik et al. (2020).
+
+# a.5.5 improving latency
+
+the slowest step of gnn inference is typically the sparse operations. it is therefore best to minimize the sizes of the messages between nodes i.e. quantize the message phase most aggressively. this makes the biggest impact on cpus which are dependent on caches to obtain good performance.
+
+we evaluated our code on cpu using numpy and scipy routines. for the gpu, we used implementations from pytorch and pytorch geometric and lightly modified them to support int8 where necessary. these results, while useful for illustrating the benefits of quantization, are by no means optimal: we did not devote significant time to improving latency. we believe better results can be obtained by taking advantage of techniques such as cache blocking or kernel fusion.
+
+# a.5.6 pitfalls
+
+training these models can be highly unstable: some experiments in the paper had standard deviations as large as  $18\%$ . we observed this to affect citation network experiments to the extent that they would not converge on gpus: all these experiments had to be run on cpus.
+
+# a.6 degradation studies
+
+figures 7 and 8 show the results of the ablation study conducted in section 5 for gcn and gin. we observe that gcn is more tolerant to int4 quantization than other architectures. gin, however, requires accurate representations after the update stage, and heavily suffers from further quantization like gat. the idea of performing different stages of inference at different precisions has been proposed, although it is uncommon (wang et al., 2018).
+
+![](images/b2bf02694f50fec255606c25e8e4bc9a29cb8d27bbc106045ad6ee5d6887439e.jpg)  
+figure 7: degradation of int8 gcn on cora as individual elements are converted to int4 without degree-quant.
+
+![](images/eec0782dc911e71ae5594ec6cc60045bb427209a55b16ff0cfce586c1fb83d9b.jpg)  
+figure 8: degradation of int8 gin on cora as individual elements are converted to int4 without degree-quant.
+
+![](images/de016baaef19c7f8052b561f6152b0584bac665f52730c6f38c0cb5532a25b30.jpg)
+
+![](images/b9e7d7f42fac5275e25cf462a7ea10aa30196f39f89b5df7d26495c13a2776db.jpg)
+
+![](images/0dd1c6bd871d7ffcca470a75167b37107aeef60fe775dc6a54cec566a2f29ae4.jpg)
+
+![](images/59ae2d6925d6fdee56a59de2871668a2e09d85725336a327287d57ceaf6c6b9d.jpg)
+
+![](images/8bd8c8942e954a1a3eec2575413553bacb51a00159bea01b891fb774d21dcec4.jpg)  
+in-degree
+
+![](images/1fd935b724b187b704ff37c53c982c9d8a1dd7957e63463984f33b7c47de26e9.jpg)  
+in-degree  
+figure 9: in-degree distribution for each of the six datasets assessed. note that a log  $y$ -axis is used for all datasets except for mnist and cifar-10.
+
+![](images/f6f5cb35163157e665efd97d3935ebb4cf79f4590fc6ec813c94b64915fff9fd.jpg)  
+figure 10: validation loss curves for gin models evaluated on reddit-binary. results averaged across 10-fold cross-validation. we show four dq-int8 experiments each with a different values for  $(p_{\mathrm{min}}, p_{\mathrm{max}})$  and our fp32 baseline.
+
+<table><tr><td>quantization</td><td>model</td><td>reddit-bin ↑</td></tr><tr><td>ref. (fp32)</td><td>gin</td><td>92.2 ± 2.3</td></tr><tr><td>ours (fp32)</td><td>gin</td><td>92.0 ± 1.5</td></tr><tr><td>dq-int8 (0.0, 0.1)</td><td>gin</td><td>91.8 ± 2.3</td></tr><tr><td>dq-int8 (0.1, 0.2)</td><td>gin</td><td>90.1 ± 2.5</td></tr><tr><td>dq-int8 (0.2, 0.2)</td><td>gin</td><td>89.0 ± 3.0</td></tr><tr><td>dq-int8 (0.2, 0.3)</td><td>gin</td><td>88.1 ± 3.0</td></tr></table>
+
+table 8: final test accuracies for fp32 and dq-int8 models whose validation loss curves are shown in fig. 10  
+
+<table><tr><td rowspan="2">quantization scheme</td><td rowspan="2">model arch.</td><td colspan="2">node classification</td><td rowspan="2">graph regression zinc ↓</td></tr><tr><td>cora ↑</td><td>citeseer ↑</td></tr><tr><td rowspan="3">qat-int8 + dq masking</td><td>gcn</td><td>81.1 ± 0.6</td><td>71.0 ± 0.7</td><td>0.468 ± 0.014</td></tr><tr><td>gat</td><td>82.1 ± 0.1</td><td>71.4 ± 0.8</td><td>0.462 ± 0.005</td></tr><tr><td>gin</td><td>78.9 ± 1.2</td><td>67.1 ± 1.7</td><td>0.347 ± 0.028</td></tr><tr><td rowspan="3">qat-int4 + dq masking</td><td>gcn</td><td>78.5 ± 1.4</td><td>62.8 ± 8.5</td><td>0.599 ± 0.015</td></tr><tr><td>gat</td><td>64.4 ± 9.3</td><td>68.9 ± 1.2</td><td>0.529 ± 0.008</td></tr><tr><td>gin</td><td>71.2 ± 2.9</td><td>56.7 ± 3.8</td><td>0.427 ± 0.010</td></tr><tr><td rowspan="3">nqat-int4 + percentile</td><td>gcn</td><td>75.6 ± 2.5</td><td>64.8 ± 3.8</td><td>0.633 ± 0.012</td></tr><tr><td>gat</td><td>70.1 ± 2.8</td><td>51.4 ± 3.4</td><td>0.596 ± 0.008</td></tr><tr><td>gin</td><td>63.5 ± 2.0</td><td>46.3 ± 4.1</td><td>0.771 ± 0.058</td></tr></table>
+
+table 9: ablation study against the two elements of degree-quant (dq). the first two rows of results are obtained with only the stochastic element of degree-quant enabled for int8 and int4. percentile-based quantization ranges are disabled in these experiments. the bottom row of results were obtained with noisy quantization (nqat) at int4 with the use of percentiles. dq masking alone is often sufficient to achieve excellent results, but the addition of percentile-based range tracking can be beneficial to increase stability. we can see that using nqat with percentiles is not sufficient to achieve results of the quality dq provides.  
+
+<table><tr><td rowspan="2">device</td><td rowspan="2">arch.</td><td colspan="3">cifar-10</td><td colspan="3">cora</td><td colspan="3">citeseer</td></tr><tr><td>fp32</td><td>w8a8</td><td>speedup</td><td>fp32</td><td>w8a8</td><td>speedup</td><td>fp32</td><td>w8a8</td><td>speedup</td></tr><tr><td rowspan="3">cpu</td><td>gcn</td><td>182ms</td><td>88ms</td><td>2.1×</td><td>0.94ms</td><td>0.74ms</td><td>1.3×</td><td>0.97ms</td><td>0.76ms</td><td>1.3×</td></tr><tr><td>gat</td><td>500ms</td><td>496ms</td><td>1.0×</td><td>0.86ms</td><td>0.78ms</td><td>1.1×</td><td>0.99ms</td><td>0.88ms</td><td>1.1×</td></tr><tr><td>gin</td><td>144ms</td><td>44ms</td><td>3.3×</td><td>0.85ms</td><td>0.68ms</td><td>1.3×</td><td>0.95ms</td><td>0.55ms</td><td>1.7×</td></tr><tr><td rowspan="3">gpu</td><td>gcn</td><td>2.1ms</td><td>1.6ms</td><td>1.3×</td><td>0.08ms</td><td>0.09ms</td><td>0.9×</td><td>0.09ms</td><td>0.09ms</td><td>1.0×</td></tr><tr><td>gat</td><td>30.0ms</td><td>27.1ms</td><td>1.1×</td><td>0.57ms</td><td>0.64ms</td><td>0.9×</td><td>0.56ms</td><td>0.64ms</td><td>0.9×</td></tr><tr><td>gin</td><td>20.9ms</td><td>16.2ms</td><td>1.2×</td><td>0.09ms</td><td>0.07ms</td><td>1.3×</td><td>0.09ms</td><td>0.07ms</td><td>1.3×</td></tr></table>
+
+table 10: int8 latency results run on a 22 core 2.1ghz intel xeon gold 6152 and, on a gtx 1080ti gpu. all layers have 128 in/out features. for cifar-10 we used batch size of 1k graphs.
+
+![](images/ee3db02f296d23391e9af4869f14768b657b7a3737071ead679a2d2f1f614e42.jpg)  
+figure 11: diagram representing how dq makes use of a topology-aware quantization strategy that is better suited for gnns. the diagram illustrates this for a gcn layer. at every training stage, a degree-based mask is generated. this mask is used in all quantization layers located after each of the stages in the message-passing pipeline. by retaining at fp32 nodes with higher-degree more often, the noisy updates during training have a lesser impact and therefore models perform better, even at int4.
+
+![](images/4968e47e22a9acd059aa07a4a2098195371b39c2ffc474ca9e2e61b326bc7676.jpg)  
+figure 12: diagram representing how nqat is implemented for gnns. the diagram illustrates this for a gcn layer. the stochastic stage only takes place when quantizing the weights, the remaining of the quantization modules happen following a standard qat strategy. a qat diagram would be similar to this one but fully quantizing the weights.
+
+![](images/df509179ceba9edf5d7545a3f32e5498a7f29089be05c704f0b27aef4d4104ea.jpg)  
+figure 13: diagrams representing how the output graph-summulation stages for graph-level tasks (e.g. graph classification, graph regression) are implemented when making use of dq (left) and nqat (right). gnns making use of dq during the node-aggregation stages (see fig. 11), do not use the stochastic element of dq in the output mlp layers but still make use of percentiles. for models making use of nqat, the final mlp still makes use of stochastic quantization of weights.
+
+# b code listings
+
+our code depends on pytorch geometric (fey & lenssen, 2019). these snippets should be compatible with python 3.7 and pytorch geometric version 1.4.3. you can see the full code on github: https://github.com/camlsys/degree-quant.
+
+# b.1 mask generation
+
+```python
+class probabilistichighdegreemask: def__init__(self,low_prob,high_prob,per_graph  $\equiv$  true): self.low_prob  $=$  low_prob self.high_prob  $=$  high_prob self.per_graph  $=$  per_graph   
+def_process_graph(self,graph): #note that: #1.the probability of being masked increases as the indegree increases #2.all nodes with the same indegree have the same bernoulli p #3.you can set this such that all nodes have some probability of being masked n  $=$  graph.num_nodes indegree  $=$  degree(graph.edge_index[1],n,dtype  $\equiv$  torch.long) counts  $=$  torch.bincount(indegree) step_size  $=$  (self.high_prob - self.low_prob)/n indegree_ps  $=$  counts \* step_size indegree_ps  $=$  torch.cumsum(indegree_ps, dim=0) indegree_ps  $+ =$  self.low_prob graphprob_mask  $=$  indegree_ps[indegree] return graph   
+def__call__(self,data): if self.per_graph and isinstance(data,batch): graphs  $=$  data.to_data_list() processed  $\equiv$  [] for g in graphs: g  $=$  self._process_graph(g) processed.append(g) return batch.from_data_list(processed) else: return self._process_graph(data)   
+def evaluate_prob_mask(data): return torch.bernoulli(dataprob_mask).to(torch(bool)
+```
+
+# b.2messagepassingwithdegree-quant
+
+here we provide code to implement the layers as used by our proposal. these are heavily based off of the classes provided by pytorch geometric, with only minor modifications to insert the quantization steps where necessary. the normal quantized versions are similar, except without any concept of high/low masking.
+
+```python
+class messagepassingmultiquant(nnmodule):
+    '''this class is a lightweight modification of the default pytorch geometric messagepassing class''' # irrelevant methods removed
+def propagate(self, edge_index, mask, size=none, **kwargs):
+    # some lines skipped ...
+    msg = self.message(**msg_kwarges)
+    if self.trainin:
+        # this is for the masking of messages:
+            edge_mask = torch.index_selectmoid, 0, edge_index[0])
+            out = torch.empty_like(msg)
+            out[edge_mask] = self.mpquantizers["message_high"] (msg[edge_mask])
+            out[-edge_mask] = self.mpquantizers["message_low"]
+            msg[^edge_mask]
+        )
+else:
+            out = self.mpquantizers["message_low"] (msg)
+aggr_kwargsself._distribute_self._aggr.params_, kwargs)
+```
+
+```python
+aggrs = self.aggregate(out, **aggr_kwarges)  
+if self.trainings:  
+    out = torch.empty_like(aggrs)  
+    out[mask] = self.mpquantizers["aggregate_high"](aggrs[mask])  
+    out[~mask] = self.mpquantizers["aggregate_low"](aggrs[~mask])  
+else:  
+    out = self.mpquantizers["aggregate_low"](aggrs)  
+update_kwarges = self.__distribute__(self.__update_parameters__, kwargs)  
+updates = self.update(out, **update_kwarges)  
+if self.trainings:  
+    out = torch.empty_like(updates)  
+out[mask] = self.mpquantizers["update_high"](updates[mask])  
+out[~mask] = self.mpquantizers["update_low"](updates[~mask])  
+else:  
+    out = self.mpquantizers["update_low"](updates)  
+return out
+```
+
+# b.2.1 gcn
+
+```python
+class gcnconvmultiquant的消息passingmultiquant):
+    # some methods missed...
+    def forward(self, x, edge_index, mask, edge_weight=none):
+        # quantizing input
+        if self.trainings:
+            x_q = torch.empty_like(x)
+            x_q[mask] = self(layerquantizers["inputs_high"] (x[mask])
+                x_q[~mask] = self(layerquantizers["inputs_low"] (x[~mask])
+            else:
+                x_q = self(layerquantizers["inputs_low"] (x)
+            # quantizing layer weights
+            w_q = self(layerquantizers["weights_low"] (self.weight)
+            if self.trainings:
+                x = torch.empty((x_q.shape[0], w_q.shape[1]).to(x_q_device)
+                x_tmp = torch/matmul(x_q, w_q)
+                x[mask] = self(layerquantizers["features_high"] (x_tmp[mask])
+                x[~mask] = self(layerquantizers["features_low"] (x_tmp[~mask])
+            else:
+                x = self(layerquantizers["features_low"] (torch/matmul(x_q, w_q))
+        if self.normalize:
+            edge_index, norm = self(norm(
+                edge_index,
+                x.size(self.node_dim),
+                edge_weight,
+                self/improved,
+                x.dtype,
+            )
+            else:
+                norm = edge_weight
+            norm = self(layerquantizers["norm"] (norm)
+            return self_propagate(edge_index, x=x, norm=norm, mask=mask)
+```

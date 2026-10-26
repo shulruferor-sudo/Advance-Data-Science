@@ -1,0 +1,464 @@
+# accelerating sparse matrix-matrix multiplication with gpu tensor cores
+
+orestis zachariadisa\*, nitin satputea, juan gomez-luna, joaquin olivaresa
+
+$^{a}$ department of electronic and computer engineering, universidad de cordoba, córdoba, spain
+
+$^{b}$ department of computer science, eth zurich, zurich, switzerland
+
+# abstract
+
+sparse general matrix-matrix multiplication (spgemm) is an essential component in many scientific and data analytics applications. however, the sparsity pattern of the input matrices and the interaction of their patterns make spgemm challenging. modern gpus include tensor core units (tcus), which specialize in dense matrix multiplication. our aim is to re-purpose tcus for sparse matrices. the key idea of our spgemm algorithm, tsparse, is to multiply sparse rectangular blocks using the mixed precision mode of tcus. tsparse partitions the input matrices into tiles and operates only on tiles which contain one or more elements. it creates a task list of the tiles, and performs matrix multiplication of these tiles using tcus. to the best of our knowledge, this is the first time that tcus are used in the context of spgemm. we show that spgemm, with our tiling approach, benefits from  $^{\dagger}$ tcus. our approach significantly improves the performance of spgemm in comparison to cusparse, cusp, rmerge2, nsparse, ac-spgemm and speck.
+
+# keywords:
+
+sparse matrix multiplication, gpu, tensor cores, parallel computing, spgemm
+
+# 1. introduction
+
+sparse general matrix-matrix multiplication (spgemm), similar to its dense counterpart, performs the matrix multiplication (mm) of two sparse matrices. the main difference between sparse and dense mm is that we have to account for sparse matrices, which contain mostly zero elements. spgemm is an important component in scientific and data analytics applications such as graph analytics [1], breadth-first-search (bfs) [2], algebraic multigrid (amg) [3], schur complement [4], etc. sparse matrices, which often contain millions of elements, require mm methods that do not waste computing resources on elements that are zero. the diverse structure and density of sparse matrices pose difficulties in regards to memory management and load balancing in parallel systems [5, 6, 7, 8, 9].
+
+the re-emergence of deep learning motivated the creation of application specific integrated circuits (asic) that specialize in mm. mm is a core component of convolution [10] and these asics accelerate the calculation of the convolutional layers significantly in comparison to the normal, general purpose, processing cores. such asics are tensor core units (tcus) from nvidia [11] and tpus from google [12]. we utilize the tcus from nvidia to accelerate spgemm for two reasons. first, accessibility. they are widely available as they are included in the new generation of gpus from nvidia. second, mixed precision. mixed precision allows tcus to mix 16-bit inputs and 32-bit multiplication and accumulation. typically, in regards to deep learning 16-bits of precision (or less) is
+
+sufficient for training purposes and therefore tensor unit manufacturers opt only for 16-bit or lower precisions. therefore, mixed precision of tcus widens the application field to scientific problems which are more demanding w.r.t. precision.
+
+our work is motivated by three key observations. first, blocking sparse matrix storage formats [13], which group the elements of the matrix into rectangular tiles, are a good fit for tcus which expect rectangular matrices as input. second, tcus are very efficient even when they are not fully occupied [14]. third, even though tcus support only low precision inputs, they can operate in mixed precision mode to perform operations that require higher precision, e.g., gemm [15, 16]. the key idea of our approach is to partition the input in tiles and multiply the tiles with tcus. tiles are sparse, but tcus perform mm efficiently even when not fully occupied. mixed precision mode is necessary in order to keep sufficient accuracy when multiplying large matrices.
+
+based on these observations, we propose a new gpu-based framework for spgemm computation. our novel methodology groups elements into tiles and uses the fast mm of tcus to multiply the tiles. to the best of our knowledge, this is the first proposal of using tcus in the context of spgemm. our tcu-based spgemm methodology, which we name tsparse, has two advantages. first, it takes advantage of fast mm of tcus. second, by utilizing tcus to process the mm, we leave the normal processing cores free for non-canonical workloads.
+
+tsparse modifies expand-sort-compress (esc) methodology [3] of cusp [17] to sort-expand and compress (seac), i.e., tsparse brings both multiplication and accumulation after the sorting step. the benefits of this change are twofold. first, tsparse does not have to maintain in memory a large matrix for
+
+the intermediate products. second, tsparse takes full advantage of multiplication-accumulation (mac) operation of tcus. to that end, we form a task list instead of calculating the intermediate products immediately. our gpu kernels consume tiles from the task list and perform mm of the tiles using tcus.
+
+we measure the performance of tsparse in matrix squaring  $(a * a)$  on matrices from suitesparse (formerly known as university of florida sparse matrix collection) [18]. we compare the performance of our approach to four state-of-the-art libraries: cusparse [19], cusp [17], rmerge2 [9], nsparse [20], ac-spgemm [7] and speck [21].
+
+the rest of the paper is organized as follows. section 2 gives a background on spgemm. section 3 presents a high-level overview of tsparse, whereas section 4 describes tsparse in-depth. section 5 introduces our test configuration, which we use in section 6 to evaluate the performance of tsparse. section 7 presents related work. finally, section 8 concludes the paper.
+
+# 2. background
+
+in this section we describe: 1) the sparse matrix storage format we use (section 2.1), 2) the sparse matrix-matrix multiplication (section 2.2), 3) the challenges in spgemm, 4) the esc methodology of cusp (section 2.4), 5) precision of real numbers (section 2.5), and 6) the tensor cores of nvidia (section 2.6).
+
+# 2.1. storage format
+
+in sparse matrices, typically, the number of non-zero (nnz) elements is much smaller than the number of zero elements. in order to save memory without degrading the performance of mm, we need an efficient way to store only non-zero (nz) elements.
+
+# 2.1.1. coo format
+
+coo format stores each nz element along with the coordinates the element would have in the dense representation of the matrix [22]. the coo format uses three arrays: for elements, for row indices and for column indices.
+
+# 2.1.2. bitmap format
+
+tcus simultaneously process multiple elements in rectangular structures. however, coo stores only single elements and has no concept of rectangular structures, therefore it is not sufficient by itself as a storage format for tsparse. for this reason, we use a bitmap-based block shaped storage format to store sparse matrices [13].
+
+in our work, we use a bitmap format similar to [13] for three reasons: 1) it is simple and straightforward, 2) square tiles of fixed size fit well to tcus, and 3) the performance of the format has been evaluated in [13]. the basic idea is to partition the matrices in a grid of  $8 \times 8$  square blocks and work only on nonempty blocks. we refer to these blocks as tiles. the elements inside each tile have the same placement as they have in the dense representation of the matrix. each element in the tile can be either zero or nz. to keep track which elements are nz we
+
+use a bitmap, a binary number of which each digit corresponds to one slot of the tile. if a slot contains a nz we set the respective bit of the bitmap to "1", otherwise to "0". then, tiles are stored in coo format. the difference with the standard coo format is that, instead of using single elements as values, now we use a tuplepair of two values: 1) an index to the element array. the element array holds the elements of the tile (elements of the same tile are in consecutive positions of the array), and 2) the bitmap of the tile.
+
+fig. 1 shows how we convert a dense matrix to bitmap format. for simplicity we use  $4 \times 4$  tiles. we represent the positions of nz elements as "1"s in the bitmap. we store four values for each tile that has one or more nz elements: 1) row index like in coo format, 2) column index like in coo format, 3) index into the element array, and 4) bitmap of the location of nz elements in the tile.
+
+# 2.2. sparse matrix-matrix multiplication
+
+the general matrix multiplication (gemm) has the form:
+
+$$
+d = a \times b + c \tag {1}
+$$
+
+where  $a, b, c$  are the input matrices and  $d$  is the output. in spgemm, similarly to dense matrices, to get one element of the output, we need to multiply the nz elements of one row of  $a$  with the corresponding nz elements of one column of  $b$  and then accumulate the intermediate products (i.e., calculate the inner product). the difference in spgemm is that we multiply the corresponding elements only if the elements in the corresponding positions of the row of  $a$  and the column of  $b$  are both nz and we accumulate only nz products. the various ways to access the elements of  $a$  and  $b$  and perform mm are listed in [23]. the same multiplication method applies even if instead of elements we use tiles. in this case, the product of two corresponding tiles is their outer product (or equally mm). we make two important observations. first, (1) takes the form
+
+$$
+c = a \times b + c \tag {2}
+$$
+
+when accumulating the tiles, where  $c$  is both output and accumulator. we use only the form of (2) for the rest of this work. second, the matrix multiplication-accumulation of small tiles is exactly what the tcus were designed to do. fig. 2 shows an example of the  $a * b$  sparse mm.
+
+# 2.3. challenges of spgemm
+
+unlike other sparse matrix operations, in spgemm both input and output are sparse. therefore, it is very difficult to utilize the knowledge we infer from the sparsity structure of the input matrices to make arithmetic and memory optimizations. the reasons that make spgemm more challenging than spmv (sparse matrix-vector multiplication) are three [5, 6, 7, 8, 9]:
+
+first, data access is highly irregular because it depends on the sparsity structure of both matrices and the interaction of both structures. mm is not trivial for two reasons: 1) it requires access of possibly distant memory locations to load the inputs, and 2) it requires inserting the result to the output with possibly irregular access patterns.
+
+# bitmap sparse matrix storage format
+
+![](images/c039dbf2a670282a4ad9829a8c80298a616a7fbab7b88759f0127aa93e5f5de9.jpg)  
+matrix in dense representation, organized as a  $3 \times 3$  grid of  $4 \times 4$  tiles
+
+![](images/1a85f16c59007c0649ec17b38a5ef8f56b9be7cd3edf2a120161d3e29df9636e.jpg)  
+16-bit bitmap tile
+
+![](images/42f69e10de7e1b6b0520841088aa8c7e7b117b9d53e1329cb67559ba68d32b15.jpg)  
+index in element array
+
+![](images/2f60641d6cdfbf62009d94ca06289bda9778134137d4835392cd8c7a5e979133.jpg)  
+bitmap storage format  
+figure 1: a  $12 \times 12$  matrix in dense (left) and bitmap formats (bottom right). tiles of  $4 \times 4$  partition the  $12 \times 12$  matrix in a  $3 \times 3$  grid of tiles. non-zero elements  $a8, a9, a11, a12$  of the circled tile are represented as “1” in the bitmap. we store the nz elements of the tile in consecutive locations in the element array. index points to the first element of the tile. on the bottom right of the figure, we circle the representation of the selected tile in bitmap format.
+
+![](images/49ac1adc10624df4369b6f1058c4746551af6d573700f63466b508dad677c540.jpg)  
+figure 2: example of the sparse matrix-matrix multiplication of two matrices  $a$  and  $b$  with dimensions  $m \times k$  and  $k \times n$  respectively. to find the output tile with coordinates  $[i, j]$ , we multiply (mm) the corresponding nz tiles of row  $i$  of  $a$  (dark blue) and column  $j$  of  $b$  (dark red).
+
+second, it is computationally expensive to know the size of the output before the actual mm. according to liu et al. [6], there are four methods to estimate how much memory we need to allocate for the output. first, the precise method, which makes an estimate that is very close to the actual size of the output, typically by doing a partial execution of the mm algorithm. second, the upper bound method, which typically uses as upper bound the amount of intermediate products. third, estimation using probability theory. fourth, progressive memory increase, which allocates more memory if the previously allocated memory overflows. in all cases, at the end of spgemm, we remove empty or unused entries from the allocated memory as necessary.
+
+third, load balancing. the sparsity structure of both matrices and the interaction of the structures determine the distribution of workload. nnz elements in each row of the input or output may vary significantly, which makes it difficult to partition the workload among threads.
+
+# 2.4. expand-sort-compress and cusp
+
+cusp [17] is a library that specializes in sparse matrix operations. it is open-source and easily accessible on github. it is written in thrust which makes it easy to read and port to other platforms. therefore, it provides a good "boilerplate" to test our approach.
+
+cusp uses expand-sort-compress esc methodology. esc performs the spgemm in three steps [17, 3]. first, expand. esc multiplies each nz element  $a_{i,j}$  of  $a$  with all nz elements of row  $b(j,:)$  of  $b$  to get the intermediate products (no accumulation in this step) [23]. second, sort. esc sorts the intermediate products of the previous step so that products that correspond to the same element of  $c$  are in consecutive positions. third, compress. esc calculates each element of  $c$  by accumulating all respective products, which are in consecutive positions, thanks to the sorting step.
+
+# 2.5. real number representation in digital computer systems
+
+computer systems have to store real numbers in bit representation. floating point numbers are a common representation. the location of the decimal point and the number of bits determines the precision and range of the represented numbers. we denote the 32-bit representation as  $fp32$ , whereas the 16-bit as  $fp16$ . in contemporary systems, typically, we use floating point numbers as defined in ieee 754 technical standard [24]. usually, the fewer the number of bits, the faster the processing of the numbers is.
+
+# 2.6. tensor core units
+
+nvidia, with the latest generations of graphical processing units (gpus) [25], brought tensor cores to the mainstream market. nvidia tcus are asics that have the purpose of accelerating mm. therefore, our work on spgemm has significant benefits by properly adapting spgemm to tcus.
+
+tcus mainly target deep learning, which is not very demanding precision-wise. therefore, to accelerate mm, tcus usually work with lower precision number representation (16-bit or less). however, fp16 or lower precision is detrimental to the output because precision and range of fp16 numbers can be insufficient when dealing with physical problems. to rectify this problem nvidia provides mixed precision functionality. mixed precision allows to mix numbers of different precision. the two defining characteristics of the mixed precision implementation of nvidia are as follows. first, although inputs  $a$  and  $b$  are in fp16 precision, their multiplication happens in full precision. second, the product is stored as fp32 to accumulators  $c$  and  $d$  [25]. fig. 3 shows the two characteristics. markidis et al. and haidar et al. [16, 15] evaluate the performance and precision of gemm and linear equation solving using the mixed precision mode of tcus. they show that tcus can be used in other physical problems, outside deep learning. we use mixed precision functionality to extend the applicability of our work to non deep learning workloads.
+
+![](images/80392f7cbb39fbfaf8c0841a7d49e3783e552f5729a4cf5ff54e7c5b9597b767.jpg)  
+figure 3: mixed precision with cuda tcus. inputs are stored in fp16, whereas the output and addend are stored in fp32. the multiplication and addition are performed in full precision.
+
+# 3. overview of our technique
+
+our tcu-based sparse gemm technique alters esc methodology in order to efficiently work with tiles. to that end, tsparse creates a task list which delivers tiles to tcus to accelerate the mm of the tiles. at this point it is important to make a distinction between the terms elements and tiles. elements represent a single real or integer number, whereas tiles represent a group of elements (section 2.1.2). this section gives a high level overview of the components of tsparse and how they relate to each other.
+
+# 3.1. creating the task list and allocating memory for tiles
+
+tsparse creates the task list in two steps. first, tsparse determines which tiles of  $a$  will be multiplied with which tiles of  $b$  in order to get each tile of  $c$ . second, unlike the expansion phase of esc, tsparse does not immediately multiply the corresponding tiles of  $a$  and  $b$ . instead, tsparse creates a task list that holds only the locations of the corresponding tuples of  $a$  and  $b$ . the entries of the task list are sorted so that pairs that
+
+correspond to the same tile of  $c$  are in consecutive positions. with the help of the task list, tsparse also estimates the number of  $c$  tiles in the output and allocates memory accordingly.
+
+# 3.2. counting kernel
+
+dense matrices contain as many elements as the product of their dimensions. however, in sparse matrix-matrix multiplication, the nnz of the output depend on the structure of the two input matrices and the interaction of these structures throughout the mm. therefore, we know the exact size of the output only after the matrices are multiplied. however, in order to allocate memory for storing the result of the mm we first need to know the exact size to allocate because gpu kernels cannot easily reallocate memory during their execution. the purpose of the counting kernel is to make an estimation of the size of memory we need to allocate in order to store the element array of  $c$ , before calling the multiplication kernel.
+
+non-blocking spgemm approaches allocate memory only for elements. tsparse allocates memory for elements, in addition to memory for tiles. however, allocating memory for elements is not as simple as calling a few parallel primitives because tile multiplication is a sparse mm. the sparsity structure of both input tiles and the interaction of the structures define the memory allocation requirements.
+
+in our implementation, we use the precise method (section 2.3) to get an estimate of the count of elements the output has, i.e., the counting kernel is a partial implementation of the multiplication kernel. the counting kernel requires shorter execution time than the multiplication kernel because it neither loads nor stores any elements. instead, this kernel uses the bitmap to put zeros and ones in the place of the elements and "simulates" the mm. we allocate memory equal to the nnz of the output of the simulated mm.
+
+# 3.3. multiplication kernel
+
+once we know how much memory to allocate for tiles and elements we use the multiplication kernel to multiply and accumulate all pairs of tiles of  $a$  and  $b$  that correspond to each  $c$  tile.
+
+# 3.4. putting everything together
+
+in order to perform the matrix multiplication of  $a$  with  $b$ , we 1) determine which products need to be accumulated for each tile of  $c$ , and 2) allocate memory for the tiles of  $c$  and the element array. using the task list and the counting kernel we determine the memory allocation size for the tiles of  $c$  and the element array, respectively. subsequently, the multiplication kernel has everything it needs to multiply  $a$  with  $b$ .
+
+we expect three benefits. first, by placing both the multiplication and accumulation steps of mm in the multiplication kernel we can use tcus for mm. by moving mm to tcus, the computational heavy mm is no longer a bottleneck of the spgemm algorithm. second, the use of bitmap format reduces memory consumption because one row index and one column index represents up to 64 elements [13]. third, by grouping elements to tiles, we reduce the amount of values we have to
+
+manipulate and therefore there are additional performance benefits (e.g., fewer values to sort during sorting phase of esc).
+
+# 4. implementation details
+
+this section describes the three main parts of our approach, tsparse, in detail: 1) the creation of the task list, 2) the estimation of how much memory to allocate for the elements of the output, and 3) the mm of the tiles. it also describes some smaller components of our implementation.
+
+# 4.1. creating the task list and allocating memory for tiles
+
+the four main parts of our algorithm are: 1) finding corresponding tiles of  $a$  and  $b$ , 2) filtering of zero products, 3) creating a task list with entries that point to the tuples of  $a$  and  $b$ , and 4) estimating how much memory to allocate for the tuples of the output. in detail:
+
+first, similarly to cusp, tsparse uses parallel primitives from thrust library to find the correspondence among tiles of  $a$  and tiles of  $b$ . the main difference with cusp is that instead of using single elements we use tiles. this is the part of our methodology that is the same between cusp and tsparse. we do not change it because it is efficient and accounts for less than  $15\%$  of the total execution time of our spgemm.
+
+second, the algorithm that finds the correspondence among tiles of  $a$  and  $b$  considers the whole tile as a single value, i.e., the result is the same regardless if the  $8 \times 8$  tile contains one or 64 elements. therefore, the correspondence algorithm finds a correspondence between tiles of  $a$  and  $b$  even if the elements inside the two tiles are not corresponding. the resulting tile of the mm of such tiles is a tile with only zero elements. tsparse has a routine that removes this type of corresponding tiles by applying boolean arithmetic on bitmaps. this routine is fast as it does not compute mms. the culling significantly lightens the workload of the rest of our methodology (fewer tiles to sort, multiply etc.).
+
+third, tsparse creates the task list. an important consideration is that in esc methodology the mm and accumulation are in different steps, i.e., mm is in the expand step and accumulation in the compress step. however, to fully take advantage of the combined mac operation of tcus we need to perform both mm and accumulation of tiles in the same step. in order to put mm and accumulation in the same step we sort the locations of the multiplicands, instead of sorting the intermediate products of the mm. by sorting the locations, we defer the mm step until after the sorting step. effectively, the locations of the multiplicands form a task list, of which each entry points to one tile of  $a$  and one tile of  $b$ . merging the expansion and compression steps and moving them after the sorting step significantly reduces both memory allocations and costly data movement to/from global memory. the reason is that tsparse does not store the intermediate products. therefore, we save memory by not allocating memory for the 64-bit bitmaps, an undefined number of up to 64 elements and the corresponding indices in the element array. we reduce data movements
+
+to/from global memory by not storing the intermediate products before the sorting step and loading them for a second time after the sorting step.
+
+fourth, our algorithm counts how many of the intermediate products correspond to the same tile of  $c$  using a segmented reduce parallel primitive on the sorted indices. we create an offset array from the prefix sum of the counted intermediate products. our gpu kernels use the offset array for indexing purposes. the prefix sum also gives the total count of tuples in the output. we use this total count to allocate memory.
+
+sorting. sorting a long task list is computationally demanding, therefore we need advanced optimization strategies. tsparse works with sorted matrices. we use this knowledge to sort the workload of each row of  $a$  separately. for this task, we use the segmented sort by kaixi et al. [26], which employs a hybrid sorting scheme based on row length.
+
+# 4.2. counting kernel
+
+the counting kernel works in four steps. first, it reads the bitmaps of  $a$  and  $b$ . second, it creates tiles, wherein each element is set to "1" or "0" based on the corresponding position in the bitmap. third, it multiplies and accumulates the tiles of  $a$  and  $b$  that correspond to each individual tile of  $c$  using tcus. fourth, we count how many elements of the resulting tile are nz with the ballot instruction. we repeat for all tiles of  $c$  and accumulate the counts. the counting kernel returns an array of which each value holds an estimation of how many elements each tile of  $c$  has.
+
+each tile contains only "1"s or "0"s, therefore: 1) the estimation of memory requirements can be more than what is actually required because the counting kernel cannot account for possible numerical cancellation (after the actual multiplication there is a compaction stage that removes empty entries from the allocated element array), and 2) half precision is enough for executing the mm of the counting kernel because we work only with zero and nz elements.
+
+# 4.3. multiplication kernel
+
+the multiplication kernel performs the actual multiplication and constructs the coo matrix of the output, i.e., it sets the row and column indices, the index and bitmap tuple and the elements of the element array. the multiplication kernel loads the actual elements from  $a$  and  $b$  and stores the result in the memory allocated by the counting kernel. we emphasize that we use only tcus for the mm and not tcus in addition to the standard cuda cores.
+
+there are two important considerations when multiplying the elements, which are real numbers. first, fp16 arithmetic has a very limited representation range of numbers, which we can easily exceed with multiplication. therefore, we prefer the mixed precision functionality of tcus. second, unlike the counting kernel where we have only positive numbers, when accumulating real numbers, elements get canceled as a result of numerical cancellation. many tiles may end up empty, something that the counting kernel, which acts on boolean elements,
+
+does not predict. for this reason, our multiplication kernel has the additional task of marking for removal tiles that are empty.
+
+fig. 4 compares element loading between the counting and multiplication kernels. the counting kernel does not need to load any actual element. it just creates "1"s based on the bitmap. the multiplication kernel, on the other hand, loads the elements and it places them according to the bitmap.
+
+![](images/ff5985c8364f0c648c3165b75919f6c16aa78d79eb9b30a000ac979680835c73.jpg)  
+counting kernel  
+figure 4: comparison of counting and multiplication kernels. the counting kernel (left) places "1"s at the locations indicated by the bitmap. the multiplication kernel (right) loads the actual elements from memory and places them at the locations indicated by the bitmap.
+
+![](images/f152dcc14a32fd3e91cb9be547a1b32d12d65eec42057b23e2bec5a0cf2a8174.jpg)  
+multiplication kernel
+
+# 4.4. other components
+
+arrangement of tiles in the tcus. nvidia does not provide an application programming interface (api) for using tcus with small  $8 \times 8$  tiles [11]. tcus execute mm on 256 elements at a time. however, our tiles have a size of  $8 \times 8$ , which means that a large part of the tcu remains unused. although a tcu does not have to be fully loaded in order to get performance benefits, we can fit two tiles in a single tcu.  $16 \times 16$  is the only supported matrix configuration that can fit two  $8 \times 8$  tiles [11]. to put two tiles in the same tcu two steps are necessary. first, we initialize the  $16 \times 16$  matrix to zero. second, the tiles must be placed in a diagonal of the  $16 \times 16$  matrix (fig. 5). if the tiles were not in the diagonal, but instead side-by-side (top-bottom), the same row (column) of the  $16 \times 16$  matrix would have elements of two unrelated tiles, which would mix the inner products (of rows of  $a$  with columns of  $b$ ) of the first tile with the inner products of the second tile. the api forces loading to/from tcus through shared memory. we find the internal layout of the registers of the tcus (fragments) and we access them directly instead. loading through registers, which are faster than shared memory, we minimize data movement and increase the performance of mm.
+
+![](images/f630ba9732a0f78e20a0256f63cd5000cb8d31915c9fcab98c48098fbc521de9.jpg)  
+tiles placement in 16x16 matrix  
+figure 5: placement of two  $8 \times 8$  tiles in the  $16 \times 16$  matrix configuration of tcus.
+
+load balancing. both counting and multiplication kernels calculate an inner product of tiles (section 2.2). the number of intermediate products required for each tile of  $c$  is different, because the number depends on the sparsity structure of  $a$  and  $b$ . therefore the workload for the computation of each tile of  $c$  is different, leading to thread blocks with different amounts of work. thread blocks with different execution times create imbalance among the sms of the gpu. to tackle this issue, we assign each pair of tiles of  $c$  to a different thread block. when a thread block finishes and releases the resources, the scheduler of the sm schedules another thread block to take its place. therefore, sms take blocks according to their needs and stay fully occupied until completion of the mm.
+
+compaction of zeros. mm creates zero elements because of numerical cancellation. to store the output in a strictly sparse format we need to remove all zeros. therefore, we need a way to detect zeros and remove them or, in other words, compact the arrays that hold the elements and the tuples. for the element array, which is just an array, we use a compaction parallel primitive from thrust. for the array that holds the tuples, we first mark empty tiles in the multiplication kernel (see section 4.3).
+
+# 4.5. putting everything together
+
+algorithm 1 summarizes tsparse. first, tsparse creates a task list (lines 1-8). second, it estimates how much memory to allocate for tiles (lines 9-15). third, it estimates how much memory to allocate for elements (lines 16-17). fourth, it multiplies the matrices (line 18). finally, it compacts zero elements (line 19) and empty tiles (line 20).
+
+algorithm 1 pseudocode for tsparse  
+1: for all nnz tiles  $a[i,j]$  in  $a[(:,:)]$  do  
+2: for all nnz tiles  $b[j,k]$  in  $b[j,:]$  do  
+3: task_list  $\leftarrow$  {row_ptr(a[i,j]),col_ptr(b[j,k])}  
+4: end for  
+5: end for  
+6: filtertileswithzeroproduct(task_list)  
+7: sortbykey( $b_{\text{cols}}[\text{task_list}], \text{task_list})$   
+8: sortbykey( $a_{\text{rows}}[\text{task_list}], \text{task_list})$   
+9: tile_count  $\leftarrow 0$   
+10: for all c in task_list do  
+11: if  $c[a_{\text{rows}}[c], b_{\text{cols}}[c]]$  is unique then  
+12: tile_count  $\leftarrow$  tile_count + 1  
+13: end if  
+14: end for  
+15: allocatememgpu(tile_count)  
+16: element_count  $\leftarrow$  countingkernel(task_list)  
+17: allocatememgpu.element_count)  
+18:  $c_{\text{tiles}}, c_{\text{elements}} \leftarrow \text{multiplicationkernel(task_list)}$   
+19: compactzeroelements( $c_{\text{elements}}$ )  
+20: compactemptytiles( $c_{\text{tiles}}$ )
+
+figure 6 illustrates details of the multiplication kernel (algorithm 1, line 18). in order to get a tile  $c$  of the output, we have
+
+to accumulate a varied number of products (mms of tiles of  $a$  and  $b$ ), e.g.,  $c0 = a1 \times b1 + a4 \times b4$  and  $c1 = a3 \times b3$  for the example of fig. 2 (note the color code of tiles). each tcu processes two tiles, e.g., tcu0 calculates  $c0$  and  $c1$ . however,  $c1$  has fewer addends. therefore, when we load the second addend of  $c0$ , we use  $0s$  in place of the second addend of  $c1$ . from the final result, we extract the bitmaps (using ballot) and elements of the output.
+
+# 5. evaluation methodology
+
+we test our approach, tsparse, on two systems: 1) intel i9-9900@3.6ghz cpu and nvidia titan rtx gpu, and 2) intel i7-8700@3.2ghz cpu and nvidia rtx 2070 gpu. both gpus are of the turing architecture [25]. we use cuda sdk v10.2 and the accompanying parallel primitives library, thrust [11], for our gpu code.
+
+we compare tsparse with cusparse from cuda toolkit [11], cusp [17], rmerge2 [9], nsparse [20], ac-spgemm [7], speck [21]. in addition, to confirm the benefit of using tcus, we create one implementation of tsparse without tcus and we name it nontcu. in nontcu, we use the same method as [13] to multiply the tiles (algorithm 2). we note that we include the time of memory allocations in the execution time of ac-spgemm.
+
+algorithm 2 matrix multiplication of two  $8 \times 8$  tiles without tcus  
+
+<table><tr><td>1:</td><td>tid {the id of a thread}</td></tr><tr><td>2:</td><td>i←0</td></tr><tr><td>3:</td><td>while i&lt;8 do</td></tr><tr><td>4:</td><td>c_tile[tid] = c_tile[tid] + a_tile[(tid/8)*dim+i]*b_tile[i*8 + mod(tid,8)]</td></tr><tr><td>5:</td><td>end while</td></tr></table>
+
+to evaluate the performance of tsparse, we perform the  $a * a$  mm, which has the benefit that both matrices have the same sparsity structure. the same structure makes it easier to make observations. in order to facilitate the presentation of the performance of tsparse, we select a subset of 16 matrices from suitesparse matrix collection [18] for our dataset. all selected matrices are square, as our  $a * a$  problem dictates. we select matrices which have elements in the fp16 range.
+
+table 1 shows the characteristics of our dataset. we denote a matrix stored in bitmap storage format as  $c_{\text{tiles}}$ . for non-tiling (i.e., single element) approaches, we denote as  $\overline{c}$  the total amount of intermediate products. similarly, for our tiling approach, we denote as  $\overline{c}_{\text{tiles}}$  the total amount of intermediate products, where each product is a mm between tiles.  $nnz(\cdot)$  of a matrix denotes the nnz values of the matrix. finally, from the second and third columns of table 1 derives the average row size of the input, which is defined as  $nnz(a)/dimensions$ , and we denote as  $\widehat{rowa}$ .
+
+we divide our dataset into two parts. the first part (upper half of table 1) consists of matrices that other works use [5, 6, 7, 8, 9, 13, 20, 19, 27, 28]. the second part (lower half of
+
+table 1) consists of matrices that we select after taking into consideration the two criteria that derive from the analysis in section 6.1: 1)  $nnz(a) > 300000$ , and 2)  $\widehat{rowa} > 42$ .
+
+# 6. results and analysis
+
+in this section, we find the criteria that define when tsparse is the recommended spgemm approach using all qualified matrices from suitesparse. then, we collect four types of measurements using the matrices in table 1: 1) the speedup of tsparse, 2) the execution time breakdown, 3) the numerical precision, and 4) the memory consumption.
+
+# 6.1. finding the selection criteria
+
+we measure the execution time of cusparse, cusp, rmerge2, nsparse, ac-spgemm, speck, nontcu and tsparse on a collection of matrices which we create from suitesparse. for this collection, we keep matrices that meet the following four conditions: 1) the input matrix has more than 10000 nnz elements, 2) the input is square with real numbers in the fp16 range, 3) the bitmap density of the input is more than one, and 4) matrices for which all approaches that participate in the comparison return correct results. we then define criteria based on the characteristics of the matrices. these criteria facilitate the selection of the most appropriate spgemm approach among tsparse and the other approaches.
+
+we find the criteria in two steps. first, we analyze how each approach works in order to identify which matrix characteristics affect the performance of said approach. second, we adjust the criteria to our matrix collection manually. alternatively, we could use a machine-learning method to find the criteria [29], which we leave for future work. we make six major observations.
+
+first, tsparse generally outperforms cusparse in the larger matrices of our collection  $(nnz(a) > 200000)$ . this happens probably because cusparse does not have sufficient shared memory to store the hash tables and therefore global memory traffic increases. nevertheless, the size of the matrix is not the only thing that decides the performance of cusparse. to the best of our knowledge, the performance of cusparse also depends on the sparsity structure of the matrix because the structure affects the number of hash conflicts.
+
+second, tsparse performs better than cusp when the number of intermediate products of tiles is smaller than the number of intermediate products of elements of cusp, i.e.,  $nnz(\overline{c}_{\mathrm{tiles}}) < nnz(\overline{c})$ . otherwise, cusp, which handles only single elements, is faster than tsparse which has an additional overhead for handling tiles.
+
+third, tsparse is faster than nsparse when the average row size of  $a$  ( $\widehat{rowa}$ ) is greater than 42 and  $nnz(a) > 100000$ . nsparse follows a hash table approach (section 7.2). therefore, larger rows possibly create more hash conflicts and hash tables are difficult to keep in shared memory (instead of the slower global memory) with large rows. we also note that web graph
+
+![](images/78c89f486fd57900d3b0b64af1dfb5ce751b9f06e2d2398f6be119ddf2160000.jpg)  
+task list
+
+![](images/6d3f23db155f18e4e40b678b6bd375c62d6cee886df1c54f094c90fffa30ff21.jpg)  
+loading to tcu0
+
+![](images/17f4cd01d9700c2cae199b58502ce9389b99f243e3051d95a4cf728c43cf2a7f.jpg)  
+figure 6: detail of the multiplication kernel. each tcu calculates two tiles of the output  $c$ . if the two output tiles require a different number of addends, we use "0"s to make them match. finally, the output of the tcu gives us the respective output elements of the two tiles and their bitmaps (using ballot operations).
+
+![](images/f5d9360fb3ede1b3307aa812d681599bf01d341b631a3e93a365a981f5f9caac.jpg)
+
+![](images/aacb2af14b2f58dd7c115586eee1c022f75273d2a6a0a119d78a6c3314c25914.jpg)  
+result of mm
+
+![](images/088d93b7c2e8b893a65431ced6fc63b8b063b87217495834d149d4b27933efe8.jpg)
+
+<table><tr><td>matrix name</td><td>dimensions (square)</td><td>nnz(a)</td><td>nnz(c)</td><td>nnz(¯c)</td><td>nnz(ctiles)</td><td>nnz(¯ctiles)</td><td>bitmap density (median, mean, std)</td></tr><tr><td>mc2depi</td><td>525825</td><td>2100225</td><td>5245952</td><td>8391680</td><td>718228</td><td>1364149</td><td>7, 6.4, 4.9</td></tr><tr><td>webbase-1m</td><td>1000005</td><td>3105536</td><td>51111996</td><td>69524195</td><td>2546355</td><td>4327469</td><td>6, 5.6, 5.3</td></tr><tr><td>cage12</td><td>130228</td><td>2032536</td><td>15231874</td><td>34610826</td><td>2945653</td><td>9295217</td><td>3, 4.5, 4.1</td></tr><tr><td>dawson5</td><td>51537</td><td>1010777</td><td>3616737</td><td>21284355</td><td>219077</td><td>1515543</td><td>6, 9.5, 9.1</td></tr><tr><td>lock1074</td><td>1074</td><td>51588</td><td>134676</td><td>2752056</td><td>3050</td><td>19520</td><td>32, 31.4, 17.3</td></tr><tr><td>patents_main</td><td>240547</td><td>560943</td><td>2281308</td><td>2604790</td><td>2089143</td><td>2511808</td><td>1, 1.0, 0.2</td></tr><tr><td>struct3</td><td>53570</td><td>1173694</td><td>3400384</td><td>26704476</td><td>146007</td><td>543125</td><td>21, 18.8, 9.8</td></tr><tr><td>wiki-vote</td><td>8297</td><td>103689</td><td>1831112</td><td>4542805</td><td>526421</td><td>3058660</td><td>1, 1.4, 1.0</td></tr><tr><td>bscstk30</td><td>28924</td><td>2043492</td><td>8946070</td><td>173481412</td><td>252076</td><td>1627326</td><td>23, 25.9, 17.9</td></tr><tr><td>nemeth21</td><td>9506</td><td>1173746</td><td>2578720</td><td>146859992</td><td>47341</td><td>523549</td><td>59, 47.0, 21.1</td></tr><tr><td>pcrystk03</td><td>24696</td><td>1751178</td><td>7240266</td><td>129128312</td><td>212471</td><td>1514965</td><td>15, 23.4, 18.8</td></tr><tr><td>pct20stif</td><td>52329</td><td>2698463</td><td>10016951</td><td>154237335</td><td>323396</td><td>1770466</td><td>17, 23.4, 18.1</td></tr><tr><td>pkustk06</td><td>43164</td><td>2571768</td><td>10596384</td><td>179924544</td><td>451380</td><td>2336176</td><td>16, 19.6, 12.9</td></tr><tr><td>pli</td><td>22695</td><td>1350309</td><td>8548665</td><td>99698581</td><td>292851</td><td>2262407</td><td>14, 15.9, 11.5</td></tr><tr><td>net50</td><td>16320</td><td>945200</td><td>40622452</td><td>79727280</td><td>1037234</td><td>8150260</td><td>8, 8.6, 11.1</td></tr><tr><td>web-notredame</td><td>325729</td><td>1497134</td><td>16801350</td><td>64593748</td><td>693759</td><td>1589613</td><td>3, 6.5, 10.7</td></tr></table>
+
+table 1: matrix characteristics. we list the size of the matrix (number of rows/columns), the number of non-zeros of: the input (nnz(a)), the output (nnz(c)), the intermediate matrix (nnz( $\overline{c}$ ), the number of tiles ( $nnz(c_{\text{tiles}})$ ), and the number of tiles of the intermediate matrix ( $nnz(\overline{c}_{\text{tiles}})$ ), and the density of the tiles of the input matrix. the upper part corresponds to matrices that are commonly used in the literature, the bottom part to matrices we selected based on our criteria.
+
+matrices (webbase-1m and web-noitredame) have high irregularity, i.e., although the average row size is small (3.1 and 4.6 respectively), there are rows with thousands of elements (maximum 4700 and 3445 respectively). therefore they are also taxing for nsparse.
+
+fourth, rmerge2 shows behavior similar to nsparse. tsparse has better performance than rmerge2 when  $\widehat{rowa} > 42$ . to the best of our knowledge, rmerge2, which follows a hybrid approach (section 7.3), uses faster kernels when the row size is smaller than the size of a cuda warp [9]. we note that the low recall score is owed to an instability of rmerge2 (possibly caused by a driver issue) that, in a seemingly random manner, decreases the performance.
+
+fifth, ac-spgemm is an esc-based approach, like cusp. therefore, a similar criterion applies to ac-spgemm. the only difference is that, as ac-spgemm has much better performance than cusp, the criterion is much stricter, i.e., 9*
+
+$nnz(\overline{c}_{\mathrm{tiles}}) < nnz(\overline{c})$
+
+sixth, speck is a hash table approach and has similar behavior to nsparse. speck generally performs better than nsparse, therefore we select a criterion similar to nsparse's but stricter, i.e.,  $\widehat{rowa} > 42$  and  $nnz(a) > 300000$ .
+
+global criterion. in summary, a range of matrix characteristics define the performance of each spgemm approach. to help with selecting tsparse over other approaches, we define two criteria that generally work well to show when tsparse is the most appropriate approach: 1)  $nnz(a) > 300000$ , and 2)  $\widehat{rowa} > 42$ . table 2 summarizes the various criteria. we note that tsparse performs better on rtx 2070 than on titan rtx, for the reasons we describe in section 6.2. therefore, we can relax the criterion for non-high-end gpus as follows:  $\widehat{rowa} > 21$ . finally, we note that the first criterion may limit the suitability of our approach for applications that reduce the
+
+<table><tr><td>approach</td><td>condition</td><td>predictions /collection size</td><td>precision</td><td>recall</td></tr><tr><td>cusparse</td><td>nnz(a) &gt;200000</td><td>122/260</td><td>0.75</td><td>0.84</td></tr><tr><td>cusp</td><td>nnz(¯c) / nnz(¯ctiles) ≥ 1</td><td>260/260</td><td>0.98</td><td>1</td></tr><tr><td>rmerge2</td><td>rowa &gt; 42 and nnz(a) &gt; 100000</td><td>53/233</td><td>0.92</td><td>0.33</td></tr><tr><td>nsparse</td><td>rowa &gt; 42 and nnz(a) &gt; 100000</td><td>53/233</td><td>0.75</td><td>0.74</td></tr><tr><td>ac-spgemm</td><td>nnz(¯c) / nnz(¯ctiles) &gt; 9</td><td>120/233</td><td>0.89</td><td>0.86</td></tr><tr><td>speck</td><td>rowa &gt; 42 and nnz(a) &gt; 300000</td><td>45/234</td><td>0.78</td><td>0.8</td></tr><tr><td>all</td><td>rowa &gt; 42 and nnz(a) &gt; 300000</td><td>45/233</td><td>0.76</td><td>0.85</td></tr></table>
+
+table 2: the criteria that define when tsparse is faster in comparison to other approaches. this table evaluates the performance of each condition using the precision and recall metrics from the classification theory. we note that the collection size varies to account for the incorrect results of each approach.
+
+size of input matrices, e.g., amg.
+
+# 6.1.1. evaluating the performance of the criteria
+
+we evaluate the speedup of tsparse over the other spgemm approaches after applying our global criterion to the matrix collection. table 3 shows the speedup of tsparse over the other spgemm approaches when applying the global criterion.
+
+we make three major observations. first, tsparse is faster than all other approaches by  $1.46 \times -36.93 \times$ , which confirms that our global criterion is reliable. second, the speedup of all approaches follows the same trends for both gpus. the rtx 2070 gpu performs better w.r.t. execution time, with more relaxed criterion, as the cpu does not bottleneck the execution time as much as on titan rtx (sections 6.3, 6.2). third, the minimum columns of table 3 show speedups  $< 1$ . this happens because of the wrong predictions of our proposed criterion (false positives).
+
+# 6.2. speedup
+
+to show the benefits of our approach that uses tcus for mm, we find the speedup over cusparse, cusp, rmerge2, nsparse, ac-spgemm, speck and nontcu for the 16 matrices of our dataset. figure 7 and fig. 8 show the speedup of tsparse over the seven approaches when calculating  $a * a$  on the titan rtx gpu. figure 7 corresponds to the first part of our dataset (randomly selected matrices), whereas fig. 8 corresponds to the second part of our dataset (matrices selected based on criteria). figures 9 and 10 present the speedup on rtx 2070. geomean indicates the geometric average of the speedup for the matrices of the respective figure.
+
+we make five major observations.
+
+first, tsparse that uses tcus performs faster than our nontcu implementation, by an average of  $1.68 \times$  this speedup may seem low considering that tcus in mixed precision promise  $4 \times$  more flops than normal fp32 operations [25]. there are two reasons that keep it low: 1) our counting and multiplication kernels, without tcus, occupy about  $50\%$  of the total execution time of spgemm, so according to amdahl's law we do not expect more than  $2 \times$  speedup of the total execution time, and 2) tsparse is memory bound, rather than arithmetic bound, because the sorting step results in a task list with entries that point to non-continuous memory locations.
+
+second, tsparse outperforms cusparse, cusp, rmerge2, nsparse, ac-spgemm and speck in 14 (15), 15 (14), 10 (10), 9 (10), 11 (12) and 8 (10) out of the 16 matrices, respectively (the performance of 2070 in parentheses). the speedup of tsparse for the randomly selected matrices is: cusparse  $2.47 \times (2.67 \times)$ , cusp  $3.78 \times (3.29 \times)$ , rmerge2  $0.79 \times (0.56 \times)$ , nsparse  $0.58 \times (0.74 \times)$ , ac-spgemm  $0.58 \times (0.71 \times)$ , speck  $0.58 \times (0.59 \times)$ , nontcu  $1.46 \times (1.72 \times)$ . with the matrices selected based on our criteria, the speedup of tsparse is: cusparse  $3.97 \times (4.96 \times)$ , cusp  $31.77 \times (28.93 \times)$ , rmerge2  $3.92 \times (2.88 \times)$ , nsparse  $2.39 \times (3.34 \times)$ , ac-spgemm  $3.37 \times (3.78 \times)$ , speck  $1.53 \times (2.35 \times)$ , nontcu  $1.61 \times (1.84 \times)$ . the total speedup for the sixteen matrices of our dataset on average (geometric mean) is: cusparse  $3.12 \times (3.64 \times)$ , cusp  $10.91 \times (9.76 \times)$ , rmerge2  $1.76 \times (1.27 \times)$ , nsparse  $1.18 \times (1.58 \times)$ , ac-spgemm  $1.51 \times (1.63 \times)$ , speck  $0.81 \times (1.17 \times)$ , nontcu  $1.59 \times (1.78 \times)$ .
+
+third, tsparse owes its performance gain to both tiling and tcus. nontcu indicates the performance we gain by using tiling only. across the matrices of our dataset, the speedup of nontcu, on titan rtx (rtx 2070), on average (geometric mean) is: cusparse  $1.97 \times (2.04 \times)$ , cusp  $6.88 \times (5.49 \times)$ , rmerge2  $1.11 \times (0.72 \times)$ , nsparse  $0.74 \times (0.89 \times)$ , ac-spgemm  $0.95 \times (0.92 \times)$ , speck  $0.51 \times (0.66 \times)$ .
+
+fourth, although the spgemm approaches generally maintain their relative ranking, the speedup of tsparse over the other approaches is greater on the rtx 2070 system. the reason is that, although the gpu parts become significantly faster on titan rtx, the cpu tasks of tsparse (e.g., memory allocation/deallocation) take the same time on both systems. tsparse scales slightly worse than the other approaches on the higher-end gpu due to the cpu bound tasks.
+
+fifth, tsparse shows better performance with denser tiles. grouping nz elements in tiles reduces the number of values to work on. according to [5], the main cost of esc is sorting. consequently, fewer values equals to less time sorting. generally, tsparse has good performance for bitmap density greater than five.
+
+# 6.3. execution time analysis
+
+in this section, we present the relative execution time of the main parts of tsparse, i.e., task list creation, sorting of the task list, counting elements of the output and the mm itself (fig.
+
+<table><tr><td rowspan="3">approach</td><td colspan="6">speedup with tsparse</td></tr><tr><td colspan="3">titan rtx (rowa &lt; 42)</td><td colspan="3">rtx 2070 (rowa &lt; 21)</td></tr><tr><td>gmean</td><td>minimum</td><td>maximum</td><td>gmean</td><td>minimum</td><td>maximum</td></tr><tr><td>cusparse</td><td>2.8</td><td>0.65</td><td>11.58</td><td>2.98</td><td>0.78</td><td>9.37</td></tr><tr><td>cusp</td><td>36.93</td><td>4.17</td><td>132.74</td><td>26.25</td><td>3.55</td><td>113.5</td></tr><tr><td>rmerge2</td><td>11.16</td><td>0.89</td><td>124.09</td><td>11.1</td><td>1.17</td><td>149.18</td></tr><tr><td>nsparse</td><td>1.49</td><td>0.65</td><td>6.64</td><td>1.77</td><td>0.84</td><td>7.8</td></tr><tr><td>ac-spgemm</td><td>3.72</td><td>0.79</td><td>19.21</td><td>3.4</td><td>0.71</td><td>12.95</td></tr><tr><td>speck</td><td>1.46</td><td>0.47</td><td>3.17</td><td>1.88</td><td>0.7</td><td>4.67</td></tr><tr><td>nontcu</td><td>1.48</td><td>1.1</td><td>1.97</td><td>1.56</td><td>1.19</td><td>2.14</td></tr></table>
+
+table 3: speedup of tsparse over the various approaches for matrices selected by our criteria.
+
+![](images/01ad025f7d573c78bc79013986aa1a1a21453e1a56ca67170772494bcd8f424c.jpg)  
+figure 7: speedup of tsparse on  $a * a$  spgemm using randomly selected matrices on titan rtx.
+
+![](images/c328b920a24a53506dd6a477158786bfe4c7c1d609357ab6219e240ff4a67fbc.jpg)  
+figure 8: speedup of tsparse on  $a * a$  spgemm using matrices selected based on criteria on titan rtx.
+
+11). we make three observations. first, creating the task list takes considerable time. the main reason is that during the task list phase we do most of the necessary memory allocations. second, sorting takes about  $19\%$ , counting about  $11\%$ , mm about  $16\%$  and compaction about  $4\%$  of the execution time. third, the runtime of counting is not much shorter than mm's.
+
+the reason is that counting includes the execution time for both the counting kernel and the memory allocations that the mm kernel needs.
+
+we note that in the execution time we include all allocations, including the allocation of the output. we also include the time for conversion from fp32 to fp16 (if the input is stored in fp32).
+
+![](images/5c9fea34870733564d8430d4c0713d041f463261e784aaff6b0f135802bd6798.jpg)  
+figure 9: speedup of tsparse on  $a * a$  spgemm using randomly selected matrices on rtx 2070.
+
+![](images/36a6d976cd278cb0294d493c4a3eb22110e75b365a76938db6e2bb98a1fd5757.jpg)  
+figure 10: speedup of tsparse on  $a * a$  spgemm using matrices selected based on criteria on rtx 2070.
+
+however, we do not include the time for conversion to/from bitmap format for fair comparison to other approaches.
+
+![](images/3b7a6fb000955b70abb2c746c3b8e35a759c04e066303d09b5542178129f6711.jpg)  
+figure 11: relative runtime of the main parts of tsparse on titan rtx.
+
+# 6.4. numerical precision
+
+tcus accept 16-bit numbers as input, whereas tcus perform mm and accumulation in 32-bit precision (mixed precision - section 2.6). in this section, we show how tsparse fares w.r.t. precision in comparison to a full 32-bit approach (we use cusp as base). figure 12 illustrates the precision of spgemm as symmetric mean absolute percentage error (smape - equation (3)).
+
+$$
+\frac{100\%}{n}\sum_{i = 1}^{n}\frac{\left|x _{i} - \hat{x}_{i}\right|}{\left|x _{i}\right| + \left|\hat{x}_{i}\right|} \tag{3}
+$$
+
+we make two observations. first, when the input matrices contain patterns of "1" and "0" the smape is  $0\%$ . second, when the inputs are real numbers the smape is on average  $0.02\%$ . exception are the cases with inputs close to the limits of the fp16 range, where the round-off error is bigger (nemeth21 - 2.49%, patents_main - 0.66%).
+
+![](images/3c76bda96bca4649159ff842b7491c81e589993cdd6c95d9b553a1b4bc82c998.jpg)  
+figure 12: numerical precision of spgemm in symmetric mean absolute percentage error (smape).
+
+# 6.5. memory requirements
+
+in this section we present the peak memory consumption of all approaches. fig. 13 presents the memory consumption for the 16 matrices of our dataset.
+
+we make four major observations. first, hash table approaches require the smallest memory area as they do not have to store huge intermediate matrices. second, esc approaches require large amounts of memory. third, tsparse, which "packs" elements into tiles, typically requires more memory than hash approaches and less than esc. the amount of memory is proportional to the bitmap density. when the average bitmap density is very low, like in patents_main and wiki-vote, tsparse requires a lot of memory due to the additional overhead for storing tiles. fourth, rmerge2 performs well as it usually requires only 5 bytes for each row of the left-hand side.
+
+![](images/fe1c4f6dcf8cf48e21e085cfa6bbbeb1d405433432040cadd009d4635ec196a1.jpg)  
+figure 13: memory consumption in mb
+
+# 6.6. summary
+
+we examine the performance of our approach in  $a * a$  and compare to cusparse, cusp, rmerge2, nsparse, acspgemm and speck over the 16 sparse matrices of our dataset. we draw two important conclusions. first, tsparse generally outperforms the other approaches for the larger matrices of our dataset when we have dense tiles and enough work per matrix row. second, tcus play an important role in the performance of our approach, speeding up nontcu  $1.68 \times$
+
+tsparse outperforms the other state-of-the-art approaches  $1.53 \times$  to  $31.77 \times$  when our selected criteria are met, without significant loss in accuracy. therefore tsparse is a suitable alternative for spgemm.
+
+# 7. related work
+
+to our knowledge, this is the first paper to use tcus in the context of spgemm. with this approach, we group nz into tiles. unlike previous methods, which use normal fp32 cores, we use tensor cores to multiply the tiles. we show that, with this approach, we can increase the performance of spgemm. in this section we summarize other spgemm implementations.
+
+# 7.1. expansion sorting compression
+
+there exists a substantial body of work on improving esc methodology that we describe in section 2.4. dalton et al. [5] improve on esc by optimizing sorting, the most time consuming step, and by localizing processing to shared memory. kunchum et al. [28], in hybridsparse, implement variants of esc. winter et al. [7], in ac-spgemm, perform esc locally in shared memory. they use dynamic scheduling of iterations of esc to keep data longer in shared memory. thus, they reduce global memory traffic and the cost of sorting a huge intermediate matrix in global memory.
+
+tsparse moves expansion and compression steps after sorting. this way we reduce memory allocation and movements and utilize mac of tcus.
+
+# 7.2. hash tables
+
+hash tables can mitigate the cost of sorting and storing huge intermediate matrices. demouth et al. [19] present one of the first implementations of spgemm with hash tables. cusparse [11] is based on the work of demouth et al. their approach has two drawbacks. first, there is imbalance between threads because different threads of the warp might have to insert a different number of values in the hash table. second, shared memory space is limited, which results in frequent data movement to global memory. anh et al. [27], in balancedhash, and nagasaka et al. [20], in nsparse, reduce the consumption of shared memory by partitioning the rows of the input or output, respectively. nsparse improves on balancedhash in two ways: 1) by using hash tables of variable size in shared memory, less shared memory is required and more thread blocks can run, and 2) by using fewer auxiliary matrices, it keeps memory traffic low and reduces memory storage requirements. deveci et al. [30] use two-level hash tables. they adapt the hash tables to the number of threads in order to create a method that is portable to many platforms. parger et al. [21], in speck find a trade-off between analysis cost for load balancing and expected gain.
+
+in tsparse, 1) we have less values to sort because elements are grouped into tiles, and 2) we avoid storing the intermediate products by using the task list to directly accumulate them.
+
+# 7.3. hybrid
+
+hybrid methods select among multiple methods/kernels during spgemm depending on the workload. dalton et al. [5] improve on esc methodology by changing the thread granularity of the sorting method based on the size of rows of  $c$ . liu et al. [6], in bhsparse, change the sorting-merging method depending on the size of rows of  $c$ . kunchum et al. [28], in hybridsparse, choose the spgemm method based on the workload of each row of  $a$ . they select among variants of esc and their own method (a gpu implementation of scatter vectors). gremse et al. [8, 9], in rmerge create different kernels for different row sizes of  $a$ . hybrid methods achieve good load balance thanks to their adaptability to the workload.
+
+we can divide tsparse in two parts. the part that performs esc on tiles to form the task list and the part that uses our kernels to perform mac operations. for the first part, we use thrust which achieves good load balance. for the second part, we let the gpu hardware scheduler manage the workload. this is possible because we employ many thread blocks, which the gpu schedules to sms based on the available resources of each sm.
+
+# 8. conclusion
+
+in this work, we utilize tcus to increase the performance of spgemm. to that end, we modify the esc method and we create a task list of mms of tiles. the key advantages of our approach, tsparse, are two. first, tiles reduce the number of values that the computationally demanding parts of esc have to act on. second, the task list sends the tiles to tcus, which not only perform mm faster than normal computation cores, but also leave the normal cores free for different workloads.
+
+the results confirm that tcus increase the performance of mm and the combination of our tiling approach with tcus provides significant benefits to spgemm. tcus increase the performance of tsparse by  $68\%$  in comparison to our nontcu implementation. our approach is, on average,  $1.53 \times$  to  $31.77 \times$  faster than cusparse, cusp, rmerge2, nsparse, ac-spgemm and speck when  $nnz(a) > 300000$  and  $\widehat{rowa} > 42$ . we conclude that our methodology improves the performance of spgemm by making efficient use of tiles and tcus. the source code of our approach is available at https://github.com/oresths/tsparse.
+
+# acknowledgment
+
+this work is supported by high performance soft-tissue navigation (hipernav - h2020-msca-itn-2016). hipernav has received funding from the european unions horizon 2020 research and innovation programme under grant agreement no 722068.
+
+# references
+
+[1] t. davis, algorithm 9xx: suitesparse: graphblas: graph algorithms in the language of sparse linear algebra.
+
+[2] j. r. gilbert, s. reinhardt, v. b. shah, high-performance graph algorithms from parallel sparse matrices, in: international workshop on applied parallel computing, springer, 2006, pp. 260-269.  
+[3] n. bell, s. dalton, l. olson, exposing fine-grained parallelism in algebraic multigrid methods, siam journal on scientific computing 34 (4) (2012) c123-c152. doi:10.1137/110838844. url https://epubs.siam.org/doi/abs/10.1137/110838844  
+[4] i. yamazaki, x. s. li, on techniques to improve robustness and scalability of a parallel hybrid linear solver, in: international conference on high performance computing for computational science, springer, 2010, pp. 421-434.  
+[5] s. dalton, l. olson, n. bell, optimizing sparse matrixmatrix multiplication for the gpu, acm transactions on mathematical software 41 (4) (2015) 1-20. doi:10.1145/2699470. url http://dl.acm.org/citation.cfm?doid=2835205. 2699470  
+[6] w. liu, b. vinter, a framework for general sparse matrix-matrix multiplication on gpus and heterogeneous processors, journal of parallel and distributed computing 85 (2015) 47-61, arxiv: 1504.05022 publisher: elsevier inc. doi:10.1016/j.jpdc.2015.06.010. url http://dx.doi.org/10.1016/j.jpdc.2015.06.010  
+[7] m. winter, d. mlakar, r. zayer, h.-p. seidel, m. steinberger, adaptive sparse matrix-matrix multiplication on the gpu, in: proceedings of the 24th symposium on principles and practice of parallel programming, ppopp '19, acm, new york, ny, usa, 2019, pp. 68-81, event-place: washington, district of columbia. doi:10.1145/3293883.3295701.  
+[8] f. gremse, a. höfter, l. o. schwen, f. kiessling, u. naumann, gpu-accelerated sparse matrix-matrix multiplication by iterative row merging, siam journal on scientific computing 37 (1) (2015) c54-c71. doi:10.1137/130948811. url http://epubs.siam.org/doi/10.1137/130948811  
+[9] f. gremse, k. kupper, u. naumann, memory-efficient sparse matrix-matrix multiplication by row merging on many-core architectures, siam journal on scientific computing 40 (4) (2018) c429-c449. doi: 10.1137/17m1121378. url https://epubs.siam.org/doi/10.1137/17m1121378  
+[10] a. vasudevan, a. anderson, d. gregg, parallel multi channel convolution using general matrix multiplication, in: 2017 ieee 28th international conference on application-specific systems, architectures and processors (asap), ieee, 2017, pp. 19-24.  
+[11] nvidia, cuda c programming guide 10.2 (november). url http://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html  
+[12] google, google cloud tpu (2019). url https://cloud.google.com/tpu/  
+[13] j. zhang, l. gruenwald, regularizing irregularity : bitmap-based and portable sparse matrix multiplication for graph data on gpus, grades-ndaisbn: 9781450356954. doi:10.1145/3210259.3210263.  
+[14] a. dakkak, c. li, j. xiong, i. gelado, w.-m. hwu, accelerating reduction and scan using tensor core units (2019) 46-57.  
+[15] a. haidar, s. tomov, j. dongarra, n. j. higham, harnessing gpu tensor cores for fast fp16 arithmetic to speed up mixed-precision iterative refinement solvers, proceedings of the international conference for high performance computing, networking, storage, and analysis (sc'18)isbn: 9781538683842.  
+[16] s. markidis, s. w. d. chien, e. laure, i. b. peng, j. s. vetter, nvidia tensor core programmability, performance & precision, proceedings - 2018 ieee 32nd international parallel and distributed processing symposium workshops, ipdpsw 2018 (2018) 522-531arxiv: 1803.04014 isbn: 9781538655559. doi:10.1109/ipdpsw.2018.00091.  
+[17] s. dalton, n. bell, l. olson, m. garland, cusp: generic parallel algorithms for sparse matrix and graph computations, version 0.5.1 (2015). url http://cusplibrary.github.io/  
+[18] t. a. davis, y. hu, the university of florida sparse matrix collection, acm transactions on mathematical software (toms) 38 (1) (2011) 1.  
+[19] j. demouth, sparse matrix-matrix multiplication on the gpu, nvidia, 2012, p. 21.  
+[20] y. nagasaka, a. nukada, s. matsuoka, high-performance and memory-saving sparse general matrix-matrix multiplication for nvidia pascal gpu, in: 2017 46th international conference on parallel process
+
+ing (icpp), ieee, bristol, united kingdom, 2017, pp. 101-110. doi: 10.1109/icpp.2017.19.  
+[21] m. parger, m. winter, d. mlakar, m. steinberger, speck: accelerating gpu sparse matrix-matrix multiplication through lightweight analysis, in: proceedings of the 25th acm sigplan symposium on principles and practice of parallel programming, acm, san diego california, 2020, pp. 362-375. doi:10.1145/3332466.3374521.  
+[22] r. barrett, m. w. berry, t. f. chan, j. demmel, j. donato, j. dongarra, v. eijkhout, r. pozo, c. romine, h. van der vorst, templates for the solution of linear systems: building blocks for iterative methods, vol. 43, siam, 1994.  
+[23] k. matam, s. r. k. b. indarapu, k. kothapalli, sparse matrix-matrix multiplication on modern architectures, in: 2012 19th international conference on high performance computing, 2012, pp. 1-10. doi:10.1109/ hipc.2012.6507483.  
+[24] i. s. committee, et al., 754-2008 ieee standard for floating-point arithmetic, ieee computer society std 2008 (2008) 517.  
+[25] nvidia, nvidia turing gpu architecture whitepaper.  
+[26] k. hou, w. liu, h. wang, w. feng, fast segmented sort on gpus, in: proceedings of the international conference on supercomputing, 2017, pp. 1-10.  
+[27] p. n. q. anh, r. fan, y. wen, balanced hashing and efficient gpu sparse general matrix-matrix multiplication, in: proceedings of the 2016 international conference on supercomputing, ics '16, acm, new york, ny, usa, 2016, pp. 36:1-36:12, event-place: istanbul, turkey. doi:10.1145/2925426.2926273. url http://doi.acm.org/10.1145/2925426.2926273  
+[28] r. kunchum, a. chaudhry, a. sukumaran-rajam, q. niu, i. nisa, p. sa-dayappan, on improving performance of sparse matrix-matrix multiplication on gpus, in: proceedings of the international conference on supercomputing, ics '17, acm, new york, ny, usa, 2017, pp. 14:1-14:11, event-place: chicago, illinois. doi:10.1145/3079079.3079106. url http://doi.acm.org/10.1145/3079079.3079106  
+[29] z. xie, g. tan, w. liu, n. sun, ia-spgemm: an input-aware auto-tuning framework for parallel sparse matrix-matrix multiplication, in: proceedings of the acm international conference on supercomputing, 2019, pp. 94-105.  
+[30] m. deveci, c. trott, s. rajamanickam, multithreaded sparse matrix-matrix multiplication for many-core andgpu architectures, parallel computing 78 (2018) 33-46.
+
+orestis zachariadis is a researcher and phd candidate at university of cordoba. he works on parallel computing for medical image registration algorithms as part of hipernav eu project. in 2018, he worked on medical technology at sintef. in 2016, he joined multidrone eu project as a research assistant at university of bristol, where he worked on object and human detection and following in videos shot from multiple drones. he holds a bsc and an msc in electrical and computer engineering from aristotle university of thessaloniki. his research interests include parallel computing, computer vision and robotics.
+
+nitin satpute is a researcher and phd candidate at university of cordoba. he works on gpu acceleration for medical image enhancement and segmentation algorithms as a part of hipernav eu project. in 2018, he worked on liver segmentation at ouh, oslo, norway. in 2019, he worked on liver enhancement at ntnu gjovik norway, where he developed fast parallel cross modality approach for liver contrast enhancement. he holds master of engineering in embedded systems from bits pilani, india. his research interests include gpu computing, medical imaging, re-configurable computing and video processing.
+
+juan gómez luna is a postdoctoral researcher at eth zürich. he received the bs and ms degrees in telecommunication engineering from the university of sevilla, spain, in 2001, and the phd degree in computer science from the university of crdoba, spain, in 2012. between 2005 and 2017, he was a lecturer at the university of córdoba. his research interests focus on processing-in-memory, gpus and heterogeneous systems, medical imaging, and bioinformatics.
+
+joaquín olivares was born in elche, spain. he received the b.s. and m.s. degree in computer sciences in 1997, and 1999, respectively, and the m.s. degree in electronics engineering in 2003, all from the universidad de granada, spain. he received the ph.d. degree in 2008 at the universidad de cordoba, spain. he is associate professor with the electronic and computer engineering department at the universidad de cordoba, spain, since 2001. he is founder and head of the advanced informatics research group. his research interests are in the field of embedded systems, computer vision, and high performance computing.

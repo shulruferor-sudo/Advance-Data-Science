@@ -1,0 +1,554 @@
+# a study of the fundamental performance characteristics of gpus and cpus for database analytics (extended version)
+
+anil shanbhag
+
+mit
+
+anil@csail.mit.edu
+
+samuel madden
+
+mit
+
+madden@csail.mit.edu
+
+xiangyao yu
+
+university of wisconsin-madison
+
+yxy@cs.wisc.edu
+
+# abstract
+
+there has been significant amount of excitement and recent work on gpu-based database systems. previous work has claimed that these systems can perform orders of magnitude better than cpu-based database systems on analytical workloads such as those found in decision support and business intelligence applications. a hardware expert would view these claims with suspicion. given the general notion that database operators are memory-bandwidth bound, one would expect the maximum gain to be roughly equal to the ratio of the memory bandwidth of gpu to that of cpu. in this paper, we adopt a model-based approach to understand when and why the performance gains of running queries on gpus vs on cpus vary from the bandwidth ratio (which is roughly  $16 \times$  on modern hardware). we propose crystal, a library of parallel routines that can be combined together to run full sql queries on a gpu with minimal materialization overhead. we implement individual query operators to show that while the speedups for selection, projection, and sorts are near the bandwidth ratio, joins achieve less speedup due to differences in hardware capabilities. interestingly, we show on a popular analytical workload that full query performance gain from running on gpu exceeds the bandwidth ratio despite individual operators having speedup less than bandwidth ratio, as a result of limitations of vectorizing chained operators on cpus, resulting in a  $25 \times$  speedup for gpus over cpus on the benchmark.
+
+# 1 introduction
+
+in the past decade, special-purpose graphics processing units (gpus) have evolved into general purpose computing devices, with the advent of general purpose parallel programming models, such as cuda [3] and opencl [7]. because of gpu's high compute power, they have seen significant adoption in deep learning and in high performance computing [4]. gpus also have significant potential to accelerate memory-bound applications such as database systems. gpus utilize high-bandwidth memory (hbm), a new class of ram that has significantly higher throughput compared to traditional ddr ram used with cpus. a single modern gpu can have up to 32 gb of hbm capable of delivering up to 1.2 tbps of
+
+memory bandwidth and 14 tflops of compute. in contrast, a single cpu can have hundreds of gb of memory with up to 100 gbps memory bandwidth and 1 tflop of compute.
+
+this rise in memory capacity, coupled with the ability to equip a modern server with several gpus (up to 20), means that it's possible to have hundreds of gigabytes of gpu memory on a modern server. this is sufficient for many analytical tasks; for example, one machine could host several weeks of a large online retailer's (with say 100m sales per day) sales data (with 100 bytes of data per sale) in gpu memory, the on-time flight performance of all commercial airline flights in the last few decades, or the time, location, and (dictionary encoded) hash tags used in every of the several billion tweets sent over the past few days.
+
+in-memory analytics is typically memory bandwidth bound. the improved memory bandwidth of gpus has led some researchers to use gpus as coprocessors for analytic query processing [15, 24, 44, 48]. however, previous work leaves several unanswered questions:
+
+- gpu-based database systems have reported a wide range of performance improvement compared to cpu-based database systems, ranging from  $2 \times$  to  $100 \times$ . there is a lack of consensus on how much performance improvement can be obtained from using gpus. past work frequently compares against inefficient baselines, e.g., monetdb [24, 44, 48] which is known to be inefficient [29]. the empirical nature of past work makes it hard to generalize results across hardware platforms.  
+- past work generally views gpus strictly as an coprocessor. every query ends up shipping data from cpu to gpu over pcie. data transfer over pcie is an order of magnitude slower than gpu memory bandwidth, and typically less than the cpu memory bandwidth. as a result, the pcie transfer time becomes the bottleneck and limits gains. to the extent that past work shows performance improvements using gpus as an coprocessor, much of those gains may be due to evaluation against inefficient baselines.  
+- there has been significant improvement in gpu hardware in recent years. most recent work on gpu-based database [15] evaluates on gpus which have memory capacity and bandwidth of 4 gb and 150 gbps respectively,
+
+while latest generation of gpus have  $8 \times$  higher capacity and bandwidth. these gains significantly improve the attractiveness of gpus for query processing.
+
+in this paper, we set out to understand the true nature of performance difference between cpus and gpus, by performing rigorous model-based and performance-based analysis of database analytics workloads after applying optimizations for both cpus and gpus. to ensure that our implementations are state-of-the-art, we use theoretical minimums derived assuming memory bandwidth is saturated as a baseline, and show that our implementations can typically saturate the memory bus, or when they cannot, describe in detail why they fall short. hence, although we offer some insights into the best implementations of different operators on cpus and gpus, the primary contribution of this paper is to serve as a guide to implementors as to what sorts of performance differences one should expect to observe in database implementations on modern versions of these different architectures.
+
+past work has used gpus mainly as coprocessors. by comparing an efficient cpu implementation of a query processor versus an implementation that uses the gpu as a coprocessor, we show that gpu-as-coprocessor offers little to no gain over a pure cpu implementation, performing worse than the cpu version for some queries. we argue that the right setting is having the working set stored directly on gpu(s).
+
+we developed models and implementations of basic operators: select, project, and join on both cpu and gpu to understand when the ratio of operator runtime on cpus to runtime on gpus deviates from the ratio of memory bandwidth of gpu to memory bandwidth of cpu. in the process, we noticed that the large degree of parallelism of gpus leads to additional materialization. we propose a novel execution model for query processing on gpus called the tile-based execution model. instead of looking at gpu threads in isolation, we treat a block of threads ("thread block") as a single execution unit, with each thread block processing a tile of items. the benefit of this tile-based execution model is that thread blocks can now cache tiles in shared memory and collectively process them. this helps avoid additional materialization. this model can be expressed using a set of primitives where each primitive is a function which takes as input of set of tiles and outputs a set of tiles. we call these primitives block-wide functions. we present crystal, a library of block-wide functions that can be used to implement the common sql operators as well as full sql queries. furthermore, we use crystal to implement the query operators on the gpu and compare their performance against equivalent state-of-the-art implementations on the cpu. we use crystal to implement the star-schema benchmark (ssb) [30] on the gpu and compare it's performance against our own cpu implementation, a state-of-the-art cpu-based olap dbms and a state-of-the-art gpu-based olap dbms. in both cases,
+
+we develop models assuming memory bandwidth is saturated and reason about the performance based on it.
+
+in summary, we make the following contributions:
+
+- we show that previous designs which use the gpu as a coprocessor show no performance gain when compared against a state-of-the-art cpu baseline. instead, using modern gpu's increased memory capacity to store working set directly on the gpu is a better design.  
+- we present crystal, a library of data processing primitives that can be composed together to generate efficient query code that can full advantage of gpu resources.  
+- we present efficient implementations of individual operators for both gpu and cpu. for each operator, we provide cost models that can accurately predict their performance  
+- we describe our implementation of ssb and evaluate both gpu and cpu implementations of it. we present cost models that can accurately predict query runtimes on the gpu and discuss why such models fall short on the cpu.
+
+# 2 background
+
+in this section, we review the basics of the gpu architecture and describe relevant aspects of past approaches to running database analytics workloads on cpu and gpu.
+
+# 2.1 gpu architecture
+
+many database operations executed on the gpu are performance bound by the memory subsystem (either shared or global memory) [48]. in order to characterize the performance of different algorithms on the gpu, it is, thus, critical to properly understand its memory hierarchy.
+
+figure 1 shows a simplified hierarchy of a modern gpu. the lowest and largest memory in the hierarchy is the global memory. a modern gpu can have global memory capacity of up to 32 gb with memory bandwidth of up to 1200 gbps. each gpu has a number of compute units called streaming multiprocessors (sms). each sm has a number of cores and a fixed set of registers. each sm also has a shared memory which serves as a scratchpad that is controlled by the programmer and can be accessed by all the cores in the sm. accesses to global memory from a sm are cached in the l2 cache (l2 cache is shared across all sms) and optionally also in the l1 cache (l1 cache is local to each sm).
+
+processing on the gpu is done by a large number of threads organized into thread blocks (each run by one sm). thread blocks are further divided into groups of threads called warps (usually consisting of 32 threads). the threads of a warp execute in a single instruction multiple threads (simt) model, where each thread executes the same instruction stream on different data. the device groups global memory loads and stores from threads in a single warp such that multiple loads/stores to the same cache line are combined into a single
+
+![](images/2ed951a2c3c192ab7e82951873bb93974ac2bd7aeceea17a764f499d74fc8c63.jpg)  
+figure 1: gpu memory hierarchy
+
+request. maximum bandwidth can be achieved when a warp's access to global memory results in neighboring locations being accessed.
+
+the programming model allows users to explicitly allocate global memory and shared memory in each thread block. shared memory has an order of magnitude higher bandwidth than global memory but has much smaller capacity (a few mb vs. multiple gb).
+
+finally, registers are the fastest layer of the memory hierarchy. if a thread block needs more registers than available, register values spill over to global memory.
+
+# 2.2 query execution on gpu
+
+with the slowing of moore's law, cpu performance has stagnated. in recent years, researchers have started exploring heterogeneous computing to overcome the scaling problems of cpus and to continue to deliver interactive performance for database applications. in such a hybrid cpu-gpu system, the two processors are connected via pcie. the pcie bandwidth of a modern machine is up to 16 gbps, which is much lower than the memory bandwidth of either cpu or gpu. therefore, data transfer between cpu and gpu is a serious performance bottleneck.
+
+past work in the database community has focused on using the gpu as a coprocessor, which we call the coprocessor model. in this model, data primarily resides in cpu's main memory. for query execution, data is shipped from the cpu to the gpu over pcie, so that (some) query processing can happen on the gpu. results are then shipped back to the cpu. researchers have worked on optimizing various database operations under the co-processor model: selection [40], join [18, 19, 22, 35, 38, 39, 47], and sort [16, 42]. several full-fledged gpu-as-coprocessor database query engines have been proposed in recent years. ocelot [20] provides a hybrid analytical engine as an extension to monetdb. ydb [48] is a gpu-based data warehousing engine. both systems used an operator-at-a-time model, where an operator library containing gpu kernel implementations of common database operators such as scans and joins is invoked on batches of tuples, running each operator to completion before moving on to the next operator. kernel fusion [46] attempted to hide in-efficiency associated with
+
+running multiple kernels for each query like in the operator-at-a-time model. kernel fusion fused operator kernels with producer-consumer dependency when possible to eliminate redundant data movement. as kernel fusion is applied as a post-processing step, it will miss opportunities where kernel configurations are incompatible (like the one in described in section 3.2). hippogriffdb [24] used gpus for large scale data warehousing where data resides on ssds. hippogriffdb claims to achieve  $100 \times$  speedup over monetdb when the ratio of memory bandwidth of gpu to cpu is roughly  $5 \times$ . we have not been able to get the source code to compare against the system. more recently, horseqc [15] proposes pipelined data transfer between cpu and gpu to improve query runtime. as we show in the next section, using horseqc ends up being slower than running the query efficiently directly on the cpu.
+
+commercial systems like omnisci [6], kinetica [5], and blazingdb [2] aim to provide real-time analytical capabilities by using gpus to store large parts (or all) of the working set. the setting used in this paper is similar to ones used by these systems. although these systems use a design similar to what we advocate, some have claimed  $1000 \times$  performance improvement by using gpus [1] but have not published rigorous benchmarks against state-of-the-art cpu or gpu databases, which is the primary aim of this paper.
+
+# 2.3 query execution on cpu
+
+database operators have been extensively optimized for modern processors. for joins, researchers have proposed using cache-conscious partitioning to improve hash join performance [9-11, 25]. schuh et al. summarized the approaches [37]. for sort, satish et al. [36] and wassenberg et al. [45] introduced buffered partitioning for radix sort. polychroniou et al. [32] presented faster variants of radix sort that use simd instructions. sompolski et al. [41] showed that combination of vectorization and compilation can improve performance of project, selection, and hash join operators. polychroniou et al. [31] presented efficient vectorized designs for selections, hash tables, and partitioning using simd gathers and scatters. prashanth et al. [27] extended the idea to generate machine code for full queries with simd operators. we use ideas from these works, mainly the works of polychroniou et al. [31, 32] for our cpu implementations.
+
+c-store [43] and monetdb [12] were among the first column-oriented engines, which formed the basis for analytical query processing. monetdb x100 [13] introduced the idea of vectorized execution that was cache aware and reduced memory traffic. hyper [29] introduced the push-based iteration and compiling queries into machine code using llvm. hyper was significantly faster than monetdb and brought query performance close to that of handwritten c code. we compare the performance of our cpu query implementations against monetdb [12] and hyper [29].
+
+select sum(lo_extendedprice * lo_discount) as revenue  
+from lineorder  
+where loquantity < 25  
+and lo_orderdate >= 19930101 and lo_orderdate <= 19940101  
+and lo_discount >= 1 and lo_discount <= 3;
+
+![](images/6b925b9c00c15d598ac33c71512ca6c9f8c97c781d2b37f5b7ac692de1c8db29.jpg)  
+figure 2: star schema benchmark q1.1  
+figure 3: evaluation on the star schema benchmark
+
+# 3 our approach
+
+in this section, we describe the tile-based execution model we use to execute queries on gpu efficiently. we begin by showing why the coprocessor model used by past works is a suboptimal design and motivate why storing the working set directly on the gpu in a heterogeneous system (as done by all commercial systems) is a better approach. through an example, we illustrate the unique challenges associated with running queries in a massively-parallel manner on the gpu. we show how by treating the thread block as the basic execution unit with each thread block processing a tile of items (similar to vector-based processing on the cpu where each thread processes a vector of items a time) leads to good performance on the gpu. we call this approach the tile-based execution model. finally, we show how this model can be expressed using a set of primitives where each primitive is a function which takes as input of set of tiles and outputs a set of tiles. we call these primitives block-wide functions. we present crystal, a library of block-wide functions that can be composed to create a full sql query.
+
+# 3.1 failure of the coprocessor model
+
+while past work has claimed speedups from using gpus in the coprocessor model, there is no consensus among past work about the performance improvement obtained from using gpus, with reported improvements varying from  $2 \times$  to  $100 \times$ .
+
+consider q1.1 from the star schema benchmark (ssb) shown in figure 2. for simplicity, assume all column entries are 4-byte integers and  $l$  is the number of entries in lineorder. an efficient implementation on a cpu will be able to generate the result using a single pass over the 4 data columns. the optimal cpu runtime  $(r_c)$  is upper bounded
+
+by  $16l / b_{c}$  where  $b_{c}$  is the cpu memory bandwidth. this is an upper bound because, if the predicates are selective, then we may be able to skip entire cache lines while accessing the lo_extendedprice column. in the coprocessor model, we have to ship 4 columns of data to gpu. thus, the query runtime on the gpu  $(r_{g})$  is lower bounded by  $16l / b_{p}$  where  $b_{p}$  is the pcie bandwidth. the bound is hit if we are able to perfectly overlap the data transfer and query execution on gpu. however, since  $b_{c} > b_{p}$  in modern cpu-gpu setups,  $r_{c} < r_{g}$ , i.e., running the query on cpu yields a lower runtime than the running query with a gpu coprocessor.
+
+to show this empirically, we ran the entire ssb with scale factor 20 on an instance where cpu memory bandwidth is 54 gbps, gpu memory bandwidth is 880 gbps, and pcie bandwidth is 12.8 gbps. the full workload details can be found in section 5.1 and the full system details can be found in table 2. we compare the performance of the gpu coprocessor with two olap dbmss: monetdb and hyper. past work on using gpus as a coprocessor mostly compared their performance against monetdb [24, 44, 48] which is known to be inefficient [29]. figure 3 shows the results. on an average, gpu coprocessor performs  $1.5 \times$  faster than monetdb but it is  $1.4 \times$  slower than hyper. for all queries, the query runtime in gpu coprocessor is bound by the pcie transfer time. we conclude the reason past work was able to show performance improvement with a gpu coprocessor is because their optimized implementations were compared against inefficient baselines (e.g., monetdb) on the cpu.
+
+with the significant increase in gpu memory capacity, a natural question is how much faster a system that treats the gpu as the primary execution engine, rather than as an accelerator, can be. we describe our architecture for such a system in the rest of this section.
+
+# 3.2 tile-based execution model
+
+while a modern cpu can have dozens of cores, a modern gpu like nvidia v100 can have 5000 cores. the vast increase in parallelism introduces some unique challenges for data processing. to illustrate this, consider running the following simple selection query as a micro-benchmark on both a cpu and a gpu:
+
+# q0: select y from r where y > v;
+
+on the cpu, the query can be efficiently executed as follows. the data is partitioned equally among the cores. the goal is to write the results in parallel into a contiguous output array. the system maintains a global atomic counter that acts as a cursor that tells each thread where to write the next result. each core processes its partition by iterating over the entries in the partition one vector of entries at a time, where a vector is about 1000 entries (small enough to fit in the l1 cache). each core makes a first pass over the first vector of entries to count
+
+the number of entries that match the predicate  $d$ . the thread increments the global counter by  $d$  to allocate output space for the matching records, and then does a second pass over the vector to copy the matched entries into the output array in the allocated range of the output. since the second pass reads data from l1 cache, the read is essentially free. the global atomic counter is a potential point of contention. however, note that each thread updates the counter once for every  $1000+$  entries and there are only around 32 threads running in parallel at any point. the counter ends up not being the bottleneck and the total runtime is approximately  $\frac{d}{b_c} + \frac{d\sigma}{b_c}$  where  $d$  is the size of the column, and  $b_c$  is the memory bandwidth on the cpu.
+
+we could run the same plan on the gpu, partitioning the data up among the thousands of threads. however, gpu threads have significantly fewer resources per thread. on the nvidia v100, each gpu thread can only store roughly 24 4-byte entries in shared memory at full occupancy, with 5000 threads running in parallel. here, the global atomic counter ends up becoming the bottleneck as all the threads will attempt to increment the counter to find the offset into the output array. to work around this, existing gpu-based database systems would execute this query in 3 steps as shown in figure 4(a). the first kernel  $k_{1}$  would be launched across a large number of threads. in it, each thread would read in column entries in a strided fashion (interleaved by thread number) and evaluate the predicate to count the number of entries matched. after processing all elements, the total number of entries matched per thread would be recorded in an array count, where count[t] is number of entries matched by thread t. the second kernel  $k_{2}$  would use the count array to compute the prefix sum of the count and store this in another array pf. recall that for an array  $a$  of  $k$  elements, the prefix sum  $p_a$  is a  $k$  element array where  $p_a[j] = \sum_{i=0}^{j-1} a_j$ . thus, the  $i^{th}$  entry in pf indicates the offset at which the  $i$ th thread should write its matched results to in the output array o. databases used an optimized routine from a cuda library like thrust [8] to run it efficiently in parallel. the third kernel  $k_{3}$  would then read in the input column again; here the  $i^{th}$  thread again scans the  $i^{th}$  stride of the input, using pf[i] to determine where to write the satisfying records. each thread also maintains a local counter  $c_i$ , initially set to 0. specifically for each satisfying entry, thread  $i$  writes it to pf[i] +  $c_i$  and then increments  $c_i$ . in the end, o[pf[t]] ... o[pf[t+1] - 1] will contain the matched entries of thread t.
+
+the above approach shifts the task of finding offsets into the output array to an optimized prefix sum kernel whose runtime is a function of  $t$  (where  $t$  is the number of threads ( $t << n$ ), instead of finding it inline using atomic updates to a counter. as a result, the approach ends up being significantly faster than the naive translation of the cpu approach to the gpu. however, there are a number of issues with this approach. first, it reads the input column from global memory
+
+![](images/35b1e0c8423c938d384c89b2482ec5d7624fac657b23adb06b050bbde42451e6.jpg)  
+figure 4: running selection on gpu
+
+![](images/7d49767391cf7d562338e6c4ce233796cd0b43a6584eaa21faa7f268a552b070.jpg)  
+figure 5: vector-based to tile-based execution models.
+
+twice, compared to doing it just once with the cpu approach. it also reads/writes to intermediate structures count and pf. finally, each thread writes to a different location in the output array resulting in random writes. to address these issues, we introduce the tile-based execution model.
+
+tile-based processing extends the vector-based processing on cpu where each thread processes a vector at a time to the gpu. figure 5 illustrates the model. as discussed earlier in section 2.1, threads on the gpu are grouped into thread blocks. threads within a thread block can communicate through shared memory and can synchronize through barriers. hence, even though a single thread on the gpu at full occupancy can hold only up to 24 integers in shared memory, a single thread block can hold a significantly larger group of elements collectively between them in shared memory. we call this unit a tile. in the tile-based execution model, instead of viewing each thread as an independent execution unit, we view a thread block as the basic execution unit with each thread block processing a tile of entries at a time. one key advantage of this approach is that after a tile is loaded into shared memory, subsequent passes over the tile will be read directly from shared memory and not from global memory, avoiding the second pass through global memory described in the implementation above.
+
+figure 4(b) shows how selection is implemented using the tile-based model. the entire query is implemented as a single kernel instead of three. figure 6 shows a sample execution with a tile of size 16 and a thread block of 4 threads for the predicate  $y > 5$ . note that this is just for illustration, as most
+
+![](images/7b5b8d50b339565f9a2f86de7c551ddedf1902ee72ce1b3c7bdaeadb8fe337b5.jpg)  
+figure 6: query q0 kernel running  $\mathbf{y} > 5$  with tile size 16 and thread block size 4
+
+modern gpus would use a thread block size that is a multiple of 32 (the warp size) and the number of elements loaded would be 4-16 times the size of the thread block. we start by initializing the global counter to 0. the kernel loads a tile of items from global memory into the shared memory. the threads then apply the predicate on all the items in parallel to generate a bitmap. for example, thread 0 evaluates the predicate for elements 0,4,8,12 (shown in red). each thread then counts the number of entries matched per thread to generate a histogram. the thread block co-operatively computes the prefix sum over the histogram to find the offset each thread writes to in shared memory. in the example, threads 0,1,2,3 match 2,1,4,3 entries respectively. the prefix sum entries 0,2,3,7 tell us thread 0 should write its matched entries to output at index 0, thread 1 should write starting at index 2, etc. we increment a global counter atomically by total number of matched entires to find the offset at which the thread block should write in the output array. the shuffle step uses the bitmap and the prefix sum to create a contiguous array of matched entries in shared memory. the final write step copies the contiguous entries from shared memory to global memory at the right offset.
+
+by treating the thread block as an execution unit, we reduce the number atomic updates of the global counter by a factor of size of tile  $t$ . the kernel also makes a single pass over the input column with the gen shuffled tile ensuring that the final write to the output array is coalesced, solving both problems associated with approach used in previous gpu databases.
+
+the general concept of the tile-based executing model i.e., dividing data into tiles and mapping threadblocks to tiles has been used in other domains like image processing [21] and high performance computing [8]. however, to the best of our knowledge this is the first work that uses it for database operations. in the next section, we present crystal, a library of data processing primitives that can be composed together to implement sql queries on the gpu.
+
+# 3.3 crystal library
+
+the kernel structure in figure 6 contains a series of steps where each is a function that takes as input a set of tiles, and
+
+![](images/9844fcb0c8f9e23300e92b6b23fad13f1468df9ee80387985e83a3f008481f57.jpg)  
+(a) select y from r where  $y > v(b)$  select y from r where  $x > w$  and  $y > v$  
+figure 7: implementing queries using crystal  
+figure 8: query q0 kernel implemented with crystal
+
+```txt
+1 //implementsselectyfromrwherey>u   
+2 //nt  $\rightarrow$  num threads   
+3//ipt  $\rightarrow$  items_per_thread   
+4 template<int nt,int ipt>   
+5 __global__void q(int\*y,int\*out,intv，int\*counter){   
+6 inttile_size  $\equiv$  get_tile_size();   
+7 int offset  $=$  get_tile_offset();   
+8 __shared__struct buffer{   
+9 int col[nt\*ipt];   
+10 int out[nt\*ipt];   
+11}；   
+12 int items[ipt];   
+13 int bitmap[ipt];   
+14 int indices[ipt];   
+15   
+16 blockloadint<nt,ipt>(col+offset,items,buffer.col,tile_size);   
+17 blockpredintgt<nt,ipt>(items,buffer.col,cutoff,,bitmap);   
+18 blockscan<nt,ipt>(bitmap,indices,buffer.col, num_selections,tile_size);   
+20   
+21 if threadidx.x  $\equiv = 0$  ）   
+22 o_off  $\equiv$  atomic_update(counter,num selections);   
+23   
+24 blockshuffleint<nt,ipt>(items,indices,buffer.out);   
+25 blockstoreint<nt,ipt>(buffer.out,out +o_off,num_selections);   
+26}
+```
+
+outputs a set of tiles. we call these primitives block-wide functions. a block-wide function is a device function<sup>1</sup> that takes in a set of tiles as input, performs a specific task, and outputs a set of tiles. instead of reimplementing these block-wide functions for each query, which would involve repetition of non-trivial functions, we developed a library called crystal.
+
+crystal $^2$  is a library of populated cuda device functions that implement the full set of primitives necessary for executing typical analytic sql spja analytical queries. figure 7(a) shows an sketch of the simple selection query implemented using block-wide functions. figure 8 shows the query kernel of the same query implemented with crystal. we use this
+
+<table><tr><td>primitive</td><td>description</td></tr><tr><td>blockload</td><td>copies a tile of items from global memory to shared memory. uses vector instructions to load full tiles.</td></tr><tr><td>blockloadsel</td><td>selectively load a tile of items from global memory to shared memory based on a bitmap.</td></tr><tr><td>blockstore</td><td>copies a tile of items in shared memory to device memory.</td></tr><tr><td>blockpred</td><td>applies a predicate to a tile of items and stores the result in a bitmap array.</td></tr><tr><td>blockscan</td><td>co-operatively computes prefix sum across the block. also returns sum of all entries.</td></tr><tr><td>blockshuffle</td><td>uses the thread offsets along with a bitmap to locally rearrange a tile to create a contiguous array of matched entries.</td></tr><tr><td>blocklookup</td><td>returns matching entries from a hash table for a tile of keys.</td></tr><tr><td>blockaggregate</td><td>uses hierarchical reduction to compute local aggregate for a tile of items.</td></tr></table>
+
+table 1: list of block-wide functions
+
+example to illustrate the key features of crystal. the input tile is loaded from the global memory into the thread block using blockload. blockload internally uses vector instructions when loading a full tile and for the tail of the input array that may not form a perfect tile, it is loaded in a striped fashion element-at-a-time. blockpred applies the predicate to generate the bitmap. a key optimization that we do in crystal is instead of storing the tile in shared memory, in cases where the array indices are statically known before hand, we choose to use registers to store the values. in this case, items (which contains entries loaded from the column) and bitmap are stored in registers. hence, in addition to 24 4-byte values that a thread can store in shared memory, this technique allows us to use roughly equal amount of registers available to store data items. next we use blockscan to compute the prefix sum. blockscan internally implements a hierarchical block-wide parallel prefix-sum approach [17]. this involves threads accessing bitmap entries of other threads - for this we load bitmap into shared memory, reusing buffer .col shared memory buffer used for loading the input column. shared memory is order of magnitude faster than global memory, hence loads and stores to shared memory in this case do not impact performance. after atomic update to find offset in output array, blockshuffle is used to reorder the array and finally we use blockstore to write to output array. the code skips some minor details like when the atomic update happens, since it is executed on thread 0, the global offset needs to be communicated back to other threads through shared memory.
+
+in addition to allowing users to write high performance kernel code that as we show later can saturate memory bandwidth, there are two usability advantages of using crystal:
+
+- modularity: block-wide functions in crystal make it easy to use non-trivial functions and reduce boilerplate code. for example, blockscan, blockload, blockaggregate each encapsulate 10's to 100's of lines of code. for the selection query example, crystal reduces lines of code from more than 300 to less than 30.  
+- extensibility: block-wide functions makes it is fairly easy to implement query kernels of larger queries. figure 7(b) shows the implementation of a selection query with two predicates. ordinary cuda code can be used along with crystal functions.
+
+crystal supports loading partial tiles like in figure 7(b). if a selection or join filters entries, we use blockloadsel to load items that matched the previous selections based on a bitmap. in this case, the thread block internally allocate space for the entire tile, however, only matched entries are loaded from global memory. table 1 briefly describes the block-wide functions currently implemented in the library.
+
+to evaluate crystal, we look at two microbenchmarks: 1) we evaluate the selection query  $q0$  with size of input array as  $2^{29}$  and selectivity is 0.5. we vary the tile sizes. we vary the thread block sizes from 32 to 1024 in multiples of 2. we have three choices for the number of items per thread: 1,2,4. figure 9 shows the results. as we increase the thread block size, the number of global atomic updates done reduces and hence the runtime improves until the thread block size approaches 512 after which it deteriorates. each streaming multiprocessor on the gpu holds maximum of 2048 threads, hence, having large thread blocks reduces number of independent thread blocks. this affects utilization particularly when thread blocks are using synchronization heavily. having 4 items per thread allows to effectively load the entire block using vector instructions. with 2 items per thread, there is reduced benefit for vectorization as half the threads are empty. with 1 item per thread there is no benefit. the best performance is seen with thread block size of 128/256 and items per thread equal to 4. in these cases, as we show later in section 4.2 saturate memory bandwidth and hence achieve optimal performance. 2) we evaluated the selection query  $q0$  using two approaches: independent threads approach (figure 4(a)) and using crystal (figure 4(b)). the number of entries in the input array is  $2^{29}$  and selectivity is 0.5. the runtime with the independent threads approach is 19ms compared to just 2.1ms when using crystal. almost all of the performance improvement is from avoiding atomic contention and being able to reorder matched entries to write in a coalesced manner.
+
+across all of the workloads we evaluated, we found that using thread block size 128 with items per thread equal to 4 is indeed the best performing tile configuration. in the rest of the paper, we use this configuration for all implementations using crystal. all the implementations with crystal are implemented in cuda c++. since crystal's block-wide
+
+![](images/6f887038d9e906131caca18c5be166add1c65fa4111acd617ab75114d75c64fd.jpg)  
+figure 9: q0 performance with varying tile sizes
+
+functions are standard device functions, they can also called directly from llvm ir.
+
+in the next section, we show how to use these block-wide functions to build efficient operators on a gpu and compare their performance to equivalent cpu implementations.
+
+# 4 operators on gpu vs cpu
+
+in order to understand the true nature of performance difference of queries on gpu vs. cpu, it is important to understand the performance difference of individual query operators. in this section, we compare the performance of basic operators: project, select, and hash join on gpu and cpu with the goal of understanding how the ratio of runtime on gpu to runtime on cpu compares to the bandwidth ratio of the two devices. we use block-wide functions from crystal to implement the operators on gpu and use equivalent state-of-the-art implementations on cpu. we also present a model for each of the operators assuming the operator saturates memory bandwidth and show that in most cases the operators indeed achieve these limits. we use the model to explain the performance difference between cpu and gpu. for the micro-benchmarks, we use a setup where gpu memory bandwidth is 880gbps and cpu memory bandwidth is 54gbps, resulting in a bandwidth ratio of 16.2 (see section 5 for system details). in all cases, we assume that the data is already in the respective device's memory.
+
+# 4.1 project
+
+we consider two forms of projection queries: one that computes a linear combination of columns (q1) and one involving user defined function (q2) as shown below:
+
+q1: select  $ax_1 + bx_2$  from r;  
+q2: select  $\sigma (ax_{1} + bx_{2})$  from r;
+
+where  $x_{1}$  and  $x_{2}$  are 4-byte floating point values. the number of entries in the input array is  $2^{29}$ .  $\sigma$  is the sigmoid function (i.e.,  $\sigma(x) = \frac{1}{1 + e^{-x}}$ ) which can represent the output of a logistic regression model. note that  $q1$  consists of basic arithmetic and will certainly be bandwidth bound.  $q2$  is representative of the most complicated projection we will likely see in any sql query.
+
+on the cpu side, we implement two variants: cpu and cpu-0pt. cpu uses a multi-threaded projection where each thread works on a partition of the input data. cpu-0pt extends cpu with two extra optimizations: (1) non-temporal writes and (2) simd instructions. non-temporal writes are write instructions that bypass higher cache levels and write out an entire cache line to main memory without first loading it to caches. simd instructions can further improve performance. with a single avx2 instruction, for example, a modern x86 system can add, subtract, multiply, or divide a group of 84-byte floating point numbers, thereby improving the computation power and memory bandwidth utilization.
+
+on the gpu side, we implement a single kernel that does two blockload's to load the tiles of the respective columns, computes the projection and does a blockstore to store it in the result array.
+
+model: assuming the queries can saturate the memory bandwidth, the expected runtime of q1 and q2 is
+
+$$
+\text {r u n t i m e} = \frac {2 \times 4 \times n}{b _ {r}} + \frac {4 \times n}{b _ {w}}
+$$
+
+where  $n$  is the number of entries in the input array and  $b_r$  and  $b_w$  are the read and write memory bandwidth, respectively. the first term of the formula models the runtime for loading columns  $x_1$  and  $x_2$ , each containing 4-byte floating point numbers. the second term models the runtime for writing the result column back to memory, which also contains 4-byte floating point numbers. note that this formula works for both cpu and gpu, by plugging in the corresponding memory bandwidth numbers.
+
+performance evaluation: figure 10 shows the runtime of queries q1 and q2 on both cpu and gpu (shown as bars) as well as the predicted runtime based on the model (shown as dashed lines). the performance of q1 on both cpu and gpu is memory-bandwidth bound. cpu-opt performs better than cpu due to the increased memory bandwidth efficiency. gpu performs substantially better than both cpu implementations due to its much higher memory bandwidth. the ratio of runtime of cpu-opt to gpu is 16.56 which is close to the bandwidth ratio of 16.2. the minor difference is because read bandwidth is slightly lower than write bandwidth on the cpu and the workload has a read:write ratio of 2:1.
+
+a simple multi-threaded implementation of q2 (i.e., cpu) does not saturate memory bandwidth and is computed bound. after using the simd instructions (i.e., cpu-0pt), performance improves significantly and the system is close to memory bandwidth bound. the ratio of runtime of cpu-0pt to gpu for q2 is 17.95. this shows that even for fairly complex projections, good implementations on modern cpus are able to saturate memory bandwidth. gpus do significantly better than cpus due to their high memory bandwidth, with the performance gain equal to the bandwidth ratio.
+
+![](images/c4bfeeea6f3468e646d4c4a814a0c776afbb4cd39d5b0fbe04e4498bfd33e0e7.jpg)  
+figure 10: project microbenchmark
+
+for each  $y$  in  $\mathbb{r}$ :
+
+if  $y > v$  ..
+
+output[i++] = v
+
+for each  $y$  in  $\mathbb{r}$ :
+
+output[i] = y
+
+i  $+ = (y > v)$
+
+(a) with branching
+
+(b) with predication
+
+# 4.2 select
+
+we now turn our attention to evaluating selections, also called selection scans. selection scans have re-emerged for main-memory query execution and are replacing tradition unclustered indexes in modern olap dbms [33]. we use the following micro-benchmark to evaluate selections:
+
+q3: select y from r where y < v;
+
+where  $y$  and  $v$  are both 4-byte floating point values. the size of input array is  $2^{29}$ . we vary the selectivity of the predicate from 0 to 1 in steps of 0.1.
+
+to evaluate the above query on a multi-core cpu, we use the cpu implementation described earlier in section 3.2. we evaluate three variants. the "naive" branching implementation (cpu if) implements the selection using an if-statement, as shown in figure 15(a). the main problem with the branching implementation is the penalty for branch mispredictions. if the selectivity of the condition is neither too high nor too low, the cpu branch predictor is unable to predict the branch outcome. this leads to pipeline stalls that hinder performance. previous work has shown that the branch misprediction penalty can be avoided by using branch-free predication technique [34]. figure 15(b) illustrates the predication approach. predication transforms the branch (control dependency) into a data dependency. cpu pred implements selection scan with predication. more recently, vectorized selection scans have been shown to improve on cpu pred by using selective stores to buffer entries that satisfy selection predicates and writing out entries using streaming stores [31]. cpu simdprd implements this approach.
+
+![](images/f9c7d31ddb4cda57d17237ad8d099f1936aa8d9e3c3ff7f23c567ddefa7a1f32.jpg)  
+figure 11: implementing selection scan  
+figure 12: select microbenchmark
+
+on the gpu, the query is implemented as a single kernel as described in section 3.2 and as shown in figure 4(b). we implement two variants: gpu if implements the selection using an if-statement and gpu pred implements it using predication.
+
+model: the entire input array is read and only the matched entries are written to the output array. assuming the implementations can write out the matched entries efficiently and saturate memory bandwidth, the expected runtime is:
+
+$$
+\text {r u n t i m e} = \frac {4 \times n}{b _ {r}} + \frac {4 \times \sigma \times n}{b _ {w}}
+$$
+
+where  $n$  is the number of entries in the input array,  $b_{r}$  and  $b_{w}$  are the read and write bandwidth of the respective device, and  $\sigma$  is the predicate selectivity.
+
+performance evaluation: figure 12 shows the runtime of the three algorithms on cpu, two algorithms on gpu, and the performance models. cpu pred does better than cpu if at all selectivities except 0 (at 0, cpu if does no writes). across the range, cpu simdpred does better than the two scalar implementations. on gpu, there is no performance difference between gpu pred and gpu if - a single branch misprediction does not impact performance on the gpu. both cpu simdpred and gpu if/pred closely track their respective theoretical models which assume saturation of memory bandwidth. the average runtime ratio of cpu-to-gpu is 15.8 which is close to the bandwidth ratio 16.2. this shows that with efficient implementations, cpu implementations saturate memory bandwidth for selections and the gain of gpu over cpu is equal to the bandwidth ratio.
+
+# 4.3 hash join
+
+hash join is the most popular algorithm used for executing joins in a database. hash joins have been extensively studied in the database literature, with many different hash join algorithms proposed for both cpus and gpus [9-11, 14, 18, 23]. the most commonly used hash join algorithm is the no partitioning join, which uses a non-partitioned global hash table. the algorithm consists of two phases: in the build phase, the tuples in one relation (typically the smaller relation) are
+
+used to populate the hash table in parallel; in the probe phase, the tuples in the other relation are used to probe the hash table for matches in parallel. for our microbenchmark, we focus on the following join query:
+
+q4: select sum(a.v + b.v) as checksum from a, b where a.k = b.k
+
+where each table a and b consists of two 4-byte integer columns  $k, v$ . the two tables are joined on key  $k$ . we keep the size of the probe table fixed at 256 million tuples, totaling 2 gb of raw data. we use a hash table with  $50\%$  fill rate. we vary the size of the build table such that it produces a hash table of the desired size in the experiment. we vary the size of the hash table from 8kb to 1gb. the microbenchmark is the same as what past works use [9-11, 37].
+
+in this section, we mainly focus on the probe phase which forms the majority of the total runtime. we discuss briefly the difference in execution with respect to build time at the end of the section. there are many hash table variants, in this section we focus on linear probing due to its simplicity and regular memory access pattern; our conclusions, however, should apply equally well to other probing approaches. linear probing is an open addressing scheme that, to either insert an entry or terminate the search, traverses the table linearly until an empty bucket is found. the hash table is simply an array of slots with each slot containing a key and a payload but no pointers.
+
+on the cpu side, we implemented three variants of linear probing. (1) cpu scalar implements a scalar tuple-at-a-time join. the probing table is partitioned equally among the threads. each thread iterates over its entries and for each entry probes the hash table to find a matching entry. on finding a match, it adds  $a.v + b.v$  to its local sum. at the end, we add the local sum to the global sum using atomic instructions. (2) cpu simd implements vertical vectorized probing in a hash table [31]. the key idea in vertical vectorization is to process a different key per simd lane and use gathers to access the hash table. assuming  $w$  vector lanes, we process  $w$  different input keys on each loop iteration. in every round, for the set of keys that have found their matches, we calculate their sum, add it to a local sum, and reload those simd lanes with new keys. (3) finally, cpu prefetch adds group prefetching to cpu scalar [14]. for each loop iteration, software prefetching instructions are inserted to load the hash table entry that will be accessed a certain number of loop iterations ahead. the goal is to better hide memory latency at the cost of increased number of instructions.
+
+on the gpu side, we implemented the join as follows. we load in a tile of keys and payloads from the probe side using blockload; the threads iterate over each tile independently to find matching entries from the hash table. each thread maintains a local sum of entries processed. after processing all entries in a tile, we use blockagg to aggregate the local
+
+sums within a thread block into a single value and increment a global sum with it.
+
+model: the probe phase involves making random accesses to the hash table to find the matching tuple from the build side. every random access to memory ends up reading an entire cache line. however, if the size of hash table is small enough such that it can be cached, then random accesses no longer hit main memory and performance improves significantly. we model the runtime as follows:
+
+1) if the hash table size is smaller than the size of the  $k^{th}$  level cache, we expect the runtime to be:
+
+$$
+r u n t i m e = \max  (\frac {4 \times 2 \times | p |}{b _ {r}}, (1 - \pi_ {k - 1}) (\frac {| p | \times c}{b _ {k}}))
+$$
+
+where  $|p|$  is the cardinality of the probe table,  $b_r$  is the read bandwidth from device memory,  $c$  is the cache line size accessed on probe,  $b_k$  is the bandwidth of level  $k$  cache in which hash table fits and  $\pi_{k-1}$  is the probability of an access hitting a  $k-1$  level cache. the first term is the time taken to scan the probe table from device memory. the second term is the time for probing the hash table. note that each probe accesses an entire cache line. if the size of level  $k$  cache is  $s_k$  and size of the hash table is  $h$ , we define cache hit ratio  $\pi_k = \min(s_k / h, 1)$ . the total runtime will be bounded by either the device memory bandwidth or the cache bandwidth. hence, the runtime is the maximum of the two terms.
+
+2) if the hash table size is larger than the size of the last level cache, we expect the runtime to be:
+
+$$
+r u n t i m e = \frac {4 \times 2 \times | p |}{b _ {r}} + (1 - \pi) (\frac {| p | \times c}{b _ {r}})
+$$
+
+where  $\pi$  is the probability that the accessed cache line is the last level cache.
+
+performance evaluation: figure 13 shows the performance evaluation of different implementations of join. both cpu and gpu variants exhibit step increase in runtime when the hash table size exceeds the cache size of a particular level. on the cpu, the step increases happen when the hash table size exceeds 256kb (l2 cache size) and 20mb (l3 cache size). on the gpu, the step increase happens when the hash table size exceeds 6mb (l2 cache size).
+
+we see that cpu simd performs worse than cpu scalar, even when the hash table is cache-resident. cpu-simd uses avx2 instructions with 256-bit registers which represent 8 lanes of 32-bit integers. with 8 lanes, we process 8 keys at a time. however, a single simd gather used to fetch matching entries from the hash table can only fetch 4 entries at a time (as each hash table lookup returns an 8 byte slot. i.e., 4-byte key and 4-byte value, with 4 lookups filling the entire register). as a result, for each set of 8 keys, we do 2 simd gathers and then de-interleave the columns into to 8 keys and 8 values. this added overhead of extra instructions does not exist in the
+
+![](images/aba20c989268aaa5d82514f03abd088e5d7b5193eee46e28d814e60a2ad3b5e7.jpg)  
+figure 13: join performance.
+
+scalar version. cpu simd is also brittle and not easy to extend to cases where hash table slot size is larger than 8 bytes. note that past work has evaluated vertical vectorization with key-only build relations which do not exhibit this issue [27, 31]. comparing cpu prefetch to cpu scalar shows that there is limited improvement from prefetching when data size is larger than the l3 cache size. when the hash table fits in cache, prefetching degrades the performs due to added overhead of the prefetching instructions.
+
+due the step change nature of the performance curves, the ratio of the runtimes varies based on hash table size. when the hash table size is between 32kb and 128kb, the hash table fits in l2 on both cpu and gpu. in this segment, we observe that the runtime is bound by dram memory bandwidth on cpu and l2 cache bandwidth on the gpu. the average gains are roughly  $5.5 \times$  which is in line with the model. when the hash table size is between 1mb and 4mb, the hash table fits in the l2 on the gpu and in the l3 cache on the cpu. the ratio of runtimes in this segment is  $14.5 \times$  which is the ratio of l2 cache bandwidth on gpu to the l3 cache bandwidth on the cpu. finally when the hash table size is larger than 128mb, the hash table does not fit in cache on either gpu or cpu. the granularity of reads from global memory is 128b on gpu while on cpu it is 64b. hence, random accesses into the hash table read twice the data on gpu compared to cpu. given the bandwidth ratio is  $16.2\mathrm{x}$ , we would expect it as roughly  $8.1\mathrm{x}$ , however it is  $10.5\mathrm{x}$  due to memory stalls. the fact that actual cpu results are slower than cpu model is because the model assumes maximum main memory bandwidth, which is not achievable as the hash table causes random memory access patterns.
+
+discussion: the runtime of the build phase in the microbenchmark shows a linear increase with size of the build relation. the build phase runtimes are less affected by caches as writes to hash table end up going to memory.
+
+in this section, we modeled and evaluated the no partitioning join. another variant of hash join is the partitioned hash join. partitioned hash joins use a partitioning routine like radix partitioning to partition the input relations into
+
+cache-sized chunks and in the second step run the join on the corresponding partitions. efficient radix-based hash join algorithms (radix join) have been proposed for cpus [9-11, 14] and for the gpus [35, 38]. radix join requires the entire input to be available before the join starts and as a result intermediate join results cannot be pipelined. hence, while radix join is faster for a single join, radix joins are not used for queries with multiple joins. while we do not explicitly model/evaluate radix joins, in the next section we discuss the radix partitioning routine that is the key component of such joins. that discussion shows that a careful radix partition implementation on both gpu and cpu are memory bandwidth bound, and hence the performance difference is roughly equal to the bandwidth ratio.
+
+# 4.4 sort
+
+in this section, we evaluate the performance of sorting 32-bit key and 32-bit value arrays based on the key. according to literature, the fastest sort algorithm for this workload is the radix sort algorithm. we start by describing the least-significant-bit (lsb) radix sort on the cpu [32] and on the gpu [28]. lsb radix sort is the fastest for the workload on the cpu. we describe why the lsb radix sort does poorly in comparison on the gpu and why an alternate version called most-significant-bit (msb) radix sort does better on the gpu [42]. we present a model for the runtime of the radix sort algorithm and then analyze the performance characteristics of radix partitioning on cpu vs gpu. our implementations are primarily based on previous work but this is first time that these algorithms are compared to each other.
+
+the lsb radix sort internally comprises a sequence of radix partition passes. given an array  $a$ , radix  $r$ , and start bit  $a$ , a radix partition pass partitions the elements of the input array  $a$  into a contiguous array of  $2^r$  output partitions based on value of r-bits  $e[a:a+r]$  (i.e., radix) of the key  $e$ . both on the cpu and gpu, radix partitioning involves two phases. in the first phase (histogram phase), each thread (cpu) / thread block (gpu) computes a histogram over its entries to find the number of entries in each partition of the  $2^r$  partitions. in the second phase (data shuffling phase), each thread (cpu) / thread block (gpu) maintains an array of pointers initialized by the prefix sum over the histogram and writes entries to the right partition based on these offsets. the entire sorting algorithm contains multiple radix partition passes, with each pass looking at a disjoint sets of bits of the key  $e$  starting from the lowest bits  $e[0:r]$  to highest bits  $e[k-r:k]$  (where  $k$  is the bit-length of the key).
+
+on the cpu, we use the implementation of polychroniou et al. [32]. in the histogram phase, each thread makes one pass over its partition, for each entry calculating its radix value and incrementing the count in the histogram (stored in the l1 cache). for the shuffle phase, we first compute a
+
+prefix sum over the histograms of all the threads (a 2d array of dimension  $2^r \times t$  where  $t$  is the number of threads) to find the partition offsets for each of the threads. next, each thread makes a pass over its partition using gathers and scatters to increment the counts in its offset array and writing to right offsets in output array. the implementation makes a number of optimizations to achieve good performance. interested reader can refer to [32] for more details.
+
+on the gpu, we implemented lsb radix sort based on the work of merrill et al. [28]. in the histogram phase, each thread block loads a tile, computes a histogram that counts the number of entries in each partition, and writes it out to global memory. prefix sum is used to find the partition offsets for each thread block in the output array. next, in the shuffling phase each thread block reads in its offset array. the radix partitioning pass described above need to do stable partitioning i.e., ensures that for two entries with the same radix, the one occurring earlier in the input array also occurs earlier in the output array. now on the gpu, in order to ensure stable partitioning for lsb radix sort we need to internally generate an offsets array for each thread from the the thread block offset array. for an r-bit radix partitioning, we need  $2^{r}$  size histogram per thread. a number of optimizations have been proposed to store the histogram efficiently in registers, details of which are described in [28]. due to restriction on number of registers available per thread, stable radix partitioning pass can only process 7-bits at a time.
+
+recently, stehle et al. [42] presented an msb radix sorting algorithm for the gpu. the msb radix sort does not require stable partitioning. as a result, in the shuffle phase, we can just maintain a single offset array of size  $2^r$  for the entire thread block. this allows msb radix sort to process up to 8-bits at a time. hence, the msb radix sort to sort array of 32-bit keys with 4 passes each processing 8-bits at a time. on the other hand, lsb radix sort can processes only 7-bits at a time, and hence needs 5 radix partitioning passes processing 6,6,6,7,7 bits each.
+
+model: in the histogram phase, we read in the key column and write out a tiny histogram. the expected runtime is:
+
+$$
+\text {r u n t i m e} _ {\text {h i s t o g r a m}} = \frac {4 \times r}{b _ {r}}
+$$
+
+where  $r$  is the size of the input array and  $b_r$  is the read bandwidth. in the shuffle phase, we read both the key and payload column and at the end write out the radix partitioned key and payload columns. if the step is memory bandwidth bound, the runtime is expected to be:
+
+$$
+\text {r u n t i m e} _ {\text {s h u f f l e}} = \frac {2 \times 4 \times r}{b _ {r}} + \frac {2 \times 4 \times r}{b _ {w}}
+$$
+
+where  $b_{w}$  is the write bandwidth.
+
+performance evaluation: we evaluate the performance of histogram and shuffle phase of the three variants: cpu stable
+
+![](images/e67c9de786a180ebca3f433eccafa3b6794a6a7ad1365dc89fe02f0998cc0f12.jpg)  
+(a) radix histogram on cpu and gpu
+
+![](images/821498b7b7b5f33aee33765f819393b4ef1b1d9075814c8cb79f5e64512b5e2d.jpg)  
+(b) radix shuffling on cpu and gpu  
+figure 14: sort microbenchmark  
+figure 15: implementing selection scan
+
+for each y in r: for each y in r:
+
+$$
+i f y > v: \quad \text {o u t p u t} [ i ] = y
+$$
+
+$$
+\operatorname {o u t p u t} [ i + + ] = v \quad i + = (y > v)
+$$
+
+(a) with branching (b) with predication
+
+(stable partitioning on cpu), gpu stable (stable partitioning on gpu), and gpu unstable (unstable partitioning on gpu). we set the size of the input arrays at 256 million entries and vary the number of radix bits we partition on. figure 14a shows the results for the histogram phase. note that in the histogram phase there is no difference between gpu stable and gpu unstable. the histogram pass is memory bandwidth bound on both the cpu and gpu. figure 14b shows the results for the shuffle phase. gpu stable is able to partition up to 7-bits at a time whereas gpu unstable is able to partition 8-bits at a time. cpu stable is able to partition up to 8-bits a time while remaining bandwidth bound. beyond 8-bits, the size of the partition buffers needed exceeds the size of l1 cache and the performance starts to deteriorate.
+
+now that we have the radix partitioning passes, we look at the sort runtime. on the cpu, we use stable partitioning to implement lsb radix sort. it ends up running 4 radix partitioning passes each looking at 8-bits at time. on the gpu, msb radix sort also sorts the data with 4 passes each processing 8-bits at a time. the time taken to sort  $2^{28}$  entries is  $464ms$  on the cpu and  $27.08ms$  on the gpu. the runtime gain is  $17.13\times$  which is close to the bandwidth ratio of  $16.2\times$ .
+
+# 5 workload evaluation
+
+now that we have a good understanding of how individual operators behave on both cpu and gpu, we will evaluate the performance of a workload of full sql queries on both hardware platforms. we first describe the query workload we use in our evaluation. we then present a high-level comparison of the performance of queries running on gpu implemented with the tile-based execution model versus our own equivalent implementation of the queries on the cpu. we also report the performance of hyper [29] on cpu and omnisci [6] on the gpu which are both state-of-the-art implementations. as a case study, we provide a detailed performance breakdown of one of the queries to explain the performance gains. finally, we present a dollar-cost comparison of running queries on cpu and gpu.
+
+we use two platforms for our evaluation. for experiments run on the cpu, we use a machine with a single socket skylake-class intel i7-6900 cpu with 8 cores that supports avx2 256-bit simd instructions. for experiments run on the gpu, we use an instance which contains an nvidia v100 gpu. we measured the bidirectional pcie transfer bandwidth to be 12.8gbps. more details of the two instances are shown in table 2. each system is running on ubuntu 16.04 and the gpu instance has cuda 10.0. in our evaluation, we ensure that data is already loaded into the respective device's memory before experiments start. we run each experiment 3 times and report the average measured execution time.
+
+# 5.1 workload
+
+for the full query evaluation, we use the star schema benchmark (ssb) [30] which has been widely used in various data analytics research studies [15, 24, 44, 48]. ssb is a simplified version of the more popular tpc-h benchmark. it has one fact table lineorder and four dimension tables date, supplier, customer, part which are organized in a star schema fashion. there are a total of 13 queries in the benchmark, divided into 4 query flights. in our experiments we run the benchmark with a scale factor of 20 which will generate the fact table with 120 million tuples. the total dataset size is around 13gb.
+
+# 5.2 performance comparison
+
+in this section, we compare the query runtimes of benchmark queries implemented using block-wide functions on the gpu (standalone gpu) to an equivalent efficient implementation of the query on the cpu (standalone cpu). we also compare against hyper (hyper), a state-of-the-art olap dbms and omnisci (omnisci), a commercial gpu-based olap dbms.
+
+in order to ensure a fair comparison across systems, we dictionary encode the string columns into integers prior to data loading and manually rewrite the queries to directly reference the dictionary-encoded value. for example, a query with predicate s_region = 'asia' is rewritten with
+
+<table><tr><td>platform</td><td>cpu</td><td>gpu</td></tr><tr><td>model</td><td>intel i7-6900</td><td>nvidia v100</td></tr><tr><td>cores</td><td>8 (16 with smt)</td><td>5000</td></tr><tr><td>memory capacity</td><td>64 gb</td><td>32 gb</td></tr><tr><td>l1 size</td><td>32kb/core</td><td>16kb/sm</td></tr><tr><td>l2 size</td><td>256kb/core</td><td>6mb (total)</td></tr><tr><td>l3 size</td><td>20mb (total)</td><td>-</td></tr><tr><td>read bandwidth</td><td>53gbps</td><td>880gbps</td></tr><tr><td>write bandwidth</td><td>55gbps</td><td>880gbps</td></tr><tr><td>l1 bandwidth</td><td>-</td><td>10.7tbps</td></tr><tr><td>l2 bandwidth</td><td>-</td><td>2.2tbps</td></tr><tr><td>l3 bandwidth</td><td>157gbps</td><td>-</td></tr></table>
+
+table 2: hardware specifications
+
+predicate s_region = 2 where 2 is the dictionary-encoded value of 'asia'. some columns have a small number of distinct values and can be represented/encoded with 1-2 byte values. however, in our benchmark we make sure all column entries are 4-byte values to ensure ease of comparison with other systems and avoid implementation artifacts. our goal is to understand the nature of the performance gains of equivalent implementations on gpu and cpu, and not to achieve best storage layout. we store the data in columnar format with each column represented as an array of 4-byte values. on the gpu, we use a thread block size of 256 with tile size of 2056 (= 8×256) resulting in 8 entries per thread per tile.
+
+figure 16 shows the results. comparing standalone cpu to hyper shows that the former does on an average  $1.17\mathrm{x}$  better than the latter. we believe hyper is missing vectorization opportunities and using a different implementation of hash tables. the comparison shows that our implementation is a fair comparison and it is quite competitive compared to a state-of-the-art olap dbms. we also compared against monetdb [12], a popular baseline for many of the past works on gpu-based databases. we found that the standalone cpu is on an average  $2.5\times$  faster than monetdb. we did not include it in the figure as it made the graph hard to read. we also tried to compare against pelaton with relaxed-operator fusion [27]. we found that the system could not load the scale factor 20 dataset. scaling down to scale factor 10, its queries were significantly slower  $(>5\times)$  than hyper or our approach.
+
+comparing standalone gpu to omnisci, we see that our gpu implementation does significantly better than omnisci with an average improvement of around  $16 \times$ . both methods run with the entire working set stored on the gpu. omnisci treats each gpu thread as an independent unit. as a result, it does not realize benefits of blocked loading and better gpu utilization got from using the tile-based model. the comparison of standalone gpu against omnisci and standalone cpu to hyper serve as a sanity check and show that our query implementations are quite competitive.
+
+comparing standalone gpu to standalone cpu, we see that the standalone gpu is on average  $25 \times$  faster than the cpu implementation. this is higher than the bandwidth ratio
+
+![](images/4d80cdff8c4bd0122819e2d214a02ad86c6e308e9025f5be33ae183dfa78480f.jpg)  
+figure 16: star schema benchmark queries
+
+select sum(lo_revenue) as revenue, d_year, p_brand  
+from lineorder, date, part, supplier  
+where lo_orderdate = d_datekey  
+and lo_partkey = p_partkey and lo_suppkey = s_suppk  
+and p_category = 'mfgr#12' and s_region = 'america'  
+group by d_year, p_brand
+
+# figure 17: ssb query 2.1
+
+of 16.2. this is surprising given that in section 4 we saw that individual query operators had a performance gain equal to or lower than the bandwidth ratio. the key reason for the performance gain being higher than the bandwidth ratio is the better latency hiding capability of gpus. to get a better sense for the runtime difference, in the next subsection we discuss models for the full sql queries and dive into why architecture differences leads to significant difference in performance gain from the bandwidth ratio.
+
+# 5.3 case study
+
+the queries in the star schema benchmark can be broken into two sets: 1) the query flight  $q1.x$  consists of queries with selections directly on the fact table with no joins and 2) the query flights  $q2.x, q3.x, q4.x$  consist of queries with no selections on fact table and multiple joins – some of which are selective. in this section, we analyze the behavior q2.1 in detail as a case study. specifically, we build a model assuming the query is memory-bandwidth bound, derive the expected runtime based on the model, compare them against the observed runtime, and explain the differences observed.
+
+figure 17 shows the query: it joins the fact table lineorder with 3 dimension tables: supplier, part, and date. the selectivity of predicates on p_category and s_region are 1/25 and 1/5 respectively. the subsequent join of part and supplier have the same selectivity. we choose a query plan where lineorder first joins supplier, then part, and finally date, this plan delivers the highest performance among the several promising plans that we have evaluated.
+
+the cardinalities of the tables lineorder, supplier, part, and date are  $120m$ ,  $40k$ ,  $1m$ , and  $2.5k$  respectively. the query runs build phase for each of the 3 joins to build their respective hash tables. then a final probe phase runs the joins pipelined. given the small size of the dimension tables,
+
+the build time is much smaller than the probe time, hence we focus on modeling the probe time. on the gpu, each thread block processes a partition of the fact table, doing each of the 3 joins sequentially and updating a global hash table at the end that maintains the aggregate. past work [26] has shown that l2 cache on the gpu is an lru set associative cache. since hash tables associated with the supplier and date table are small, we can assume that they remain in the l2 cache. the size of the part hash table is larger than l2 cache. we model the runtime as consisting of 3 components:
+
+1) the time taken to access the columns of the fact table:
+
+$$
+\begin{array}{l} r _ {1} = \left(\frac {4 | l |}{c} + \min  \left(\frac {4 | l |}{c}, | l | \sigma_ {1}\right) + \min  \left(\frac {4 | l |}{c}, | l | \sigma_ {1} \sigma_ {2}\right) \right. \\ + \min  (\frac {4 | l |}{c}, | l | \sigma_ {1} \sigma_ {2})) \times \frac {c}{b _ {r}} \\ \end{array}
+$$
+
+where  $\sigma_{1}$  and  $\sigma_{2}$  are join selectivities associated with join with supplier and part tables respectively,  $|l|$  is the cardinality of the lineorder table,  $c$  is size of cache line, and  $b_{r}$  is the global memory read bandwidth. for each column except the first, the number of cache lines accessed is the minimum of: 1) accessing all cache lines of the column  $(\frac{4|l|}{c})$  and 2) accessing a cache line per entry read  $(|l|\sigma)$ .
+
+2) time taken to probe the join hash tables:
+
+$$
+r _ {2} = (2 \times | s | + 2 \times | d | + (1 - \pi) (| l | \sigma_ {1})) \times \frac {c}{b _ {r}}
+$$
+
+where  $|s|$  and  $|d|$  are cardinalities of the supplier and date table,  $(|l| \sigma_1)$  represents the number of lookups into the parhash table and  $\pi$  is the probability of finding the part hash table lookup in the l2 cache.
+
+3) time taken to read and write to the result table:
+
+$$
+r _ {3} = | l | \sigma_ {1} \sigma_ {2} \times \frac {c}{b _ {r}} + | l | \sigma_ {1} \sigma_ {2} \times \frac {c}{b _ {w}}
+$$
+
+the total runtime on gpu is  $r_1 + r_2 + r_3$ . the key difference with respect to cpu is that on the cpu, all three hash tables fit in the l3 cache. hence for cpu, we would have  $r_2 = (2 \times |s| + 2 \times |d| + 2 \times |p|)$ . to calculate  $\pi$ , we observe that the size of the part hash table (with perfect hashing) is  $2 \times 4 \times 1m = 8mb$ . with the supplier and date table in cache, the available
+
+cache space is 5.7mb. hence the probability of part lookup in l2 cache is  $\pi = 5.7 / 8$ . plugging in the values we get the expected runtimes on the cpu and gpu as  $47~\mathrm{ms}$  and  $3.7~\mathrm{ms}$  respectively compared to actual runtime of  $125~\mathrm{ms}$  and  $3.86~\mathrm{ms}$ .
+
+we see that the model predicted runtime on the gpu is close to the actual runtime whereas on the cpu, the actual runtime is higher than the modeled runtime. this is in large part because of the ability of gpus to hide memory latency even with irregular accesses. simt gpus run scalar code, but they "tie" all the threads in a warp to execute the same instruction in a cycle. for instance, gathers and scatter are written as scalar loads and stores to non-contiguous locations. in a way, cpu threads are similar to gpu warps and gpu threads are similar to simd lanes. a key difference between simt model on gpu vs simd model on cpu is what happens on memory access. on the cpu, if a thread makes a memory access, the thread waits for the memory fetch to return. if the cache line being fetched is not in cache, it leads to a memory stall. cpu have prefetchers to remedy this, but prefetchers do not work well with irregular access patterns like join probes. on the gpu, a single streaming multiprocessor (sm) usually has 64 cores that can execute 2 warps (64 threads) at any point. however, the sm can keep  $>2$  warps active at a time. on nvidia v100, each sm can hold 64 warps in total with 2 executing at any point in time. any time a warp makes a memory request, the warp is swapped out from execution into the active pool and another warp that is ready to execute ends up executing. once the memory fetch returns, the earlier warp can resume executing at the next available executor cores. this is similar to swapping of threads on disk access on cpu. this key feature allows gpus to avoid the memory stalls associated with irregular accesses as long as enough other threads are ready to execute. modeling query performance of multi-join queries on cpus is an interesting open problem which we plan to address as future work.
+
+# 5.4 cost comparison
+
+the paper has so far demonstrated that gpus can have superior performance than cpus for data analytics. however, gpus are known to be more expensive than cpus in terms of cost. table 3 shows both the purchase and renting cost of cpu and gpu that match the hardware used in this paper (i.e., table 2). for renting costs, we use the cost of ec2 instances provided by amazon web services (aws). for cpu, we choose the instance type r5.2xlarge which contains a modern skylake cpu with 8 cores, with a cost of $0.504 per hour. for gpu, we choose the instance type p3.2xlarge whose specs are similar to r5.2xlarge plus it has an nvidia v100 gpu, with a cost of $3.06 per hour. the cost ratio of the two systems is about 6×. for purchase costs, we compare the estimate of a single socket server blade to the same server blade with one nvidia v100 gpu. the cost ratio of the two systems at the high end is less than 6×. the average performance gap, however, is about
+
+<table><tr><td></td><td>purchase cost</td><td>renting cost</td></tr><tr><td>cpu</td><td>$2.5k</td><td>$0.504 per hour</td></tr><tr><td>gpu</td><td>$cpu + 8.5k</td><td>$3.06 per hour</td></tr></table>
+
+table 3: purchase and renting cost of cpu and gpu.
+
+$25 \times$  according to our evaluation (cf. section 5.2), which leads to a factor of 4 improvement in cost effectiveness of gpu over cpu. although the performance and cost will vary a lot across different cpu and gpu technologies, the ratio between the two will not change as much. therefore, we believe the analysis above should largely apply to other hardware selection.
+
+# 5.5 discussion
+
+in this paper, we showed through our model-based analysis and empirical evaluation that there is limited gain from using gpus as a coprocessor and that the runtime gain from running queries on the gpu vs cpu is  $1.5x$  the bandwidth ratio of the two devices. we believe that these results should help pivot the community towards treating gpus as primary execution engine. however, this paper largely focused on using a single gpu, which has limited memory capacity. there are many challenges that need to be addressed before gpus have widespread adoption that were beyond the scope of this paper and make for exciting future work:
+
+- distributed+hybrid it is possible to attach multiple gpus onto a single machine that can greatly increase the aggregated hbm memory capacity. these machines will also having significant cpu memory. executing queries on this heterogeneous system is still an open problem.  
+- compression data compression could be used to fit more data into gpu's memory. gpus have higher compute to bandwidth ratio than cpus which could allow use of non-byte addressable packing schemes.  
+- strings/non-scalar data types handling arbitrary strings and array data types efficiently on gpus is still an open problem.
+
+# 6 conclusion
+
+this paper compared cpus and gpus on database analytics workloads. we demonstrated that running an entire sql query on a gpu delivers better performance than using the gpu as an accelerator. to ease implementation of high-performance sql queries on gpus, we developed crystal, a library supporting a tile-based execution model. our analysis on ssb, a popular analytics benchmark, shows that modern gpus are  $25 \times$  faster and  $4 \times$  more cost effective than cpus. this makes a strong case for using gpus as the primary execution engine when the dataset fits into gpu memory.
+
+# references
+
+[1] 1000x faster data exploration with gpus. https://www.omnisci.com/blog/mapd.  
+[2] blazingdb. https://blazingdb.com.  
+[3] cuda c programming guide. http://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html.  
+[4] gpu-accelerated supercomputers change the balance of power on the top500. https://bit.ly/2ucbint.  
+[5] kinetica. https://kinetica.com/.  
+[6] omnisci. https://omnisci.com.  
+[7] opencl. https://www.khronos.org/opencl/.  
+[8] thrust. https://thrust.github.io/.  
+[9] c. balkesen, g. alonso, j. teubner, and m. t. özsu. multi-core, main-memory joins: sort vs. hash revisited. proceedings of the vldb endowment, 7(1):85-96, 2013.  
+[10] c. balkesen, j. teubner, g. alonso, and m. t. özsu. main-memory hash joins on multi-core cpus: tuning to the underlying hardware. in data engineering (icde), 2013 ieee 29th international conference on, pages 362-373. ieee, 2013.  
+[11] s. blanas, y. li, and j. m. patel. design and evaluation of main memory hash join algorithms for multi-core cpus. in proceedings of the 2011 acm sigmod international conference on management of data, pages 37-48. acm, 2011.  
+[12] p. a. boncz et al. monet: a next-generation dbms kernel for query-intensive applications. universiteit van amsterdam [host], 2002.  
+[13] p. a. boncz, m. zukowski, and n. nes. monetdb/x100: hyper-pipelining query execution. in cidr, volume 5, pages 225-237, 2005.  
+[14] s. chen, a. ailamaki, p. b. gibbons, and t. c. mowry. improving hash join performance through prefetching. acm transactions on database systems (tods), 32(3):17, 2007.  
+[15] h. funke, s. breß, s. noll, v. markl, and j. teubner. pipelined query processing in coprocessor environments. in proceedings of the 2018 international conference on management of data, pages 1603-1618. acm, 2018.  
+[16] n. govindaraju et al. gputerasort: high performance graphics co-processor sorting for large database management. in sigmod, 2006.  
+[17] m. harris, s. sengupta, and j. d. owens. parallel prefix sum (scan) with cuda. gpu gems, 3(39):851-876, 2007.  
+[18] b. he, k. yang, r. fang, m. lu, n. govindaraju, q. luo, and p. sander. relational joins on graphics processors. in proceedings of the 2008 acm sigmod international conference on management of data, pages 511-524, 2008.  
+[19] j. he, m. lu, and b. he. revisiting co-processing for hash joins on the coupled cpu-gpu architecture. pvldb, 2013.  
+[20] m. heimel, m. saecker, h. pirk, s. manegold, and v. markl. hardware-oblivious parallelism for in-memory column-stores. *pvldb*, 2013.  
+[21] j. holewinski, l.-n. pouchet, and p. sadayappan. high-performance code generation for stencil computations ongpu architectures. in proceedings of the 26th acm international conference on supercomputing, pages 311-320. acm, 2012.  
+[22] t. kaldewey, g. lohman, r. mueller, and p. volk. gpu join processing revisited. in damon, 2012.  
+[23] h. lang, v. leis, m.-c. albutiu, t. neumann, and a. kemper. massively parallel numa-aware hash joins. in in memory data management and analysis, pages 3-14. springer, 2015.  
+[24] j. li, h.-w. tseng, c. lin, y. papakonstantinou, and s. swanson. hippogriffdb: balancing i/o and gpu bandwidth in big data analytics. proceedings of the vldb endowment, 9(14):1647-1658, 2016.  
+[25] s. manegold, p. a. boncz, and m. l. kersten. optimizing database architecture for the new bottleneck: memory access. proceedings of the vldb endowment, 9(3):231-246, 2000.
+
+[26] x. mei and x. chu. dissectinggpu memory hierarchy through microbenchmarking. ieee transactions on parallel and distributed systems, 2016.  
+[27] p. menon, t. c. mowry, and a. pavlo. relaxed operator fusion for in-memory databases: making compilation, vectorization, and prefetching work together at last. proceedings of the vldb endowment, 11(1):1-13, 2017.  
+[28] d. merrill and a. grimshaw. high performance and scalable radix sorting: a case study of implementing dynamic parallelism for gpu computing. parallel processing letters, 21(02):245-272, 2011.  
+[29] t. neumann. efficiently compiling efficient query plans for modern hardware. proceedings of the vldb endowment, 4(9):539-550, 2011.  
+[30] p. o'neil, e. o'neil, x. chen, and s. revilak. the star schema benchmark and augmented fact table indexing. in technology conference on performance evaluation and benchmarking, pages 237-252. springer, 2009.  
+[31] o. polychroniou, a. raghavan, and k. a. ross. rethinking simd vectorization for in-memory databases. in proceedings of the 2015 acm sigmod international conference on management of data, pages 1493-1508. acm, 2015.  
+[32] o. polychroniou and k. a. ross. a comprehensive study of main-memory partitioning and its application to large-scale comparison-and radix-sort. in proceedings of the 2014 acm sigmod international conference on management of data. acm, 2014.  
+[33] v. raman, g. attaluri, r. barber, n. chainani, d. kalmuk, v. kulandaisamy, j. leenstra, s. lightstone, s. liu, g. m. lohman, et al. db2 with blu acceleration: so much more than just a column store. proceedings of the vldb endowment, 6(11):1080-1091, 2013.  
+[34] k. a. ross. selection conditions in main memory. acm transactions on database systems (tods), 29(1):132-161, 2004.  
+[35] r. rui and y.-c. tu. fast equi-join algorithms on gpus: design and implementation. in proceedings of the 29th international conference on scientific and statistical database management, page 17. acm, 2017.  
+[36] n. satish, c. kim, j. chhugani, a. d. nguyen, v. w. lee, d. kim, and p. dubey. fast sort on cpus and gpus: a case for bandwidth oblivious simd sort. in proceedings of the 2010 acm sigmod international conference on management of data, pages 351-362. acm, 2010.  
+[37] s. schuh, x. chen, and j. dittrich. an experimental comparison of thirteen relational equi-joins in main memory. in proceedings of the 2016 international conference on management of data, pages 1961–1976. acm, 2016.  
+[38] p. sioulas, p. chrysogelos, m. karpathiotakis, r. appuswamy, and a. ailamaki. hardware-conscious hash-joins on gpus. technical report, 2019.  
+[39] e. a. sitaridi and k. a. ross. ameliorating memory contention of olap operators ongpu processors. in proceedings of the eighth international workshop on data management on new hardware, pages 39-47. acm, 2012.  
+[40] e. a. sitaridi and k. a. ross. optimizing select conditions on gpus. in proceedings of the ninth international workshop on data management on new hardware, page 4. acm, 2013.  
+[41] j. sompolski, m. zukowski, and p. boncz. vectorization vs. compilation in query execution. in proceedings of the seventh international workshop on data management on new hardware. acm, 2011.  
+[42] e. stehle and h.-a. jacobsen. a memory bandwidth-efficient hybrid radix sort on gpus. in sigmod. acm, 2017.  
+[43] m. stonebraker, d. j. abadi, a. batkin, x. chen, m. cherniack, m. ferreira, e. lau, a. lin, s. madden, e. o'neil, et al. c-store: a column-oriented dbms. in proceedings of the 31st international conference on very large data bases, pages 553-564. vldb endowment, 2005.  
+[44] k. wang, k. zhang, y. yuan, s. ma, r. lee, x. ding, and x. zhang. concurrent analytical query processing with gpus. proceedings of the vldb endowment, 7(11):1011-1022, 2014.
+
+[45] j. wassenberg and p. sanders. engineering a multi-core radix sort. in european conference on parallel processing, pages 160-169. springer, 2011.  
+[46] h. wu, g. diamos, s. cadambi, and s. yalamanchili. kernel weaver: automatically fusing database primitives for efficientgpu computation. in 2012 45th annual ieee/acm international symposium on microarchitecture. ieee, 2012.
+
+[47] m. yabuta, a. nguyen, s. kato, m. edahiro, and h. kawashima. relational joins on gpus: a closer look. ieee transactions on parallel and distributed systems, 28(9):2663-2673, 2017.  
+[48] y. yuan, r. lee, and x. zhang. the yin and yang of processing data warehousing queries on gpu devices. pvldb, 2013.

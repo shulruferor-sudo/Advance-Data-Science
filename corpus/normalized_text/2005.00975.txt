@@ -1,0 +1,373 @@
+# efficient second-order treecrf for neural dependency parsing
+
+yu zhang, zhenghua li\*, min zhang
+
+institute of artificial intelligence, school of computer science and technology, soochow university, suzhou, china
+
+yzhang.cs@outlook.com, {zhli13,minzhang} @suda.edu.cn
+
+# abstract
+
+in the deep learning (dl) era, parsing models are extremely simplified with little hurt on performance, thanks to the remarkable capability of multi-layer bilstms in context representation. as the most popular graph-based dependency parser due to its high efficiency and performance, the bioffine parser directly scores single dependencies under the arc-factorization assumption, and adopts a very simple local token-wise cross-entropy training loss. this paper for the first time presents a second-order treecrf extension to the bioffine parser. for a long time, the complexity and inefficiency of the inside-outside algorithm hinder the popularity of treecrf. to address this issue, we propose an effective way to batchify the inside and viterbi algorithms for direct large matrix operation on gpus, and to avoid the complex outside algorithm via efficient back-propagation. experiments and analysis on 27 datasets from 13 languages clearly show that techniques developed before the dl era, such as structural learning (global treecrf loss) and high-order modeling are still useful, and can further boost parsing performance over the state-of-the-art bioaffine parser, especially for partially annotated training data. we release our code at https://github.com/yzhangcs/crfpar.
+
+# 1 introduction
+
+as a fundamental task in nlp, dependency parsing has attracted a lot of research interest due to its simplicity and multilingual applicability in capturing both syntactic and semantic information (nivre et al., 2016). given an input sentence  $\pmb{x} = w_0w_1\ldots w_n$ , a dependency tree, as depicted in figure 1, is defined as  $\pmb{y} = \{(i,j,l), 0 \leq i \leq n, 1 \leq j \leq n, l \in \mathcal{l}\}$ , where  $(i,j,l)$  is a dependency from the head word  $w_i$  to the modifier word
+
+![](images/79bc0ba1b934c82d6792d4faf9295c0da8e6e71c6f53de0fb09e9dfe749b76e7.jpg)  
+figure 1: an example full dependency tree. in the case of partial annotation, only some (not all) dependencies are annotated, for example, the two thick (blue) arcs.
+
+$w_{j}$  with the relation label  $l\in \mathcal{l}$ . between two mainstream approaches, this work focuses on the graph-based paradigm (vs. transition-based).
+
+before the deep learning (dl) era, graph-based parsing relies on many hand-crafted features and differs from its neural counterpart in two major aspects. first, structural learning, i.e., explicit awareness of tree structure constraints during training, is indispensable. most non-neural graph-based parsers adopt the max-margin training algorithm, which first predicts a highest-scoring tree with the current model, and then updates feature weights so that the correct tree has a higher score than the predicted tree.
+
+second, high-order modeling brings significant accuracy gains. the basic first-order model factors the score of a tree into independent scores of single dependencies (mcdonald et al., 2005a). second-order models were soon propose to incorporate scores of dependency pairs, such as adjacent-siblings (mcdonald and pereira, 2006) and grand-parent-child (carreras, 2007; koo and collins, 2010), showing significant accuracy improvement yet with the cost of lower efficiency and more complex decoding algorithms.
+
+in contrast, neural graph-based dependency parsing exhibits an opposite development trend. pei et al. (2015) propose to use feed-forward neural
+
+networks for automatically learning combinations of dozens of atomic features similar to chen and manning (2014), and for computing subtree scores. they show that incorporating second-order scores of adjacent-sibling subtrees significantly improved performance. then, both wang and chang (2016) and kiperwasser and goldberg (2016) propose to utilize bilstm as an encoder and use minimal feature sets for scoring single dependencies in a first-order parser. these three representative works all employ global max-margin training. dozat and manning (2017) propose a strong and efficient bi-affine parser and obtain state-of-the-art accuracy on a variety of datasets and languages. the biaffine parser is also first-order and employs simpler and more efficient non-structural training via local head selection for each token (zhang et al., 2017).
+
+observing such contrasting development, we try to make a connection between pre-dl and dl techniques for graph-based parsing. specifically, the first question to be addressed in this work is: can previously useful techniques such as structural learning and high-order modeling further improve the state-of-the-art $^2$  biaffine parser, and if so, in which aspects are they helpful?
+
+for structural learning, we focus on the more complex and less popular treecrf instead of max-margin training. the reason is two-fold. first, estimating probability distribution is the core issue in modern data-driven nlp methods (le and zuidema, 2014). the probability of a tree, i.e.,  $p(\boldsymbol{y} \mid \boldsymbol{x})$ , is potentially more useful than an unbounded score  $s(\boldsymbol{x}, \boldsymbol{y})$  for high-level nlp tasks when utilizing parsing outputs. second, as a theoretically sound way to measure model confidence of subtrees, marginal probabilities can support minimum bayes risk (mbr) decoding (smith and smith, 2007), and are also proven to be crucial for the important research line of token-level active learning based on partial trees (li et al., 2016).
+
+one probable reason for the less popularity of treecrf, despite its usefulness, is due to the complexity and inefficiency of the inside-outside algorithm, especially the outside algorithm. as far as we know, all existing works compute the inside and outside algorithms on cpus. the inefficiency issue becomes more severe in the dl era, due to
+
+the unmatched speed of cpu and gpu computation. this leads to the second question: can we batchify the inside-outside algorithm and perform computation directly on gpus? in that case, we can employ efficient treecrf as a built-in component in dl toolkits such as pytorch for wider applications (cai et al., 2017; le and zuidema, 2014).
+
+overall, targeted at the above two questions, this work makes the following contributions.
+
+- we for the first time propose second-order treecrf for neural dependency parsing. we also propose an efficient and effective triaffine operation for scoring second-order subtrees.  
+- we propose to batchify the inside algorithm via direct large tensor computation on gpus, leading to very efficient treecrf loss computation. we show that the complex outside algorithm is no longer needed for the computation of gradients and marginal probabilities, and can be replaced by the equally efficient back-propagation process.  
+- we conduct experiments on 27 datasets from 13 languages. the results and analysis show that both structural learning and high-order modeling are still beneficial to the state-of-the-art biaffine parser in many ways in the dl era.
+
+# 2 the basic biaffine parser
+
+we re-implement the state-of-the-art biaffine parser (dozat and manning, 2017) with two modifications, i.e., using charlstm word representation vectors instead of pos tag embeddings, and the first-order eisner algorithm (eisner, 2000) for projective decoding instead of the non-projective mst algorithm.
+
+scoring architecture. figure 2 shows the scoring architecture, consisting of four components.
+
+input vectors. the  $i$ th input vector is composed of two parts: the word embedding and the charlstm word representation vector of  $w_{i}$ .
+
+$$
+\mathbf {e} _ {i} = \operatorname {e m b} \left(w _ {i}\right) \oplus \operatorname {c h a r l s t m} \left(w _ {i}\right) \tag {1}
+$$
+
+where  $\mathrm{charlstm}(w_i)$  is obtained by feeding  $w_{i}$  into a bilstm and then concatenating the two last hidden vectors (lample et al., 2016). we find that replacing pos tag embeddings with
+
+![](images/7f402b2269a94f628f1ccae7bea7d9b1eca50413fac53cb4ef84d56da61d00c5.jpg)  
+figure 2: scoring architecture with second-order extension.
+
+$\mathrm{charlstm}(w_i)$  leads to consistent improvement, and also simplifies the multilingual experiments by avoiding pos tag generation (especially n-fold jackknifing on training data).
+
+bilstm encoder. to encode the sentential contexts, the parser applies three bilstm layers over  $\mathbf{e}_0\ldots \mathbf{e}_n$ . the output vector of the top-layer bilstm for the  $i$ th word is denoted as  $\mathbf{h}_i$ .
+
+mlp feature extraction. two shared mlps are applied to  $\mathbf{h}_i$ , obtaining two lower-dimensional vectors that detain only syntax-related features:
+
+$$
+\mathbf {r} _ {i} ^ {h}; \mathbf {r} _ {i} ^ {m} = \operatorname {m l p} ^ {h / m} \left(\mathbf {h} _ {i}\right) \tag {2}
+$$
+
+where  $\mathbf{r}_i^h$  and  $\mathbf{r}_i^m$  are the representation vector of  $w_{i}$  as a head word and a modifier word respectively.
+
+biaffine scorer. dozat and manning (2017) for the first time propose to compute the score of a dependency  $i \to j$  via biaffine attention:
+
+$$
+s (i, j) = \left[ \begin{array}{c} \mathbf {r} _ {j} ^ {m} \\ 1 \end{array} \right] ^ {\mathrm {t}} \mathbf {w} ^ {b i a f f i n e} \mathbf {r} _ {i} ^ {h} \tag {3}
+$$
+
+where  $\mathbf{w}^{biaffine} \in \mathbb{r}^{d \times d}$ . the computation is extremely efficient on gpus.
+
+local token-wise training loss. the biaffine parser adopts a simple non-structural training loss, trying to independently maximize the local probability of the correct head word for each word. for a gold-standard head-modifier pair  $(w_{i},w_{j})$  in a training instance, the cross-entropy loss is
+
+$$
+l (i, j) = - \log \frac {e ^ {s (i , j)}}{\sum_ {0 \leq k \leq n} e ^ {s (k , j)}} \tag {4}
+$$
+
+in other words, the model is trained based on simple head selection, without considering the tree structure at all, and losses of all words in a minibatch are accumulated.
+
+decoding. having scores of all dependencies, we adopt the first-order eisner algorithm with time complexity of  $o(n^{3})$  to find the optimal tree.
+
+$$
+\boldsymbol {y} ^ {*} = \arg \max  _ {\boldsymbol {y}} \left[ s (\boldsymbol {x}, \boldsymbol {y}) \equiv \sum_ {i \rightarrow j \in \boldsymbol {y}} s (i, j) \right] \tag {5}
+$$
+
+handling dependency labels. the bioffine parser treats skeletal tree searching and labeling as two independent (training phase) and cascaded (parsing phase) tasks. this work follows the same strategy for simplicity. please refer to dozat and manning (2017) for details.
+
+# 3 second-order treecrf
+
+this work substantially extends the biaffine parser in two closely related aspects: using probabilistic treecrf for structural training and explicitly incorporating high-order subtree scores. specifically, we further incorporate adjacent-sibling subtree scores into the basic first-order model: $^3$
+
+$$
+s (\boldsymbol {x}, \boldsymbol {y}) = \sum_ {i \rightarrow j \in \boldsymbol {y}} s (i, j) + \sum_ {i \rightarrow \{k, j \} \in \boldsymbol {y}} s (i, k, j) \tag {6}
+$$
+
+where  $k$  and  $j$  are two adjacent modifiers of  $i$  and satisfy either  $i < k < j$  or  $j < k < i$ .
+
+as a probabilistic model, treecrf computes the conditional probability of a tree as
+
+$$
+p (\boldsymbol {y} \mid \boldsymbol {x}) = \frac {e ^ {s (\boldsymbol {x} , \boldsymbol {y})}}{z (\boldsymbol {x}) \equiv \sum_ {\boldsymbol {y} ^ {\prime} \in \mathcal {y} (\boldsymbol {x})} e ^ {s (\boldsymbol {x} , \boldsymbol {y} ^ {\prime})}} \tag {7}
+$$
+
+where  $\mathcal{v}(\pmb{x})$  is the set of all legal (projective) trees for  $\pmb{x}$ , and  $z(\pmb{x})$  is commonly referred to as the normalization (or partition) term.
+
+during training, treecrf employs the following structural training loss to maximize the conditional probability of the gold-standard tree  $\mathbf{y}$  given  $\mathbf{x}$ .
+
+$$
+\begin{array}{l} l (\boldsymbol {x}, \boldsymbol {y}) = - \log p (\boldsymbol {y} \mid \boldsymbol {x}) \tag {8} \\ = - s (\boldsymbol {x}, \boldsymbol {y}) + \log z (\boldsymbol {x}) \\ \end{array}
+$$
+
+![](images/e1a03d7ba0d4049eb7118c024a6ebb47883d51ab3853547e2001ee5e3bcfec6a.jpg)
+
+![](images/abe6b5cfdab0b75dd4455f14a2f255b294c096673c80bf6d89e8d8be7731ba92.jpg)
+
+![](images/8e534cde44efeb4e517372a5382acf0f8430c0171649993024ab11403e43511f.jpg)  
+figure 3: diagrams of the second-order inside algorithm based on bottom-up dynamic programming.
+
+# 3.1 scoring second-order subtrees
+
+to avoid major modification to the original scoring architecture, we take a straightforward extension to obtain scores of adjacent-sibling subtrees. first, we employ three extra mlps to perform similar feature extraction.
+
+$$
+\mathbf {r} _ {i} ^ {h ^ {\prime}}; \mathbf {r} _ {i} ^ {s}; \mathbf {r} _ {i} ^ {m ^ {\prime}} = \mathrm {m l p} ^ {h ^ {\prime} / s / m ^ {\prime}} \left(\mathbf {h} _ {i}\right) \tag {9}
+$$
+
+where  $\mathbf{r}_i^{h'}; \mathbf{r}_i^s; \mathbf{r}_i^{m'}$  are the representation vectors of  $w_i$  as head, sibling, and modifier respectively.
+
+then, we propose a natural extension to the bi-affine equation, and employ triaffine for score computation over three vectors.
+
+$$
+s (i, k, j) = \left[ \begin{array}{c} \mathbf {r} _ {k} ^ {s} \\ 1 \end{array} \right] ^ {\mathrm {t}} \mathbf {r} _ {i} ^ {h ^ {\prime} \mathrm {t}} \mathbf {w} ^ {\text {t r i a f f i n e}} \left[ \begin{array}{c} \mathbf {r} _ {j} ^ {m ^ {\prime}} \\ 1 \end{array} \right] \tag {10}
+$$
+
+where  $\mathbf{w}^{tri\text{affine}} \in \mathbb{r}^{d' \times d' \times d'}$  is a three-way tensor. the triaffine computation can be quite efficiently performed with the einsum function on pytorch.
+
+# 3.2 computing treecrf loss efficiently
+
+the key to treecrf loss is how to efficiently compute  $\log z(x)$ , as shown in equation 8. this problem has been well solved long before the dl era for non-neural dependency parsing. straightforwardly, we can directly extend the viterbi decoding algorithm by replacing max product with sum
+
+algorithm 1 second-order inside algorithm.
+
+1: define:  $i, s, c \in \mathbb{r}^{n \times n \times b}$  ▷  $b$  is #sents in a batch  
+2: initialize:  $c_{i,i} = \log e^0 = 0, 0 \leq i \leq n$  
+3: for  $w = 1$  to  $n$  do  
+4: batchify:  $0 \leq i$ ;  $j = i + w \leq n$  
+5:  $i_{i,j} = \log \left(\sum_{i <   r <   j}e^{i_{i,r} + s_{r,j} + s(i,r,j)}\right) + \mathrm{s(i,j)}$  
+6:  $s_{i,j} = \log \sum_{i\leq r <   j}e^{c_{i,r} + c_{j,r + 1}}$  
+7:  $c_{i,j} = \log \sum_{i < r \leq j} e^{i_{i,r} + c_{r,j}}$  
+8: end for  $\triangleright$  refer to figure 3  
+9: return  $c_{0,n} \equiv \log z$
+
+product, and naturally obtain  $\log z(x)$  in the same polynomial time complexity. however, it is not enough to solely perform the inside algorithm for non-neural parsing, due to the inapplicability of the automatic differentiation mechanism. in order to obtain marginal probabilities and then feature weight gradients, we have to realize the more sophisticated outside algorithm, which is usually at least twice slower than the inside algorithm. this may be the major reason for the less popularity of treecrf (vs. max-margin training) before the dl era.
+
+as far as we know, all previous works on neural treecrf parsing explicitly implement the inside-outside algorithm for gradient computation (zhang et al., 2019; jiang et al., 2018). to improve efficiency, computation is transferred from gpus to cpus with cython programming.
+
+this work shows that the inside algorithm can be effectively batchified to fully utilize the power of gpus. figure 3 and algorithm 1 together illustrate the batchified version of the second-order inside algorithm, which is a direct extension of the second-order eisner algorithm in mcdonald and pereira (2006) by replacing max product with sum product. we omit the generations of incomplete, complete, and sibling spans in the opposite direction from  $j$  to  $i$  for brevity.
+
+basically, we first pack the scores of same-width spans at different positions  $(i,j)$  for all  $b$  sentences in the data batch into large tensors. then we can do computation and aggregation simultaneously on gpus via efficient large tensor operation.
+
+similarly, we also batchify the decoding algorithm. due to space limitation, we omit the details.
+
+it is noteworthy that the techniques described here are also applicable to other grammar formulations such as cky-style constituency parsing (finkel et al., 2008; drozdov et al., 2019).
+
+# 3.3 outside via back-propagation
+
+eisner (2016) proposes a theoretical proof on the equivalence between the back-propagation mechanism and the outside algorithm in the case of constituency (phrase-structure) parsing. this work empirically verifies this equivalence for dependency parsing.
+
+moreover, we also find that marginal probabilities  $p(i \to j \mid x)$  directly correspond to gradients after back-propagation with  $\log z(x)$  as the loss:
+
+$$
+\frac {\partial \log z}{\partial \mathrm {s} (i , j)} = \sum_ {\boldsymbol {y}: (i, j) \in \boldsymbol {y}} p (\boldsymbol {y} \mid \boldsymbol {x}) = p (i \rightarrow j \mid \boldsymbol {x}) \tag {11}
+$$
+
+which can be easily proved. for treecrf parsers, we perform mbr decoding (smith and smith, 2007) by replacing scores with marginal probabilities in the decoding algorithm, leading to a slight but consistent accuracy increase.
+
+# 3.4 handling partial annotation
+
+as an attractive research direction, studies show that it is more effective to construct or even collect partially labeled data (nivre et al., 2014; hwa, 1999; pereira and schabes, 1992), where a sentence may correspond to a partial tree  $|\pmb{y}^p| < n$  in the case of dependency parsing. partial annotation can be very powerful when combined with active learning, because annotation cost can be greatly reduced if annotators only need to annotate sub-structures that are difficult for models. li et al. (2016) present a detailed survey on this topic. moreover, peng et al. (2019) recently released a partially labeled multi-domain chinese dependency treebank based on this idea.
+
+then, the question is how to train models on partially labeled data. li et al. (2016) propose to extend treecrf for this purpose and obtain promising results in the case of non-neural dependency parsing. this work applies their approach to the neural biaffine parser. we are particularly concerned at the influence of structural learning and high-order modeling on the utilization of partially labeled training data.
+
+for the basic biaffine parser based on first-order local training, it seems the only choice is omitting losses of unannotated words. in contrast, tree constraints allow annotated dependencies to influence the probability distributions of unannotated words, and high-order modeling further helps by promoting inter-token interaction. therefore, both
+
+structural learning and high-order modeling are intuitively very beneficial.
+
+under partial annotation, we follow li et al. (2016) and define the training loss as:
+
+$$
+\begin{array}{l} l (\boldsymbol {x}, \boldsymbol {y} ^ {p}) = - \log \sum_ {\boldsymbol {y} \in \mathcal {y} (\boldsymbol {x}); \boldsymbol {y} \supseteq \boldsymbol {y} ^ {p}} p (\boldsymbol {y} \mid \boldsymbol {x}) \\ z (\boldsymbol {x}, \boldsymbol {y} ^ {p}) \equiv \sum e ^ {s (\boldsymbol {x}, \boldsymbol {y})} \\ = - \log \frac {\mathbf {y} \in \mathcal {y} (\mathbf {x}) ; \mathbf {y} \supseteq \mathbf {y} ^ {p}}{z (\mathbf {x})} \tag {12} \\ \end{array}
+$$
+
+where  $z(\pmb{x}, \pmb{y}^p)$  only considers all legal trees that are compatible with the given partial tree and can also be efficiently computed like  $z(\pmb{x})$ .
+
+# 4 experiments
+
+data. we conduct experiments and analysis on 27 datasets from 13 languages, including two widely used datasets: the english penn treebank (ptb) data with stanford dependencies (chen and manning, 2014), and the chinese data at the conll09 shared task (hajic et al., 2009).
+
+we also adopt the chinese dataset released at the nlpcc19 cross-domain dependency parsing shared task (peng et al., 2019), containing one source domain and three target domains. for simplicity, we directly merge the train/dev/test data of the four domains into larger ones respectively. one characteristic of the data is that most sentences are partially annotated based on active learning.
+
+finally, we conduct experiments on universal dependencies (ud) v2.2 and v2.3 following ji et al. (2019) and zhang et al. (2019) respectively. we adopt the 300d multilingual pretrained word embeddings used in zeman et al. (2018) and take the charlstm representations as input. for ud2.2, to compare with ji et al. (2019), we follow the raw text setting of the conll18 shared task (zeman et al., 2018), and directly use their sentence segmentation and tokenization results. for ud2.3, we also report the results of using gold-standard pos tags to compare with zhang et al. (2019).
+
+evaluation metrics. we use unlabeled and labeled attachment score (uas/las) as the main metrics. punctuations are omitted for ptb. for the partially labeled nlpcc19 data, we adopt the official evaluation script, which simply omits the words without gold-standard heads to accommodate partial annotation. we adopt dan bikels randomized parsing evaluation comparator for significance test.
+
+![](images/fc758f46a5d39ce46967b3ae6f64041ec30e1ddc5f55bf11c04a01c3ef52aef2.jpg)  
+figure 4: parsing speed comparison on ptb-test.
+
+parameter settings. we directly adopt most parameter settings of dozat and manning (2017), including dropout and initialization strategies. for charlstm, the dimension of input char embeddings is 50, and the dimension of output vector is 100, following lample et al. (2016). for the second-order model, we set the dimensions of  $\mathbf{r}_i^{h' / s / m'}$  to 100, and find little accuracy improvement when increasing to 300. we trained each model for at most 1,000 iterations, and stop training if the peak performance on the dev data does not increase in 100 consecutive epochs.
+
+models. loc uses local cross-entropy training loss and employs the eisner algorithm for finding the optimal projective tree. crf and crf20 denote the first-order and second-order treecrf model respectively.  $\mathrm{loc}_{\mathrm{mst}}$  denotes the basic local model that directly produces non-projective tree based on the mst decoding algorithm of dozat and manning (2017).
+
+# 4.1 efficiency comparison
+
+figure 4 compares the parsing speed of different models on ptb-test. for a fair comparison, we run all models on the same machine with intel xeon cpu (e5-2650v4, 2.20ghz) and geforce gtx 1080 ti gpu. "crf (cpu)" refers to the model that explicitly performs the inside-outside algorithm using cython on cpus. multi-threading is employed since sentences are mutually independent. however, we find that using more than 4 threads does not further improve the speed.
+
+we can see that the efficiency of treecrf is greatly improved by batchifying the inside algorithm and implicitly realizing the outside algorithm by back-propagation on gpus. for the first-order crf model, our implementation can parse about 500 sentences per second, over 10 times faster than the multi-thread "crf (cpu)". for the second-order crf2o, our parser achieves the speed of 400
+
+<table><tr><td></td><td colspan="2">dev</td><td colspan="2">test</td></tr><tr><td></td><td>uas</td><td>las</td><td>uas</td><td>las</td></tr><tr><td colspan="5">ptb</td></tr><tr><td>biaffine17</td><td>-</td><td>-</td><td>95.74</td><td>94.08</td></tr><tr><td>f&amp;k19</td><td>-</td><td>-</td><td>-</td><td>91.59</td></tr><tr><td>li19</td><td>95.76</td><td>93.97</td><td>95.93</td><td>94.19</td></tr><tr><td>ji19</td><td>95.88</td><td>93.94</td><td>95.97</td><td>94.31</td></tr><tr><td>zhang19</td><td>-</td><td>-</td><td>-</td><td>93.96</td></tr><tr><td>loc</td><td>95.82</td><td>93.99</td><td>96.08</td><td>94.47</td></tr><tr><td>crf w/o mbr</td><td>95.74</td><td>93.96</td><td>96.04</td><td>94.34</td></tr><tr><td>crf</td><td>95.76</td><td>93.99</td><td>96.02</td><td>94.33</td></tr><tr><td>crf2o w/o mbr</td><td>95.92</td><td>94.16</td><td>96.14</td><td>94.49</td></tr><tr><td>crf2o</td><td>95.90</td><td>94.12</td><td>96.11</td><td>94.46</td></tr><tr><td colspan="5">conll09</td></tr><tr><td>biaffine17</td><td>-</td><td>-</td><td>88.90</td><td>85.38</td></tr><tr><td>li19</td><td>88.68</td><td>85.47</td><td>88.77</td><td>85.58</td></tr><tr><td>loc</td><td>89.07</td><td>86.10</td><td>89.15</td><td>85.98</td></tr><tr><td>crf w/o mbr</td><td>89.04</td><td>86.04</td><td>89.14</td><td>86.06</td></tr><tr><td>crf</td><td>89.12</td><td>86.12</td><td>89.28</td><td>86.18†</td></tr><tr><td>crf2o w/o mbr</td><td>89.29</td><td>86.24</td><td>89.49</td><td>86.39</td></tr><tr><td>crf2o</td><td>89.44</td><td>86.37</td><td>89.63‡</td><td>86.52‡</td></tr><tr><td colspan="5">nlpcc19</td></tr><tr><td>loc</td><td>77.01</td><td>71.14</td><td>76.92</td><td>71.04</td></tr><tr><td>crf w/o mbr</td><td>77.40</td><td>71.65</td><td>77.17</td><td>71.58</td></tr><tr><td>crf</td><td>77.34</td><td>71.62</td><td>77.53‡</td><td>71.89‡</td></tr><tr><td>crf2o w/o mbr</td><td>77.58</td><td>71.92</td><td>77.89</td><td>72.25</td></tr><tr><td>crf2o</td><td>78.08</td><td>72.32</td><td>78.02‡</td><td>72.33‡</td></tr></table>
+
+table 1: main results. we perform significance test against loc on the test data, where “†” means p < 0.05 and “‡” means p < 0.005. biaffine17: dozat and manning (2017); f&k19: falenska and kuhn (2019); li19: li et al. (2019); ji19: ji et al. (2019); zhang19: zhang et al. (2019).
+
+sentences per second, which is able to meet the requirements of a real-time system. more discussions on efficiency are presented in appendix a.
+
+# 4.2 main results
+
+table 1 lists the main results on the dev and test data. the trends on dev and test are mostly consistent. for a fair comparison with previous works, we only consider those without using extra resources such as elmo (peters et al., 2018) and bert (devlin et al., 2019). we can see that our baseline loc achieves the best performance on both ptb and conll09.
+
+on ptb, both crf and crf2o fail to improve
+
+![](images/79465f328bbd403fe8ef8d3b10a175221753e06b91d0aa213ec54fddd3cbe95c.jpg)  
+figure 5: convergence curves (las vs. training epochs) on dev data of ptb, conll09, and nlpcc19.
+
+![](images/92b90df628e79ce0de55a6a0fc669d8af829e0f6a029b7abcd9b8824dc7e80cb.jpg)
+
+![](images/68c37980fa608b535a2687cfea36dd2eca257f7806a95b43b8b3d2b1bb983418.jpg)
+
+<table><tr><td rowspan="2"></td><td rowspan="2">p</td><td colspan="2">sib</td><td rowspan="2">ucm</td><td rowspan="2">lcm</td></tr><tr><td>r</td><td>f</td></tr><tr><td colspan="6">ptb</td></tr><tr><td>loc</td><td>91.16</td><td>90.80</td><td>90.98</td><td>61.59</td><td>50.66</td></tr><tr><td>crf</td><td>91.24</td><td>90.92</td><td>91.08</td><td>61.92</td><td>50.33</td></tr><tr><td>crf2o</td><td>91.56</td><td>91.11</td><td>91.33</td><td>63.08</td><td>50.99</td></tr><tr><td colspan="6">conll09</td></tr><tr><td>loc</td><td>79.20</td><td>79.02</td><td>79.11</td><td>40.10</td><td>28.91</td></tr><tr><td>crf</td><td>79.17</td><td>79.55</td><td>79.36</td><td>40.61</td><td>29.38</td></tr><tr><td>crf2o</td><td>81.00</td><td>80.63</td><td>80.82</td><td>42.53</td><td>30.09</td></tr></table>
+
+table 2: sub- and full-tree performance on test data.
+
+the parsing accuracy further, probably because the performance is already very high. however, as shown by further analysis in section 4.3, the positive effect is actually introduced by structural learning and high-order modeling.
+
+on conll09, crf significantly outperforms loc, and crf2o can further improve the performance.
+
+on the partially annotated nlpcc19 data, crf outperforms loc by a very large margin, indicating the usefulness of structural learning in the scenario of partial annotation. crf20 further improves the parsing performance by explicitly modeling second-order subtree features. these results confirm our intuitions discussed in section 3.4. please note that the parsing accuracy looks very low because the partially annotated tokens are usually difficult for models.
+
+# 4.3 analysis
+
+impact of mbr decoding. for crf and crf20, we by default to perform mbr decoding, which employs the eisner algorithm over marginal probabilities (smith and smith, 2007) to find the best tree.
+
+$$
+\boldsymbol {y} ^ {*} = \arg \max  _ {\boldsymbol {y}} \left[ \sum_ {i \rightarrow j \in \boldsymbol {y}} p (i \rightarrow j | \boldsymbol {x}) \right] \tag {13}
+$$
+
+![](images/a8d112cf422d02efdd08f1d730e815c951a767b3351e639889c725ee93a331ee.jpg)  
+figure 6: las on ptb (left) and conll09-test (right) regarding the amount of training data (dependencies vs. sentences).
+
+![](images/aec11a91a33d8673757a8dfbb5102a4bb342a994a87977e802c5751eec17e59b.jpg)
+
+table 1 reports the results of directly finding 1-best trees according to dependency scores. except for ptb, probably due to the high accuracy already, mbr decoding brings small yet consistent improvements for both crf and crf2o.
+
+convergence behavior. figure 5 compares the convergence curves. for clarity, we plot one data point corresponding to the peak las every 20 epochs. we can clearly see that both structural learning and high-order modeling consistently improve the model. crf2o achieves steadily higher accuracy and converges much faster than the basic loc.
+
+performance at sub- and full-tree levels. beyond the dependency-wise accuracy (uas/las), we would like to evaluate the models regarding performance at sub-tree and full-tree levels. table 2 shows the results. we skip the partially labeled nlpcc19 data. ucm means unlabeled complete matching rate, i.e., the percent of sentences obtaining whole correct skeletal trees, while lcm further requires that all labels are also correct.
+
+for sib, we evaluate the model regarding unlabeled adjacent-sibling subtrees (system outputs vs. gold-standard references). according to equation 6,  $(i,k,j)$  is an adjacent-sibling subtree, if and only if  $w_{k}$  and  $w_{j}$  are both children of  $w_{i}$  at the same side, and there are no other children of  $w_{i}$  between them. given two trees, we can col
+
+<table><tr><td></td><td>bg</td><td>ca</td><td>cs</td><td>de</td><td>en</td><td>es</td><td>fr</td><td>it</td><td>nl</td><td>no</td><td>ro</td><td>ru</td><td>avg.</td></tr><tr><td colspan="14">ud2.2</td></tr><tr><td>loc_mst</td><td>90.44</td><td>91.11</td><td>91.04</td><td>80.21</td><td>86.86</td><td>90.67</td><td>87.99</td><td>91.19</td><td>88.24</td><td>90.35</td><td>86.24</td><td>93.01</td><td>88.95</td></tr><tr><td>loc</td><td>90.45</td><td>91.14</td><td>90.97</td><td>80.02</td><td>86.83</td><td>90.56</td><td>87.76</td><td>91.14</td><td>87.72</td><td>90.74</td><td>86.20</td><td>93.01</td><td>88.88</td></tr><tr><td>crf</td><td>90.73</td><td>91.25</td><td>91.01</td><td>80.56†</td><td>86.92</td><td>90.81†</td><td>88.16</td><td>91.64†</td><td>88.10</td><td>90.85</td><td>86.50</td><td>93.17†</td><td>89.14‡</td></tr><tr><td>crf2o</td><td>90.77</td><td>91.29</td><td>91.54†</td><td>80.46</td><td>87.32†</td><td>90.86†</td><td>87.96</td><td>91.91‡</td><td>88.62‡</td><td>91.02†</td><td>86.90‡</td><td>93.33‡</td><td>89.33‡</td></tr><tr><td colspan="14">using raw text</td></tr><tr><td>ji19</td><td>88.28</td><td>89.90</td><td>89.85</td><td>77.09</td><td>81.16</td><td>88.93</td><td>83.73</td><td>88.91</td><td>84.82</td><td>86.33</td><td>84.44</td><td>86.62</td><td>85.83</td></tr><tr><td>crf2o</td><td>89.72</td><td>91.27</td><td>90.94</td><td>78.26</td><td>82.88</td><td>90.79</td><td>86.33</td><td>91.02</td><td>87.92</td><td>90.17</td><td>85.71</td><td>92.49</td><td>88.13</td></tr><tr><td colspan="14">ud2.3</td></tr><tr><td>loc_mst</td><td>90.56</td><td>91.03</td><td>91.98</td><td>81.59</td><td>86.83</td><td>90.64</td><td>88.23</td><td>91.67</td><td>88.20</td><td>90.63</td><td>86.51</td><td>93.03</td><td>89.23</td></tr><tr><td>loc</td><td>90.57</td><td>91.10</td><td>91.85</td><td>81.68</td><td>86.54</td><td>90.47</td><td>88.40</td><td>91.53</td><td>88.18</td><td>90.65</td><td>86.31</td><td>92.91</td><td>89.19</td></tr><tr><td>crf</td><td>90.52</td><td>91.19</td><td>92.02</td><td>81.43</td><td>86.88†</td><td>90.76†</td><td>88.75</td><td>91.76</td><td>88.08</td><td>90.79</td><td>86.54</td><td>93.16‡</td><td>89.32‡</td></tr><tr><td>crf2o</td><td>90.76</td><td>91.12</td><td>92.15‡</td><td>81.94</td><td>86.93†</td><td>90.81‡</td><td>88.83†</td><td>92.34‡</td><td>88.21†</td><td>90.78</td><td>86.62</td><td>93.22‡</td><td>89.48‡</td></tr><tr><td colspan="14">using gold pos tags</td></tr><tr><td>zhang19</td><td>90.15</td><td>91.39</td><td>91.10</td><td>83.39</td><td>88.52</td><td>90.84</td><td>88.59</td><td>92.49</td><td>88.37</td><td>92.82</td><td>84.89</td><td>93.11</td><td>89.85</td></tr><tr><td>crf2o</td><td>91.32</td><td>92.57</td><td>92.66</td><td>84.56</td><td>88.98</td><td>91.88</td><td>89.83</td><td>92.94</td><td>89.85</td><td>93.26</td><td>87.39</td><td>93.86</td><td>90.76</td></tr></table>
+
+table 3: las on ud2.2 and ud2.3 test datasets. again,  $\dagger$  and  $\ddagger$  means significance level at  $p < {0.05}$  and  $p < {0.005}$  respectively against the loc parser.
+
+lect all adjacent-sibling subtrees and compose two sets of triples. then we evaluate the p/r/f values. please note that it is impossible to evaluate sib for partially annotated references.
+
+we can clearly see that by modeling adjacent-sibling subtree scores, the sib performance obtains larger improvement than both crf and loc, and this further contributes to the large improvement on full-tree matching rates (ucm/lcm).
+
+capability to learn from partial trees. to better understand why crf2o performs very well on partially annotated nlpcc19, we design more comparative experiments by retaining either a proportion of random training sentences (full trees) or a proportion of random dependencies for each sentence (partial trees). figure 6 shows the results.
+
+we can see that the performance gap is quite steady when we gradually reduce the number of training sentences. in contrast, the gap clearly becomes larger when each training sentence has less annotated dependencies. this shows that crf20 is superior to the basic loc in utilizing partial annotated data for model training.
+
+# 4.4 results on universal dependencies
+
+table 3 compares different models on ud datasets, which contain a lot of non-projective trees. we adopt the pseudo-projective approach (nivre and
+
+nilsson, 2005) for handling the ubiquitous non-projective trees of most languages. basically, the idea is to transform non-projective trees into projective ones using more complex labels for post-processing recovery.
+
+we can see that for the basic local parsers, the direct non-projective  $\mathrm{loc}_{\mathrm{mst}}$  and the pseudoprojective loc achieve very similar performance.
+
+more importantly, both crf and crf2o produce consistent improvements over the baseline in many languages. on both ud2.2 and ud2.3, our proposed crf2o model achieves the highest accuracy for 10 languages among 12, and obtains significant improvement in more than 7 languages. overall, the averaged improvement is 0.45 and 0.29 on ud2.2 and ud2.3 respectively, which is also significant at  $p < 0.005$ .
+
+on average, our crf2o parser outperforms ji et al. (2019) by 2.30 on ud2.2 raw texts following conll-2018 shared task setting, and zhang et al. (2019) by 0.91 on ud2.3 data with gold pos tags. it is noteworthy that the german (de) result is kindly provided by tao ji after rerunning their parser with predicted xpos tags, since their reported result in ji et al. (2019) accidentally used gold-standard sentence segmentation, tokenization, and xpos tags. our crf2o parser achieves an average las of 87.64 using their xpos tags.
+
+# 5 related works
+
+batchification has been widely used in linear-chain crf, but is rather complicated for tree structures. eisner (2016) presents a theoretical proof on the equivalence of outside and back-propagation for constituent tree parsing, and also briefly discusses other formalisms such as dependency grammar. unfortunately, we were unaware of eisner's great work until we were surveying the literature for paper writing. as an empirical study, we believe this work is valuable and makes it practical to deploy treecrf models in real-life systems.
+
+falenska and kuhn (2019) present a nice analytical work on dependency parsing, similar to gaddy et al. (2018) on constituency parsing. by extending the first-order graph-based parser of kiperwasser and goldberg (2016) into second-order, they try to find out how much structural context is implicitly captured by the bilstm encoder. they concatenate three bilstm output vectors  $(i,k,j)$  for scoring adjacent-sibling subtrees, and adopt max-margin loss and the second-order eisner decoding algorithm (mcdonald and pereira, 2006). based on their negative results and analysis, they draw the conclusion that high-order modeling is redundant because bilstm can implicitly and effectively encode enough structural context. they also present a nice survey on the relationship between rnns and syntax. in this work, we use a much stronger basic parser and observe more significant uas/las improvement than theirs. particularly, we present an in-depth analysis showing that explicitly high-order modeling certainly helps the parsing model and thus is complementary to the bilstm encoder.
+
+ji et al. (2019) employ graph neural networks to incorporate high-order structural information into the biaffine parser implicitly. they add a three-layer graph attention network (gat) component (velicković et al., 2018) between the mlp and biaffine layers. the first gat layer takes  $\mathbf{r}_i^h$  and  $\mathbf{r}_i^m$  from mlps as inputs and produces new representation  $\mathbf{r}_i^{h1}$  and  $\mathbf{r}_i^{m1}$  by aggregating neighboring nodes. similarly, the second gat layer operates on  $\mathbf{r}_i^{h1}$  and  $\mathbf{r}_i^{m1}$ , and produces  $\mathbf{r}_i^{h2}$  and  $\mathbf{r}_i^{m2}$ . in this way, a node gradually collects multi-hop high-order information as global evidence for scoring single dependencies. they follow the original local head-selection training loss. in contrast, this work adopts global treecrf loss and explicitly incorporates high-order scores into the biaffine parser.
+
+zhang et al. (2019) investigate the usefulness of structural training for the first-order biaffine parser. they compare the performance of local head-selection loss, global max-margin loss, and treecrf loss on multilingual datasets. they show that treecrf loss is overall slightly superior to max-margin loss, and las improvement from structural learning is modest but significant for some languages. they also show that structural learning (especially treecrf) substantially improves sentence-level complete matching rate, which is consistent with our findings. moreover, they explicitly compute the inside and outside algorithms on cpus via cython programming. in contrast, this work proposes an efficient second-order treecrf extension to the biaffine parser, and presents much more in-depth analysis to show the effect of both structural learning and high-order modeling.
+
+# 6 conclusions
+
+this paper for the first time presents second-order treecrf for neural dependency parsing using tri-affine for explicitly scoring second-order subtrees. we propose to batchify the inside algorithm to accommodate gpus. we also empirically verify that the complex outside algorithm can be implicitly performed via efficient back-propagation, which naturally produces gradients and marginal probabilities. we conduct experiments and detailed analysis on 27 datasets from 13 languages, and find that structural learning and high-order modeling can further enhance the state-of-the-art biaffine parser in various aspects: 1) better convergence behavior; 2) higher performance on sub- and full-tree levels; 3) better utilization of partially annotated data.
+
+# acknowledgments
+
+the authors would like to thank: 1) the anonymous reviewers for the helpful comments, 2) wenliang chen for helpful discussions on high-order neural dependency parsing, 3) tao ji for kindly sharing the data and giving beneficial suggestions for the experiments on conll18 datasets, 4) wei jiang, yahui liu, haoping yang, houquan zhou and mingyue zhou for their help in paper writing and polishing. this work was supported by national natural science foundation of china (grant no. 61876116, 61525205, 61936010) and a project funded by the priority academic program development (papd) of jiangsu higher education institutions.
+
+# references
+
+jiong cai, yong jiang, and kewei tu. 2017. crf autoencoder for unsupervised dependency parsing. in proceedings of emnlp, pages 1638-1643.  
+xavier carreras. 2007. experiments with a higher-order projective dependency parser. in proceedings of emnlp, pages 957-961.  
+danqi chen and christopher manning. 2014. a fast and accurate dependency parser using neural networks. in proceedings of emnlp, pages 740-750.  
+jacob devlin, ming-wei chang, kenton lee, and kristina toutanova. 2019. bert: pre-training of deep bidirectional transformers for language understanding. in proceedings of naacl, pages 4171-4186.  
+timothy dozat and christopher d. manning. 2017. deep bioaffine attention for neural dependency parsing. in proceedings of iclr.  
+timothy dozat, peng qi, and christopher d. manning. 2017. stanford's graph-based neural dependency parser at the conll 2017 shared task. in proceedings of conll, pages 20-30.  
+andrew drozdov, patrick verga, mohit yadav, mohit iyyer, and andrew mccallum. 2019. unsupervised latent tree induction with deep inside-outside recursive auto-encoders. in proceedings of naacl, pages 1129-1141.  
+jason eisner. 2000. bilexical grammars and their cubic-time parsing algorithms. in advances in probabilistic and other parsing technologies.  
+jason eisner. 2016. inside-outside and forward-backward algorithms are just backprop (tutorial paper). in proceedings of ws, pages 1-17.  
+agnieszka falenska and jonas kuhn. 2019. the (non-)utility of structural features in bilstm-based dependency parsers. in proceedings of acl, pages 117-128.  
+jenny rose finkel, alex kleeman, and christopher d. manning. 2008. efficient, feature-based, conditional random field parsing. in proceedings of acl, pages 959-967.  
+david gaddy, mitchell stern, and dan klein. 2018. what's going on in neural constituency parsers? an analysis. in proceedings of naacl, pages 999-1010.  
+jan hajic, massimiliano ciaramita, richard johansson, daisuke kawahara, maria antonia martí, lluis marquez, adam meyers, joakim nivre, sebastian padó, jan štepanek, pavel stránek, mihai surdeanu, nianwen xue, and yi zhang. 2009. the conll-2009 shared task: syntactic and semantic dependencies in multiple languages. in proceedings of conll, pages 1-18.
+
+rebecca hwa. 1999. supervised grammar induction using training data with limited constituent information. in proceedings of acl, pages 73-79.  
+tao ji, yuanbin wu, and man lan. 2019. graph-based dependency parsing with graph neural networks. in proceedings of acl, pages 2475-2485.  
+xinzhou jiang, zhenghua li, bo zhang, min zhang, sheng li, and luo si. 2018. supervised treebank conversion: data and approaches. in proceedings of acl, pages 2706-2716.  
+eliyahu kiperwasser and yoav goldberg. 2016. simple and accurate dependency parsing using bidirectional lstm feature representations. transactions of acl, pages 313-327.  
+terry koo and michael collins. 2010. efficient third-order dependency parsers. in proceedings of acl, pages 1-11.  
+guillaume lample, miguel ballesteros, sandeep subramanian, kazuya kawakami, and chris dyer. 2016. neural architectures for named entity recognition. in proceedings of naacl, pages 2475-2485.  
+phong le and willem zuidema. 2014. the inside-outside recursive neural network model for dependency parsing. in proceedings of emnlp, pages 729-739.  
+ying li, zhenghua li, min zhang, rui wang, sheng li, and luo si. 2019. self-attentive biaffine dependency parsing. in proceedings of ijcai, pages 5067-5073.  
+zhenghua li, min zhang, yue zhang, zhanyi liu, wenliang chen, hua wu, and haifeng wang. 2016. active learning for dependency parsing with partial annotation. in proceedings of acl, pages 344-354.  
+xuezhe ma and hai zhao. 2012. fourth-order dependency parsing. in proceedings of coling, pages 785-796.  
+ryan mcdonald, koby crammer, and fernando pereira. 2005a. online large-margin training of dependency parsers. in proceedings of acl, pages 91-98.  
+ryan mcdonald and fernando pereira. 2006. online learning of approximate dependency parsing algorithms. in proceedings of eacl, pages 81-88.  
+ryan mcdonald, fernando pereira, kiril ribarov, and jan hajic. 2005b. non-projective dependency parsing using spanning tree algorithms. in proceedings of emnlp, pages 523-530.  
+joakim nivre, yoav goldberg, and ryan mcdonald. 2014. squibs: constrained arc-eager dependency parsing. cl, pages 249-257.
+
+joakim nivre, marie-catherine de marneffe, filip ginter, yoav goldberg, jan hajic, christopher d. manning, ryan mcdonald, slav petrov, sampo pyysalo, natalia silveira, reut tsarfaty, and daniel zeman. 2016. universal dependencies v1: a multilingual treebank collection. in proceedings of lrec, pages 1659-1666.  
+joakim nivre and jens nilsson. 2005. pseudoprojective dependency parsing. in proceedings of acl, pages 99-106.  
+wenzhe pei, tao ge, and baobao chang. 2015. an effective neural network model for graph-based dependency parsing. in proceedings of acl-ijcnlp, pages 313-322.  
+xue peng, zhenghua li, min zhang, rui wang, yue zhang, and luo si. 2019. overview of the nlpcc 2019 shared task: cross-domain dependency parsing. in proceedings of nlpcc, pages 760-771.  
+fernando pereira and yves schabes. 1992. inside-outside reestimation from partially bracketed corpora. in proceedings of acl, pages 128-135.  
+matthew peters, mark neumann, mohit iyyer, matt gardner, christopher clark, kenton lee, and luke zettlemoyer. 2018. deep contextualized word representations. in proceedings of naacl, pages 2227-2237.  
+david a. smith and noah a. smith. 2007. probabilistic models of nonprojective dependency trees. in proceedings of emnlp, pages 132-140.  
+robert endre tarjan. 1977. finding optimum branchings. networks, pages 25-35.  
+petar velicković, guillem cucurull, arantxa casanova, adriana romero, pietro lio, and yoshua bengio. 2018. graph attention networks. in proceedings of iclr.  
+wenhui wang and baobao chang. 2016. graph-based dependency parsing with bidirectional lstm. in proceedings of acl, pages 2475-2485.  
+xinyu wang, jingxian huang, and kewei tu. 2019. second-order semantic dependency parsing with end-to-end neural networks. in proceedings of acl, pages 4609-4618.  
+daniel zeman, jan hajic, martin popel, martin potthast, milan straka, filip ginter, joakim nivre, and slav petrov. 2018. conll 2018 shared task: multilingual parsing from raw text to universal dependencies. in proceedings of conll, pages 1-21.  
+xingxing zhang, jianpeng cheng, and mirella lapata. 2017. dependency parsing as head selection. in proceedings of eacl, pages 665-676.  
+zhisong zhang, xuezhe ma, and eduard hovy. 2019. an empirical investigation of structured output modeling for graph-based neural dependency parsing. in proceedings of acl, pages 5592-5598.
+
+# a more on efficiency
+
+training speed. during training, we greedily find the 1-best head for each word without tree constraints. therefore, the processing speed is faster than the evaluation phase. specifically, for loc, crf and crf2o, the average one-iteration training time is about 1min, 2.5min and 3.5min on ptb. in other words, the parser consumes about 700/300/200 sentences per second.
+
+mst decoding. as dozat et al. (2017) pointed out, they adopted an ad-hoc approximate algorithm which does not guarantee to produce the highest-scoring tree, rather than the chuliu/edmonds algorithm for mst decoding. the time complexity of the chuliu/edmonds algorithm is  $o(n^{2})$  under the optimized implementation of tarjan (1977). please see the discussion of mcdonald et al. (2005b) for details.
+
+for  $\mathrm{loc}_{\mathrm{mst}}$ , we directly borrow the mst decoding approach in the original parser of dozat and manning (2017).  $\mathrm{loc}_{\mathrm{mst}}$  achieves 94.43 las on ptb-test (inferior to 94.47 of loc, see table 1), and its parsing speed is over 1000 sentences per second.
+
+faster decoding strategy. inspired by the idea of chuliu/edmonds algorithm, we can further improve the efficiency of the crf parsing models by avoiding the eisner decoding for some sentences. the idea is that if by greedily assigning a local max-scoring head word to each word, we can already obtain a legal projective tree, then we omit the decoding process for the sentence. we can judge whether an output is a legal tree (single root and no cycles) using the tarjan algorithm in  $o(n)$  time complexity. further, we can judge whether a tree is a projective tree also in a straightforward way very efficiently. in fact, we find that more than  $99\%$  sentences directly obtain legal projective trees on ptb-test by such greedy assignment on marginal probabilities first. we only need to run the decoding algorithm for the left sentences.

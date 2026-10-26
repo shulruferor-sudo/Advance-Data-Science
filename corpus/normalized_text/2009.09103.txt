@@ -1,0 +1,560 @@
+# c-saw: a framework for graph sampling and random walk on gpus
+
+santosh pandey
+
+lingda  $\mathrm{li^{+}}$
+
+adolfy hoisie+
+
+xiaoye s. li*
+
+hang liu
+
+stevens institute of technology  $^+$  brookhaven national laboratory \*lawrence berkeley national laboratory
+
+abstract—many applications require to learn, mine, analyze and visualize large-scale graphs. these graphs are often too large to be addressed efficiently using conventional graph processing technologies. fortunately, recent research efforts find out graph sampling and random walk, which significantly reduce the size of original graphs, can benefit the tasks of learning, mining, analyzing and visualizing large graphs by capturing the desirable graph properties. this paper introduces c-saw, the first framework that accelerates sampling and random walk framework on gpus. particularly, c-saw makes three contributions: first, our framework provides a generic api which allows users to implement a wide range of sampling and random walk algorithms with ease. second, offloading this framework on gpu, we introduce warp-centric parallel selection, and two novel optimizations for collision migration. third, towards supporting graphs that exceed the gpu memory capacity, we introduce efficient data transfer optimizations for out-of-memory and multi-gpu sampling, such as workload-aware scheduling and batched multi-instance sampling. taken together, our framework constantly outperforms the state of the art projects in addition to the capability of supporting a wide range of sampling and random walk algorithms.
+
+# i. introduction
+
+graph is a natural format to represent relationships that are prevalent in a wide range of real-world applications, such as, material/drug discovery [1], web-structure [2], social network [3], protein-protein interaction [4], knowledge graphs [5], among many others. learning, mining, analyzing and visualizing graphs is hence of paramount value to our society. however, as the size of the graph continues to grow, the complexity of handling those graphs also soars. in fact, large-scale graph analytics is deemed as a grand challenge that draws a great deal of attention. popular evidences are graph 500 [6] and graphchallenge [7].
+
+fortunately, recent research efforts find out graph sampling and random walk, which significantly reduce the size of the original graphs, can benefit learning, mining and analyzing large graphs, by capturing the desirable graph properties [8]–[10]. for instance, zeng et al. [11], graphsaint [12], graphzoom [13], pytorch-biggraph [14] and deep graph library (dgl) [15] manage to learn from the sampled graphs and arrive at vertex embeddings that are either similar or better than directly learning on the original gigantic graphs [13]. weisfeiler-lehman algorithm [16] exploits graph sampling to find isomorphic graphs. furthermore, various random walk methods are used to generate vertex ranking and embedding in a graph [17]–[20]. sampling and random walk can also help classical graph computing algorithms, such as bfs [21] and pagerank [18].
+
+despite great importance, limited efforts have been made to deploy graph sampling and random walk algorithms on gpus which come with tempting computing, data access capabilities and ever-thriving community [9]. this paper finds three major challenges that prevent this effort.
+
+first, although there is a variety of platforms to accelerate traditional graph processing algorithms on gpus [22]–[25], graph sampling and random walk pose unique challenges. unlike traditional graph algorithms which often treat various vertices and edges similarly and focus on optimizing the operations on the vertex or edge, sampling and random walk algorithms center around how to select a subset of vertex or edge based upon a bias (section ii-b). once selected, the vertex is merely visited again. consequently, how to efficiently select the vertices of interest which is rarely studied by traditional algorithms becomes the core of sampling and random walk. this process needs to construct and potentially update the selection bias repeatedly which is very expensive hence significantly hampers the performance.
+
+second, it is difficult to arrive at a gpu-based framework for various graph sampling and random walk algorithms that address the needs of vastly different applications. particularly, there exists a rich body of graph sampling and random walk algorithms (detailed in section ii-a), deriving the common functionalities for a framework and exposing different needs as user programming interface is a daunting task. and offloading this framework on gpu to enjoy the unprecedented computing and bandwidth capability yet hiding the gpu programming complexity further worsens the challenge.
+
+third, an extremely large graph, which drives the needs of graph sampling and random walk, usually goes beyond the size of gpu memory. while there exists an array of solutions for gpu-based large graph processing, namely, unified memory [26], topology-aware partition [27] and vertex-range based partitions [28], graph sampling and random walk algorithms, which require all the neighbors of a vertex to present in order to compute the selection probability, exhibit stringent requirement on the partitioning methods. in the meantime, the asynchronous and out-of-order nature of graph sampling and random walk provides some unique optimization opportunities for out-of-memory sampling, which are neither shared nor explored by traditional out-of-memory systems.
+
+this work advocates c-saw, to the best of our knowledge, the first gpu-based framework that addresses all the three aforementioned challenges and supports a wide range of
+
+<table><tr><td rowspan="3" colspan="2">bias criterion</td><td colspan="4"># of neighbors (neighborsize)</td></tr><tr><td colspan="2">per layer</td><td colspan="2">per vertex</td></tr><tr><td>1</td><td>&gt;1</td><td>constant</td><td>variable</td></tr><tr><td colspan="2">unbiased</td><td>simple random walk, metropolis hasting random walk, random walk with jump, random walk with restart</td><td></td><td>unbiased neighbor sampling</td><td>forest fire sampling, snowball sampling</td></tr><tr><td rowspan="2">biased</td><td>static</td><td>biased random walk</td><td>layer sampling</td><td>biased neighbor sampling</td><td></td></tr><tr><td>dynamic</td><td>multi-dimensional random walk, node2vec</td><td></td><td></td><td></td></tr></table>
+
+table i: the design space of traversal based sampling and random walk algorithms.
+
+sampling and random walk algorithms. taken together, csaw significantly outperforms the state of the art systems that support either part of sampling or random walk algorithms. the contributions of this paper are as follows:
+
+- we propose a generic framework which allows end users to express a large family of sampling and random walk algorithms with ease (section iii).  
+- we implement efficient gpu sampling with novel techniques. our techniques parallelize the vertex selection on gpus, with efficient algorithm and system optimizations for vertex collision migration (section iv).  
+- we propose asynchronous designs for sampling and random walk, which optimizes the data transfer efficiency for graphs that exceed the gpu memory capacity. we further scale c-saw to multiple gpus (section v).
+
+the remainder of this paper goes as follows: section ii presents the background. section iii outlines the application programming interface (api) and sections iv and v optimize c-saw. section vi presents the evaluation results. section vii discusses the related works and section viii concludes.
+
+# ii. background
+
+# a. graph sampling & random walk variations
+
+this section presents the required background for various graph sampling and random walk algorithms [29]. graph sampling refers to the random exploration of a graph, which results in a subgraph of the original graph.
+
+one pass sampling only goes through the original graph once to extract a sample. random node and random edge sampling belong to this category [29]. they select a subset of vertices/edges in original graph uniformly and randomly.
+
+traversal based sampling often traverses the graph in a breath-first search manner to better preserve the properties of original graphs [30]. traversal based sampling follows sampling without replacement methodology, i.e., it avoids sampling the same vertex more than once.
+
+as shown in table i, traversal based sampling algorithms are categorized based upon the number of sampled neighbors, called neighborsize, and the criterion to select neighbors, which is referred to as bias. snowball sampling [31] initiates the sample using a set of uniformly selected seed vertices. iteratively, it adds all neighbors of every sampled vertex into the sample, until a required depth is reached. neighbor sampling [32] samples a constant number of neighbors per vertex. the sampling could be either biased or unbiased. forest fire sampling [29] can be regarded as a probabilistic version
+
+of neighbor sampling, which selects a variable number of neighbors for each vertex based on a burning probability. unlike neighbor and forest fire sampling, which select neighbors for each vertex independently, layer sampling [9] samples a constant number of neighbors for all vertices present in the frontier in each round. it repeats this process until a certain depth is reached.
+
+random walk simulates a stochastic process of traversing the graph to form a path of connected vertices. the length of path is constrained by a user given sampling budget. random walk can be viewed as a special case of sampling when only one neighbor is sampled at a step with the salient difference lies in that random walk allows repeated appearance of a vertex while sampling does not. table i summarizes the design space of random walk algorithms.
+
+similar to traversal based sampling, random walk algorithms use bias to decide the probability of selecting a certain neighbor. for unbiased simple random walk, the bias is uniform for all neighbors, i.e., every neighbor has the same chance to be selected. deepwalk [17] and metropolis hasting random walk [33] are two examples of unbiased random walk. while deepwalk samples neighbors uniformly, meropolis hasting random walk decides to either explore the sampled neighbor or choose to stay at the same vertex based upon the degree of source and neighbor vertices.
+
+for a biased random walk, the bias varies across neighbors. furthermore, depending on how to decide the bias, biased random walks are classified into static random walks and dynamic random walks. for static random walk, the bias is determined by the original graph structure and does not change at runtime. biased deepwalk [34] is an example of static random walk which extends the original deepwalk algorithm. the degree of each neighbor is used as its bias.
+
+since a simple random walk may get stuck locally, random walk with jump [35], random walk with restart [36] and multi-independent random walk [30] are introduced. particularly, random walk with jump jumps to a random vertex under a certain probability. random walk with restart jumps to a predetermined vertex. multi-independent random walk performs multiple instances of random walk independently.
+
+for dynamic random walks, the bias depends upon the runtime states. node2vec [19] and multi-dimensional random walk (a.k.a. frontier sampling) [37] belong to this genre. node2vec is an advanced version of deepwalk which provides more control to the random walk. the bias of a neighbor depends upon the edge weight and its distance from the vertex explored at preceding step. in multi-dimensional random walk, a pool of seed vertices are selected at the beginning. at each
+
+![](images/f3a75eab0f53672b925f17ee203462fce6bdd75e4a2176ebae449e50ca43fe2a.jpg)  
+(a) toy graph
+
+![](images/1193fdf224e020b8b8a4f5d4f7cde08d52a6fe6d83c5b2b15596def6a6d6f595.jpg)  
+(b) inverse transform sampling  
+fig. 1: example of graph sampling and vertex selection techniques. (a) a toy graph example to select a neighbor of  $v_{8}$  ( $v_{5}, v_{7}, v_{9}, v_{10}, v_{11}$ ), assuming the bias of a neighbor is defined as its degree. (b) inverse transform sampling which does a binary search on a 1-d space to select  $v_{7}$ . (c) dartboard method that rejects  $\mathbf{1}$  and accepts  $\mathbf{2}$  ( $v_{7}$ ). (d) alias method that selects  $v_{7}$ .
+
+![](images/40e197965d163202ca1c121af6623adcf261e5bba8872789c24e63cb16827c77.jpg)  
+(c) dartboard method
+
+![](images/814911c33343660fb4ee82ca38ecac75417660f1f065d2d6d52999a760b55e06.jpg)  
+(d) alias method
+
+step, multi-dimensional random walk explores one vertex  $v$  from the pool based on their degrees. one random neighbor of  $v$  is added to the pool to replace  $v$ . this process repeats until a desired number of vertices are sampled.
+
+summary. traversal based sampling and random walk are widely used and share two core similarities: 1) they are based on graph traversal, and 2) they selectively sample vertices based on biases (detailed in section ii-b). their difference is the number of sampled neighbors, as shown in table i. in the rest of this paper, we use graph sampling to refer to both traversal based sampling and random walk, unless explicitly specified.
+
+# b. bias based vertex selection
+
+this section discusses the key challenge of graph sampling: to select vertices based on user defined biases, i.e., bias based vertex selection. as discussed in section ii-a, all sampling algorithms involve the process of picking up a subset of vertices from a candidate pool of vertices. for unbiased graph sampling, the selection is straightforward: one can generate a random integer in the range of 1 to the candidate count and use it to select a vertex. vertex selection is more challenging biased graph sampling. given certain biases, we need to calculate the probability of selecting a certain vertex, which is called transition probability. theorem 1 gives the formula to calculate transition probabilities from biases.
+
+theorem 1. let vertices  $v_{1}, v_{2}, \ldots, v_{n}$  be the  $n$  candidates, and the transition probability of  $v_{k}$ , i.e.,  $t_{k}$ , be proportional to the bias  $b_{k}$ . then, one can formally obtain  $t_{k} = \frac{b_{k}}{\sum_{i=1}^{n} b_{i}}$ .
+
+theorem 1 underscores that bias is the key to calculate transition probability. all popular vertex selection algorithms - inverse transform sampling [38], dartboard [39], and alias method [40], [41] - obey this rule.
+
+the key idea of inverse transform sampling is to generate the cumulative distribution function of the transition probability. fig. 1(b) shows an example. first, inverse transform sampling computes the prefix sum of biases of candidate vertices, to get an array  $s$ , where  $s_{m} = \sum_{i=1}^{m} b_{i-1}$  ( $1 \leq m \leq n+1$ ) and  $n =$  total # of candidate vertices. in fig. 1(b),  $s = \{0,3,9,11,13,15\}$ . then  $s$  is normalized using  $s_{n+1}$  to get array  $f$ , where  $f_{m} = s_{m} / s_{n+1}$  ( $1 \leq m \leq n+1$ ).  $f = \{0,0.2,0.6,0.73,0.87,1\}$  in fig. 1(b). in this way, the transition probability of  $v_{k}$  can be derived with  $f$ , because
+
+$$
+\begin{array}{l} t _ {k} = \frac {b _ {k}}{\sum_ {i = 1} ^ {n} b _ {i}} = \frac {\sum_ {i = 1} ^ {k} b _ {i} - \sum_ {i = 1} ^ {k - 1} b _ {i}}{\sum_ {i = 1} ^ {n} b _ {i}} \tag {1} \\ = \frac {s _ {k} - s _ {k - 1}}{s _ {n}} = \frac {s _ {k}}{s _ {n}} - \frac {s _ {k - 1}}{s _ {n}} = f _ {k} - f _ {k - 1}. \\ \end{array}
+$$
+
+we call the array of  $f$  cumulative transition probability space (ctps). to select a neighbor, inverse transform sampling generates a random number  $r$  in the range of  $(0,1)$ , and employs a binary search of  $r$  over the ctps. assuming  $r = 0.5$  in fig. 1(b), it falls between  $f_{2} = 0.2$  and  $f_{3} = 0.6$ . as a result, the second candidate  $v_{7}$  is selected on the ctps. when implemented sequentially, its has the computational complexity of  $o(n)$ , determined by the prefix sum calculation.
+
+dartboard [39] uses 2d random numbers to select/reject vertices. as shown in fig. 1(c), we build a 2d board using the bias of each vertex as a bar, and then throw a dart to the 2d board formed by two random numbers. if it does not hit any bar (e.g.,  $\mathbf{1}$ ), we reject the selection and throw another dart, until a bar is hit (e.g.,  $\mathbf{2}$ ). this method may require many trials before picking up a vertex successfully, especially for scale-free graphs where a few candidates have much larger biases than others. similar to dartboard, the alias method [41] also uses a 2d board. to avoid rejection, the alias method converts the sparse 2d board into a dense one as shown in fig. 1(d). it breaks down and distributes large biases across bins on the x axis, with the guarantee that a single bin contains at most two vertices. the drawback of alias method is its high preprocessing cost to break down and distribute biases, which is not suitable for gpus.
+
+# iii. c-saw architecture
+
+# a. motivation
+
+need for generic sampling framework. after sifting across numerous graph analytical frameworks (detailed in section vii), we find the need of a new framework for graph sampling, because sampling algorithms pose distinct needs on both the framework design and apis. for framework design, several sampling algorithms, e.g., layer sampling, require the information beyond a vertex and its neighbors for computing, which postulates hardship for traditional vertex-centric frameworks that limit the view of a user to a vertex and its 1-hop neighbors. when it comes to api design, bias is the essence of sampling and random walk. in comparison, traditional graph frameworks focus upon the operators that alter the
+
+![](images/decbeb2b0d8ff8f9431221f16572ea5b6e6b47e1602e8521ef5c905fe6fb9e94.jpg)  
+fig. 2: c-saw framework and api functions.
+
+information on an edge or a vertex, e.g., minimum operator in single source shortest path. we also notice recent attempts, e.g., knightking [39] and graphsaint [12], but they cannot support both sampling and random walk algorithms.
+
+need for sampling and random walk on gpus. for sampling, short turnaround time is the key. it is also the root cause of the invention of sampling [11], [42]. the good news is that gpu is a proven vehicle to drive an array of graph algorithms beyond their performance ceiling [22]–[25], [43]–[45], thanks to the unprecedented computing capability and memory bandwidth [46]. when it comes to sampling which are much more random than traditional graph algorithms, gpus will best cpu at even larger margins because extreme randomness puts the large caches of cpu in vein.
+
+# b. c-saw: a bias-centric sampling framework
+
+c-saw offloads sampling and random walk on gpus with the goal of a simple and expressive api and a high performance framework. particularly, simple means the end users can program c-saw without knowing the gpu programming syntax. expressiveness requires c-saw to not only support the known sampling algorithms discussed in section ii-a, but also prepare to support emerging ones. high performance targets the framework design. that is, the programming simplicity does not prevent c-saw from exploring major gpu and sampling related optimizations.
+
+c-saw encompasses two types of user involvements, i.e., parameter and api based options. the parameter-based option only needs a choice from the end users thus is simple, e.g., deciding the number of selected frontier vertices (frontiersize in line 4 of fig. 2(b)) and neighbors (neighborsize in line 6). api based involvement, in contrast, provides more expressiveness to users. particularly, c-saw offers three user defined api functions as shown in fig. 2(a), most of which surround bias, that is, vertexbias, edgebias, and update. we will discuss the design details of these api functions in section iii-c.
+
+![](images/85cfa708b45646f8e435424d858ef54ded53cd35b38587f681647ee92357de30.jpg)  
+fig. 3: implementing two sampling algorithms with c-saw api.
+
+fig. 2(b) gives an overview of the c-saw algorithm. particularly, bias based vertex selection occurs in two places: to select frontier vertices from a pool (line 4), and to select the neighbors of frontier vertices (line 6). while the latter case is required by all graph sampling algorithms, the former becomes essential when users want to introduce more randomness, such as multi-dimensional random walk.
+
+in the beginning, the frontier frontierpool is initialized with a set of seed vertices (line 2). sampling starts from these seeds until reaching the desired depth (line 3). in each iteration of the while loop, first, vertexbias is called on the frontierpool to retrieve the bias for each candidate vertex. select method uses the biases provided by vertexbias to choose frontiersize vertices as the current frontier (line 4). next, all neighbors of the frontier vertices are collected in the neighborpool using the gatherneighbors method (line 5). for these neighbors, we first define their biases using the edgebias method. similarly, select method uses the biases to choose neighborsize neighbors from the neighborpool (line 6). from the selected neighbors, update is used to pick new vertices for the frontierpool (line 7). the selected neighbors are also added to the final sample list sampled (line 8) before we move forward to the next iteration.
+
+# c. c-saw api
+
+vertexbias defines the bias associated with a candidate vertex of the frontierpool. we often use the pertinent property of vertex to derive the bias. equation (2) formally defines the bias for each vertex  $v$  in the frontierpool. we apply function  $f_{vbias}$  over the property of  $v$  to define the associated bias.
+
+$$
+\begin{array}{l} \text {v e r t e x b i a s} \\ v \in \text {f r o n t i e r p o o l} \end{array} \xleftarrow {\longleftarrow} f _ {v b i a s} (v). \tag {2}
+$$
+
+using multi-dimensional random walk as an example, it uses the vertex degree as a bias for the vertex of interest.
+
+edgebias defines the bias of each neighbor in the neighborpool. it is named as edgebias because every neighboring vertex is associated with an edge. while, again, any static or dynamic bias is applicable, a typical bias is induced from the properties of the associated edge. equation (3) defines edge-bias formally. let  $v$  be the source vertex of  $u$ . assuming
+
+![](images/e75b954a0845373430bc7a88c046b34a7ecf96f7187661edeaf114014d6d399c.jpg)  
+fig. 4: a multi-dimensional random walk example. assuming  $\{v_{8}, v_{0}, v_{3}\}$  in frontierpool $_t$ , we use vertexbias to select  $v_{8}$  as the sampling frontier at iteration  $t$ . based on edgebias in fig. 3(d), we select  $v_{7}$ , and put it in sampled edges array. according to update, c-saw further puts  $v_{7}$  in frontierpool $_{t+1}$  as  $\{v_{0}, v_{3}, v_{7}\}$ . similar process continues until c-saw gathers adequate samples.
+
+edge  $e = (v, u)$  carries the essential properties of  $v, u$  and  $e$ , we arrive at the following edge bias:
+
+edgebias  $\longleftarrow$ $f_{ebias}(e)$  (3)
+
+update decides the vertex that should be added to the frontierpool based on the sampled neighbors. it can return any vertex to provide maximum flexibility. for instance, this method can be used to filter out vertices that have been visited before for most traversal based sampling algorithms. whereas for random walk, this method can be used to implement the jump or restart action in the random walk with jump and with start, respectively. equation (4) quantifies this method, where we will decide whether to add the sampled vertex  $u$ , a neighbor of frontier  $v$  from edge  $e$  into frontierpool based upon the properties of  $e$  and its endpoints.
+
+frontierpool  $\longleftarrow$  update(e) (4)
+
+# d. case study
+
+c-saw can support all graph sampling and random walk algorithms introduced in section ii-a. fig. 3 exhibits how to use c-saw to implement two popular algorithms: node2vec and multi-dimensional random walk.
+
+without loss of generality, we use the simplest example, i.e., multi-dimensional random walk to illustrate how c-saw works, as shown in fig. 4. frontiersize and neighborsize are set as 3 and 1 respectively. vertexbias is based on the degree of vertices in the frontier pool in multi-dimensional random walk. edgebias returns 1, resulting in the same transition probability for every neighbor. update always adds the currently sampled neighbor to the frontierpool.
+
+# iv. optimizing gpu sampling
+
+fig. 2(b) has shown the overall algorithm of c-saw. in this section, we discuss how to implement this algorithm efficiently on gpus. we will discuss our general strategies to parallelize the select function on gpus (section iv-a) and how to address the conflict when multiple gpu threads select the same vertex (section iv-b).
+
+# a. warp-centric parallel selection
+
+the core part of the c-saw algorithm is to select a subset of vertices from a pool (lines 4 and 6 in fig. 2(b)). as discussed
+
+![](images/5160c884fb4cf3dd26b1bf914463b710e5e7cb51e28900c93512d7cfc0dee9ad.jpg)  
+fig. 5: the unoptimized implementation of select function.
+
+in section ii-b, several algorithms have been proposed in this regard. in this paper, we adopt inverse transform sampling [38] for gpu vertex selection, because 1) it allows to calculate transition probabilities with flexible and dynamic biases, and 2) it shows more regular control flow which is friendly to gpu execution. fig. 5 illustrates the select algorithm using inverse transform sampling. we aim to have an efficient gpu implementation of it.
+
+inter-warp parallelism. each thread warp, no matter intra or inter thread blocks, is assigned to sample a vertex in frontierpool. to fully saturate gpu resources, thousands of candidate vertices needs to be sampled concurrently. there are two sources of them. first of all, many sampling algorithms naturally sample all vertices in frontierpool concurrently. for instance, neighbor sampling allows all vertices in frontierpool to be sampled concurrently and requires a separate neighborpool for each vertex in the frontierpool.
+
+second, most sampling applications including graph convolutional network (gcn) [47], deepwalk, node2vec, and personalized pagerank (ppr) [42], need to launch many instances of sampling either from the same seeds or different seeds. here, an instance generates one sampled graph from the original graph. particularly, for all algorithms except multi-dimensional random walk, an instance starts with one source vertex. for multi-dimensional random walk, an instance has multiple source vertices, which collectively generate one sampled graph. applications like gcn require multiple sample instances for training the model [9], [12], [48], while deepwalk, node2vec, and ppr require multi-source random walk to either generate vertex embeddings or estimate ppr [17], [19], [49]. with thousands of concurrent instances, c-saw is able to leverage the full computing power of gpu. since the interwarp parallelism is straightforward to implement, we focus on exploiting the intra-warp parallelism for c-saw.
+
+intra-warp parallelism. a thread warp is used to execute one instance of select on a pool of vertices. an obvious alternative is to use a thread block. most real world graphs follow power-law degree distribution, i.e., the majority of the vertices in the graph have very few edges. using a thread block for a neighbor pool will fail to saturate the resource.
+
+![](images/e4f9d80c22e20c87af7cd3533785b5e38a429a2387718bb313feefdb398f2a19.jpg)  
+(a) repeated sampling on original ctps
+
+![](images/0f4047a91f9f7d078984fe7c481ed0ec58bfbbfc7455b40637a4761e0313357d.jpg)  
+(b) sampling on the updated ctps
+
+![](images/f56a4d209f7d89f09bfc3f6f3878503c951acf9c94c1f45a59b508331183a123.jpg)  
+(c) c-saw bipartite region search  
+fig. 6: assuming  $v_{7}$  is already selected (dotted line in ctps): (a) naive repeated sampling on the original ctps, (b) updated sampling on the recalculated ctps, and (c) our bipartite region search approach.
+
+our evaluation shows that using thread warps achieves  $\sim 2\times$  speedup compared with using thread blocks. thus we choose to use thread warps to exploit the parallelism within select.
+
+as shown in fig. 5, first, select calculates the prefix sum of the biases of all vertices (line 6). fortunately, parallel prefix sum is a well-studied area on gpus. in this paper, we adopt the kogge-stone algorithm [50] which presents superior performance for the prefix sum of warp-level where all threads execute in lock-step. the normalization of prefix sums (line 7) can be naturally parallelized by distributing the division of different array elements across threads.
+
+to parallelize the vertex selection loop (line 10-14), c-saw dedicates one thread for each vertex selection to maximize the parallelism. for each loop iteration, a random number is generated to select one vertex, as introduced in section ii-b. however, this creates a crucial challenge that different threads may select the same vertex, i.e., selection collision.
+
+# b. migrating selection collision
+
+to migrate the aforementioned selection collision, we propose two interesting solutions: bipartite region search, and bitmap based collision detection. before introducing our new design, we first discuss naive solutions.
+
+naive solutions. a naive solution is to have a do-while loop (line 10-14 in fig. 5) to re-select another one until success, i.e., repeated sampling. however, many iterations may be needed to make a successful selection. as shown in fig. 6(a), if the region of  $v_{7}$  (i.e., 0.2 - 0.6 in ctps) is already selected, our newly generated random number 0.58 will not lead to a successful selection. in fact, our evaluation observes that this method suffers for scale-free graphs whose transition probability can be highly skewed, or when a large fraction of the candidates need to be selected i.e. larger neighborsize.
+
+another solution is to recalculate the ctps by excluding the already selected vertices, i.e., updated sampling, such as fig. 6(b). then we can always pick unselected vertices by searching through the updated ctps. particularly in fig. 6(b), we will perform another kogge-stone prefix-sum for the new bias array  $\{3,2,2,2\}$  towards  $\{0,3,5,7,9\}$ . consequently, the ctps becomes  $\{0,0.33,0.56,0.78,1\}$ . then, the random number  $r = 0.58$  selects  $v_{10}$ . recalculating prefix sum is, however, time consuming.
+
+bipartite region search inherits the advantages of both repeated and updated sampling, while avoiding their drawbacks.
+
+that is, it does not need the expensive ctps update compared with updated sampling, while greatly improve the chance of successful selection compared with repeated sampling.
+
+particularly, while updated sampling updates the ctps without changing the random number as shown in fig. 6(b), the key idea of bipartite region search is to adjust the random number  $r$  so that the ctps remains intact and can be reused. most importantly, bipartite region search warrants that its random number adjustment leads to the same selections as updated sampling. note, this method is called bipartite region search because when the random number selects an already selected vertex, bipartite region search searches either the right or the left side of the already selected region in ctps. below, we discuss this adjustment.
+
+1 generate a random number  $r^\prime$ $(0\leq r^{\prime} < 1)$  
+use  $r'$  to select a vertex in ctps. if the vertex has not been selected, done. otherwise, the region that  $r'$  falls into corresponds to a pre-selected vertex. assume the boundary of this region in ctps is  $(l, h)$ . go to 3.  
+let  $\lambda = 1 / (1 - (h - l))$ ,  $\delta = h - l$  and update  $r$  to  $r' / \lambda$ . if  $r < l$ , select  $(0, l)$  and go to 4. otherwise select  $(h, 1)$  and go to 5.  
+use the updated  $r$  to search in  $(0, l)$ . if updated  $r$  falls in another selected region, go to 1. otherwise done.  
+further update  $r$  to  $r + \delta$  and search in  $(h, 1)$ . if updated  $r$  falls in another selected region, go to ①. otherwise done.
+
+fig. 6(c) explains how bipartite region search works for the same example in fig. 6(b). assuming we get a random number  $r' = 0.58$ , it corresponds to  $v_7$  in the original ctps. since  $v_7$  is already selected, bipartite region search will adjust this random number to 0.348 in ③. since the updated  $r = 0.348 > l = 0.2$ , bipartite region search selects (0.6,1) to explore. consequently in ⑤, we further add  $\delta = 0.4$  to  $r$  which leads to  $r = 0.748$ . 0.748 corresponds to  $v_{10}$ , and thus results in a successful selection. it is important to note that this selection is identical as updated sampling in fig. 6(b).
+
+proof of bipartite region search. we will prove the soundness of bipartite region search mathematically, in the scenario when one and only one vertex has been pre-selected.
+
+theorem 2. assuming  $v_{k}$ 's probability region is  $(f_{k}, f_{k + 1})$  in the original ctps. remind the definition of  $f$  in section ii-b. let  $v_{s}$  be the pre-selected vertex, and  $f_{k}^{\prime}$  be the probability in the updated ctps.  $l = f_{k}$ ,  $h = f_{k + 1}$ ,  $\lambda = \frac{1}{1 - (h - l)}$  and  $\delta = h - l$ , we prove that:
+
+$$
+f _ {k} ^ {\prime} = \left\{ \begin{array}{l l} \lambda \cdot f _ {k}; & k <   s, \\ \lambda \cdot (f _ {k} - \delta); & o t h e r w i s e. \end{array} \right. \tag {5}
+$$
+
+proof. adopting equation 1, we get  $f_{k} = \frac{\sum_{i = 1}^{k - 1}b_{i}}{\sum_{i = 1}^{n}b_{i}}$ . denoting  $\mathbb{f} = \sum_{i = 1}^{s - 1}b_i + \sum_{i = s + 1}^n b_i$ , theorem 1 leads to:
+
+$$
+f _ {k} ^ {\prime} = \left\{ \begin{array}{l l} \frac {\sum_ {i = 1} ^ {k - 1} b _ {i}}{\mathbb {f}}; & k <   s, \\ \frac {\sum_ {i = 1} ^ {s - 1} b _ {i} + \sum_ {i = s + 1} ^ {k - 1} b _ {i}}{\mathbb {f}}; & \text {o t h e r w i s e .} \end{array} \right. \tag {6}
+$$
+
+when  $k <   s$
+
+$$
+f _ {k} ^ {\prime} = \frac {\sum_ {i = 1} ^ {k - 1} b _ {i}}{\mathbb {f}} = \frac {\sum_ {i = 1} ^ {k - 1} b _ {i}}{\sum_ {i = 1} ^ {n} b _ {i}} \cdot \frac {\sum_ {i = 1} ^ {n} b _ {i}}{\mathbb {f}} = f _ {k} \cdot \frac {\sum_ {i = 1} ^ {n} b _ {i}}{\mathbb {f}}. \tag {7}
+$$
+
+since  $\frac{\sum_{i=1}^{n} b_i}{\mathbb{f}} = \frac{1}{1 - (h - l)} = \lambda$ , we prove  $f_k' = \lambda \cdot f_k$ . when  $k > s$ ,
+
+$$
+\begin{array}{l} f _ {k} ^ {\prime} = \frac {\sum_ {i = 1} ^ {s - 1} b _ {i} + \sum_ {i = s + 1} ^ {k - 1} b _ {i}}{\mathbb {f}} = \frac {\sum_ {i = 1} ^ {s - 1} b _ {i} + \sum_ {i = s + 1} ^ {k - 1} b _ {i}}{\sum_ {i = 1} ^ {n} b _ {i}} \cdot \frac {\sum_ {i = 1} ^ {n} b _ {i}}{\mathbb {f}} \\ = \frac {\sum_ {i = 1} ^ {s - 1} b _ {i} + \sum_ {i = s + 1} ^ {k - 1} b _ {i}}{\sum_ {i = 1} ^ {n} b _ {i}} \cdot \lambda = \frac {\sum_ {i = 1} ^ {k - 1} b _ {i} - b _ {s}}{\sum_ {i = 1} ^ {n} b _ {i}} \cdot \lambda \\ = \left(\frac {\sum_ {i = 1} ^ {k - 1} b _ {i}}{\sum_ {i = 1} ^ {n} b _ {i}} - \frac {b _ {s}}{\sum_ {i = 1} ^ {n} b _ {i}}\right) \cdot \lambda = \left(f _ {k} - \frac {b _ {s}}{\sum_ {i = 1} ^ {n} b _ {i}}\right) \cdot \lambda . \tag {8} \\ \end{array}
+$$
+
+since  $\frac{b_s}{\sum_{i=1}^{n} b_i} = h - l = \delta$ , we obtain  $f_k' = \lambda \cdot (f_k - \delta)$ .
+
+theorem 2 states that one can adjust the probabilities from the original ctps to derive the updated ctps. reversing the transformation direction, we further obtain:
+
+$$
+f _ {k} = \left\{ \begin{array}{l l} \frac {f _ {k} ^ {\prime}}{\lambda}; & k <   s, \\ \frac {f _ {k} ^ {\prime}}{\lambda} + \delta ; & \text {o t h e r w i s e .} \end{array} \right. \tag {9}
+$$
+
+since  $r'$  is the random number for the updated ctps, we can substitute  $f_k'$  with  $r'$  in equation 9 to derive the corresponding  $r$  in the original ctps that falls right at the region boundaries of original ctps, e.g.,  $\{0, 0.33, 0.56, 0.78, 1\}$  in fig. 6(b) fall right at  $\{0, 0.2, 0.73, 0.87, 1\}$  in fig. 6(c). further, since  $f_k$  is a strictly monotonic function of  $f_k'$ , it is clear that if  $r'$  falls between the region boundaries of the updated ctps, the derived  $r$  will also do so in the original ctps. this ensures bipartite region search will make identical selection as if the ctps is updated. it is also provable that statistically, the selection probability of our algorithm is the same as the desired transition probability in more complicated scenarios where multiple vertices have been pre-selected.
+
+strided bitmap for collision detection. bipartite region search requires a collision detection mechanism. we introduce a per vertex bitmap to detect selection collision (line 13 in fig. 5). for every candidate vertex, there is a unique bit in the bitmap to indicate whether it has been selected. the bitmap is shared by all threads of a warp. after each thread selects a vertex, we perform an atomic compare-and-swap operation to the corresponding bit in the bitmap. if the bit is 0, which means no other threads have picked this vertex, we set it to 1.
+
+since gpus do not have variables that support bit-wise atomic operations currently, we may use either 8-bit or 32-bit integer variables for bitmap representation, where each bit corresponds to one vertex. as using 32-bit variables results in more conflicts when updating multiple bits within the same variable, we choose 8-bit variables instead.
+
+![](images/86132b267f8e3672e335fc63b464dd6af70b0361a2b12b372446c84cc60f6acc.jpg)  
+fig. 7: sampling the neighbors of  $v_{8}$  in fig. 1(a), under: (a) contiguous bitmap and (b) strided bitmaps.
+
+to resolve the atomic contentions, we propose to use strided bitmaps, inspired by the set-associative cache organization [51]. a strided bitmap scatters the bits of adjacent vertices across different 8-bit variables, as shown in fig. 7. instead of using the first five bits of the same 8-bit variable to indicate the status of all vertices in the contiguous bitmap, the strided bitmap spreads them into two variables to reduce conflicts.
+
+data structures. c-saw employs three major data structures: frontier queues, per-warp bitmap, and per-warp ctps. all these data structures are allocated in the gpu global memory before sampling starts. a frontier queue is a structure of three arrays, vertexid, instanceid, and currdepth to keep track of the sampling process. till now, all threads share one frontier queue, with a few exceptions that will be introduced in section v. per-warp bitmaps and ctpss are stored as arrays and get reused across the entire sampling process. they are also located in global memory.
+
+# v. out-of-memory & multi-gpu c-saw
+
+thanks to sampling and random walk which lift important obstacles for out-of-memory computation, that is, they need neither the entire graph nor synchronization during computation. this section takes advantage of this opportunity to enable fast out-of-memory and multi-gpu c-saw.
+
+# a. graph partition
+
+c-saw partitions the graph by simply assigning a contiguous and equal range of vertices and all their neighbor lists to one partition. we adopt this method instead of advanced topology-aware partition (e.g., metis [27], [28], [52]) and 2-d partition [53], for three reasons. first and foremost, sampling and random walk require all the edges of a vertex be present in order to compute the transition probability. splitting the neighbor list of any vertex, which is the case in 2-d partition, would introduce fine-grained communication between partitions, that largely hampers the performance. second, topology-aware partition would require extremely long preprocessing time, as well as yield discontinued vertex ranges which often lead to more overhead than benefit. third, this simple partitioning method allows c-saw to decide which partition a vertex belongs to in constant time that is important for fast bulk asynchronous sampling (fig. 8).
+
+# b. workload-aware partition scheduling
+
+since multiple sampling instances are independent of each other, this dimension of flexibility grants c-saw the freedom of dynamically scheduling various partitions based upon the workload from both graph partitions and workers (such as gpu kernels and devices).
+
+workload-aware partition scheduling. c-saw tracks the number of frontier vertices that falls into each partition to determine which partition will offer more workload (1 in fig. 8). we refer them as active vertices. based upon the count, we also allocate thread blocks to each gpu kernel with thread block based workload balancing described in next paragraph. subsequently, the partitions that contain more workload are transferred to the gpu earlier and sampled first (2 in fig. 8). non-blocking cudamemcpyasync is used to copy partitions to the gpu memory asynchronously. c-saw samples this partition until it has no active vertices. note that, c-saw stores frontier queues from all partitions in the gpu memory. it allows a partition to insert new vertices to its frontier queue, as well as the frontier queues of other partitions to enable communications. the actively sampled partition is only released from the gpu memory when its frontier queue is empty. the reason is that partitions with more active vertices often insert more neighbors in its own frontier queue, which further leads to more workloads. as a result, this design can reduce the number of partitions transferred from cpu to gpu.
+
+when it comes to computation, we dedicate one gpu kernel to one active partition along with a cuda stream, in order to overlap the data transfer and sampling of different active partitions. after parallel partition sampling finishes, we count the vertex number in each frontier queue to decide which partitions should be transferred to gpu for sampling next (3) in fig. 8). the entire sampling is complete when there are no active vertices in all partitions.
+
+thread block based workload balancing. depending upon the properties of graphs and sample seeds, frontiers are likely not equally distributed across partitions. as a result, the sampling and data transfer time are not the same as well. since the straggler kernel determines the overall execution time, it is ideal to balance the workload across kernels. consequently, we implicitly partition the gpu resources by controlling the thread block number of different kernels.
+
+example. fig. 8 shows an example of out-of-memory sampling. here, we assume three graph partitions (i.e.,  $\mathrm{p_1}$ ,  $\mathrm{p_2}$ ,  $\mathrm{p_3}$ ) for the same graph in fig. 1(a), two gpu kernels (i.e.,  $\mathrm{kernel_1}$  and  $\mathrm{kernel_2}$ ), and the gpu memory can contain two active partitions. if we start sampling from vertices  $\{0, 2, 8\}$ ,  $\mathrm{p_1}$ ,  $\mathrm{p_2}$ , and  $\mathrm{p_3}$  will have 2, 0, and 1 active vertices initially. hence, kernel  $\mathrm{k_1}$  is assigned to work on  $\mathrm{p_1}$  and kernel  $\mathrm{k_2}$  for  $\mathrm{p_3}$ . to balance the workload, the ratio of thread block numbers assigned to  $\mathrm{k_1}$  and  $\mathrm{k_2}$  is set to 2:1. assuming vertices 0, 2, and 8 pick 7, 3, and 5, respectively, the frontier queues for  $\mathrm{p_1}$ ,  $\mathrm{p_2}$  and  $\mathrm{p_3}$  become  $\{3\}$ ,  $\{7, 5\}$  and  $\{\phi\}$  as shown in bottom right of fig. 8. subsequently,  $\mathrm{k_2}$  exits because  $\mathrm{p_3}$ 's frontier queue is empty, while  $\mathrm{k_1}$  continues sampling 3 and puts 4 into the frontier queue of  $\mathrm{p_2}$ . then,  $\mathrm{k_1}$  also exits and leaves  $\{7, 5, 4\}$  in the frontier queue of  $\mathrm{p_2}$  to be scheduled next.
+
+correctness. the out-of-order nature of the workload-aware partition scheduling does not impact the correctness of c-saw. with out-of-order scheduling, the sampling of one instance is not in the breath-first order as in the in-order case. the actual
+
+![](images/e06e594c0bc52c7336a99384897ecc7205a044845dcd3cb47547b386e98a2b59.jpg)  
+fig. 8: workload-aware scheduling of graph partition. the upper part shows the toy graph and its partition. we start sampling within partitions 1 and 3. the lower part shows an example for out-of-memory sampling. for simplicity, we hide instanceid and currdepth from the frontier queue.
+
+sampling order can be considered as a combination of breath-first and depth-first orders. however, since we keep track of the depth of sampled vertices to prevent an instance from reaching beyond the desired depth, the sampling result will be the same as if it is done in the breath first order.
+
+# c. batched multi-instance sampling
+
+in the out-of-memory setting, c-saw introduces batched multi-instance sampling, which concurrently samples multiple instances, to combat the expensive data transferring cost.
+
+batched sampling is implemented by combining the active vertices of various concurrently sampling instances into a single frontier queue for each partition. along with the queue, we need to keep two extra metadata for each vertex, i.e., instanceid and currdepth, which tracks the instance that a vertex belongs to and stores the current depth of that instance respectively. during sampling, a thread warp in the kernel can work on any vertex in the queue, no matter whether they are from the same or different instances. after it finishes selecting vertices (line 6 in fig. 2(b)), instanceid is used to find the corresponding frontier pool and sampled graph to update (line 7-8). note that there may exist multiple copies of the same vertex in the queue, because a common vertex can be sampled by multiple instances.
+
+batched sampling can also balance the workload across sampling instances. otherwise, if we sample various instances separately, since many real-world graphs hold highly skewed degree distributions, some instances may encounter higher degree vertices more often and thus more workloads. this will end up with skewed workload distributions. batched sampling solves this problem using a vertex-grained workload distribution, instead of instance-grained distribution.
+
+# d. multi-gpu c-saw
+
+as the number of sources continues to grow, the workload will saturate one gpu and go beyond. in this context, scaling c-saw to multiple gpus would help accelerate the sampling performance. since various sampling instances are independent from each other, c-saw simply divides all the sampling
+
+![](images/f1ae8a93990d9edd64e168b6b1359e0050bb456715ae870a87d016b0f89b84da.jpg)  
+(a) c-saw vs. knightking on biased random walk.
+
+![](images/51a6a75859777b0bd6e0f7622ad35bb5da5572a10d2278c67bddefa8bde5dfa1.jpg)  
+(b) c-saw vs. graphsaint on multi-dimensional random walk.  
+fig. 9: c-saw vs. the state-of-the-art in million sampled edges per second with 1 gpu and 6 gpus (higher is better).
+
+instances into several disjoint groups, each of which contains equal number of instances. here, the number of disjoint groups is the same as the number of gpus. afterwards, each gpu will be responsible for one sampling group. during sampling, each gpu will perform the same tasks as shown in fig. 8 and no inter-gpu communication is required.
+
+# vi. evaluations
+
+c-saw is implemented with  $\sim 4,000$  lines of cuda code and compiled by cuda toolkit 10.1.243 and  $\mathrm{g + + }$  7.4.0 with optimization flag as -o3. we evaluate c-saw on the summit supercomputer of oak ridge national laboratory [54]. each summit node is equipped with 6 nvidia tesla v100 gpus, dual-socket 22-core power9 cpus and 512 gb main memory. particularly, each v100 gpu is equipped with 16gb device memory. for the random number generation, we use the curand library [55].
+
+<table><tr><td>dataset</td><td>abbr.</td><td>vertex count</td><td>edge count</td><td>avg. degree</td><td>size (of csr)</td></tr><tr><td>amazon0601 [56]</td><td>am</td><td>0.4m</td><td>3.4m</td><td>8.39</td><td>59 mb</td></tr><tr><td>as-skitter [56]</td><td>as</td><td>1.7m</td><td>11.1m</td><td>6.54</td><td>325 mb</td></tr><tr><td>cit-patents [56]</td><td>cp</td><td>3.8m</td><td>16.5m</td><td>4.38</td><td>293 mb</td></tr><tr><td>livejournal [56]</td><td>lj</td><td>4.8m</td><td>68.9m</td><td>14.23</td><td>1.1 gb</td></tr><tr><td>orkut [56]</td><td>or</td><td>3.1m</td><td>117.2m</td><td>38.14</td><td>1.8 gb</td></tr><tr><td>reddit [12], [57]</td><td>re</td><td>0.2m</td><td>11.6m</td><td>49.82</td><td>179 mb</td></tr><tr><td>web-google [56]</td><td>wg</td><td>0.8m</td><td>5.1m</td><td>5.83</td><td>85 mb</td></tr><tr><td>yelp [12], [57]</td><td>ye</td><td>0.7m</td><td>6.9m</td><td>9.73</td><td>111 mb</td></tr><tr><td>friendster [56]</td><td>fr</td><td>65.6m</td><td>1.8m</td><td>27.53</td><td>29 gb</td></tr><tr><td>twitter [58]</td><td>tw</td><td>41.6m</td><td>1.5m</td><td>35.25</td><td>22 gb</td></tr></table>
+
+table ii: details of evaluated graphs.
+
+dataset. we use the graph datasets in table ii to study c-saw. this dataset collection contains a wide range of applications, such as social networks (lj, or, fr and tw), forum discussion (re and ye), online shopping (am), citation networks (cp), computer routing (as) and web page (wg).
+
+metrics. instead of traversed edges per second (teps) in classical graph analytics [22], [23], we introduce a new metric - sampled edges per second (seps) - to evaluate the performance of sampling and random walk. formally, seps  $= \frac{\# \text{samplededges}}{\text{time}}$ . this metric is more suitable than teps to evaluate sampling and random walk because these algorithms might use different methods thus traverse a different number of edges but end up with the same number of sampled edges. similar to previous work [22], [23], the kernel execution time is used to compute seps, i.e., the time spent on generating the
+
+samples, except for the out-of-memory case that also includes the time for transferring the partitions. note, each reported result is an average of three runs with different sets of seeds.
+
+test setup. analogous to graphsaint [12], we generate 4,000 instances for random walk algorithms and 2000 instances for sampling algorithms. for sampling, both the neighborsize (i.e., number of neighbors sampled from one frontier) and depth are 2 for analyzing the performance of c-saw except forest fire, which uses  $p_{f} = 0.7$  to derive neighborsize as in [29]. for biased random walk algorithm, the length of the walk is 2,000. for multi-dimensional random walk, similar to graphsaint, we use 2,000 as the frontiersize for each instance.
+
+# a. c-saw vs. state-of-the-art
+
+first, we compare c-saw against the state-of-the-art frameworks, knightking and graphsaint. our profiling result shows that both graphsaint and knightking use multiple threads to perform the computation, where the # threads = # cores. since knightking only supports random walk variations, we compare c-saw with knightking for biased random walk. graphsaint provides both python and  $\mathrm{c + + }$  implementations. we choose the  $\mathrm{c + + }$  implementation [11] which exhibits better performance. the  $\mathrm{c + + }$  version only supports multi-dimensional random walk which is studied in fig. 9(b).
+
+as shown in fig. 9, c-saw presents superior performance over both projects. on average, c-saw is  $10 \times$  and  $14.7 \times$  faster than knightking with 1 gpu and 6 gpus, respectively. compared to graphsaint, c-saw is  $8.1 \times$  and  $11.5 \times$  faster with 1 gpu and 6 gpus respectively. each instance of sampled graphs has 1,703 edges on average. while c-saw outperforms both projects across all graphs, we generally observe better speedup on graphs with a lower average degree, such as, am, cp and wg on knightking and am on graphsaint. this is rooted from 1) the superior computing capability of gpu over cpu, 2) c-saw is free of bulk synchronous parallelism (bsp) [59], which allows it to always have adequate computing tasks for sparse graphs, and 3) the unprecedented bandwidth of the v100 gpu over the power9 cpu, i.e., 900 gb/s vs. 170 gb/s [54]. this underscores the need of gpu-based sampling and random walk.
+
+![](images/c3ef4ce74aeac383753a18ac481cde7c1c9dfa2780ba9aa958ba3a9c7344dc58.jpg)  
+(a) biased neighbor sampling.
+
+![](images/2c01c72bc1c835ac98d4e759b902941c6f58c66aa889786081814ac9a8c49ccd.jpg)  
+(b) forest fire sampling.
+
+![](images/4fd1700c158926c3604403425e282b3b72572a9592d3ffebef98c6063da6df35.jpg)  
+(c) layer sampling.
+
+![](images/a38e86715598eade4fa2010e54a2c7ba067959ba4199068d513e2329e738c294.jpg)  
+(d) unbiased neighbor sampling.  
+fig. 12: total search reduction by bitmap for various algorithms.
+
+![](images/6a9c03dc11e883ac5b2cd5b7a29c23e3e01f2754f1d6baa670821fdc228db66d.jpg)  
+fig. 10: performance impacts of in-memory optimizations for various sampling algorithms.  
+(a) biased neighbor sampling.
+
+![](images/82c64931784b0f1cd3adab79c99ed29371caf35de954424f9433b2681c66eeeb.jpg)  
+(b) forest fire sampling.
+
+![](images/05dc59db8f65adab18708a1a93c4cd3e77aee24241f64d444e9f646fe1c03627.jpg)  
+(c) layer sampling.
+
+![](images/16cc95fcccbb5fba8f385471b8a1159a1eec74be1415c4d01d98bd3f878e4bd7.jpg)  
+(d) unbiased neighbor sampling.  
+fig. 11: average # iteration w/ and w/o bipartite region search for various algorithms.
+
+# b. in-memory optimization
+
+fig. 10 studies the performance impacts of bipartite region search and bitmap optimizations over repeated sampling (fig. 6(a)) and updated sampling (fig. 6(b)) across four applications, which include both biased and unbiased algorithms. repeated sampling is used as the performance baseline for comparison. fr and tw are not studied in this subsection because they exceed the gpu memory capacity. particularly, bipartite region search introduces, on average,  $1.7 \times$ ,  $1.4 \times$ ,  $1.7 \times$  and  $1.17 \times$  speedup, on biased neighbor sampling, forest fire sampling, layer sampling, and unbiased neighbor sampling respectively. bipartite region search presents better performance compared with both repeated sampling and updated sampling. bitmap further improves speedup to  $1.8 \times$ ,  $1.5 \times$ ,  $1.8 \times$ , and  $1.28 \times$  on these four applications, respectively. the performance for am, cp, and wg gleams the effectiveness of c-saw. with a lower average degree of vertices, they suffer
+
+![](images/feadb34cbd539e7bf7a2d50ef7b83fa0aeadde56913faa2e98b71e83b8168cf4.jpg)  
+(a) biased neighbor sampling.
+
+![](images/57169a3abc7f2034012e30859904682dc2b65039d91816ea8bca4ee6ca588602.jpg)  
+(b) forest fire sampling.
+
+![](images/5bd195dca9dcc501d77c68480a450660868eae22201a73d5fc7bfdc73781330e.jpg)  
+(c) layer sampling.
+
+![](images/1c1b60da93a1f9cc6274c0e94e51013db84de77f018d15223f272eb1fa641a85.jpg)  
+(d) unbiased neighbor sampling.
+
+from more selection collision. using bipartite region search, we achieve better speedup by mitigating the collision.
+
+fig. 11 and 12 further profile the effectiveness of our two optimizations. on average, bipartite region search reduces the average number of iterations to pick a neighbor by  $5.0 \times$ ,  $1.5 \times$ ,  $1.8 \times$ , and  $1.7 \times$  for these four applications, respectively. here, # iterations refers to the trip count of do-while loop in fig. 5 (line 10-14), which represents the amount of computation used to select a vertex. for analysis, we compare the average number of iterations for all sampled vertices, i.e.,  $\frac{\text{total # iterations of sampled vertices}}{\# \text{sampled vertices}}$ . we observe more reduction on # iterations for biased neighbor sampling than other algorithms as it has a higher selection collision chance and thus requires more iterations without bipartite region search. with relatively larger neighbor pools, collision is less likely to happen in layer sampling which explains its lower benefits from bipartite region search. similarly, unbiased neighbor sampling and forest fire sampling incur less collision due to unbiased sampling. fig. 12 shows the effectiveness of bitmap over the baseline which stores the sampled vertices in the gpu shared memory and performs a linear search to detect collision. the ratio metric in fig. 12 compares the total number of searches performed by bitmap with that of baseline, i.e., ratio =  $\sum \# \text{searches in bitmap}$ . compared to baseline, bitmap reduces the total searches by  $63\%$ ,  $83\%$ ,  $71\%$ , and  $81\%$  for these four applications, respectively. despite of the significant search count reduction from bitmap, the overhead of atomic operations refrains us from achieving speedups proportional with the search count reduction.
+
+# c. out-of-memory optimization
+
+fig. 13 presents the performance impacts of multi-instance batched sampling (ba), workload-aware scheduling (ws), and thread block based workload balancing (bal) on both large graphs and small graphs. for the sake of analysis, we pretend small graphs do not fit in gpu memory. for the experimental analysis, we use 4 partitions for each graph and two cuda
+
+![](images/9ba74bb17c537ddc6d2f235dee5829535cf3907730dc2b133e6fd9b67d1026b6.jpg)  
+(a) biased neighbor sampling.
+
+![](images/27ad4a640684c3d7bd426149b4fd96ab9dd05fc38b30d25ee35b12e8d21d3de3.jpg)  
+(b) biased random walk.
+
+![](images/b483bd705eace7f4519681c3b9297db1ecf7c723004c3ce1a23d72159b092b70.jpg)  
+(c) forest fire sampling.
+
+![](images/e5b9ce7253d9caeccc07d7a47452739c91154f1c218ce2f1b9465c81bf5c1612.jpg)  
+(d) unbiased neighbor sampling.
+
+![](images/48a915b7de792376b741c57d8c2b76e38a5e62bf17d8bec7725b50e2db7628ae.jpg)  
+fig. 13: performance impacts of out-of-memory optimizations. here, baseline implementation refers to partition transfer based on active partition without any optimization.  
+(a) biased neighbor sampling.
+
+![](images/2fc70306c2e955d9a3f7cd2985ead7d010a10ebed9317fed45c349825cddd25a.jpg)  
+(b) biased random walk.  
+fig. 15: partition transfer counts for workload-aware scheduling (lower is better).
+
+![](images/64218b7f9cfbee2273dfec064fe0911913b881b0e246d43b50d0d599efe98f08.jpg)  
+(c) forest fire sampling.
+
+![](images/0e8734ace6f55cef5c6b26906d4f8e338cdca3624fbb4a47e5014af55a3eee03.jpg)  
+(d) unbiased neighbor sampling.
+
+streams. assume the gpu memory can keep at most two partitions at the same time, for all graphs. particularly, batched sampling introduces, on average,  $2.0 \times$ ,  $1.9 \times$ ,  $2.1 \times$ , and  $2.7 \times$  speedup, respectively on biased neighbor sampling, biased random walk, forest fire sampling, and unbiased neighbor sampling. workload-aware scheduling further introduces  $3.2 \times$ ,  $2.8 \times$ ,  $3.9 \times$ , and  $3.3 \times$  speedups on these four applications, respectively. workload balancing gives, on average,  $3.5 \times$  speedup over all applications.
+
+fig. 14 and 15 reasons the effectiveness of two optimizations. we use standard deviation to measure workload imbalance in runtime of two kernels for overall sampling. on average, multi-instance batched sampling (ba) and thread block based workload balancing (bal) reduce the average kernel time by  $27\%$ ,  $12\%$ ,  $23\%$ , and  $26\%$ , respectively on
+
+![](images/b468f155d04417c11c61352ff44724ca414eea4d81a7b6071563a2b9d7b37fc5.jpg)  
+(a) biased neighbor sampling.
+
+![](images/5639e8de6692a2dce08c16a84128334d915417baecfdbae54f824aee6dc4e20d.jpg)  
+(b) biased random walk.
+
+![](images/c6f2428f0021c5ba1fd643da3be34818c02889cca1781131ff1fcaf90fab3e41.jpg)  
+(c) forest fire sampling.
+
+![](images/c23dbcda0689fc7880335401ed17dc82178ab4037b38be386efdea35229b5d5b.jpg)  
+(d) unbiased neighbor sampling.
+
+four applications. as active vertices increase exponentially with depth during sampling, biased neighbor sampling, forest fire sampling, and unbiased neighbor sampling observe more reduction in kernel time than biased random walk. workload-aware scheduling reduces the overall partition transfers by  $1.2 \times$ ,  $1.3 \times$ ,  $1.2 \times$ , and  $1.1 \times$  on these four applications, respectively. even with moderate decrease in partition transfers, we still achieve noticeable speedups.
+
+![](images/cac48a8f45fc942016ac9b07d2529a6a01e1411c9970febd10b4696ace7c03b4.jpg)  
+(a) neighborsize: 1 - 8.
+
+![](images/a8fad2fb41cbc917382813a0482d3523b829b6eaaae65fa30fd59a75c496f072.jpg)  
+fig. 14: standard deviation of kernel time for multi-instance batching and workload-aware balancing in out-of-memory c-saw (lower is better). here, baseline represents even distribution of resources.  
+(b) # instances:  $2k - 16k$ .  
+fig. 16: biased neighbor sampling with (a) neighborsize as 1, 2, 4 and 8 and (b) # instances as 2k, 4k, 8k and 16k.
+
+# d. studying neighborsize and # instances in c-saw
+
+fig. 16 reports the time consumption impacts of various neighborsize and # instances. here, we use depth= 3 and 16k instances in fig. 16 (a) for extensive analysis. for fig. 16 (b), we use neighborsize = 8. as shown in fig. 16(a), larger neighborsize leads to longer sampling time. the average
+
+![](images/2cc4a82e0fc814de71222253fc32834cf5be8dabf75e98ed1be27a156c60322b.jpg)
+
+![](images/97b671e570730ebf7e99eaf89b0c5ad73df0e1d97389f9125f94ed1b198f2e62.jpg)  
+fig. 17: scaling c-saw from 1 to 6 gpus with (a) 2,000 and (b) 8,000 instances for biased neighbor sampling.
+
+sampling time for neighborsize of 1, 2, 4, and 8 are 3, 4, 7, and  $14~\mathrm{ms}$ . similarly, the increase of sampling instances, as shown in fig. 16(b) also results in longer sampling time. the average sampling time for  $2\mathrm{k}$ ,  $4\mathrm{k}$ ,  $8\mathrm{k}$ , and  $16\mathrm{k}$  instances is 2, 5, 9, and  $15~\mathrm{ms}$ . it is important to note that graphs with higher average degrees, i.e., tw, re, and or, have longer sampling time, while the impact of graph sizes on sampling time is secondary.
+
+# e. c-saw scalability
+
+fig. 17 scales c-saw from 1 to 6 gpus for different number of sampling instances. for 2,000 and 8,000 instances, we achieve  $1.8 \times$  and  $5.2 \times$  speedup with 6 gpus, respectively. the reason is that 2,000 instances fail to saturate 6 gpus. with 8,000 instances, we observe more workloads that lead to better scalability. we also observe that lower average degree graphs present better scalability because their workloads are better distributed across sampling instances.
+
+# vii. related works
+
+despite there is a surge of frameworks for classical graph algorithms including think like a vertex [59], [60], an edge [61], a graph [62], an io partition [63], and domain specific languages [64], [65], among many others [24], [66], [67], very few projects target graph sampling and random walk which are the focus of c-saw. this section discusses the closely related work from the following three aspects.
+
+programming interface. knightking [39] proposes a walker-centric model to support random walk [33], [37], e.g., node2vec [19], [68], deepwalk [17], and ppr [42], [69], [70], and hence fails to accommodate sampling algorithms that are important for graph learning and sparsification [9], [29], [37], [48], [71]-[73]. similarly for [74], [75] which also only support limited sampling/random walk algorithms.
+
+graphsaint [11], [12] explores three graph sampling methods, i.e., random vertex and edge sampling, and random walk based sampler, but fails to arrive at a universal framework. [76] supports deletion based sampling algorithms [77]. but this design is inefficient for large graphs that need to remove most edges. in this work, c-saw offers a bias-centric framework that can support both sampling and random walk algorithms, and hide the gpu programming complexity from end users.
+
+transition probability optimizations. existing projects often explore the following optimizations, i.e., probability pre-computation and data structure optimization. particularly, knightking [39] pre-computes the alias table for static transition probability, and resorts to dartboard for the dynamic counterpart which is similar to [11]. interestingly, kpar [78] even proposes to pre-compute random walks to expedite the process. since large graphs cannot afford to index the probabilities of all vertices, [70] only pre-computes for hub vertices and further uses hierarchical alias method, i.e., alias tree for distributed sampling. however, not all sampling and random walk algorithms could have deterministic probabilities that support pre-computation. c-saw finds inverse transform sampling to be ideal for gpus, and achieves superior performance over the state-of-the-art even when computing the probability during runtime.
+
+out-of-memory processing. gpu unified memory and partition-centric are viable method for out-of-memory graph processing. since graph sampling is irregular, unified memory is not a suitable option [79], [80]. besides, partition-centric options [63], [81]–[84] load each graph partition from either secondary storage to memory or cpu memory to gpu for processing. since prior work deals with classical graph algorithms, they need bsp. in contrast, c-saw takes advantage of the asynchronous nature of sampling to introduce workload-aware scheduling and batched sampling to reduce the data transfer between gpu and cpu.
+
+# viii. conclusion
+
+this paper introduces c-saw, a novel, generic, and optimized gpu graph sampling framework that supports a wide range of sampling and random walk algorithms. particularly, we introduce novel bias-centric framework, bipartite region search and workload aware out-of-gpu and multi-gpu scheduling for c-saw. taken together, our evaluation shows that c-saw bests the state-of-the-art.
+
+# acknowledgement
+
+we thank the anonymous reviewers for their helpful suggestions and feedbacks. this research is supported in part by the national science foundation crii award no. 2000722, the u.s. department of energy, office of science, office of advanced scientific computing research, under contract no. de-ac02-05ch11231 at lawrence berkeley national laboratory, and brookhaven national laboratory, which is operated and managed for the u.s. department of energy office of science by brookhaven science associates under contract no. de-sc0012704.
+
+# references
+
+[1] jiaxuan you, bowen liu, zhitao ying, vijay pande, and jure leskovec. graph convolutional policy network for goal-directed molecular graph generation. in advances in neural information processing systems (neurips), pages 6410-6421, 2018.  
+[2] ravi kumar, p ragbavan, sridhar rajagopalan, and andrew tomkins. the web and social networks. computer, 35(11):32-36, 2002.  
+[3] laura garton, caroline haythornthwaite, and barry wellman. studying online social networks. journal of computer-mediated communication (jcmc), 3(1), 1997.  
+[4] christian von mering, roland krause, berend snel, michael cornell, stephen g oliver, stanley fields, and peer bork. comparative assessment of large-scale data sets of protein-protein interactions. nature, 417(6887):399, 2002.  
+[5] roel popping. knowledge graphs and network text analysis. social science information (ssi), 42(1):91-106, 2003.  
+[6] richard c murphy, kyle b wheeler, brian w barrett, and james a ang. introducing the graph 500. cray users group (cug), 19:45-74, 2010.  
+[7] graphchallenge. https://graphchallenge.mit.edu/, february 2020.  
+[8] wenbing huang, tong zhang, yu rong, and junzhou huang. adaptive sampling towards fast graph representation learning. in advances in neural information processing systems (neurips), pages 4563-4572, 2018.  
+[9] hongyang gao, zhengyang wang, and shuiwang ji. large-scale learnable graph convolutional networks. in proceedings of the 24th acm international conference on knowledge discovery & data mining (sigkdd), pages 1416-1424. acm, 2018.  
+[10] jianfei chen, jun zhu, and le song. stochastic training of graph convolutional networks with variance reduction. arxiv preprint arxiv:1710.10568, 2017.  
+[11] hanqing zeng, hongkuan zhou, ajitesh srivastava, rajgopal kannan, and viktor prasanna. accurate, efficient and scalable graph embedding. in ieee international parallel and distributed processing symposium (ipdps), pages 462-471. ieee, 2019.  
+[12] hanqing zeng, hongkuan zhou, ajitesh srivastava, rajgopal kannan, and viktor prasanna. graphsaint: graph sampling based inductive learning method. arxiv preprint arxiv:1907.04931, 2019.  
+[13] chenhui deng, zhiqiang zhao, yongyu wang, zhiru zhang, and zhuo feng. graphzoom: a multi-level spectral approach for accurate and scalable graph embedding. arxiv preprint arxiv:1910.02370, 2019.  
+[14] adam lerer, ledell wu, jiajun shen, timothee lacroix, luca wehrstedt, abhijit bose, and alex peysakhovich. pytorch-biggraph: a large-scale graph embedding system. arxiv preprint arxiv:1903.12287, 2019.  
+[15] minjie wang, lingfan yu, da zheng, quan gan, yu gai, zihao ye, mufei li, jinjing zhou, qi huang, chao ma, ziyue huang, qipeng guo, hao zhang, haibin lin, junbo zhao, jinyang li, alexander smola, and zheng zhang. deep graph library: towards efficient and scalable deep learning on graphs. arxiv preprint arxiv:1909.01315, 2019.  
+[16] nino shervashidze, pascal schweitzer, erik jan van leeuwen, kurt mehlhorn, and karsten m borgwardt. weisfeiler-lehman graph kernels. journal of machine learning research (jmlr), 12(77):2539-2561, 2011.  
+[17] bryan perozzi, rami al-rfou, and steven skiena. deepwalk: online learning of social representations. in proceedings of the 20th acm international conference on knowledge discovery and data mining (sigkdd), pages 701-710, 2014.  
+[18] lawrence page, sergey brin, rajeev motwani, and terry winograd. the pagerank citation ranking: bringing order to the web. technical report, stanford infolab, 1999.  
+[19] aditya grover and jure leskovec, node2vec: scalable feature learning for networks. in proceedings of the 22nd acm international conference on knowledge discovery and data mining (sigkdd), pages 855-864, 2016.  
+[20] aapo kyrola. drunkardmob: billions of random walks on just a pc. in proceedings of the 7th acm conference on recommender systems (recsys), pages 257-264, 2013.  
+[21] richard e korf and peter schultze. large-scale parallel breadth-first search. in american association for artificial intelligence (aaai), volume 5, pages 1380–1385, 2005.  
+[22] hang liu and h howie huang. enterprise: breadth-first graph traversal on gpus. in proceedings of the international conference for
+
+high performance computing, networking, storage and analysis (sc), pages 1-12. ieee, 2015.  
+[23] yangzihao wang, andrew davidson, yuechao pan, yuduo wu, andy riffel, and john d owens. gunrock: a high-performance graph processing library on the gpu. in proceedings of the 21st acm sigplan symposium on principles and practice of parallel programming (ppopp), pages 1–12, 2016.  
+[24] hang liu and h howie huang. simd-x: programming and processing of graph algorithms on gpus. in proceedings of the usenix conference on usenix annual technical conference (atc), pages 411-427, 2019.  
+[25] anil gaihre, zhenlin wu, fan yao, and hang liu. xbfs: exploring runtime optimizations for breadth-first search on gpus. in proceedings of the 28th international symposium on high-performance parallel and distributed computing (hpdc), pages 121–131, 2019.  
+[26] prasun gera, hyojong kim, piyush sao, hyesoon kim, and david bader. traversing large graphs on gpus with unified memory. proceedings of the vldb endowment (pvldb), 13(7):1119-1133, 2020.  
+[27] george karypis and vipin kumar. a fast and high quality multilevel scheme for partitioning irregular graphs. siam journal on scientific computing (sisc), 20(1):359-392, 1998.  
+[28] stephen guattery and gary l miller. on the performance of spectral graph partitioning methods. in acm-siam symposium on discrete algorithms (soda), volume 95, pages 233-242, 1995.  
+[29] jure leskovec and christos faloutsos. sampling from large graphs. in proceedings of the 12th acm international conference on knowledge discovery and data mining (sigkdd), pages 631-636. acm, 2006.  
+[30] pili hu and wing cheong lau. a survey and taxonomy of graph sampling. arxiv preprint arxiv:1308.5865, 2013.  
+[31] alex d stivala, johan h koskinen, david a rolls, peng wang, and garry l robins. snowball sampling for estimating exponential random graph models for large networks. social networks, 47:167-188, 2016.  
+[32] neighborsampler. https://docs.dgl.ai/en/0.4.x/api/python/sampler.html, february 2020.  
+[33] rong-hua li, jeffrey xu yu, lu qin, rui mao, and tan jin. on random walk based graph sampling. in 31st international conference on data engineering (icde), pages 927-938. ieee, 2015.  
+[34] michael cochez, petar ristoski, simone paolo ponzetto, and heiko paulheim. biased graph walks for rdf graph embeddings. in proceedings of the 7th international conference on web intelligence, mining and semantics (wims), pages 1-12, 2017.  
+[35] leonidas tzevelekas, konstantinos oikonomou, and ioannis stavrakakis. random walk with jumps in large-scale random geometric graphs. computer communications, 33(13):1505-1514, 2010.  
+[36] hanghang tong, christos faloutsos, and jia-yu pan. fast random walk with restart and its applications. in sixth international conference on data mining (icdm), pages 613-622. ieee, 2006.  
+[37] bruno ribeiro and don towsley. estimating and sampling graphs with multidimensional random walks. in proceedings of the 10th acm conference on internet measurement (sigcomm), pages 390-403, 2010.  
+[38] sheehan olver and alex townsend. fast inverse transform sampling in one and two dimensions. arxiv preprint arxiv:1307.1223, 2013.  
+[39] ke yang, mingxing zhang, kang chen, xiaosong ma, yang bai, and yong jiang. knightking: a fast distributed graph random walk engine. in proceedings of the 27th acm symposium on operating systems principles (sosp), pages 524-537, 2019.  
+[40] alastair j walker. an efficient method for generating discrete random variables with general distributions. acm transactions on mathematical software (toms), 3(3):253-256, 1977.  
+[41] aaron q li, amr ahmed, sujith ravi, and alexander j smola. reducing the sampling complexity of topic models. in proceedings of the 20th acm international conference on knowledge discovery and data mining (sigkdd), pages 891–900, 2014.  
+[42] peter a lofgren, siddhartha banerjee, ashish goel, and c seshadhri. fast-ppr: scaling personalized pagerank estimation for large graphs. in proceedings of the 20th acm international conference on knowledge discovery and data mining (sigkdd), pages 1436–1445. acm, 2014.  
+[43] hang liu, h howie huang, and yang hu. ibfs: concurrent breadth-first search on gpus. in proceedings of the international conference on management of data (sigmod), pages 403–416. acm, 2016.
+
+[44] santosh pandey, xiaoye sherry li, aydin buluc, jiejun xu, and hang liu. h-index: hash-indexing for parallel triangle counting on gpus. in ieee high performance extreme computing conference (hpec), pages 1-7. ieee, 2019.  
+[45] mauro bisson and massimiliano fatica. high performance exact triangle counting on gpus. ieee transactions on parallel and distributed systems (tpds), 28(12):3501-3510, 2017.  
+[46] stephen w keckler, william j dally, brucek khailany, michael garland, and david glasco. gpus and the future of parallel computing. ieee micro, 31(5):7-17, 2011.  
+[47] thomas n kipf and max welling. semi-supervised classification with graph convolutional networks. arxiv preprint arxiv:1609.02907, 2016.  
+[48] jie chen, tengfei ma, and cao xiao. fastgcn: fast learning with graph convolutional networks via importance sampling. arxiv preprint arxiv:1801.10247, 2018.  
+[49] morteza alamgir and ulrike von luxburg. multi-agent random walks for local clustering on graphs. in ieee international conference on data mining (icdm), pages 18-27. ieee, 2010.  
+[50] duane merrill and andrew grimshaw. parallel scan for stream architectures. university of virginia, department of computer science, charlottesville, va, usa, technical report cs2009-14, 2009.  
+[51] norman p jouppi. improving direct-mapped cache performance by the addition of a small fully-associative cache and prefetch buffers. acm sigarch computer architecture news, 18(2si):364-373, 1990.  
+[52] george karypis and vipin kumar. metis-unstructured graph partitioning and sparse matrix ordering system, version 2.0. university of minnesota, 1995.  
+[53] erik g boman, karen d devine, and sivasankaran rajamanickam. scalable matrix computations on large scale-free graphs using 2d graph partitioning. in proceedings of the international conference on high performance computing, networking, storage and analysis (sc), pages 1-12, 2013.  
+[54] oak ridge national lab. summit oak ridge national laboratory's 200 petaflop supercomputer. retrieved from https://www.olcf.ornl.gov/olcf-resources/compute-systems/summit/. accessed: 2020, march 6.  
+[55] xiang tian and khaled benkrid. mersenne twister random number generation on fpga, cpu and gpu. in nasa/esa conference on adaptive hardware and systems (ahs), pages 460-464. ieee, 2009.  
+[56] jure leskovec and andrej krevl. snap datasets: stanford large network dataset collection. http://snap.stanford.edu/data, june 2014.  
+[57] graphsaint dataset. https://github.com/graphsaint/graphsaint, february 2020.  
+[58] twitter (www) network dataset - konect. http://konect.uni-koblenz.de/networks/twitter, february 2020.  
+[59] grzegorz malewicz, matthew h austern, aart jc bik, james c dehnert, ilan horn, nate leiser, and grzegorz czajkowski. pregel: a system for large-scale graph processing. in proceedings of the acm international conference on management of data (sigmod), pages 135-146, 2010.  
+[60] yucheng low, joseph e gonzalez, aapo kyrola, danny bickson, carlos e guestrin, and joseph hellerstein. graphlab: a new framework for parallel machine learning. arxiv preprint arxiv:1408.2041, 2014.  
+[61] amitabha roy, ivo mihailovic, and willy zwaenepoel. x-stream: edge-centric graph processing using streaming partitions. in proceedings of the twenty-fourth acm symposium on operating systems principles (sosp), pages 472-488, 2013.  
+[62] yuanyuan tian, andrey balmin, severin andreas corsten, shirish tatikonda, and john mcpherson. from" think like a vertex" to" think like a graph". proceedings of the vldb endowment (pvldb), 7(3):193-204, 2013.  
+[63] hang liu and h howie huang. graphene: fine-grained io management for graph computing. in proceedings of the 15th usenix conference on file and storage technologies (fast), pages 285–299, 2017.  
+[64] sungpack hong, hassan chafi, edic sedlar, and kunle olukotun. greenmarl: a dsl for easy and efficient graph analysis. in proceedings of the seventeenth international conference on architectural support for programming languages and operating systems (asplos), pages 349-362, 2012.  
+[65] yunming zhang, mengjiao yang, riyadh baghdadi, shoaib kamil, julian shun, and saman amarasinghe. graphit: a high-performance graph dsl. proceedings of the acm on programming languages (oopsla), 2:1–30, 2018.  
+[66] david a bader and kamesh madduri. gtgraph: a synthetic graph generator suite. atlanta, ga, february, 38, 2006.
+
+[67] narayanan sundaram, nadathur rajagopalan satish, md mostofa ali patwary, subramanya r dulloor, satya gautam vadlamudi, dipankar das, and pradeep dubey. graphmat: high performance graph analytics made productive. arxiv preprint arxiv:1503.07241, 2015.  
+[68] jiezhong qiu, yuxiao dong, hao ma, jian li, kuansan wang, and jie tang. network embedding as matrix factorization: unifying deepwalk, line, pte, and node2vec. in proceedings of the eleventh acm international conference on web search and data mining (wsdm), page 459-467, new york, ny, usa, 2018. association for computing machinery.  
+[69] taher h. haveliwala. topic-sensitive pagerank: a context-sensitive ranking algorithm for web search. technical report 2003-29, stanford infolab, 2003.  
+[70] wenqing lin. distributed algorithms for fully personalized pagerank on large graphs. in the world wide web conference (www), pages 1084-1094. acm, 2019.  
+[71] rex ying, ruining he, kaifeng chen, pong eksombatchai, william l hamilton, and jure leskovec. graph convolutional neural networks for web-scale recommender systems. in proceedings of the 24th acm international conference on knowledge discovery & data mining (sigkdd), pages 974-983, 2018.  
+[72] will hamilton, zhitao ying, and jure leskovec. inductive representation learning on large graphs. in advances in neural information processing systems (neurips), pages 1024-1034, 2017.  
+[73] anil gaihre, santosh pandey, and hang liu. deanonymizing cryptocurrency with graph learning: the promises and challenges. in ieee conference on communications and network security (cns), pages 1-3. ieee, 2019.  
+[74] kartik lakhotia, rajgopal kannan, aditya gaur, ajitesh srivastava, and viktor prasanna. parallel edge-based sampling for static and dynamic graphs. in proceedings of the 16th acm international conference on computing frontiers (cf), pages 125-134, 2019.  
+[75] xiaowei chen, yongkun li, pinghui wang, and john lui. a general framework for estimating graphlet statistics via random walk. arxiv preprint arxiv:1603.07504, 2016.  
+[76] usman tariq, umer i cheema, and fahad saeed. power-efficient and highly scalable parallel graph sampling using fpgas. in international conference on reconfigurable computing and fpgas (reconfig), pages 1-6. ieee, 2017.  
+[77] vaishnavi krishnamurthy, michalis faloutsos, marek chrobak, jun-hong cui, li lao, and allon g percus. sampling large internet topologies for simulation purposes. computer networks, 51(15):4284-4302, 2007.  
+[78] jieming shi, renchi yang, tianyuan jin, xiaokui xiao, and yin yang. realtime top-k personalized pagerank over large graphs on gpus. proceedings of the vldb endowment (pvldb), 13(1):15-28, 2019.  
+[79] alok mishra, lingda li, martin kong, hal finkel, and barbara chapman. benchmarking and evaluating unified memory for openmp gpu offloading. in proceedings of the fourth workshop on the llvm compiler infrastructure in hpc (llvm-hpc), new york, ny, usa, 2017. acm.  
+[80] lingda li and barbara chapman. compiler assisted hybrid implicit and explicit gpu memory management under unified address space. in proceedings of the international conference for high performance computing, networking, storage and analysis (sc), pages 1-16. acm, 2019.  
+[81] aapo kyrola, guy blelloch, and carlos guestrin. graphchi: largescale graph computation on just a pc. in presented as part of the 10th symposium on operating systems design and implementation (osdi), pages 31-46, hollywood, ca, 2012. usenix.  
+[82] da zheng, disa mhembere, randal burns, joshua vogelstein, carey e priebe, and alexander s szalay. flashgraph: processing billion-node graphs on an array of commodity ssds. in proceedings of the 13th usenix conference on file and storage technologies (fast), pages 45-58, 2015.  
+[83] wei han, daniel mawhirter, bo wu, and matthew buland. graphie: large-scale asynchronous graph traversals on just a gpu. in 26th international conference on parallel architectures and compilation techniques (pact), pages 233-245. ieee, 2017.  
+[84] wei-lin chiang, xuanqing liu, si si, yang li, samy bengio, and choi-jui hsieh. cluster-gcn: an efficient algorithm for training deep and large graph convolutional networks. in proceedings of the 25th acm international conference on knowledge discovery & data mining (sigkdd), pages 257-266, 2019.

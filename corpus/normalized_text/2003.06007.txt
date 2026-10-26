@@ -1,0 +1,523 @@
+# a fault-tolerance shim for serverless computing
+
+vikram sreekanti  
+uc berkeley
+
+joseph e. gonzalez  
+uc berkeley
+
+chenggang wu  
+uc berkeley
+
+joseph m. hellerstein  
+uc berkeley
+
+saurav chhatrapati  
+uc berkeley
+
+jose m. faleiro  
+microsoft research
+
+# abstract
+
+serverless computing has grown in popularity in recent years, with an increasing number of applications being built on functions-as-a-service (faas) platforms. by default, faas platforms support retry-based fault tolerance, but this is insufficient for programs that modify shared state, as they can unwittingly persist partial sets of updates in case of failures. to address this challenge, we would like atomic visibility of the updates made by a faas application.
+
+in this paper, we present aft, an atomic fault tolerance shim for serverless applications. aft interposes between a commodity faas platform and storage engine and ensures atomic visibility of updates by enforcing the read atomic isolation guarantee. aft supports new protocols to guarantee read atomic isolation in the serverless setting. we demonstrate that aft introduces minimal overhead relative to existing storage engines and scales smoothly to thousands of requests per second, while preventing a significant number of consistency anomalies.
+
+# 1 introduction
+
+serverless computing is an emerging area of focus in research [2, 5, 16-22, 35] and industry [3]. its key attraction is simplicity: users upload code and select trigger events (e.g., api invocation, file upload), and the cloud provider transparently manages deployment, scaling, and billing for those programs. users are charged for resource time used rather than having to plan and provision resources in advance.
+
+in today's public clouds, serverless computing most often refers to functions-as-a-service (faas). faas platforms allow users to construct applications in high-level languages while imposing limitations on what those applications can do. one key limitation is the requirement that programs be stateless—requests are not guaranteed to be routed to any particular instance of a program, so developers cannot rely on machine-local state to handle requests. as a result, applications built on faas infrastructure must either be purely functional or modify state in a shared storage system like amazon web services' s3 or google cloud's datastore.
+
+faas platforms provide some measure of fault tolerance with retries—systems like aws lambda and azure functions automatically retry functions if they fail, and clients typically will re-issue requests after a timeout. retries ensure that functions are executed at-least once, and cloud providers encourage developers to write idempotent programs [24]
+
+because idempotence logically ensures at-most once execution. combining retry-based at-least once execution and idempotent at-most once execution would seem to guarantee exactly once execution, a standard litmus test for correct fault handling in distributed systems.
+
+this idempotence requirement is both unreasonable for programmers—as programs with side-effects are ubiquitous—and also insufficient to guarantee exactly once serverless execution. to see why idempotence is insufficient, consider a function  $f$  that writes two keys,  $k$  and  $l$ , to storage. if  $f$  fails between its writes of  $k$  and  $l$ , parallel requests might read the new version of  $k$  while reading an old version of  $l$ . even if  $f$  is idempotent—meaning that a retry of  $f$  would write the same versions of  $k$  and  $l$ —the application has exposed a fractional execution in which some updates are visible and others are not. as a result, developers are forced to explicitly reason about the correctness of their reads in addition to the idempotence of their applications—an already difficult task.
+
+we propose that in a retry-based fault-tolerance model, atomicity is necessary to solve these challenges: either all the updates made by an application should be visible or none of them should. returning to the example above, if  $f$  fails between the writes of  $k$  and  $l$ , an atomicity guarantee would ensure that  $f$ 's version of  $k$  would not be visible to other functions without  $f$ 's version of  $l$ . atomicity thus prevents fractional executions from becoming visible.
+
+a simple solution here is to use serializable transactions. functions have well-defined beginnings and endings, making a transactional model a natural fit to guarantee atomicity for faas platforms. in reality, each logical request in an application will likely span multiple functions—as it would be difficult to pack a whole application into one function—meaning transactions should span compositions of functions. however, strongly consistent transactional systems have well-known scaling bottlenecks [11, 12] that make them ill-suited for serverless settings, which must accommodate unbounded numbers of client arrivals.
+
+instead, we turn to read atomicity, a coordination-free isolation level introduced in [4]. intuitively, read atomic isolation guarantees that transactions do not leak partial side effects to each other, which is the requirement described above. however, the original implementation of read atomic isolation—termed ramp in [4]—makes key limiting assumptions that are unreasonable in our setting. first, their storage
+
+system forbids replication, which limits locality and scalability of reads. second, they assume that every transaction's read and write sets are predeclared, which is unreasonable for interactive applications that make dynamic decisions.
+
+# 1.1 a fault-tolerance shim
+
+our goal in this paper is to provide fault tolerance in the context of widely-used faas platforms and storage systems. to that end, we present aft, an atomic fault tolerance shim for serverless computing. aft provides fault-tolerance for faas applications by interposing between a faas platform (e.g., aws lambda, azure functions) and a cloud storage engine (e.g., aws s3, google cloud bigtable). updates written to storage during a single logical request—which may span multiple functions—are buffered by aft and atomically committed at request end. aft enforces the read atomic isolation guarantee, ensuring that transactions never see partial side effects and only read data from sets of atomic transactions. given the unsuitability of the original ramp protocols for serverless infrastructure, we develop new protocols to support read atomic isolation over shared storage backends. importantly, aft maintains a high measure of flexibility by only relying on the storage engine for durability.
+
+the contributions of this paper are the following:
+
+- the design of aft, a low-overhead, transparent fault tolerance shim for serverless applications that is flexible enough to work with many combinations of commodity compute platforms and storage engines.  
+- a new set of protocols to guarantee read atomic isolation for shared, replicated storage systems.  
+- a garbage collection scheme for our protocols that significantly reduces the storage overheads of read atomic isolation.  
+- a detailed evaluation of aft, demonstrating that it imposes low latency penalties and scales smoothly to hundreds of clients and thousands of requests per second, while preventing consistency anomalies.
+
+# 2 background and motivation
+
+in this section, we describe prior work on read atomicity and its guarantees (§2.1), and we explain the technical challenges in providing read atomicity for serverless applications (§2.2).
+
+# 2.1 read atomic isolation
+
+the read atomic isolation guarantee, introduced by bailis et al. in [4], aims to ensure that transactions do not view partial effects of other transactions. bailis et al. provide the following definition: "a system provides read atomic isolation (ra) if it prevents fractured reads anomalies and also prevents transactions from reading uncommitted, aborted, or intermediate data." in this paper, we refer to reads of "uncommitted, aborted, or intermediate" data as dirty reads. a fractured read happens when, "... transaction  $t_{i}$  writes versions  $x_{m}$  and  $y_{n}$
+
+(in any order, with  $x$  possibly but not necessarily equal to  $y$ ), [and]  $t_{j}$  [later] reads version  $x_{m}$  and version  $y_{k}$ , and  $k < n$ . the read atomic isolation level is a good fit for the serverless setting because it enforces atomic visibility of updates without strong consistency or coordination.
+
+# 2.2 challenges and motivation
+
+the protocols introduced in [4] make two assumptions that are unreasonable for serverless applications: pre-declared read/write sets and a linearizable, unreplicated, and sharded storage backend. relaxing these assumptions enables us to bring read atomic isolation to the serverless setting but raises new challenges around consistency and visibility.
+
+read and write sets. [4] requires that each transaction declares its read and write sets in advance, in order to correctly ensure that the transaction's operations adhere to the definition of read atomicity above. we relax this assumption, allowing requests to issue reads and writes without restriction, and we develop new read atomic protocols that allow us to dynamically construct atomic read sets (§3). the drawback of this flexibility is that clients may be forced to read data that is more stale than they would have under the original ramp protocol, and in rare cases, a request may be forced to abort because there are no valid key versions for it to read. we explain this tradeoff in more detail in §3.6.
+
+shared storage backends. the ramp protocols assume linearizable, unreplicated, and shared-nothing storage shards, each of which operate independently. each shard is the sole "source of truth" for the set of keys it stores, which can lead to scaling challenges in skewed workloads. this design is incompatible with standard cloud applications, where workloads can often be highly skewed [7, 34] and require strong durability. to that end, aft offers read atomic isolation in a shim layer over a durable shared storage backend without requiring the storage layer to provide consistency guarantees and partitioning. we avoid the scaling pitfalls of ramp by letting all nodes commit data for all keys. this requires carefully designing commit protocols for individual nodes (§3.3) and ensuring that nodes are aware of transactions committed by their peers (§4). our coordination-free and fungible node design leads to a potential ballooning of both data and metadata, which we address in §5.
+
+serverless applications. serverless applications are typically compositions of multiple functions. we model each request as a linear composition of one or more functions executing on a faas platform. aft must ensure atomic reads and writes across all functions in the composition, each of which might be executed on a different machine—this informs our design. in effect, we must support a "distributed" client session as the transaction moves across functions, and we must ensure that retries upon failure guarantee idempotence. we discuss these issues in more detail in §3.
+
+![](images/a361a23b7f36fcaae2c3bbe0bf45f64ac58dc3d6f7387fab258714591481693d.jpg)  
+figure 1. a high-level overview of the aft shim in context.
+
+# 3 achieving atomicity
+
+in this section, we describe how aft achieves atomic writes and reads at a single node. we first discuss aft's api, architecture, and components (§3.1). we then formally state the guarantees we make (§3.2); we describe aft's protocol for each of the guarantees in §3.3-§3.5. in §4, we discuss how aft operates in distributed settings.
+
+# 3.1 architecture and api
+
+aft offers transactional key-value store api, shown in table 1. we refer to each logical request (which might span multiple faas functions) as a transaction. a new transaction begins when a client calls starttransaction, and the transaction is assigned a globally-unique uuid. at commit time, each transaction is given a commit timestamp based on the machine's local system clock. in the rest of the paper, we refer to this  $\langle$  timestamp,uuid $\rangle$  pair as the transaction's id. aft uses each transaction's id to ensure that its updates are only persisted once, assuring idempotence in the face of retries—as discussed in §1, guaranteeing idempotence and atomicity results in exactly once execution semantics. we do not rely on clock synchronization for the correctness of our protocols, and we only use system time to ensure relative freshness of reads. as a result, we need not coordinate to ensure timestamp uniqueness—ties are broken by lexicographically comparing transactions' uuids.
+
+each transaction sends all operations to a single aft node. within the bounds of a transaction, clients interact with aft like a regular key-value store, by calling get(txid, key) and put(txid, key, value). when a client calls committransaction, aft assigns a commit timestamp, persists all of the transaction's updates, and only acknowledges the request once the updates are durable. at any point during its execution, if a client calls aborttransaction, none of its updates are made visible, and the data is deleted.
+
+figure 1 shows a high-level overview of the system architecture. each aft node is composed of a transaction manager, an atomic write buffer, and a local metadata cache. the
+
+<table><tr><td>api</td><td>description</td></tr><tr><td>starttransaction()-&gt;txid</td><td>begins a new transaction and returns a transaction id.</td></tr><tr><td>get(txid, key)-&gt;value</td><td>retrieves key in the context of the transaction keyed by txid.</td></tr><tr><td>put(txid, key, value)</td><td>performs an update for transaction txid.</td></tr><tr><td>aborttransaction(txid)</td><td>aborts transaction txid and discards any updates made by it.</td></tr><tr><td>committransaction(txid)</td><td>commits transciation txid and persists its updates; only acknowledges after all data and metadata has been persisted.</td></tr></table>
+
+table 1. aft offers a simple transactional key-value store api. all get and put operations are keyed by the id transaction within which they are executing.
+
+atomic write buffer gathers each transaction's writes and is responsible for atomically persisting them at commit time. the transaction manager tracks which key versions each transaction has read thus far and is responsible for enforcing the read atomicity guarantee described later in this section. aft maintains a transaction commit set storage, which holds the id of each committed transaction and its corresponding write set. we defer discussion of fault management and garbage collection to §4 and §5, respectively.
+
+algorithm 1 (\$3.4) requires access to the list of recently committed transactions. to avoid metadata fetches on each read, aft caches the ids of recently committed transactions and locally maintains an index that maps from each key to the recently created versions of that key. when an aft node starts (e.g., after recovering from failure), it bootstraps itself by reading the latest records in the transaction commit set to warm its metadata cache. we discuss how the metadata cache is pruned by the garbage collection processes in  $\s 5$ .
+
+in addition to a metadata cache, aft has a data cache, which stores values for a subset of the key versions in the metadata cache. the data cache improves performance by avoiding storage lookups for frequently accessed versions; we measure its effects in §6.2.
+
+aft make no assumptions about the serverless compute layer it is interacting with—it simply responds to the api calls described in table 1. the only assumption aft makes about the underlying storage engine is that updates are durable once acknowledged. aft does not rely on the storage engine to enforce any consistency guarantees or to immediately make keys visible after they are written.
+
+# 3.2 definitions
+
+a transaction  $t$ 's id is denoted by its subscript: transaction  $t_{i}$  has id  $i$ . we say that  $t_{i}$  is newer than  $t_{j}$  ( $t_{i} > t_{j}$ ) if  $i > j$ —we describe how ids are compared in §3.1. a key without a subscript,  $k$ , refers to any version of that key;  $k_{i}$  is the version of key  $k$  written by transaction  $t_{i}$ . each key has a null
+
+version, followed by many non-null versions. importantly, key versions are hidden from users: clients requests reads and writes of keys, and aft automatically determines which versions are compatible with each request.
+
+we define a transaction  $t_{i}$ 's write set,  $t_{i}$ .writeset, as the set of key versions written by this transaction. similarly, each key version has a cowritten set: if  $t_{i}$  writes  $k_{i}$ ,  $k_{i}$ .cowritten is the same as  $t_{i}$ .writeset.
+
+as described in §2.1, read atomic isolation requires preventing dirty reads and preventing fractured reads. aft ensures two simple properties in addition to read atomicity that most programmers are familiar with: read-your-writes and repeatable read. we describe these four properties briefly.
+
+dirty reads. to prevent dirty reads, aft guarantees that if transaction  $t_{i}$  reads key version  $k_{j}$  written by transaction  $t_{j}$ ,  $t_{j}$  must have successfully committed.
+
+fractured reads. to avoid fractured reads, each transaction's read set must form an atomic readset defined below:
+
+definition 1 (atomic readset). let  $r$  be a set of key versions.  $r$  is an atomic readset if  $\forall k_{i} \in r, \forall l_{i} \in k_{i}$ . cowritten,  $l_{j} \in r \rightarrow j \geq i$ .
+
+in other words, for each key version  $k_{i}$  read by transaction  $t_{j}$ , if  $t_{j}$  also reads a version of key  $l$  that was cowritten with  $k_{i}$  (i.e.,  $t_{j}$  reads  $l_{i}$ ), we return a version of  $l$  that is no older than  $l_{i}$ . consider a scenario where there are two committed transactions in storage,  $t_{1}: \{l_{1}\}$  and  $t_{2}: \{k_{2}, l_{2}\}$ , where the set following the colon denotes the set of key versions written by the corresponding transaction. if a new transaction,  $t_{n}$  first requests  $k$  and reads  $k_{2}$ , a subsequent read of  $l$  must return a version of  $l$  that is at least as new as  $l_{2}$  (i.e.,  $l_{2}$  or some newer version). if  $t_{n}$  were to read  $l_{1}$ , that would violate definition 1 because  $l$  is in the cowritten set of  $k_{2}$ , and  $l_{1} < l_{2}$ .
+
+read your writes. guaranteeing read your writes requires ensuring that a transaction reads the most recent version of a key it previously wrote. say a transaction  $t_{i}$  writes key version  $k_{i_{1}}$ ; a following read of  $k$  should return  $k_{i_{1}}$ . if  $t_{i}$  then proceeds to write  $k_{i_{2}}$ , future reads will return  $k_{i_{2}}$ .
+
+repeatable read. repeatable read means that a transaction should view the same key version if it requests the same key repeatedly: if  $t_{i}$  reads version  $k_{j}$  then later requests a read of  $k$  again, it should read  $k_{j}$ , unless it wrote its own version of  $k$ ,  $k_{i}$ , in the interim. note that this means the read-your-writes guarantee will be enforced at the expense of repeatable reads.
+
+# 3.3 preventing dirty reads
+
+aft implements atomic updates via a simple write-ordering protocol. aft's atomic write buffer sequesters all the updates for each transaction. when committransaction is called, aft first writes the transaction's updates to storage. once all updates have successfully been persisted, aft writes the transaction's write set, timestamp, and uuid to
+
+the transaction commit set in storage. only after the commit set is updated does aft acknowledge the transaction as committed to the client and make the transaction's data visible to other requests. if a client calls aborttransaction, its updates are simply deleted from the atomic write buffer, and no state is persisted in the storage engine. this protocol is carefully ordered to ensure that dirty data is never visible.
+
+crucially, to avoid coordination, aft does not overwrite keys in place: each key version is mapped to a unique storage key, determined by its transaction's id. this naturally increases aft's storage and metadata footprints; we return to this point in §5, where we discuss garbage collection.
+
+aft prevents dirty reads by only making a transaction's updates visible to other transactions after the correct metadata has been persisted. as we will see in section 3.4, aft only allows reads from transactions that have already committed by consulting the local committed transaction cache (see section 3.1).
+
+for long-running transactions with large update sets, users might worry that forcing all updates to a single atomic write buffer means that the update set must fit in memory on a single machine. however, when an atomic write buffer is saturated, it can proactively write intermediary data to storage. the protocols described in this section guarantee that this data will not be made visible until the corresponding commit record is persisted. if a aft node fails after such a write happens but before a commit record is written, the intermediary writes must be garbage collected; we discuss this in section 5.
+
+# 3.3.1 atomic fault tolerance
+
+this write-ordering protocol is sufficient to guarantee fault tolerance in the face of application and aft failures. when an application function fails, none of its updates will be persisted, and its transaction will be aborted after a timeout. if the function is retracted, it can use the same transaction id to continue the transaction, or it can begin a new transaction.
+
+there are two cases for aft failures. if a transaction had not finished when an aft node fails, we consider its updates lost, and clients must redo the whole transaction. if the transaction had finished and called committransaction, we will read its commit metadata (if it exists) during the aft startup process ( $\s 3.1$ ). if we find commit metadata, our write-ordering protocol ensures that the transaction's key versions are persisted; we can declare the transaction successful. if no commit record is found, the client must retry.
+
+# 3.4 preventing fractured reads
+
+in this section, we introduce aft's atomic read protocol. we guarantee that after every consecutive read, the set of key versions read thus far forms an atomic readset (definition 1). unlike in [4], we do not require that applications declare their read sets in advance. we enable this flexibility
+
+algorithm 1 atomicread: for a key  $k$ , return a key version  $k_j$  such that the read set  $r$  combined with  $k_j$  does not violate definition 1.  
+input:  $k,r$  ,writebuffer,storage,keyversionindex   
+1: lower  $\coloneqq 0$  // transaction id lower bound.   
+2: // lines 3-5 check case (1) of the inductive proof.   
+3: for  $l_{i}\in r$  do   
+4: if  $k\in l_i$  .cowritten then // we must read  $k_{j}$  such that  $j\geq i$    
+5: lower  $=$  max(lower,i)   
+6: // get the latest version of  $k$  that we are aware of.   
+7: latest  $\coloneqq$  max(keyversionindex[k])   
+8: if latest  $= =$  none  $\wedge$  lower  $= = 0$  then   
+9: return null   
+10: target  $\coloneqq$  none // the version of  $k$  we want to read.   
+11: candidateversions  $\coloneqq$  sort.filter(keyversionindex[k],kv.tid  $\geq$  lower))//get all versions of  $k$  at least as new as lower.   
+12: // loop through versions of  $k$  in reverse timestamp order - lines 13-23 check case (2) of the inductive proof.   
+13: for  $t\in$  candidateversions.reverse() do   
+14: valid  $\coloneqq$  true   
+15: for  $l_{i}\in k_{t}$  .cowritten do   
+16: if  $l_{j}\in r\land j <   t$  then   
+17: valid  $\coloneqq$  false   
+18: break   
+19: if valid then   
+20: target  $= t / /$  the most recent valid version.   
+21: break   
+22: if target  $\equiv =$  none then   
+23: return null   
+24:  $r_{new}\coloneqq r\cup \{k_{target}\}$    
+25: return storage.get(ktarget),rnew
+
+via versioning—the client may read older versions because prior reads were from an earlier timestamp.
+
+aft uses the metadata mentioned in section 3.1 to ensure that reads are correct. as discussed in section 3.3, a transaction's updates are made visible only after its commit metadata is written to storage. algorithm 1 uses the local cache of committed transaction metadata and recent versions of keys to ensure that reads are only issued from already-committed transactions.
+
+algorithm 1 shows our protocol for guaranteeing atomic reads. if a client requests key  $k$ , two constraints limit the versions it can read. first, if  $k_{i}$  was cowritten with an earlier read  $l_{i}$ , we must return a version,  $k_{j}$ , that is at least as new as  $k_{i}$  ( $j \geq i$ ). second, if we previously read some version  $l_{i}$ , the  $k_{j}$  return cannot be cowritten with  $l_{j} \mid j > i$ ; if it was, then we should have returned  $l_{j}$  to the client earlier, and this read set would violate read atomicity.
+
+theorem 1. given  $k$  and  $r$ , the  $r_{new}$  produced by algorithm 1 is an atomic readset, as defined in definition 1.
+
+proof. we prove by induction on the size of  $r$ .
+
+base case. before the first read is issued,  $r$  is empty and is trivially an atomic readset. after executing algorithm 1
+
+for the first read,  $r_{new}$  contains a single key,  $k_{target}$ , so theorem 1 holds;  $r_{new}$  is an atomic readset.
+
+inductive hypothesis: let  $r$  be the atomic readset up to this point in the transaction, and let  $k_{target}$  be the key version returned by algorithm 1. we show that  $r_{new}$  is also an atomic readset. from the constraints described above, we must show that (1)  $\forall l_i \in r, k_i \in l_i$ . cowritten  $\rightarrow$  target  $\geq i$ , and (2)  $\forall l_{target} \in k_{target}$ . cowritten,  $l_i \in r \rightarrow i \geq target$ .
+
+lines 3-5 of algorithm 1 ensure (1) by construction, as the lower bound of target is computed by selecting the largest transaction id in  $r$  that modified  $k$  -we never return a version that is older than lower. we iterate through versions of  $k$  that are newer than lower, starting with the most recent version first. lines 13-23 check if each version satisfies case (2) we iterate through all the cowritten keys of each candidate version. if any cowritten key is in  $r$ , we declare the candidate version valid if and only if the cowritten key's version is not newer than the version in  $r$ . if there are no valid versions, we return null.
+
+in summary,  $k_{j}$  satisfies case (1) because we consider no versions older than lower, and it is satisfies case (2) because we discard versions of  $k$  that conflict with previous reads.
+
+# 3.5 other guarantees
+
+aft makes two other guarantees, defined in §3.2: read-your-writes and repeatable reads. we briefly discuss each.
+
+read-your-writes when a transaction requests a key that is currently stored in its own write set, we simply return that data immediately; this guarantees the read-your-writes property described above. note that this process operates outside of the scope of algorithm 1. key versions that are stored in the atomic write buffer are not yet assigned a commit timestamp, so they cannot correctly participate in the algorithm. we make this exception because read-your-writes is a useful guarantee for programmers.
+
+repeatable read. ensuring repeatable read is a corollary of theorem 1. as mentioned in 3.2, read-your-writes takes precedence over repeatable read; therefore, corollary 1.1 only applies in transactions without intervening writes of  $k$ .
+
+corollary 1.1. let  $r$  be an atomic readset for a transaction  $t_{i}$ , and let  $k_{j}, r_{new}$  be the results of algorithm 1.  $k \notin t_{i}$ . writeset  $\wedge k_{i} \in r \rightarrow k_{i} == k_{j}$ .
+
+proof. given  $r_{new}$  and  $k_j$  as the results of algorithm 1, theorem 1 tells us that  $\forall l_i \in r, k_i \in l_i$ . cowritten  $\rightarrow j \geq i$ . since  $k_i \in r$  (and trivially,  $k_i \in k_i$ ). cowritten), we know that  $j \geq i$  for the  $k_j$  returned by algorithm 1.
+
+theorem 1 further guarantees that  $\forall l_{j} \in k_{j}$ . cowritten,  $l_{i} \in r \rightarrow i \geq j$ . once more, since  $k_{j} \in k_{j}$ . cowritten and  $k_{i} \in r$ , we know that  $i \geq j$ . combining these two cases,  $i == j$ , meaning algorithm 1 guarantees repeatable read.
+
+# 3.6 staleness
+
+our protocol is more flexible than ramp because it allows interactively defined read sets. however, it increases the potential for reading stale data because of restriction (2) in the proof of theorem 1. if  $t_r$  reads  $l_i$ , it cannot later read  $k_j$  if  $l_j \in k_j$ . cowritten,  $j > i$ , because this violates the definition 1. the ramp protocol in [4] avoided this pitfall with pre-declared read sets— $l$  and  $k$  are read at the same time. if the storage engine returns the same  $l_i$  and  $k_j$  as above, [4] repairs this mismatch by forcing a read of  $l_j$ . however, in our system, if  $k_i$  is exposed to the client without knowledge of the later read of  $l$ , we cannot repair the mismatch.
+
+in extreme cases, this can cause transaction aborts. continuing our example, if  $t_r$  reads  $l_i$  and then requests  $k$ , algorithm 1 will determine that  $k_j$  is not a valid version for  $t_r$ . if  $k_j$  is the only version of  $k$ , we return null because  $\{l_i, k_j\}$  does not form atomic readset. note that this equivalent to reading from a fixed database snapshot—if no versions of  $l$  exist as of time  $i$ , a client would read null, abort, and retry.
+
+# 4 scaling aft
+
+a key requirement for any serverless system is the ability to scale to hundreds or thousands of parallel clients. the protocols described in §3 ensure read atomicity for a single aft replica. in this section, we discuss how we scale aft while maintaining distributed consistency.
+
+as discussed earlier, we explicitly chose to avoid coordination-based techniques, as they have well-known issues with performance and scalability [11, 12]. aft nodes do not coordinate on the critical path of each transactions. the write protocol described in §3.3 allows each transaction to write to separate storage locations, ensuring that different nodes do not accidentally overwrite each others' updates.
+
+allowing each node to commit transactions without coordination improves performance but requires ensuring nodes are aware of transactions committed by other nodes. each machine has a background thread that periodically—every 1 second—gathers all transactions committed recently on this node and broadcasts them to all other nodes. this thread also listens for messages from other replicas. when it receives a new commit set, it adds all those transactions to its local commit set cache and updates its key version index.
+
+in a distributed setting where we might be processing thousands of transactions a second, the cost of communicating this metadata can be extremely high. we now describe an optimization that reduces aft's communication overheads. §4.2 discusses fault-tolerance for distributed deployments. in §4.3, we describe aft's deployment model.
+
+# 4.1 pruning commit sets
+
+to avoid communicating unnecessary metadata, we proactively prune the set of transactions that each node multicasts. in particular, any transaction that is locally superseded does
+
+algorithm 2 istransactionsuperseded: check whether transaction  $t_{i}$  has been superseded—if there is a newer version of every key version written by  $t_{i}$ .
+
+input:  $t_{i}$ , keyversionindex
+
+1: for  $k_{i} \in t_{i}$ . writeset do  
+2: latest := klatest_tid()  
+3: if latest  $= = i$  then  
+4: return false  
+5: return true
+
+not need to be broadcast. a transaction  $t_{i}$  is locally superseded if,  $\forall k_{i} \in t_{i}$ . writeset,  $\exists k_{j} \mid j > i$  that is, for every key written by  $t_{i}$ , there are committed versions of those keys written by transactions newer than  $t_{i}$ . for highly contended workloads in particular—where the same data is likely to be written often—this significantly reduces the volume of metadata that must be communicated between replicas.
+
+algorithm 2 how we determine if a transaction is superseded. each node's background multicast protocol checks whether a recently committed transaction is superseded before sending it to other replicas. if the transaction is superseded, it is omitted entirely from the multicast message. similarly, for each transaction received via multicast, the receiving node checks to see if it is superseded by transactions stored locally; if it is, we do not merge it into our the metadata cache. note that we can safely make decisions about transaction supersedence without coordination because each transaction receives monotonically increasing sets of keys; once a transaction is superseded on a particular node, that node can safely delete the transaction metadata.
+
+# 4.2 fault tolerance
+
+we now turn to guaranteeing fault tolerance for the distributed protocols described in this section; we consider both safety and liveness. to guarantee safety, we rely on our write-ordering protocol, which ensures that each node does not persist dirty data and that commits are correctly acknowledged. to guarantee liveness, we must further ensure that if a replica commits a transaction, acknowledges to a client, and fails before broadcasting the commit, other replicas are still made aware of the committed data. if other nodes do not know about the committed transaction, the new data will be in storage but will never be visible to clients, which is equivalent to not having committed.
+
+to this end, distributed deployments of aft have a fault manager (see figure 1) that lives outside of the request critical path. the fault manager receives every node's committed transaction set without our pruning optimization applied. it periodically scans the transaction commit set in storage and checks for persisted commit records that it has not received via broadcast. it notifies all aft nodes of any such transactions, ensuring that data is never lost once it has been committed. thus, if a aft node acknowledges a commit to
+
+the client but fails before broadcasting it to other aft nodes, the fault manager will read that transaction's commit record and ensure that other nodes are aware of the transaction's updates. the fault manager is itself stateless and fault-tolerant: if it fails, it can simply scan the commit set again.
+
+# 4.3 deployment and autoscaling
+
+aft is deployed using kubernetes [23], a cluster management tool that deploys applications running in docker containers [14]. each aft replica as well as the fault manager run in separate docker containers and on separate machines. the fault manager described above is responsible for detecting failed nodes and configuring their replacements.
+
+an important part of any serverless system is the ability to autoscale in response to workload changes. our protocols for achieving distributed fault tolerance and read atomicity do not require coordination, and distributed deployments of aft scale with low overhead, which we will demonstrate in §6.5. the second aspect of this challenge is making accurate scaling decisions without user intervention. this is a question of designing an efficient policy for choosing to add and remove nodes from the system. that policy is pluggable in aft out of scope this paper; we return to it in section 8.
+
+# 5 garbage collection
+
+in the protocols described thus far, there are two kinds of data that would grow monotonically if left unchecked. the first is transaction commit metadata—the list of all transactions committed by aft thus far. the second is set of key versions. as described in §3.3, each transaction's updates are written to unique keys in the storage engine and are never overwritten. over time, the overheads incurred from these sources can grow prohibitive, in terms of both performance and cost. in §5.1, we describe how each node clears its local metadata cache, and in §5.2, we describe how we reduce storage overheads by deleting old data globally.
+
+# 5.1 local metadata garbage collection
+
+in §4.2, we introduced algorithm 2, which enables each node to locally determine whether a particular transaction has been superseded because there are newer versions of all keys the transaction wrote. to locally garbage collect transaction metadata, a background garbage collection (gc) process periodically sweeps through all committed transactions in the metadata cache. for each transaction, the background process executes algorithm 2 to check if it is superseded and ensures that no currently-executing transactions have read from that transaction's write set.
+
+if both conditions are met, we remove that transaction from the commit set cache and evict any cached data from that transaction. this significantly reduces our metadata overheads because old transactions are frequently discarded as new transactions arrive. while supersedence can safely
+
+be decided locally, individual nodes cannot make decisions about whether to delete key versions because a transaction running at another node might read the superseded transaction's writes. as a result, we next describe a global protocol that communicates with all replicas to garbage collect key versions. each individual replica maintains a list of all locally deleted transaction metadata to aid in the global protocol.
+
+# 5.2 global data garbage collection
+
+the fault manager discussed in §4 also serves as a global garbage collector (gc). we combine these processes because the fault manager already receives commit broadcasts from aft nodes, which allows us to reduce communication costs. the global gc process executes algorithm 2 to determine which transactions have been superseded. it generates a list of transactions it considers superseded and asks all nodes if they have locally deleted those transactions. if all nodes have deleted a transaction's metadata, we can be assured that no running transactions will attempt to read the deleted items. nodes respond with the transactions they have deleted, and when the gc process receives acknowledgements from all nodes<sup>1</sup>, it deletes the corresponding transaction's writes and commit metadata. we allocate separate cores for the data deletion process, which allows us to batch expensive delete operations separate from the gc process.
+
+# 5.2.1 limitation: missing versions
+
+there is one key shortcoming to this protocol. recall from section 3.6 that aft returns null if there are no key versions in the valid timestamp range from algorithm 1. this problem can be exacerbated by our garbage collection protocol.
+
+as mentioned earlier, our local metadata gc protocol will not delete a transaction  $t_{i}$  if a running transaction,  $t_{j}$ , has read from  $t_{i}$ 's write set. however, since we do not know each running transaction's full read set, we might delete data that would be required by a running transaction in the future. consider the following transactions and write sets:  $t_{a}: \{k_{a}\}, t_{b}: \{l_{b}\}, t_{c}: \{k_{c}, l_{c}\}, a < b < c$ . say a transaction  $t_{r}$  first reads  $k_{a}$  then requests key  $l$ . the gc process will not delete  $t_{a}$  because  $t_{r}$  has read from it and is uncommitted. however, it might delete  $t_{b}$  if there are no restrictions on it; when  $t_{r}$  attempts to read  $l$ , it will find no valid versions since  $l_{c}$  is invalid, and algorithm 1 will return null.
+
+long-running transactions accessing frequently updated keys are particularly susceptible to this pitfall. these transactions might be forced to repeatedly retry because of missing versions, significantly increasing latencies. in practice, we mitigate this issue by garbage collecting the oldest transactions first. in our evaluation, we did not encounter valid versions of keys had been deleted by the gc process.
+
+# 6 evaluation
+
+in this section, we present a detailed evaluation of aft. a key design goal for aft is the flexibility to run on a variety of cloud storage backends, so we implemented aft over aws s3, a large scale object storage system, and aws dynamodb, a cloud-native key-value store. we also run aft over redis (deployed via aws elasticache) because it offers best-case performance for a memory-speed kvs despite the fact that it is not an autoscaling storage engine. all experiments use redis in cluster mode with 2 shards and 2 nodes per shard, unless stated otherwise.
+
+first, we measure aft's performance overheads and consistency benefits by comparing it to a variety of other serverless storage architectures ( $\s 6.1$ ). we then evaluate aspects of the system design: read caching ( $\s 6.2$ ), scalability ( $\s 6.5$ ), and garbage collection ( $\s 6.6$ ). finally, we measure aft's ability to tolerate and recover quickly from faults ( $\s 6.7$ ).
+
+aft is implemented in just over 2,500 lines of go and 700 lines of python and runs on top of kubernetes [23]. the majority of the aft protocols described in this paper are implemented in go. we use python to spin up and configure kubernetes clusters as well as to detect node failures in kubernetes and to reconfigure the cluster in such an event. we use a simple stateless load balancer implemented in go to route requests to aft nodes in a round-robin fashion. all experiments were run in the us-east-1a aws availability zone (az). each aft node ran on a c5.2xlarge ec2 instance with 8vcpus (4 physical cores) and 16gb of ram.
+
+# 6.1 aft overheads
+
+we first measure the performance overheads introduced by aft relative to interacting with cloud storage engines without aft. to isolate the overheads introduced by function-as-a-service platforms, we first measure io cost with and without aft interposed (§6.1.1); we then measure end-to-end latencies and consistency anomalies for transactions running on aws lambda over a variety of storage engines (§6.1.2).
+
+# 6.1.1 io latency
+
+we first compare the cost of writing data directly to dynamodb and to the cost of the same set of writes using aft's commit protocol (§3.3). to isolate our performance overheads, we issue writes from a single thread in a vm rather than using a faas system. we measure four configurations. our two baselines write directly to dynamodb, one with sequential writes and the other with batching. batching provides best-case performance, but interactive applications can rarely batch multiple writes. aft takes advantage of batched writes by default in its commit protocol—all client updates sent to the atomic write buffer are written to storage in a single batch when possible. we also measure two configurations over aft—one where the client sends sequential writes to aft, and one where the client sends a single batch.
+
+![](images/95cc88c3310e846896093aab8b6f6673fb26b4ea6340d8c026706f653be77242.jpg)  
+figure 2. the median (box) and 99th percentile (whisker) latencies across 1,000 sequential requests for performing 1, 5, and 10 writes from a single client to dynamodb and aft with and without batching. aft's automatic batching allows it to significantly outperform sequential writes to dynamodb, while its commit protocol imposes a small fixed overhead relative to batched writes to dynamodb.
+
+figure 2 shows the latency for performing 1, 5, and 10 writes. as expected, the latency of sequential writes to dynamodb increases roughly linearly with the number of writes, and the 99th percentile latency increases superlinearly. the latency of batched writes to dynamodb on the other hand scales much better, increasing by about  $2 \times$  from 1 write to 10.
+
+both aft configurations take advantage of batched writes. aft sequential's performance scales better than dynamodb sequential's, but latency increases about  $70\%$  from 1 write to 10 writes—this is primarily due to the cost and network variance incurred by issuing sequential requests from the client to aft. the aft batch bar measures a client who sends all writes in a single request to aft, leading to much more consistent performance. we observe a fixed difference of about 6ms between the dynamodb batch and the aft batch measurements—this is (1) the cost of the extra network overhead imposed by shipping data to aft, and (2) the cost of writing the extra commit record our protocol requires.
+
+takeaway: for interactive applications that perform sequential writes, aft significantly improves io latency by automatically batching updates.
+
+# 6.1.2 end-to-end latency
+
+next, we measure the end-to-end latency of executing transactions on aws lambda with and without aft interposed between the compute and storage layers. we evaluate three storage systems: aws s3, aws dynamodb, and redis. each transaction is composed of 2 functions, which perform one write and two reads each; all reads and writes are of 4kb objects. we chose small transactions because they reflect many real-world crud applications and because they highlight aft's overheads; we use this workload in the rest of our evaluation. we measure performance and consistency anomalies with a lightly skewed workload (a zipfian coefficient of
+
+![](images/ee394f67882b94401e77a3d9a48b8a87184b7b4b3d4084dfea51a2b3cf68e741.jpg)  
+figure 3. the end-to-end latency for executing a transaction with two sequential functions, each of which does 1 write and 2 reads (6 ios total) on aws s3, aws dynamodb, and aws elasticache (redis). numbers are reported from 10 parallel clients, each running 1,000 transactions.
+
+<table><tr><td>storage engine</td><td>consistency level</td><td>ryw anomalies</td><td>fr anomalies</td></tr><tr><td>aft</td><td>read atomic</td><td>0</td><td>0</td></tr><tr><td>s3</td><td>none</td><td>595</td><td>836</td></tr><tr><td>dynamodb</td><td>none</td><td>537</td><td>779</td></tr><tr><td>dynamodb</td><td>serializable</td><td>0</td><td>115</td></tr><tr><td>redis</td><td>shard 
+linearizable</td><td>215</td><td>383</td></tr></table>
+
+table 2. a count of the number of anomalies observed under read atomic consistency for dynamodb, s3, and redis over the 10,000 transactions run in figure 3. read-your-write (ryw) anomalies occur when transactions attempt to read keys they wrote and observe different versions. fractured read (fr) anomalies occurs when transactions read fractured updates with old data (see §2.1). aft's read atomic isolation prevents up to  $13\%$  of transactions from observing anomalies otherwise allowed by dynamodb and s3.
+
+1.0). figure 3 and table 2 show our results. the bars labeled "plain" in figure 3 represent end-to-end transaction latencies measured by running functions which write data directly to the respective storage engines. when executing requests without aft, we detect consistency anomalies by embedding the same metadata aft uses—a timestamp, a uuid, and a cowritten key set—into the key-value pairs; this accounts for about an extra 70 bytes on top of the 4kb payload.
+
+consistency. aft's key advantage over dynamodb, redis, and s3 is its read atomic consistency guarantee. we measure two types of anomalies here. read-your-write (ryw) anomalies occur when a transaction writes a key version and does not later read the same data; fractured read (fr) anomalies occur when a read violates the properties described in §2.1—these encompass repeatable read anomalies (see §3.5). table 2 reports the number of inconsistencies observed in the 10,000 transactions from figure 3. vanilla dynamodb and s3 have weak consistency guarantees and incur similar
+
+numbers of anomalies— $6\%$  of transactions experience ryw anomalies, and  $8\%$  experience fr anomalies.
+
+each redis shard is linearizable but no guarantees are made across shards. this consistency model combined with low latency io enables it to eliminate many anomalies by chance, as reads and writes interfere with each other less often. nonetheless, we still found anomalies on  $6\%$  of requests.
+
+we also evaluate dynamodb's transaction mode [13], which provides stronger consistency than vanilla dynamodb. in contrast to aft's general purpose transactions, dynamodb supports transactions that are either read-only or write-only. all operations in a single transaction either succeed or fail as a group; however, dynamodb's transaction mode does not to guarantee atomicity for transactions that span multiple functions--each transaction is only a single api call. to accommodate this model, we modified the workload slightly: the first function in the request does a two-read transaction, and the second function does a two-read transaction followed by a two-write transaction. we grouped all writes into a single transaction to guarantee that the updates are installed atomically rather than being spread across two separate transactions--this reduces the flexibility of the programming model but is more favorable to dynamodb's transactional guarantees.
+
+this setup avoids ryw anomalies because all of a request's writes are done in a single transaction. however, reads are spread across two transactions in two different functions, so we still encounter fr anomalies on over  $1\%$  of requests. dynamodb serializes all transactions, so many writes will be executed between the two read transactions, making our application likely to read newer data in the second read transaction that conflicts with data read in the first.
+
+performance. aft imposes the highest overhead over s3—25% slower than baseline at median and 14% at 99th percentile. s3 is a throughput-oriented object store that has high write latency variance, particularly for small objects [9, 40], and even in the aft-less configuration, s3 is 4 to  $10 \times$  slower than other storage systems. our design writes each key version to a separate storage key; this is poorly suited to s3, which has high random io latencies and is sensitive to data layouts. for this reason, we do not consider s3 in the rest of our evaluation. we return to this point in §8.
+
+aft is able to match dynamodb plain's performance. in this workload, each function does one write, so when writing directly from lambda to dynamodb, function cannot take advantage of write batching. on the other hand, aft's use of batching offsets the cost of its extra commit metadata write. with transaction mode enabled, dynamodb proactively aborts transactions in the case of conflict, so the reported latencies include retries. aft improves median performance over dynamodb's transaction mode by  $18\%$  at median and by  $2.5\times$  at the 99th percentile.
+
+![](images/4a0cbd22db92d09bb2eeebfc1cd29b26e36516296dbf5c025a06ae885d51fe0e.jpg)  
+figure 4. end-to-end latency for aft over dynamodb (aft-d) and redis (aft-r) with and without read caching enabled, as well as dynamodb's transaction mode. we vary the skew of the data access distribution to demonstrate the effects of contended workloads. caching improves aft-d's performance by up to  $15\%$ , while it has little effect on aft-r's performance. dynamodb's transaction mode suffers under high contention due to large numbers of repeated retries.
+
+finally, aft imposes a  $20\%$  latency penalty compared to redis plain because we are not able to take advantage of batching. while redis supports a mset operation to write multiple keys at once, that operation can only modify keys in a single shard. since requests can write arbitrary data, we are not guaranteed to modify keys in a single shard and cannot consistently batch updates.
+
+takeaway: aft offers performance that is competitive with state-of-the-art cloud storage engines while also eliminating a significant number of anomalies.
+
+# 6.2 read caching & data skew
+
+we now turn our attention to aft's data caching, its effect on performance, and its interaction with access distribution skewness. in this experiment, we use the same workload as in section 6.1.2—a 2-function transaction with 2 reads and 1 write per function. figure 4 shows the median and 99th percentile latencies for aft deployed over dynamodb (aft-d) and redis (aft-r) with and without caching. we also measure dynamodb's transaction mode; we omit any configurations that do not provide transactions in some form. we measured 3 zipfian distributions: 1.0 (lightly contended), 1.5 (moderately contended), and 2.0 (heavily contended).
+
+interestingly, we find that aft-r's performance varies very little across all configurations. read caching does not improve performance because the cost of fetching a 4kb payload from redis is negligible compared to invoking a lambda function and executing our read and write protocols. while recent work has shown that redis' performance can suffer under high contention [38], this experiment measures latencies and thus does not saturate redis's capacity.
+
+with caching, aft-d's performance improves by  $10\%$  for the lightly contended workload and up to  $17\%$  for the heavily
+
+![](images/313cd82945a7bd5c6707228211b8ff7f49d62114a67392b0e4d4320023fed20e.jpg)  
+figure 5. median and 99th percentile latency for aft over dynamodb and redis as a function of read-write ratio, from transactions with  $0\%$  reads to transactions with  $100\%$  reads. aft over redis should little variation, while our use of batching over dynamodb leads to small effects based on read-write ratios.
+
+contended workload. as distribution skew increases, so does the likelihood that we have a valid key version cached, thus improving performance.
+
+finally, we measure dynamodb's transaction mode. interestingly, we find that for  $\text{zipf} = 1.0$ , dynamodb's transactional performance improves relative to figure 3 in §6.1.2. this is because we use a larger dataset in this experiment (100,000 keys vs 1,000 keys), so the lightly contended workload is less likely to encounter data access conflicts. as we increase contention, performance degrades significantly, and for the most contended workload, aft-d is  $2 \times$  faster at median and  $7.6 \times$  better at the tail.
+
+takeaway: introducing read caching unlocks significant performance improvements for aft, particularly for skewed access distributions.
+
+# 6.3 read-write ratios
+
+next, we look at the effects of read-write ratios within a single transaction. thus far, our workload has consisted of transactions with only 4 writes and 2 reads split across 2 functions. in this section, we will use longer transactions with 10 total ios and vary the percentage of those ios that are reads from  $0\%$  to  $100\%$ .
+
+figure 5 shows our results. with aft running over dynamodb, performance is largely consistent with less than  $10\%$  variance. there is a slight increase in median latency from  $0\%$  reads to  $80\%$  reads. at  $0\%$  reads, there are two api calls to dynamodb—one to write the batch of updates, and the other to write the transaction's commit record. as we add reads, each individual read results in a separate api call, resulting in a slight increase in latency. at  $100\%$  reads, we remove the batch write api call, leading to a small dip in latency.  $0\%$  and  $20\%$  reads (i.e., 10 and 8 writes, respectively) have higher tail latencies because the larger numbers of writes increase the chance that the batch writes hit slower
+
+![](images/c1d0d5dd41bc8be426c3331ea2dbc8aeb19b9b7f206ce42c48f9ebd146137990.jpg)  
+figure 6. median and 99th percentile latency for aft over dynamodb and redis as a function of transaction length, from 1 function (3 ios) to 10 functions (30 ios). longer transactions mask the overheads of aft's protocols, which play a bigger role in the performance of the shorter transactions.
+
+shards in the underlying storage engine—this is similar to the differences in tail latencies seen in figure 2.
+
+aft over redis shows very little variation in performance across all read-write ratios. this is because redis (in cluster mode) does not support writing multiple objects at once, and the system treats reads and writes roughly uniformly. as a result, for all configurations, we make 11 api calls—10 for the ios and 1 for the final commit record.
+
+takeaway: aft maintains consistent performance across a variety of read-write ratios with minor variations based on the characteristics of the underlying storage system.
+
+# 6.4 transaction length
+
+in this experiment, we study the performance impact of transaction length. we vary transactions from 1 function to 10 functions, where each function consists of 2 reads and 1 write. figure 6 shows our results.
+
+aft scales roughly linearly with transaction length over both dynamodb and redis. as in previous experiments, aft's use of dynamodb's batching capabilities means that the overhead of increased writes is masked with the batch update operation. as a result, 10-function transactions are only  $6.2 \times$  slower than 1-function transactions—intuitively, this corresponds to the fact that  $\frac{2}{3}$  (or  $67\%$  ) of our api calls are reads, which scale linearly, while the remaining writes are batches into one api call.
+
+as before, redis requires separate api calls for each write operation and thus 10-function transactions are  $8.9 \times$  slower than 1-function transactions. the remaining difference is because the cost of writing an extra commit record to storage as a fixed cost is a large portion of the operating time of a 1-function transaction but a much smaller portion for 10-function transactions. dynamodb is  $59\%$  slower than redis for 1-function transactions but only  $13\%$  slower for 10-function transactions. in the rest of our experiments, we use
+
+![](images/2a30492743768c2ed2b9e553d77d873cd136740ce79671a22c28166f021dbd8f.jpg)  
+figure 7. the throughput of a single aft node as a function of number of simultaneous clients issues requests to it. we can see a single node scales linearly until about 40 clients for dynamodb and 45 clients for redis, at which point, the throughput plateaus.
+
+2-function transactions because they more clearly highlight our overheads than longer transactions do.
+
+takeaway: aft scales linearly with transaction length and is able to mask update and commit overheads for longer transactions.
+
+# 6.5 scalability
+
+in this section, we evaluate aft's scalability relative to the number of parallel clients. we first measure the number of clients a single aft node can support in §6.5.1. we then measure the overhead of the distributed protocols in §4 by measuring throughput in distributed deployments.
+
+# 6.5.1 single-node scalability
+
+in this section, we measure the number of parallel clients that a single aft node can support. we run the same 2-function, 6-io transactions as before under the moderate contention level (zipf=1.5), and we we vary the number of clients from 1 to 50. each client makes 1,000 requests by synchronously invoking the transaction, waiting for a response, and then triggering another transaction. figure 7 shows our results with aft deployed over dynamodb and redis.
+
+we find that aft scales linearly until 40 and 45 clients for dynamodb and redis, respectively. at this point, contention for shared data structures causes aft's throughput to plateau. similar to previous experiments, aft over redis achieves better performance than aft over dynamodb. because redis offers significantly lower io latencies, each transaction completes faster (see figure 3). our clients synchronously invoke each lambda, so the reduced latency directly translates to better throughput. at peak, aft over redis is able to achieve 900 transaction per second, while aft over dynamodb achieves just under 600 transaction per second.
+
+takeaway: a single aft node is able to scale linearly to over 40 clients (600tps), demonstrating the low overhead of our read atomic protocols.
+
+![](images/46acd766f28d6317b94df9989a9ba325653e8681ed4b224c61483da449a47e59.jpg)  
+figure 8. aft is able to smoothly scale to hundreds of parallel clients and thousands of transactions per second while deployed over both dynamodb and redis. we saturate either dynamodb's throughput limits or aws lambda's concurrent function invocation limit while scaling within  $90\%$  of ideal throughput.
+
+# 6.5.2 distributed scalability
+
+we now turn to measuring aft's ability to scale smoothly for multi-node deployments. based on the results in §6.5.1, we ran 40 clients per aft node and progressively scaled up the number of nodes. figure 8 shows our results.
+
+deployed over dynamodb, we find that aft is able to scale seamlessly to 8,000 transactions per second for 640 parallel clients. aft scales at slope that is within  $90\%$  of the ideal slope, where the ideal throughput is the number of nodes multiplied by a single node's throughput. we originally intended to demonstrate scalability to a thousand parallel clients, but we were restricted by aws dynamodb's resource limits, which would not let us scale beyond what is shown.
+
+with redis, we observe that aft is similarly able to scale linearly. similar to §6.5.1, aft over redis has a higher aggregate throughput due to lower io latencies. nonetheless, throughput remains within  $90\%$  of ideal. throughput for 640 clients plateaus not because of aft overheads but because we were limited by the number of concurrent function invocations supported by aws lambda.
+
+note that we manually configured both storage systems with the appropriate resources. we chose to disable dynamodb's autoscaling because the goal of this experiment was not to measure efficacy of their autoscaling policy. in general, however, dynamodb's autoscaling support makes it well-suited to serverless applications, while redis is a fixed-deployment system with high reconfiguration overheads.
+
+takeaway: aft is able to efficiently scale to thousands of transactions per second and hundreds of parallel clients within  $90\%$  of ideal throughput.
+
+# 6.6 garbage collection overheads
+
+in this experiment, we quantify the overhead of enabling aft's global garbage collection (§5.2). we run a single aft node with 40 clients and measure throughput with garbage
+
+![](images/99ec181c549476dcc586adef901e8f452eea29cab54318435761089b22f5a5ef.jpg)  
+figure 9. throughput for aft over dynamodb with and without global data garbage collection enabled. the garbage collection process has no effect on throughput while effectively deleting transactions at the same rate aft processes them under a moderately contended workload (zipf=1.5).
+
+collection enabled and disabled. we also measured the number of transactions deleted per second when garbage collection is enabled. figure 9 shows our results.
+
+there is no discernible difference between throughput with garbage collection enabled and disabled. the bulk of the work related to determining transaction supersedence happens periodically on each node to reduce metadata overheads (see §4.1). as a result, the global gc protocol simply collects lists of superseded transactions from all aft nodes and deletes transactions that all nodes consider superseded.
+
+the cost of this garbage collection process is that we require separate cores that are dedicated to deleting old data. however, the resources allocated to garbage collection are much smaller than the resources required to run the system: for the four cores we used to run the aft node, we only required 1 core to delete transactions.
+
+takeaway: aft's local metadata garbage collection enables efficient global deletion of superseded data with no effect on system throughput and at reasonable added cost.
+
+# 6.7 fault tolerance
+
+finally, in this experiment, we measure aft's performance in the presence of failures. we know from our protocols and prior experiments that the behavior and performance of aft nodes is independent. in this experiment, we are looking to measure the effect of a node failure and the cost of recovering from failure—that is how long it takes for a node to cold start and join the system. figure 10 shows our results.
+
+we run aft with 4 nodes and 200 parallel clients and terminate a node just before 10 seconds. we see that throughput immediately drops about  $16\%$ . within 5 seconds, the aft management process determines that a node has failed, and it adds assigns a new node to join the cluster. note that we pre-allocate "standby" nodes to avoid having to wait for new ec2 vms to start, which can take up to 3 minutes.
+
+![](images/5d55541eb342f0b9faef73ce4dc9f071e214f856d965343727c8cb1b11daca91.jpg)  
+figure 10. aft's fault manager is able to detect faults and allocate new resources within a reasonable time frame; the primary overheads we observe are due to the cost of downloading docker containers and warming up aft's metadata cache. aft's performance does not suffer significantly in the interim.
+
+over the next 45 seconds, this new node downloads the aft docker container and updates its local metadata cache. just after 60 seconds, the node joins the cluster, and throughput returns to pre-failure peaks within a few seconds. note that throughput is on a slight downward slope between 10 and 60 seconds—this is because the remaining three nodes are saturated, and the queue of pending requests grows, causing throughput to decrease.
+
+note that the overheads involved in starting a new node can be further mitigated by downloading containers in advance and by maintaining standby nodes with warm metadata caches. these are engineering tasks that are not fundamental to the design of aft.
+
+takeaway: aft's fault management system is able to detect and recover from faults in a timely fashion.
+
+# 7 related work
+
+atomic reads. the ramp protocols in [4] are the only prior work we are aware of that explicitly addresses read atomic isolation. however, another coordination-free consistency model that guarantees atomic reads atomic is transactional causal consistency (tcc), implemented in systems like occult [27] and cure [1]. in addition to atomic reads, causal consistency guarantees that reads and writes respect lamport's "happens-before" relation [25]. in general, causal systems must track each transaction's read set in addition to its write set, which adds a metadata overhead that read atomicity does not require.
+
+two key aspects distinguish our approach from prior work. first, [4], [27], and [1] achieve read atomicity at the storage layer, whereas aft is a shim above the storage engine. this allows for more flexibility as aft users can pick any key-value storage system, while still maintaining consistency. second, the mechanisms used to achieve read atomic isolation in [27] and [1] rely on fixed node membership at the
+
+storage layer, which we cannot assume in an autoscaling serverless environment. the read atomic isolation protocols in this paper do not require knowledge of node membership. aft only requires membership for garbage collection of data, which happens off the critical path of transaction processing.
+
+multi versioning. the idea of multi-version concurrency control and storage dates back to the 1970s [8, 31]. the original postgres storage manager [33] introduced the notion of maintaining a commit log separate from data version storage, an idea we adopted in aft. more recently, a variety of systems have proposed and evaluated techniques for multiversion concurrency [15, 28, 39]. these systems all offer some form of strong transactional consistency (e.g., snapshot isolation, serializability), which aft and the ramp protocols do not. similar to the causal approaches, these systems also enforce consistency in the storage system, while aft offers consistency over a variety of storage backends.
+
+fault tolerance. there is a rich literature on fault tolerance for distributed systems (see, e.g., [30, 36]). many techniques are conceivably applicable in the faas context, from checkpoint/restart of containers or virtual machines (e.g. [26]) to log- (or "lineage-") based replay (e.g. [37]) to classical process pairs (e.g., [6]). our approach is based on the simple retry-from-scratch model used by existing serverless platforms such as aws lambda and google cloud functions, and appropriate to short-lived interactive ("transactional") tasks. as noted above, existing faas platforms attempt to offer at-least-once execution semantics, but may expose fractional writes from failed function attempts. aft's built-in atomicity and idempotence guarantees allow a simple retry scheme to achieve exact-once semantics that provides both safety and liveness in the face of failures.
+
+# 8 conclusion and future work
+
+in this paper, we presented aft, a low-overhead fault-tolerance shim for serverless computing. aft interposes between commodity faas platforms and key-value stores to achieve fault-tolerance by transparently guaranteeing read atomic isolation [4]. we develop new distributed protocols for read atomicity, which build on shared storage for high throughput and do not require pre-declared read and write sets. aft adds minimal overhead to existing serverless architectures and scales linearly with the size of the cluster, while offering exactly-once execution in the face of failures.
+
+while aft brings fault tolerance guarantees to faas programmers for the first time, we believe there are a variety of interesting avenues for future work.
+
+efficient data layout. as observed in §6.1.2, aft's key-per-version data layout works well over dynamodb and redis, which are optimized for small key access, but performs poorly over s3. in settings with high-volume updates, we would like to optimize data layouts for a system like s3. aft's design allows us to explore techniques for high-volume,
+
+write heavy workloads, inspired by log-structured merge trees [29] and log-structured file systems [32], where writes are appended as efficiently as possible, and re-organized offline into read-optimized data structures.
+
+autoscaling policies. as a shim layer, aft allows us to autoscale fault-tolerance infrastructure independently of both storage and compute. policies for efficient and accurate autoscaling decisions are a natural next step. there are two aspects to this problem. from a functionality perspective, we must accurately measure system load per node and effectively manage cluster size to meet application requirements. in terms of scheduling, economic models and sla design may offer a useful angle for engineering the interplay of potentially unbounded platform costs and user behavior.
+
+data and cache partitioning. partitioned caching is a well-studied technique in large-scale web systems [10]. naive caching schemes like aft's will result in every node caching largely the same data, particularly for skewed workloads. it may be preferable to intelligently partition the space of keys across nodes [10] to make better use of global memory while maintaining load balance. doing this in aft would mean that each transaction would interact with multiple aft nodes, raising interesting new design challenges for maintaining read atomic consistency.
+
+recovery for long-running faas programs as discussed in §7, our retry approach could be augmented with recovery-based techniques such as checkpointing and logging/lineage, so that long-running faas programs need not restart from scratch. these mechanisms are not inconsistent with our atomicity design, but details need to be worked out—e.g., to ensure that metadata management and garbage are handled correctly upon recovery.
+
+the design of aft as a disaggregated shim layer enables us to study these topics in the context of commodity serverless infrastructure—even as the computing and storage platforms evolve.
+
+# references
+
+[1] deepethi devaki akkoorath, alejandro z tomsic, manuel bravo, zhongmiao li, tyler crain, annette bieniusa, nuno preguiça, and marc shapiro. cure: strong semantics meets high availability and low latency. in 2016 ieee 36th international conference on distributed computing systems (icdcs), pages 405-414. ieee, 2016.  
+[2] istemi ekin akkus, ruichuan chen, ivica rimac, manuel stein, klaus satzke, andre beck, paarijaat aditya, and volker hilt. sand: towards high-performance serverless computing. in 2018 usenix annual technical conference (usenix atc 18), pages 923-935, 2018.  
+[3] aws lambda - case studies. https://aws.amazon.com/lambda/resources/customer-case-studies/.  
+[4] peter bailis, alan fekete, joseph m. hellerstein, ali ghodsi, and ion stoica. scalable atomic visibility with ramp transactions. in proceedings of the 2014 acm sigmod international conference on management of data, sigmod '14, pages 27-38, new york, ny, usa, 2014. acm.  
+[5] ioana baldini, paul castro, kerry chang, perry cheng, stephen fink, vatche ishakian, nick mitchell, vinod muthusamy, rodric rabbah,
+
+aleksander slominski, et al. serverless computing: current trends and open problems. in research advances in cloud computing, pages 1-20. springer, 2017.  
+[6] joel bartlett, jim gray, and bob horst. fault tolerance in tandem computer systems. in the evolution of fault-tolerant computing, pages 55-76. springer, 1987.  
+[7] paul beame, paraschos koutris, and dan suciu. skew in parallel query processing. in proceedings of the 33rd acm sigmod-sigact-sigart symposium on principles of database systems, pages 212-223. acm, 2014.  
+[8] philip a. bernstein and nathan goodman. multiversion concurrency control&mdash;theory and algorithms. acm trans. database syst., 8(4):465-483, december 1983.  
+[9] matthias brantner, daniela florescu, david graf, donald kossmann, and tim kraska. building a database on s3. in proceedings of the 2008 acm sigmod international conference on management of data, sigmod '08, pages 251-264, new york, ny, usa, 2008. acm.  
+[10] lee breslau, pei cao, li fan, graham phillips, scott shenker, et al. web caching and zipf-like distributions: evidence and implications. in *ieee infocom*, volume 1, pages 126-134. institute of electrical engineers inc (ieee), 1999.  
+[11] e. brewer. cap twelve years later: how the “rules” have changed. computer, 45(2):23-29, feb 2012.  
+[12] tushar d chandra, robert griesemer, and joshua redstone. paxos made live: an engineering perspective. in proceedings of the twenty-sixth annual acm symposium on principles of distributed computing, pages 398-407. acm, 2007.  
+[13] amazon dynamodb transactions: how it works - amazon dynamodb. https://docsaws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html.  
+[14] enterprise application container platform | docker. https://www.docker.com.  
+[15] jose m. faleiro and daniel j. abadi. rethinking serializable multiversion concurrency control. proc. vldb endow., 8(11):1190-1201, july 2015.  
+[16] sadjad fouladi, francisco romero, dan iter, qian li, shuvo chatterjee, christos kozyrakis, matei zaharia, and keith winstein. from laptop to lambda: outsourcing everyday jobs to thousands of transient functional containers. in 2019 usenix annual technical conference (usenix atc 19), pages 475-488, 2019.  
+[17] sadjad fouladi, riad s. wahby, brennan shacklett, karthikeyan vasuki balasubramaniam, william zeng, rahul bhalerao, anirudh sivaraman, george porter, and keith winstein. encoding, fast and slow: low-latency video processing using thousands of tiny threads. in 14th usenix symposium on networked systems design and implementation (nsdi 17), pages 363-376, boston, ma, 2017. usenix association.  
+[18] yu gan, yanqi zhang, dailun cheng, ankitha shetty, priyal rathi, nayan katarki, ariana bruno, justin hu, brian ritchken, brendon jackson, et al. an open-source benchmark suite for microservices and their hardware-software implications for cloud & edge systems. in proceedings of the twenty-fourth international conference on architectural support for programming languages and operating systems, pages 3-18. acm, 2019.  
+[19] joseph m. hellerstein, jose m. faleiro, joseph gonzalez, johann schleier-smith, vikram sreekanti, alexey tumanov, and chenggang wu. serverless computing: one step forward, two steps back. in cidr 2019, 9th biennial conference on innovative data systems research, asilomar, ca, usa, january 13-16, 2019, online proceedings, 2019.  
+[20] eric jonas, johann schleier-smith, vikram sreekanti, chia-che tsai, anurag khandelwal, qifan pu, vaishaal shankar, joao menezes carreira, karl krauth, neeraja yadwadkar, joseph gonzalez, raluca ada popa, ion stoica, and david a. patterson. cloud programming simplified: a berkeley view on serverless computing. technical report
+
+ucb/eecs-2019-3, eecs department, university of california, berkeley, feb 2019.  
+[21] eric jonas, shivaram venkataraman, ion stoica, and benjamin recht. occupy the cloud: distributed computing for the  $99\%$ . corr, abs/1702.04024, 2017.  
+[22] ana klimovic, yawen wang, patrick stuedi, animesh trivedi, jonas pfefferle, and christos kozyrakis. pocket: elastic ephemeral storage for serverless analytics. in 13th {usenix} symposium on operating systems design and implementation (\{osdi\} 18), pages 427-444, 2018.  
+[23] kubernetes: production-grade container orchestration. http://kubernetes.io.  
+[24] make a lambda function idempotent. https://aws.amazon.com/premiumsupport/knowledge-center/lambda-function-idempotent/.  
+[25] leslie lamport. the part-time parliament. acm transactions on computer systems (tocs), 16(2):133-169, 1998.  
+[26] wubin li and ali kanso. comparing containers versus virtual machines for achieving high availability. in 2015 ieee international conference on cloud engineering, pages 353-358. ieee, 2015.  
+[27] syed akbar mehdi, cody littley, natacha crooks, lorenzo alvisi, nathan bronson, and wyatt lloyd. i can't believe it's not causal! scalable causal consistency with no slowdown cascades. in 14th usenix symposium on networked systems design and implementation (nsdi 17), pages 453-468, boston, ma, march 2017. usenix association.  
+[28] thomas neumann, tobias muhlbauer, and alfons kemper. fast serializable multi-version concurrency control for main-memory database systems. in proceedings of the 2015 acm sigmod international conference on management of data, sigmod '15, pages 677-689, new york, ny, usa, 2015. acm.  
+[29] patrick o'neil, edward cheng, dieter gawlick, and elizabeth o'neil. the log-structured merge-tree (ism-tree). acta informatica, 33(4):351-385, 1996.  
+[30] brian randell. system structure for software fault tolerance. *ieee transactions on software engineering*, pages 220-232, 1975.  
+[31] david patrick reed. naming and synchronization in a decentralized computer system. phd thesis, massachusetts institute of technology, 1978.  
+[32] mendel rosenblum and john k ousterhout. the design and implementation of a log-structured file system. acm transactions on computer systems (tocs), 10(1):26-52, 1992.  
+[33] michael stonebraker. the design of the postgres storage system. in proceedings of the 13th international conference on very large data bases, vldb '87, pages 289-300, san francisco, ca, usa, 1987. morgan kaufmann publishers inc.  
+[34] rebecca taft, essam mansour, marco serafini, jennie duggan, aaron j. elmore, ashraf aboulnaga, andrew pavlo, and michael stonebraker. e-store: fine-grained elastic partitioning for distributed transaction processing systems. proc. vldb endow., 8(3):245-256, november 2014.  
+[35] erwin van eyk, alexandru iosup, simon seif, and markus thömmes. the spec cloud group's research vision on faas and serverless architectures. in proceedings of the 2nd international workshop on serverless computing, pages 1-4. acm, 2017.  
+[36] maarten van steep and andrew s. tanenbaum. distributed systems. createspace independen publishing platform, 3.01 edition, 2018.  
+[37] stephanie wang, john liagouris, robert nishihara, philipp moritz, ujval misra, alexey tumanov, and ion stoica. lineage stash: fault tolerance off the critical path. in proceedings of the 27th acm symposium on operating systems principles, pages 338-352. acm, 2019.  
+[38] chenggang wu, jose faleiro, yihan lin, and joseph hellerstein. anna: a kvs for any scale. ieee transactions on knowledge and data engineering, 2019.  
+[39] yingjun wu, joy arulraj, jiexi lin, ran xian, and andrew pavlo. an empirical evaluation of in-memory multi-version concurrency control. proc. vldb endow., 10(7):781-792, march 2017.
+
+[40] zhe wu, curtis yu, and harsha v. madhyastha. costlo: cost-effective redundancy for lower latency variance on cloud storage services. in 12th usenix symposium on networked systems design and implementation (nsdi 15), pages 543-557, oakland, ca, may 2015. usenix association.

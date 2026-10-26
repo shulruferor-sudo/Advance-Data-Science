@@ -1,0 +1,515 @@
+# offline meta-reinforcement learning with advantage weighting
+
+eric mitchell 1 rafael rafailov 1 xue bin peng 2 sergey levine 2 chelsea finn 1
+
+# abstract
+
+this paper introduces the offline meta-reinforcement learning (offline meta-rl) problem setting and proposes an algorithm that performs well in this setting. offline meta-rl is analogous to the widely successful supervised learning strategy of pre-training a model on a large batch of fixed, pre-collected data (possibly from various tasks) and fine-tuning the model to a new task with relatively little data. that is, in offline meta-rl, we meta-train on fixed, pre-collected data from several tasks in order to adapt to a new task with a very small amount (less than 5 trajectories) of data from the new task. by nature of being offline, algorithms for offline meta-rl can utilize the largest possible pool of training data available and eliminate potentially unsafe or costly data collection during meta-training. this setting inherits the challenges of offline rl, but it differs significantly because offline rl does not generally consider a) transfer to new tasks or b) limited data from the test task, both of which we face in offline meta-rl. targeting the offline meta-rl setting, we propose meta-actor critic with advantage weighting (macaw), an optimization-based meta-learning algorithm that uses simple, supervised regression objectives for both the inner and outer loop of meta-training. on offline variants of common meta-rl benchmarks, we empirically find that this approach enables fully offline meta-reinforcement learning and achieves notable gains over prior methods. code available at https://sites.google.com/view/macaw-metarl.
+
+# 1. introduction
+
+meta-reinforcement learning (meta-rl) has emerged as a promising strategy for tackling the high sample complexity
+
+$^{1}$ stanford university  $^{2}$ university of california, berkeley. correspondence to: eric mitchell <eric.mitchell@cs.stanford.edu>.
+
+proceedings of the  $38^{th}$  international conference on machine learning, pmlr 139, 2021. copyright 2021 by the author(s).
+
+of reinforcement learning algorithms, when the goal is to ultimately learn many tasks. meta-rl algorithms exploit shared structure among tasks during meta-training, amortizing the cost of learning across tasks and enabling rapid adaptation to new tasks during meta-testing from only a small amount of experience. yet unlike in supervised learning, where large amounts of pre-collected data can be pooled from many sources to train a single model, existing meta-rl algorithms assume the ability to collect millions of environment interactions online during meta-training. developing offline meta-rl methods would enable such methods, in principle, to leverage existing data from any source, making them easier to scale to real-world problems where large amounts of data might be necessary to generalize broadly. to this end, we propose the offline meta-rl problem setting and a corresponding algorithm that uses only offline (or batch) experience from a set of training tasks to enable efficient transfer to new tasks without requiring any further interaction with either the training or testing environments. see figure 1 for a comparison of offline meta-rl and standard meta-rl.
+
+because the offline setting does not allow additional data collection during training, it highlights the desirability of a consistent meta-rl algorithm. a meta-rl algorithm is consistent if, given enough diverse data on the test task, adaptation can find a good policy for the task regardless of the training task distribution. such an algorithm would provide a) rapid adaptation to new tasks from the same distribution as the train tasks while b) allowing for improvement even for out of distribution test tasks. however, designing a consistent meta-rl algorithm in the offline setting is difficult: the consistency requirement suggests we might aim to extend the model-agnostic meta-learning (maml) algorithm (finn et al., 2017a), since it directly corresponds to fine-tuning at meta-test time. however, existing maml approaches use online policy gradients, and only value-based approaches have proven effective in the offline setting. yet combining maml with value-based rl subroutines is not straightforward: the higher-order optimization in maml-like methods demands stable and efficient gradient-descent updates, while td backups are both somewhat unstable and require a large number of steps to propagate reward information across long time horizons.
+
+to address these challenges, one might combine maml
+
+with a supervised, bootstrap-free rl subroutine, such as advantage-weighted regression (awr) (peters and schaal, 2007; peng et al., 2019), for both for the inner and outer loop of a gradient-based meta-learning algorithm, yielding a 'maml+awr' algorithm. however, as we will discuss in section 4 and find empirically in section 5, naively combining maml and awr in this way does not provide satisfactory performance because the awr policy update is not sufficiently expressive. motivated by prior work that studies the expressive power of maml (finn and levine, 2018), we increase the expressive power of the meta-learner by introducing a carefully chosen policy update in the inner loop. we theoretically prove that this change increases the richness of the policy's update and find empirically that this policy update can dramatically improve adaptation performance and stability in some settings. we further observe that the relatively shallow feedforward neural network architectures used in reinforcement learning are not well-suited to optimization-based meta-learning and suggest an alternative that proves critical for good performance across four different environments. we call the resulting meta-rl algorithm and architecture meta actor-critic with advantage weighting, or macaw.
+
+our main contributions are the offline meta-rl problem setting itself and macaw, an offline meta-reinforcement learning algorithm and architecture that possesses three key properties: sample efficiency, offline meta-training, and consistency at meta-test time. to our knowledge, macaw is the first algorithm to successfully combine gradient-based meta-learning and off-policy value-based rl. our evaluations include experiments on offline variants of standard continuous control meta-rl benchmarks as well as settings specifically designed to test the robustness of an offline meta-learner with scarce or poor-quality training data. in all comparisons, macaw significantly outperforms fully offline variants state-of-the-art off-policy rl and meta-rl baselines.
+
+# 2. preliminaries
+
+in reinforcement learning, an agent interacts with a markov decision process (mdp) to maximize its cumulative reward. an mdp is a tuple  $(s, \mathcal{a}, t, r)$  consisting of a state space  $s$ , an action space  $\mathcal{a}$ , stochastic transition dynamics  $t: s \times \mathcal{a} \times s \to [0,1]$ , and a reward function  $r$ . at each time step, the agent receives reward  $r_t = r(s_t, a_t, s_{t+1})$ . the agent's objective is to maximize the expected return (i.e., discounted sum of rewards)  $\mathcal{r} = \sum_t \gamma^t r_t$ , where  $\gamma \in [0,1]$  is a discount factor. existing meta-rl problem statements generally consider tasks drawn from a distribution  $\mathcal{t}_i \sim p(\mathcal{t})$ , where each task  $\mathcal{t}_i = (s, \mathcal{a}, p_i, r_i)$  represents a different mdp. both the dynamics and reward function may vary across tasks. the tasks are generally as
+
+sumed to exhibit some (unknown) shared structure. during meta-training, the agent is presented with tasks sampled from  $p(\mathcal{t})$ ; at meta-test time, an agent's objective is to rapidly find a high-performing policy for a (potentially unseen) task  $\mathcal{t}' \sim p(\mathcal{t})$ . that is, with only a small amount of experience on  $\mathcal{t}'$ , the agent should find a policy that achieves high expected return on that task. during meta-training, the agent meta-learns parameters or update rules that enables such rapid adaptation at test-time.
+
+model-agnostic meta-learning one class of algorithms for addressing the meta-rl problem (as well as metasupervised learning) are variants of the maml algorithm (finn et al., 2017a), which involves a bi-level optimization that aims to achieve fast adaptation via a few gradient updates. specifically, maml optimizes a set of initial policy parameters  $\theta$  such that a few gradient-descent steps from  $\theta$  leads to policy parameters that achieve good task performance. at each meta-training step, the inner loop adapts  $\theta$  to a task  $\mathcal{t}$  by computing  $\theta' = \theta - \alpha \nabla_{\theta} \mathcal{l}_{\mathcal{t}}(\theta)$ , where  $\mathcal{l}$  is the loss function for task  $\mathcal{t}$  and  $\alpha$  is the step size (in general,  $\theta'$  might be computed from multiple gradient steps, rather than just one as is written here). the outer loop updates the initial parameters as  $\theta \gets \theta - \beta \nabla_{\theta} \mathcal{l}_{\mathcal{t}}'(\theta')$ , where  $\mathcal{l}_{\mathcal{t}}'$  is a loss function for task  $\mathcal{t}$ , which may or may not be the same as the inner-loop loss function  $\mathcal{l}_{\mathcal{t}}$ , and  $\beta$  is the outer loop step size. maml has been previously instantiated with policy gradient updates in the inner and outer loops (finn et al., 2017a; rothfuss et al., 2018), which can only be applied to on-policy meta-rl settings; we address this shortcoming in this work.
+
+advantage-weighted regression. to develop an offline meta-rl algorithm, we build upon advantage-weighted regression (awr) (peng et al., 2019), a simple offline rl method. the awr policy objective is given by
+
+$$
+\begin{array}{l} \mathcal {l} ^ {\mathrm {a w r}} (\vartheta , \varphi , b) = \\ \mathbb {e} _ {\mathbf {s}, \mathbf {a} \sim b} \left[ - \log \pi_ {\vartheta} (\mathbf {a} | \mathbf {s}) \exp \left(\frac {1}{t} \left(\mathcal {r} _ {b} (\mathbf {s}, \mathbf {a}) - v _ {\varphi} (\mathbf {s})\right)\right) \right] \tag {1} \\ \end{array}
+$$
+
+where  $b = \{\mathbf{s}_j, \mathbf{a}_j, \mathbf{s}_j', r_j\}$  can be an arbitrary dataset of transition tuples sampled from some behavior policy, and  $\mathcal{r}_b(\mathbf{s}, \mathbf{a})$  is the return recorded in the dataset for performing action  $\mathbf{a}$  in state  $\mathbf{s}$ ,  $v_{\varphi}(\mathbf{s})$  is the learned value function for the behavior policy evaluated at state  $\mathbf{s}$ , and  $t > 0$  is a temperature parameter. the term  $\mathcal{r}_b(\mathbf{s}, \mathbf{a}) - v_{\varphi}(\mathbf{s})$  represents the advantage of a particular action. the objective can be interpreted as a weighted regression problem, where actions that lead to higher advantages are assigned larger weights. the value function parameters  $\varphi$  are typically trained using simple regression onto monte carlo returns, and the policy parameters  $\vartheta$  are trained using  $\mathcal{l}^{\mathrm{awr}}$ . next, we discuss the offline meta-rl problem and some of the challenges it poses.
+
+![](images/da2fbf419cb20dfa3190cddc050bf3db9d03064c835147b356411fd0596d8753.jpg)  
+figure 1: comparing the standard meta-rl setting (left), which includes on-policy and off-policy meta-rl, with offline meta-rl (right). in standard meta-rl, new interactions are sampled from the environment during both meta-training and meta-testing, potentially storing experiences in a replay buffer (off-policy meta-rl). in offline meta-rl, a batch of data is provided for each training task  $\mathcal{t}_i$ . this data could be the result of prior skills learned, demonstrations, or other means of data collection. the meta-learner uses these static buffers of data for meta-training and can then learn a new test task when given a small buffer of data for that task.
+
+![](images/c42feb740bef69beb55a9f817c31a91bf9a0756cd83fc0cdf33dea8ab1f5c844.jpg)
+
+# 3. the offline meta-rl problem
+
+in the offline meta-rl problem setting, we aim to leverage offline multi-task experience to enable fast adaptation to new downstream tasks. a task  $\mathcal{t}_i$  is defined as a tuple  $(\mathcal{m}_i,\mu_i)$  containing a markov decision process (mdp)  $\mathcal{m}_i$  and a fixed, unknown behavior policy  $\mu_{i}$ . each  $\mu_{i}$  might be an expert policy, sub-optimal policy, or a mixture policy (e.g. corresponding the replay buffer of an rl agent). tasks are drawn from a task distribution  $p(\mathcal{t}) = p(\mathcal{m},\mu)$ . during meta-training, an offline meta-rl algorithm cannot interact with the environment, and instead has access only to a fixed buffer of transition tuples  $d_{i} = \{s_{i,j},a_{i,j},s_{i,j}^{\prime},r_{i,j}\}$  sampled from  $\mu_{i}$  for each task. during meta-testing, a (typically unseen) test task  $\mathcal{t}_{\mathrm{test}} = (\mathcal{m}_{\mathrm{test}},\mu_{\mathrm{test}})$  is drawn from  $p(\mathcal{t})$ . we consider two different meta-testing procedures. in the fully offline meta-rl setting, the meta-trained agent is presented with a small batch of experience  $d_{\mathrm{test}}$  sampled from  $\mu_{\mathrm{test}}$ . the agent's objective is to adapt using only  $d_{\mathrm{test}}$  to find the highest-performing policy possible for  $\mathcal{m}_{\mathrm{test}}$ . alternatively, in the offline meta-rl with online fine-tuning setting, the agent can perform additional online data collection and learning after being provided with the offline data  $d_{\mathrm{test}}$ . note that in both settings, if  $\mu_{\mathrm{test}}$  samples data uninformative for solving  $\mathcal{m}_{\mathrm{test}}$ , we might expect test performance to be affected; we consider this possibility in our experiments.
+
+sampling data from fixed batches at meta-training time, rather than from the learned policy itself, distinguishes offline meta-rl from the standard meta-rl setting. this setting is particularly applicable in situations when allowing online exploration might be difficult, expensive, or dangerous. we introduce both variants of the problem because for some settings, limited online data collection may be possible, especially with a reasonably performant/safe policy
+
+acquired through fully offline adaptation. prior meta-rl methods require interaction with the mdp for each of the meta-training tasks (finn et al., 2017a), and though some prior methods build on off-policy rl algorithms (rakelly et al., 2019), these algorithms are known to perform poorly in the fully offline setting (levine et al., 2020). both of the offline meta-rl settings described above inherit the distributional difficulties of offline rl, which means that addressing this problem setting requires a new type of meta-rl method capable of meta-training on offline data, in addition to satisfying the consistency desideratum described in section 1.
+
+# 4. macaw: meta actor-critic with advantage weighting
+
+to address the numerous challenges posed by offline metarl, we propose meta actor-critic with advantage weighting (macaw). macaw is an offline meta-rl algorithm that learns initializations  $\phi$  and  $\theta$  for a value function  $v_{\phi}$  and policy  $\pi_{\theta}$ , respectively, that can rapidly adapt to a new task seen at meta-test time via gradient descent. both the value function and the policy objectives correspond to simple weighted regression losses in both the inner and outer loop, leading to a stable and consistent inner-loop adaptation process and outer-loop meta-training signal. while these objectives build upon awr, we show that the naive application of an awr update in the inner loop can lead to unsatisfactory performance, motivating the enriched policy update that we describe in section 4.1. in sections 4.2 and 4.3, we detail the full meta-training procedure and an important architectural component of the policy and value networks.
+
+algorithm 1 macaw meta-training  
+1: input: tasks  $\{\mathcal{t}_i\}$  , offline buffers  $\{d_i\}$    
+2: hyperparameters: learning rates  $\alpha_{1},\alpha_{2},\eta_{1},\eta_{2}$  training iterations  $n$  , temperature  $t$    
+3: randomly initialize meta-parameters  $\theta$  ,  $\phi$    
+4: for  $n$  steps do   
+5: for task  $\mathcal{t}_i\in \{\mathcal{t}_i\}$  do   
+6: sample disjoint batches  $d_{i}^{\mathrm{tr}}$ $d_{i}^{\mathrm{ts}}\sim d_{i}$    
+7:  $\phi_i^\prime \gets \phi -\eta_1\nabla_\phi \mathcal{l}_v(\phi ,d_i^{\mathrm{tr}})$    
+8:  $\theta_i^\prime \leftarrow \theta -\alpha_1\nabla_\theta \mathcal{l}_\pi (\theta ,\phi_i^\prime ,d_i^{\mathrm{tr}})$    
+9: end for   
+10:  $\phi \gets \phi -\eta_2\sum_i[\nabla_\phi \mathcal{l}_v(\phi_i^\prime ,d_i^{\mathrm{ts}})]$    
+11:  $\theta \gets \theta -\alpha_2\sum_i[\nabla_\theta \mathcal{l}^{\mathrm{awr}}(\theta_i^\prime ,\phi_i^\prime ,d_i^{\mathrm{ts}})]$    
+12: end for
+
+# 4.1. inner-loop macaw procedure
+
+the adaptation process for macaw consists of a value function update followed by a policy update and can be found in lines 6-8 in algorithm 1. optimization-based meta-learning methods typically rely on truncated optimization for the adaptation process (finn et al., 2017a), to satisfy both computational and memory constraints (wu et al., 2018; rajeswaran et al., 2019), and macaw also uses a truncated optimization. however, value-based algorithms that use bootstrapping, such as q-learning, can require many iterations for values to propagate. therefore, we use a bootstrap-free update for the value function that simply performs supervised regression onto monte-carlo returns. given a batch of training data  $d_{i}^{\mathrm{tr}}$  collected for  $\mathcal{t}_i$ , macaw adapts the value function by taking one or a few gradient steps on the following supervised objective:
+
+$$
+\begin{array}{l} \phi_ {i} ^ {\prime} \leftarrow \phi - \eta_ {1} \nabla_ {\phi} \mathcal {l} _ {v} \left(\phi , d _ {i} ^ {\mathrm {t r}}\right), \quad \text {w h e r e} \\ \mathcal {l} _ {v} (\phi , d) \triangleq \mathbb {e} _ {\mathbf {s}, \mathbf {a} \sim d} \left[ \left(v _ {\phi} (\mathbf {s}) - \mathcal {r} _ {d} (\mathbf {s}, \mathbf {a})\right) ^ {2} \right] \tag {2} \\ \end{array}
+$$
+
+and where  $\mathcal{r}_d(\mathbf{s},\mathbf{a})$  is the monte carlo return from the state  $\mathbf{s}$  taking action  $\mathbf{a}$  observed in  $d$ .
+
+after adapting the value function, we proceed to adapting the policy. the awr algorithm updates its policy by performing supervised regression onto actions weighted by the estimated advantage, where the advantage is given by the return minus the value:  $\mathcal{r}_d(\mathbf{s},\mathbf{a}) - v_{\phi_i'}(\mathbf{s})$ . while it is tempting to use this same update rule here, we observe that this update does not provide the meta-learner with sufficient expressive power to be a universal update procedure for the policy, using universality in the sense used by finn and levine (2018). for maml-based methods to approximate any learning procedure, the inner gradient must not discard information needed to infer the task (finn and levine, 2018). the gradient of the awr objective does not contain full information of both the regression weight and the regression target. that is, one cannot recover both the advantage weight
+
+algorithm 2 macaw meta-testing  
+1: input: test task  $\mathcal{t}_j$  offline experience  $d$  , metapolicy  $\pi_{\theta}$  , meta-value function  $v_{\phi}$    
+2: hyperparameters: learning rates  $\alpha_{1},\eta$  , adaptation iterations  $n$  , temperature  $t$    
+3: initialize  $\theta_0\gets \theta$ $\phi_0\gets \phi$    
+4: for  $n$  steps do   
+5:  $\phi_{t + 1}\gets \phi_t - \eta_1\nabla_{\phi_t}\mathcal{l}_v(\phi_t,d)$    
+6:  $\theta_{t + 1}\gets \theta_t - \alpha_1\nabla_{\theta_t}\mathcal{l}_{\pi}(\theta_t,\phi_{t + 1},d)$    
+7: end for
+
+and the action from the gradient. we formalize this problem in theorem 1 in appendix a. to address this issue and make our meta-learner sufficiently expressive, the macaw policy update performs both advantage-weighted regression onto actions as well as an additional regression onto action advantages. this enriched policy update is only used during adaptation, and the predicted advantage is used only to enrich the inner loop policy update during meta-training; during meta-test, this predicted advantage is discarded. we prove the universality of the enriched policy update in theorem 2 in appendix a. we observe empirically the practical impact of the universality property with an ablation study presented in figure 5 (left).
+
+to make predictions for both the awr loss and advantage regression, our policy architecture has two output heads corresponding to the predicted action given the state,  $\pi_{\theta}(\cdot |\mathbf{s})$  and the predicted advantage given both state and action  $a_{\theta}(\mathbf{s},\mathbf{a})$ . this architecture is shown in figure 2. policy adaptation proceeds as:
+
+$$
+\theta_ {i} ^ {\prime} \leftarrow \theta - \alpha_ {1} \nabla_ {\theta} \mathcal {l} _ {\pi} \left(\theta , \phi_ {i} ^ {\prime}, d _ {i} ^ {\mathrm {t r}}\right), \text {w h e r e} \mathcal {l} _ {\pi} = \mathcal {l} ^ {\mathrm {a w r}} + \lambda \mathcal {l} ^ {\mathrm {a d v}} \tag {3}
+$$
+
+in our policy update, we show only one gradient step for conciseness of notation, but it can be easily extended to multiple gradient steps. the awr loss is given in equation 1, and the advantage regression loss  $\mathcal{l}^{\mathrm{adv}}$  is given by:
+
+$$
+\begin{array}{l} \mathcal {l} ^ {\mathrm {a d v}} \left(\theta , \phi_ {i} ^ {\prime}, d\right) \triangleq \\ \underset {\mathbf {s}, \mathbf {a} \sim d} {\mathbb {e}} \left[ \left(a _ {\theta} (\mathbf {s}, \mathbf {a}) - \left(\mathcal {r} _ {d} (\mathbf {s}, \mathbf {a}) - v _ {\phi_ {i} ^ {\prime}} (\mathbf {s})\right)\right) ^ {2} \right] (4) \\ \end{array}
+$$
+
+adapting with  $\mathcal{l}_{\pi}$  rather than  $\mathcal{l}^{\mathrm{awr}}$  addresses the expressiveness problems noted earlier. this adaptation process is done both in the inner loop of meta-training and during meta-test time, as outlined in algorithm 2. macaw is thus consistent at meta-test time because it executes a well-defined rl fine-tuning subroutine based on awr during adaptation. next, we describe the meta-training procedure for learning the meta-parameters  $\theta$  and  $\phi$ , the initializations of the policy and value function, respectively.
+
+# 4.2. outer-loop macaw procedure
+
+to enable rapid adaptation at meta-test time, we meta-train a set of initial parameters for both the value function and policy to optimize the awr losses  $\mathcal{l}_v$  and  $\mathcal{l}^{\mathrm{awr}}$ , respectively, after adaptation (l9-10 in algorithm 1). we sample a batch of data  $d_{i}^{\mathrm{ts}}$  for the outer loop update that is disjoint from the adaptation data  $d_{i}^{\mathrm{tr}}$  in order to promote few-shot generalization rather than memorization of the adaptation data. the meta-learning procedure for the value function follows maml, using the supervised monte carlo objective:
+
+$$
+\begin{array}{l} \min  _ {\phi} \mathbb {e} _ {\mathcal {t} _ {i}} \left[ \mathcal {l} _ {v} \left(\phi_ {i} ^ {\prime}, d _ {i} ^ {\mathrm {t s}}\right) \right] = \\ \min  _ {\phi} \mathbb {e} _ {\mathcal {t} _ {i}} \left[ \mathcal {l} _ {v} \left(\phi - \eta_ {1} \nabla_ {\phi} \mathcal {l} _ {v} \left(\phi , d _ {i} ^ {\mathrm {t r}}\right), d _ {i} ^ {\mathrm {t s}}\right) \right] \tag {5} \\ \end{array}
+$$
+
+where  $\mathcal{l}_v$  is defined in equation 2. this objective optimizes for a set of initial value function parameters such that one or a few inner gradient steps lead to an accurate value estimator.
+
+unlike the inner loop, we optimize the initial policy parameters in the outer loop with a standard advantage-weighted regression objective, since expressiveness concerns only certain to the inner loop where only a small number of gradient steps are taken. hence, the meta-objective for our initial policy parameters is as follows:
+
+$$
+\begin{array}{l} \min  _ {\theta} \mathbb {e} _ {\mathcal {t} _ {i}} \left[ \mathcal {l} ^ {\mathrm {a w r}} \left(\theta_ {i} ^ {\prime}, \phi_ {i} ^ {\prime}, d _ {i} ^ {\mathrm {t s}}\right) \right] = \\ \min  _ {\theta} \mathbb {e} _ {\mathcal {t} _ {i}} \left[ \mathcal {l} ^ {\mathrm {a w r}} \left(\theta - \alpha_ {1} \nabla_ {\theta} \mathcal {l} _ {\pi} \left(\theta , \phi_ {i} ^ {\prime}, d _ {i} ^ {\mathrm {t r}}\right), \phi_ {i} ^ {\prime}, d _ {i} ^ {\mathrm {t s}}\right) \right] \tag {6} \\ \end{array}
+$$
+
+where  $\mathcal{l}_{\pi}$  is defined in equation 3 and  $\mathcal{l}^{\mathrm{awr}}$  is defined in equation 1. note we use the adapted value function for policy adaptation. the complete macaw algorithm is summarized in algorithm 1.
+
+# 4.3. macaw architecture
+
+macaw's enriched policy update (equation 3) is motivated by the desire to make inner loop policy updates more expressive. in addition to augmenting the objective, we can also take an architectural approach to increasing gradient expressiveness. recall that for an mlp, a single step of gradient descent can only make a rank-1 update to each weight matrix. finn and levine (2018) show that this implies that mlps must be impractically deep for maml to be able to produce any learning procedure. however, we can shortcut this rank-1 limitation with a relatively simple change to the layers of an mlp, which we call a weight transform layer. for a complete mathematical description of this strategy, see appendix b. this layer maps a latent code into the layer's weight matrix and bias, which are then used to compute the layer's output just as in a typical fully-connected layer. this 'layer-wise linear hypernetwork' (ha et al., 2016) doesn't change the class of functions computable by the layer on its input, but it increases the expressivity of maml's gradient. because we update the
+
+latent code by gradient descent in the inner loop (which is mapped back into a new weight matrix and bias in the forward pass) we can, in theory, acquire weight matrix updates of rank up to the dimensionality of the latent code.
+
+we use this strategy for all of the weights in both the value function network and the policy network (for all layers in the body and both heas shown in figure 2). this architecture shares the motivation of enabling more expressive adaptation without increasing model expressiveness described in (arnold et al., 2021) and is similar to latent embedding optimization (rusu et al., 2019). however, the choice of using simple linear mapping functions allows us to apply weight transform layers to the entire network while still pro
+
+![](images/38adba35997ad1e981b994f735bc78a28af37f0adf7ef43ac9e5beb00431d17f.jpg)  
+figure 2: macaw policy architecture. solid lines show forward pass; dashed lines show gradient flow during backward pass during adaptation only; the advantage head is not used in the outer loop policy update.
+
+viding more expressive gradients, and we allow each layer's parameters to be constructed from a different latent code. our ablation experiments find that this layer improves learning speed and stability.
+
+# 5. experiments
+
+the primary goal of our empirical evaluations is to test whether we can acquire priors from offline multi-task data that facilitate rapid transfer to new tasks. our evaluation compares macaw with three sensible approaches to this problem: meta-behavior cloning, multi-task offline rl with fine-tuning, and an offline variant of the state-of-the-art off-policy meta-rl method, pearl (rakelly et al., 2019). further, we evaluate a) macaw's ability to leverage online fine-tuning at meta-test time; b) the importance of macaw's enriched policy update (equation 3) and weight transformation (appendix b); and c) how each method's performance is affected when the sampling of the task space during training is very sparse. to do so, we construct offline variants of the widely-used simulated continuous control benchmark problems introduced by finn et al. (2017a); rothfuss et al. (2018), including the half-cheetah with varying goal directions and varying goal velocities, the walker with varying physical parameters, and the ant with varying goal directions. for our main comparison (figure 3), the offline data for each experiment is generated from the replay buffer of a rl agent trained from scratch. this reflects a practical scenario where an agent has previously learned a
+
+![](images/a9b3d0f28cae5c8f9336f6823fbfc1ed28adc06999305ccac56e0e72eab3214b.jpg)
+
+![](images/d6ad5a3c0b330738d97ff5597e506208232ed358ee8c44c64a0d2ec1a79e9536.jpg)
+
+![](images/8138dcb36bb0a8b4bf415551668da8793ee9c24d2fbd82a71d91fc30d78940f9.jpg)  
+figure 3: comparing macaw with (i) an offline variant of pearl (rakelly et al., 2019), a state-of-the-art off-policy meta-rl method, (ii) an offline multi-task training + fine tuning method based on awr (peng et al., 2019), and (iii) a meta-behavior cloning baseline. shaded regions show one standard error of the mean reward of four seeds. macaw is the only algorithm to consistently outperform the imitation learning baseline, and also learns with the fewest number of training steps in every environment (note the log x axis).
+
+![](images/d4c974beaf0de8b568b4f2eb0a4419c65654c116f9826e7ea741578f040e77a6.jpg)
+
+set of tasks via rl, stored its experiences, and now would like to quickly learn a related task. in our ablations, we vary the offline data quantity and quality to better evaluate robustness to these factors. data collection information is available in appendix d.
+
+can we learn to adapt to new tasks quickly from purely offline data? our first evaluation compares three approaches to the offline meta-rl problem setting, testing their ability to leverage the offline task datasets in order to quickly adapt to a new task. specifically, we compare macaw with i) offline pearl (rakelly et al., 2019), ii) multi-task awr (peng et al., 2019), which uses 20 steps of adam (kingma and ba, 2015) to adapt to a new task at meta-test time (offline mt+ft) and iii) a meta-behavior cloning baseline. we choose pearl and awr because they achieve state-of-the-art performance in off-policy meta-rl and offline rl, respectively, and are readily adaptable to the offline meta-rl problem. as in (rakelly et al., 2019), for each experiment, we sample a finite set of training tasks and held out test tasks upfront and keep these fixed throughout training. figure 3 shows the results. we find that macaw is the only algorithm to consistently outperform the meta-behavior cloning baseline. multi-task awr + fine-tuning makes meaningful progress on the simpler cheetah problems, but it is unable to adapt well on the more challenging walker and ant problems. offline pearl shows initial progress on cheetah-velocity and walker-params, but strug
+
+gles to make steady progress on any of the problems. we attribute pearl's failure to q-function extrapolation error, a problem known to affect many off-policy rl algorithms (fujimoto et al., 2019), as well as generally unstable offline bootstrapping. macaw's and awr's value function is bootstrap-free and their policy updates maximize a weighted maximum likelihood objective during training, which biases the policy toward safer actions (peng et al., 2019), implicitly avoiding problems caused by extrapolation error. in contrast to offline pearl and multi-task awr, macaw trains efficiently and relatively stably on all problems, providing an approach to learning representations from multi-task offline data that can be effectively adapted to new tasks at meta-test time.
+
+can macaw leverage online experience at meta-test time? ideally, an offline meta-rl algorithm should be able to leverage both offline and online data at meta-test time. here, we evaluate macaw's and pearl's ability to improve over offline-only meta-test performance using additional environment interactions collected online in the cheetah-velocity, walker-params, and ant-direction problems. for both algorithms, we perform the initial offline adaptation with a single batch of 256 transitions from  $\mu_{\mathrm{test}_i}$  for each test task  $\mathcal{t}_{\mathrm{test}_i}$ , as in the fully offline setting. then, we run online training (rl), alternating between actor/critic updates and online data collection for  $10\mathrm{k}$  and  $20\mathrm{k}$  new environment steps. the results are reported in table 1. we find
+
+<table><tr><td>problem</td><td colspan="3">macaw (ours)</td><td colspan="3">offline pearl</td></tr><tr><td># online steps</td><td>0</td><td>10k</td><td>20k</td><td>0</td><td>10k</td><td>20k</td></tr><tr><td>cheetah-vel</td><td>-121.6</td><td>-64.0</td><td>-60.5</td><td>-273.6</td><td>-301.8</td><td>-297.1</td></tr><tr><td>walker-params</td><td>324.9</td><td>286.0</td><td>296.9</td><td>204.6</td><td>117.8</td><td>178.3</td></tr><tr><td>ant-dir</td><td>251.9</td><td>370.2</td><td>376.5</td><td>-135.3</td><td>57.0</td><td>123.9</td></tr></table>
+
+table 1: comparing macaw and pearl's average return on held-out test tasks after offline adaptation (0 steps) followed by online fine-tuning with  $10\mathrm{k}$  and  $20\mathrm{k}$  online interactions. macaw achieves better performance in all configurations.
+
+that macaw improves over offline performance with 10k environment steps for 2 out of 3 problems, while pearl is unable to improve over offline-only performance using either 10k or 20k steps of online experience for 2 out of 3 problems. we attribute macaw's ability to better leverage online experience to the fact that macaw is a gradient-based meta-rl algorithm, which explicitly meta-trains for fine-tunability. although we meta-train with only a single inner-loop gradient step, past work has demonstrated that maml can continue to improve at meta-test time with more adaptation gradient steps than were using during meta-training (finn et al., 2017a). walker-params proves to be the most difficult environment for both algorithms to leverage online experience, perhaps due to the fact that the environment dynamics change across tasks in this problem, rather than the reward function.
+
+how does macaw's performance differ from maml+awr? macaw has two key features distinguishing it from maml+awr: the enriched policy loss and weight transform layers. here, we use the cheetah-velocity setting to test the effects of both of these components. ablating the enriched policy loss amounts to optimizing equation 1 rather than equation 3 during adaptation; ablating the weight transform layers corresponds to using standard fully-connected layers in both policy and value function. our first ablation uses a random exploration policy rather than offline data for adaptation, as we hypothesize this setting is most difficult for the naive maml+awr algorithm due to the low signal-to-noise ratio in the adaptation data. the results are shown in figure 4. in this experiment, we use a randomly initialized exploration policy  $\pi_{\mathrm{exp}}$  to sample an offline batch (30 trajectories) of adaptation data  $\tilde{d}_i$  for each meta-training task. during meta-training, we sample  $d_i^{\mathrm{tr}}$  from  $\tilde{d}_i$  rather than  $d_i$  (this corresponds to a minor change to l6 of algorithm 1). during testing, we use trajectories sampled from  $\pi_{\mathrm{exp}}$  rather than the pre-collected offline buffer  $d$  to perform adaptation. we find that macaw provides much faster learning with both the enriched policy loss and weight transform layers than either ablated
+
+![](images/83e9d2c571c20fc7dec7eb8015c86a89412bf1981519c1a6b1b83614a4c8279b.jpg)  
+figure 4: additional ablation of macaw using online adaptation data. adaptation data for both train and test tasks is collected using rollouts of a randomly initialized exploration policy, rather than offline replay buffers of trained rl agents.
+
+algorithm. the degradation in asymptotic performance as a result of removing the enriched policy loss is particularly striking; the random exploration data makes disambiguating the task using the standard awr policy loss difficult, reinforcing the need for a universal policy update procedure in order to adapt to new tasks successfully. our next ablation experiment more closely examines the effect of the quality of the adaptation data on the post-adaptation policy performance.
+
+to identify when policy update expressiveness is most crucial, we return to the fully offline setting in order to systematically vary the quality of the data sampled during adaptation for both meta-training and meta-testing. we run three variations of this ablation study, using the first 100k, middle 100k, and final 100k transitions in the replay buffer for the offline policies as proxies for poor, medium, and expert offline trajectories. the offline policy learning curves in appendix d.2 show that this is a reasonable heuristic. we use expert outer loop data (last 100k steps) for all experiments, to ensure that any failures are due to inner loop data quality. figure 5 (left) shows the results. the ablated algorithm performs well when the offline adaptation data comes from a near-optimal policy, which is essentially a one-shot imitation setting (orange); however, when the offline adaptation data comes from a policy pre-convergence, the difference between macaw and the ablated algorithm becomes larger (blue and red). this result supports the intuition that policy update expressiveness is of greater importance when the adaptation data is more random, because in this case the adaptation data includes a weaker signal from which to infer the task (e.g. the task cannot be inferred by simply looking at the states visited). because an agent is unable to collect further experience from the environment during offline adaptation, it is effectively at the mercy of the quality of the behavior policy that produced the data.
+
+![](images/bd2549be6cc62d92975f349c3046dc5eb8f06f25032959c5bdac49100e26949d.jpg)  
+figure 5: left: ablating macaw's enriched policy update when varying the quality of the inner loop adaptation data. solid lines correspond to macaw, dashed lines correspond to macaw without the enriched policy update. as data quality worsens, the enriched update becomes increasingly important. bad, medium, and good data correspond to the first, middle, and last 500 trajectories from the lifetime replay buffer of the behavior policy for each task. center: ablating macaw's weight transform layer in the same experimental setting as the cheetah-velocity experiment in figure 3. without the additional expressiveness, learning is much slower and less stable. right: train task sparsity split performance of macaw, offline pearl, and offline mt+fine tune. macaw shows the most consistent performance when different numbers of tasks are used, performing well even when only three tasks are used for training.
+
+![](images/49da612b0f5cbc1bc9cf6974698fda8e8b2e622efa603fee2a8c91d4d2bbe1af.jpg)
+
+![](images/89659e3680129877b3c45be5682c13fcc66a122147ec63a240e28e0325082872.jpg)
+
+next, we ablate the weight transform layers, comparing maml+awr+enriched policy update with macaw. figure 5 (center) suggests that the weight transform layers significantly improve both learning speed and stability. the no wt-equal width variant removes the weight transform from each fully-connected layer, replacing it with a regular fully-connected layer of equal width in the forward pass. the no wt-equal params variant replaces each of macaw's weight transform layers with a regular fully-connected layer of greater (constant for all layers) width, to keep the total number of learnable parameters in the network roughly constant. in either case, we find that macaw provides a significant improvement in learning speed, as well as stability when compared to the equal width variant. figure 6 in the appendix shows that this result is consistent across problems.
+
+how do algorithms perform with varying numbers of meta-training tasks? generally, we prefer an offline meta-rl algorithm that can generalize to new tasks when presented with only a small number of meta-training tasks sampled from  $p(\mathcal{t})$ . in this section, we conduct an experiment to evaluate the extent to which various algorithms rely on dense sampling of the space of tasks during training in order to generalize well. we compare the test performance of macaw, offline pearl, and offline multi-task awr + fine-tuning as we hold out an increasingly large percentage of the cheetah-velocity task space. because offline pearl was unsuccessful in the original cheetah-velocity setting in figure 3, we collect 7x more offline data per task to use during training in this experiment, finding that this allows offline pearl to learn more successfully, leading to a more interesting comparison. the results are presented in figure 5 (right). surprisingly, offline pearl completely fails to learn both when training tasks are plentiful and when they are scarce, but learns relatively effectively in the mid
+
+dle regime (5-20 tasks). see luna gutierrez and leonetti (2020) for in-depth discussion of when more training tasks can hurt performance in meta-rl. in our experiments, we often observe instability in offline pearl's task inference and value function networks when training on too many offline tasks. on the other hand, with too few tasks, the task inference network simply provides insufficient information for the value functions or policy to identify the task. the multi-task learning + fine-tuning baseline exhibits a steadier degradation in performance as training tasks are removed, likely owing to its bootstrap-free learning procedure. similarly to offline pearl, it is not able to learn a useful prior for fine-tuning when only presented with 3 tasks for training. however, macaw finds a solution of reasonable quality for any sampling of the task space, even for very dense or very sparse samplings of the training tasks. in practice, this property is desirable, because it allows the same algorithm to scale to very large offline datasets while still producing useful adaptation behaviors for small datasets. we attribute macaw's robustness the strong prior provided by sgd-based adaptation during both meta-training and meta-testing.
+
+# 6. related work
+
+meta-learning algorithms enable efficient learning of new tasks by learning elements of the learning process itself (schmidhuber, 1987; bengio et al., 1992; thrun and pratt, 1998; finn, 2018). we specifically consider the problem of meta-reinforcement learning. prior methods for meta-rl can generally be categorized into two groups. contextual meta-rl methods condition a neural network on experience using a recurrent network (wang et al., 2016; duan et al., 2016; fakoor et al., 2020), a recursive network (mishra et al., 2017), or a stochastic inference net
+
+work (rakelly et al., 2019; zintgraf et al., 2020; humplik et al., 2019; sæmundsson et al., 2018). optimization-based meta-rl methods embed an optimization procedure such as gradient descent into the meta-level optimization (finn et al., 2017a; nagabandi et al., 2019; rothfuss et al., 2018; zintgraf et al., 2019; gupta et al., 2018; mendonca et al., 2019; yang et al., 2019), potentially using a learned loss function (houthooft et al., 2018; bechtle et al., 2019; kirsch et al., 2020). in prior works, the former class of approaches tend to reach higher asymptotic performance, while the latter class is typically more robust to out-of-distribution tasks, since the meta-test procedure corresponds to a well-formed optimization. concurrent work by dorfman and tamar (2020) investigates the offline meta-rl setting, directly applying an existing meta-rl algorithm, varibad (zintgraf et al., 2020), to the offline setting. the proposed method further assumes knowledge of the reward function for each task to relabel rewards and share data across tasks with shared dynamics. macaw does not rely on this knowledge nor the assumption that some tasks share dynamics, but this technique could be readily combined with macaw when these assumptions do hold.
+
+unlike these prior works, we aim to develop an optimization-based meta-rl algorithm that can both learn from entirely offline data and produces a monotonic learning procedure. only a handful of previous model-free meta-rl methods leverage off-policy data at all (rakelly et al., 2019; mendonca et al., 2019), although one concurrent work does consider the fully offline setting (dorfman and tamar, 2020). guided meta-policy search (mendonca et al., 2019) is optimization-based but not applicable to the batch setting as it partially relies on policy gradients. finally, pearl (rakelly et al., 2019) and its relatives (fakoor et al., 2020) correspond to a contextual meta-learning approach sensitive to the meta-training task distribution without fin-tuning (fakoor et al., 2020) at test time. we also compare to pearl, and find that, as expected, it performs worse than in the off-policy setting, since the fully offline setting is substantially more challenging than the off-policy setting that it was designed for. this paper builds on the idea of batch off-policy or offline reinforcement learning (fujimoto et al., 2019; kumar et al., 2019b; wu et al., 2019; levine et al., 2020; agarwal et al., 2020), extending the problem setting to the meta-learning setting. several recent works that have successfully applied neural networks to offline rl (fuji-moto et al., 2019; jaques et al., 2019; kumar et al., 2019a; wu et al., 2019; peng et al., 2019; agarwal et al., 2020). we specifically choose to build upon the advantage-weighted regression (awr) algorithm (peng et al., 2019). we find that awr performs well without requiring dynamic programming, using monte carlo estimation to infer the value function. this property is appealing, as it is difficult to combine truncated optimization-based meta-learners such
+
+as maml (finn et al., 2017a) with td learning, which requires a larger number of gradient steps to effectively back-up values.
+
+# 7. limitations & future work
+
+while macaw is able to adapt to new tasks from offline data, macaw does not learn an exploration policy from offline meta-training. an interesting direction for future work is to consider how an agent might learn better online exploration policies than the random policies used in our experiments using only offline data during meta-training. the problem of learning to explore has largely been considered in on-policy settings in the past (gupta et al., 2018; zintgraf et al., 2020) but also recently in offline settings (dorfman and tamar, 2020). in addition, macaw uses regression onto monte carlo returns rather than bootstrapping to fit its value function, which could reduce asymptotic performance during online fine-tuning in some cases. future work might investigate alternatives such as td-lambda. finally, the result of the task sparsity ablation suggests that macaw learns non-trivial adaptation procedures even with a small number of meta-training tasks; this suggests that macaw might prove useful in a continual or sequential learning setting, in which adapting quickly after training on only a small number of tasks is particularly valuable.
+
+# 8. conclusion
+
+in this work, we formulated the problem of offline meta-reinforcement learning and presented macaw, a practical algorithm that achieves good performance on various continuous control tasks compared with other state-of-the-art meta-rl algorithms. we motivated the design of macaw by the desire to build an offline meta-rl algorithm that is both sample-efficient (using value-based rl subroutines) and consistent (running a full-fledged rl algorithm at test time). we consider fully offline meta-training and meta-testing both with and without online adaptation or fine-tuning, showing that macaw is effective both when collecting online data is totally infeasible as well as when some online data collection is possible at meta-test time. we hope that this work serves as the basis for future research in offline meta-rl, enabling more sample-efficient learning algorithms to make better use of purely observational data from previous tasks and adapt to new tasks more quickly.
+
+# 9. acknowledgements
+
+we acknowledge saurabh kumar for helpful discussions. eric mitchell is funded by a knight-hennessy fellowship xue bin peng is funded by a nserc postgraduate scholarship and berkeley fellowship for graduate study. this work was supported in part by intel corporation.
+
+# references
+
+rishabh agarwal, dale schuurmans, and mohammad norouzi. an optimistic perspective on offline reinforcement learning. in international conference on machine learning, 2020.  
+sebastien m. r. arnold, shariq iqbal, and fei sha. when maml can adapt fast and how to assist when it cannot. in arindam banerjee and kenji fukumizu, editors, proceedings of the 24th international conference on artificial intelligence and statistics, volume 130 of proceedings of machine learning research, pages 244-252. pmlr, 13-15 apr 2021. url http://proceedings.mlrpress/v130/arnold21a.html.  
+sarah bechtle, artem molchanov, yevgen chebotar, edward grefenstette, ludovic righetti, gaurav sukhatme, and franziska meier. meta-learning via learned loss. arxiv preprint arxiv:1906.05374, 2019.  
+samy bengio, yoshua bengio, jocelyn cloutier, and jan gecsei. on the optimization of a synaptic learning rule. in preprints conf. optimality in artificial and biological neural networks, volume 2. univ. of texas, 1992.  
+tristan deleu, tobias würfl, mandana samiei, joseph paul cohen, and yoshua bengio. torchmeta: a meta-learning library for pytorch, 2019. url https://arxiv.org/abs/1909.06576. available at: https://github.com/tristandeleu/pytorch-meta.  
+ron dorfman and aviv tamar. offline meta reinforcement learning. arxiv preprint arxiv:2008.02598, 2020.  
+yan duan, john schulman, xi chen, peter l bartlett, ilya sutskever, and pieter abbeel. rl2: fast reinforcement learning via slow reinforcement learning. arxiv preprint arxiv:1611.02779, 2016.  
+rasool fakoor, pratik chaudhari, stefano soatto, and alexander j. smola. meta-q-learning. in international conference on learning representations, 2020.  
+chelsea finn and sergey levine. meta-learning and universality: deep representations and gradient descent can approximate any learning algorithm. international conference on learning representations, 10 2018.  
+chelsea finn, pieter abbeel, and sergey levine. model-agnostic meta-learning for fast adaptation of deep networks. in international conference on machine learning, 2017a.  
+chelsea finn, tianhe yu, tianhao zhang, pieter abbeel, and sergey levine. one-shot visual imitation learning via meta-learning. corl, abs/1709.04905, 2017b. url http://arxiv.org/abs/1709.04905.
+
+chelsea b finn. learning to learn with gradients. university of california, berkeley, 2018.  
+scott fujimoto, herke hoof, and david meger. addressing function approximation error in actor-critic methods. in international conference on machine learning, pages 1582-1591, 2018.  
+scott fujimoto, david meger, and doina precup. off-policy deep reinforcement learning without exploration. in kamalika chaudhuri and ruslan salakhutdinov, editors, proceedings of the 36th international conference on machine learning, volume 97 of proceedings of machine learning research, pages 2052-2062, long beach, california, usa, 09-15 jun 2019. pmlr. url http://proceedings.mlr.press/v97/fujimoto19a.html.  
+edward grefenstette, brandon amos, denis yarats, phu mon htut, artem molchanov, franziska meier, douwe kiela, kyunghyun cho, and soumith chintala. generalized inner loop meta-learning. arxiv preprint arxiv:1910.01727, 2019.  
+abhishek gupta, russell mendonca, yuxuan liu, pieter abbeel, and sergey levine. meta-reinforcement learning of structured exploration strategies. in advances in neural information processing systems, pages 5302-5311, 2018.  
+david ha, andrew dai, and quoc v. le. hypernetworks, 2016.  
+tuomas haarnoja, aurick zhou, pieter abbeel, and sergey levine. soft actor-critic: off-policy maximum entropy deep reinforcement learning with a stochastic actor. arxiv preprint arxiv:1801.01290, 2018.  
+rein houthooft, yuhua chen, phillip isola, bradly stadie, filip wolski, openai jonathan ho, and pieter abbeel. evolved policy gradients. in advances in neural information processing systems, pages 5400-5409, 2018.  
+jan humplik, alexandre galashov, leonard hasenclever, pedro a ortega, yee whye teh, and nicolas heess. meta reinforcement learning as task inference. arxiv preprint arxiv:1905.06424, 2019.  
+natasha jaques, asma ghandeharioun, judy hanwen shen, craig ferguson, agata lapedriza, noah jones, shixiang gu, and rosalind picard. way off-policy batch deep reinforcement learning of implicit human preferences in dialog. arxiv preprint arxiv:1907.00456, 2019.  
+diederik p. kingma and jimmy ba. adam: a method for stochastic optimization. in yoshua bengio and yann lecun, editors, 3rd international conference on learning representations, iclr 2015, san diego, ca, usa, may
+
+7-9, 2015, conference track proceedings, 2015. url http://arxiv.org/abs/1412.6980.  
+louis kirsch, sjoerd van steenkiste, and juergen schmidhuber. improving generalization in meta reinforcement learning using learned objectives. in international conference on learning representations, 2020. url https://openreview.net/forum?id=slevherypr.  
+aviral kumar, justin fu, matthew soh, george tucker, and sergey levine. stabilizing off-policy q-learning via bootstrapping error reduction. in advances in neural information processing systems, pages 11761-11771, 2019a.  
+aviral kumar, justin fu, george tucker, and sergey levine. stabilizing off-policy q-learning via bootstrapping error reduction. neurips, 2019b. url http://arxiv.org/abs/1906.00949.  
+b. m. lake, r. salakhutdinov, and j. b. tenenbaum. human-level concept learning through probabilistic program induction. science, 350(6266):1332-1338, december 2015. doi: 10.1126/science.aab3050. url https://doi.org/10.1126/science.aab3050.  
+sergey levine, aviral kumar, george tucker, and justin fu. offline reinforcement learning: tutorial, review, and perspectives on open problems. arxiv preprint arxiv:2005.01643, 2020.  
+ricardo luna gutierrez and matteo leonetti. information-theoretic task selection for meta-reinforcement learning. in h. larochelle, m. ranzato, r. hadsell, m. f. balcan, and h. lin, editors, advances in neural information processing systems, volume 33, pages 20532-20542. curran associates, inc., 2020. url https://proceedings.neurips.cc/paper/2020/file/ec3183a7f107d1b8ddb90cb3c01ea7d5-paper.pdf.  
+russell mendonca, abhishek gupta, rosen kralev, pieter abbeel, sergey levine, and chelsea finn. guided metapolicy search. in advances in neural information processing systems, pages 9653-9664, 2019.  
+nikhil mishra, mostafa rohaninejad, xi chen, and pieter abbeel. meta-learning with temporal convolutions. arxiv:1707.03141, 2017.  
+anusha nagabandi, ignasi clavera, simin liu, ronald s fearing, pieter abbeel, sergey levine, and chelsea finn. learning to adapt in dynamic, real-world environments through meta-reinforcement learning. international conference on learning representations (iclr), 2019.
+
+ashvin nair, murtaza dalal, abhishek gupta, and sergey levine. accelerating online reinforcement learning with offline datasets, 2020.  
+xue bin peng, aviral kumar, grace zhang, and sergey levine. advantage-weighted regression: simple and scalable off-policy reinforcement learning, 2019.  
+jan peters and stefan schaal. reinforcement learning by reward-weighted regression for operational space control. in proceedings of the 24th international conference on machine learning, icml '07, page 745-750, new york, ny, usa, 2007. association for computing machinery. isbn 9781595937933. doi: 10.1145/1273496.1273590. url https://doi.org/10.1145/1273496.1273590.  
+aravind rajeswaran, chelsea finn, sham m kakade, and sergey levine. meta-learning with implicit gradients. in advances in neural information processing systems, pages 113-124, 2019.  
+kate rakelly, aurick zhou, deirdre quillen, chelsea finn, and sergey levine. efficient off-policy meta-reinforcement learning via probabilistic context variables. in international conference on machine learning, 2019.  
+jonas rothfuss, dennis lee, ignasi clavera, tamim asfour, and pieter abbeel. prompt: proximal meta-policy search. arxiv preprint arxiv:1810.06784, 2018.  
+andrei a. rusu, dushyant rao, jakub sygnowski, oriol vinyals, razvan pascanu, simon osindero, and raia haddell. meta-learning with latent embedding optimization. in international conference on learning representations, 2019. url https://openreview.net/forum?id=bjgklhack7.  
+steindór sæmundsson, katja hofmann, and marc peter deisenroth. meta reinforcement learning with latent variable gaussian processes. arxiv preprint arxiv:1803.07551, 2018.  
+jurgen schmidhuber. evolutionary principles in self-referential learning. on learning how to learn: the meta-meta-... hook.) diploma thesis, institut f. informatik, tech. univ. munich, 1:2, 1987.  
+sebastian thrun and lorien pratt. learning to learn: introduction and overview. in *learning to learn*, pages 3-17. springer, 1998.  
+oriol vinyals, charles blundell, timothy lillicrap, koray kavukcuoglu, and daan wierstra. matching networks for one shot learning. in d. lee, m. sugiyama, u. luxburg, i. guyon, and r. garnett, editors, advances in neural information processing systems, volume 29, pages 3630-3638. curran associates,
+
+inc., 2016. url https://proceedings.neurips.cc/paper/2016/file/90e1357833654983612fb05e3ec9148c-paper.pdf.  
+jane x wang, zeb kurth-nelson, dhruva tirumala, hubert soyer, joel z leibo, remi munos, charles blundell, dharshan kumaran, and matt botvinick. learning to reinforcement learn. arxiv preprint arxiv:1611.05763, 2016.  
+yifan wu, george tucker, and ofir nachum. behavior regularized offline reinforcement learning. arxiv preprint arxiv:1911.11361, 2019.  
+yuhuai wu, mengye ren, renjie liao, and roger grosse. understanding short-horizon bias in stochastic meta-optimization. arxiv preprint arxiv:1803.02021, 2018.  
+yuxiang yang, ken caluwaerts, atil iscen, jie tan, and chelsea finn. norml: no-reward meta learning. in proceedings of the 18th international conference on autonomous agents and multiagent systems, pages 323-331. international foundation for autonomous agents and multiagent systems, 2019.  
+tianhe yu, deirdre quillen, zhanpeng he, ryan julian, karol hausman, chelsea finn, and sergey levine. metaworld: a benchmark and evaluation for multi-task and meta reinforcement learning. in conference on robot learning, 2019.  
+luisa zintgraf, kyriacos shiarlis, maximilian igl, sebastian schulze, yarin gal, katja hofmann, and shimon white-son. varibad: a very good method for bayes-adaptive deep rl via meta-learning. in international conference on learning representations, 2020.  
+luisa m zintgraf, kyriacos shiarlis, vitaly kurin, katja hofmann, and shimon whiteson. fast context adaptation via meta-learning. in international conference on machine learning, 2019.
+
+# appendix
+
+# a. macaw auxiliary loss and update expressiveness
+
+finn and levine (2018) lay out conditions under which the maml update procedure is universal, in the sense that it can approximate any function  $f(\mathbf{x}, \mathbf{y}, \mathbf{x}^*)$  arbitrarily well (given enough capacity), where  $\mathbf{x}$  and  $\mathbf{y}$  are the support set inputs and labels, respectively, and  $\mathbf{x}^*$  is the test input. universality in this sense is an attractive property because it implies that the update is expressive enough to approximate any update procedure; a method that does not possess the universality property might be limited in its asymptotic post-adaptation performance because it cannot express (or closely approximate) the true optimal update procedure. in order for the maml update procedure to be universal, several requirements of the network architecture, hyperparameters, and loss function must be satisfied. most of these are not method-specific in that they stipulate minimum network depth, activation functions, and non-zero learning rate for any neural network. however, the condition placed on the loss function require more careful treatment. the requirement is described in definition 1.
+
+definition 1. a loss function is 'universal' if the gradient of the loss with respect to the prediction(s) is an invertible function of the label(s) used to compute the loss.
+
+we note that definition 1 is a necessary but not sufficient condition for an update procedure to be universal (see other conditions above and finn and levine (2018)). for the awr loss function (copied below from equation 1 with minor changes), the labels are the ground truth action  $\mathbf{a}$  and the corresponding advantage  $\mathcal{r}(\mathbf{s},\mathbf{a}) - v_{\phi_i'}(\mathbf{s})$ .
+
+$$
+\begin{array}{l} \mathcal {l} ^ {\mathrm {a w r}} \left(\mathbf {s}, \mathbf {a}, \theta , \phi_ {i} ^ {\prime}\right) = \\ - \log \pi_ {\theta} (\mathbf {a} | \mathbf {s}) \exp \left(\frac {1}{t} \left(\mathcal {r} (\mathbf {s}, \mathbf {a}) - v _ {\phi_ {i} ^ {\prime}} (\mathbf {s})\right)\right) (7) \\ \end{array}
+$$
+
+for simplicity and without loss of generality (see finn and levine (2018), sections 4 & 5), we will consider the loss for only a single sample, rather than averaged over a batch.
+
+in the remainder of this section, we first state in theorem 1 that the standard awr policy loss function does not satisfy the condition for universality described in definition 1. the proof is by a simple counterexample. next, we state in theorem 2 that the macaw auxiliary loss does satisfy the universality condition, enabling a universal update procedure given the other generic universality conditions are satisfied (note that the macaw value function loss satisfies the condition in definition 1 because it uses l2 regression (finn and levine, 2018)).
+
+# a.1. non-universality of standard awr policy loss function
+
+intuitively, the awr gradient does not satisfy the invertibility condition because it does not distinguish between a small error in the predicted action that has a large corresponding advantage weight and a large error in the predicted action (in the same direction) that has a small corresponding advantage weight. the following theorem formalizes this statement.
+
+theorem 1. the awr loss function  $\mathcal{l}^{awr}$  is not universal according to definition 1.
+
+the proof is by counterexample; we will show that there exist different sets of labels  $\{\mathbf{a}_1, a_1(\mathbf{s}, \mathbf{a}_1)\}$  and  $\{\mathbf{a}_2, a_2(\mathbf{s}, \mathbf{a}_1)\}$  that produce the same gradient for some output of the model. first, rewriting equation 7 with  $a(\mathbf{s}, \mathbf{a}) = \left( \mathcal{r}(\mathbf{s}, \mathbf{a}) - v_{\phi_i'}(\mathbf{s}) \right)$ , we have
+
+$$
+\mathcal {l} ^ {\mathrm {a w r}} (\mathbf {s}, \mathbf {a}, \theta) = - \log \pi_ {\theta} (\mathbf {a} | \mathbf {s}) \exp \left(\frac {a (\mathbf {s} , \mathbf {a})}{t}\right)
+$$
+
+because our policy is parameterized as a gaussian with fixed diagonal covariance  $\sigma^2 i$ , we can again rewrite this loss as
+
+$$
+\mathcal {l} ^ {\mathrm {a w r}} (\mathbf {s}, \mathbf {a}, \hat {\mathbf {a}} _ {\mu}) =
+$$
+
+$$
+\left(\log \frac {1}{(2 \pi \sigma^ {2}) ^ {\frac {k}{2}}} + \frac {| | \mathbf {a} - \hat {\mathbf {a}} _ {\mu} | | ^ {2}}{2 \sigma^ {2}}\right) \exp \left(\frac {a (\mathbf {s} , \mathbf {a})}{t}\right) \tag {8}
+$$
+
+where  $\hat{\mathbf{a}}_{\mu}$  is the mean of the gaussian output by the policy and  $k = \dim (\mathbf{a})$ . for the purpose of the simplicity of the counterexample, we assume the policy output  $\hat{\mathbf{a}}_{\mu}$  is  $\mathbf{0}$ . the gradient of this loss with respect to the policy output is
+
+$$
+\nabla_ {\hat {\mathbf {a}} _ {\mu}} \mathcal {l} ^ {\mathrm {a w r}} (\mathbf {s}, \mathbf {a}, \mathbf {0}) = - \frac {1}{\sigma^ {2}} \exp \left(\frac {a (\mathbf {s} , \mathbf {a})}{t}\right) \mathbf {a}
+$$
+
+to demonstrate that the gradient operator applied to this loss function is not invertible, we pick two distinct label values and show that they give the same gradient. we pick  $\mathbf{a}_1 = [1,\dots,1]^t$ ,  $a_1(\mathbf{s},\mathbf{a}_1) = t$  and  $\mathbf{a}_2 = [0.1,\dots,0.1]^t$ ,  $a_2(\mathbf{s},\mathbf{a}_2) = \log(10)t$ . inserting these values into equation a.1, this gives gradients  $g_1 = \frac{-e}{\sigma^2} [1,\dots,1]^t$  and  $g_2 = \frac{-10e}{\sigma^2} [0.1,\dots,0.1]^t = \frac{-e}{\sigma^2} [1,\dots,1]^t = g_1$ . thus the gradient of the standard awr loss does not possess sufficient information to recover the labels uniquely and using this loss for policy adaptation does not produce a universal policy update procedure. next, we show how the auxiliary loss used in macaw alleviates this problem.
+
+# a.2. universality of the macaw policy adaptation loss function
+
+in this section, we show that by adding an additional term to the awr loss function, we acquire a loss that satisfies
+
+the condition stated in definition 1, which we state in theorem 2. intuitively, the additional loss term allows the gradient to distinguish between the cases that were problematic for the awr loss (large action error and small advantage weight vs small action error and large advantage weight).
+
+theorem 2. the macaw policy loss function  $\mathcal{l}_{\pi}$  is universal according to definition 1.
+
+the macaw policy adaptation loss (given in equation 3) is the sum of the awr loss and an auxiliary advantage regression loss (the following is adapted from equation 8):
+
+$$
+\mathcal {l} _ {\pi} (\mathbf {s}, \mathbf {a}, \hat {\mathbf {a}} _ {\mu}, \hat {a}) =
+$$
+
+$$
+\begin{array}{l} \left(\log \frac {1}{(2 \pi \sigma^ {2}) ^ {\frac {k}{2}}} + \frac {| | \mathbf {a} - \hat {\mathbf {a}} _ {\mu} | | ^ {2}}{2 \sigma^ {2}}\right) \exp \left(\frac {a (\mathbf {s} , \mathbf {a})}{t}\right) + \\ \lambda (a (\mathbf {s}, \mathbf {a}) - \hat {a}) ^ {2} \\ \end{array}
+$$
+
+where  $\hat{a}$  is the predicted advantage output from the policy advantage head and  $\lambda$  is the advantage regression coefficient. the gradient of this loss with respect to the predicted advantage  $\hat{a}$  is
+
+$$
+g _ {\mathrm {a d v}} = \nabla_ {\hat {a}} \mathcal {l} _ {\pi} (\mathbf {s}, \mathbf {a}, \hat {\mathbf {a}} _ {\mu}, \hat {a}) = 2 \lambda (\hat {a} - a (\mathbf {s}, \mathbf {a})) \tag {9}
+$$
+
+and the gradient of the loss with respect to  $\hat{\mathbf{a}}_{\mu}$  is
+
+$$
+\mathbf {g} _ {\mathrm {a w r}} = \nabla_ {\hat {\mathbf {a}} _ {\mu}} \mathcal {l} _ {\pi} (\mathbf {s}, \mathbf {a}, \hat {\mathbf {a}} _ {\mu}, \hat {a}) = \frac {1}{\sigma^ {2}} \exp \left(\frac {a (\mathbf {s} , \mathbf {a})}{t}\right) (\hat {\mathbf {a}} _ {\mu} - \mathbf {a}) \tag {10}
+$$
+
+we write the combined gradient as  $\mathbf{g} = \begin{bmatrix} g_{\mathrm{adv}} \\ \mathbf{g}_{\mathrm{awr}} \end{bmatrix}$ . in order to provide a universal update procedure, we must be able to recover both the action label  $\mathbf{a}$  and the advantage label  $a(\mathbf{s}, \mathbf{a})$  from  $\mathbf{g}$ . first, because  $g_{\mathrm{adv}}$  is an invertible function of  $a(\mathbf{s}, \mathbf{a})$ , we can directly extract the advantage label by re-arranging equation 9:
+
+$$
+a (\mathbf {s}, \mathbf {a}) = \frac {g _ {\mathrm {a d v}} - 2 \lambda \hat {a}}{- 2 \lambda}
+$$
+
+similarly,  $\mathbf{g}_{\mathrm{awr}}$  is an invertible function of a, so we can then extract the action label by re-arranging equation 10:
+
+$$
+\mathbf {a} = \frac {\mathbf {g} _ {\mathrm {a w r}} - \frac {1}{\sigma^ {2}} \exp \left(\frac {a (\mathbf {s} , \mathbf {a})}{t}\right) \hat {\mathbf {a}} _ {\mu}}{- \frac {1}{\sigma^ {2}} \exp \left(\frac {a (\mathbf {s} , \mathbf {a})}{t}\right)} \tag {11}
+$$
+
+because we can compute  $a(\mathbf{s}, \mathbf{a})$  from  $g_{\mathrm{adv}}$ , there are no unknowns in the rhs of equation 11 and we can compute a (here,  $\sigma$ ,  $\lambda$ , and  $t$  are known constants); it is thus the additional information provided by  $g_{\mathrm{adv}}$  that resolves the ambiguity that is problematic for the standard awr policy loss gradient. we have now shown that both the action label and advantage label used in the macaw policy adaptation loss are recoverable from its gradient, implying that the update procedure is universal under the conditions given by finn and levine (2018), which concludes the proof.
+
+# b. weight transform layers
+
+here, we describe in detail the 'weight transformation' layer that augments the expressiveness of the maml update in macaw. first, we start with the observation in past work (finn et al., 2017b) that adding a 'bias transformation' to each layer improves the expressiveness of the maml update. to understand the bias transform, we compare with a typical fully-connected layer, which has the forward pass
+
+$$
+\mathbf {y} = \sigma (w \mathbf {x} + \mathbf {b})
+$$
+
+where  $\mathbf{x}$  is the previous layer's activations,  $\mathbf{b}$  is the bias vector,  $w$  is the weight matrix, and  $\mathbf{y}$  is this layer's activations. for a bias transformation layer, the forward pass is
+
+$$
+\mathbf {y} = \sigma \left(w \mathbf {x} + w ^ {b} \mathbf {z}\right)
+$$
+
+where  $\mathbf{z}$  and  $w^{b}$  are learnable parameters of the bias transformation. during adaptation, either only the vector  $\mathbf{z}$  or both the vector  $\mathbf{z}$  and the bias matrix  $w^{b}$  are adapted. the vector  $w^{b}\mathbf{z}$  has the same dimensionality as the bias in the previous equation. this formulation does not increase the expressive power of the forward pass of the layer, but it does allow for a more expressive update of the 'bias vector'  $w^{b}\mathbf{z}$  (in the case of  $\dim (\mathbf{z}) = \dim (\mathbf{b})$  and  $w^{b} = i$ , we recover the standard fully-connected layer).
+
+for a weight transformation layer (used in macaw), we extend the idea of computing the bias from a latent vector to the weight matrix itself. we now present the forward pass for a weight transformation layer with  $d$  input and  $d$  output dimensions and latent dimension  $c$ . first, we compute  $w = w^{\mathrm{wt}}\mathbf{z}$ , where  $w^{\mathrm{wt}} \in \mathbb{r}^{(d^2 + d) \times c}$ . the first  $d^2$  components of  $w$  are reshaped into the  $d \times d$  weight matrix of the layer  $w^*$ , and the last  $d$  components are used as the bias vector  $b^*$ . the forward pass is then the same as a regular fully-connected layer, but using the computed matrix and bias  $w^*$  and  $b^*$  instead of a fixed matrix and bias vector; that is  $y = \sigma(w^* \mathbf{x} + \mathbf{b}^*)$ . during adaptation, both the latent vector  $\mathbf{z}$  and the transform matrix  $w^{\mathrm{wt}}$  are adapted. we note that adapting  $\mathbf{z}$  enables the post-adaptation weight matrix used in the forward pass,  $w^*$ , to differ from the pre-adaptation weight matrix  $w^*$  by a matrix of rank up to the dimension of  $\mathbf{z}$ , whereas gradient descent with normal layers makes rank-1 updates to weight matrices. we hypothesize it is this added expressivity that makes the weight transform layer effective. a comparison of macaw with and without weight transformation layers can be found in figures 5-center and 7.
+
+# c. additional experiments and ablations
+
+# c.1. weight transform ablation study
+
+in addition to the results shown in figure 5 (center), we include an ablation of the weight transform here for all tasks. figure 6 shows these results. we find that across
+
+environments, the weight transform plays a significant role in increasing training speed, stability, and even final performance. on the relatively simple cheetah direction benchmark, it does not affect the quality of the final meta-trained agent, but it does improve the speed and stability of training. on the other three (more difficult) tasks, we see a much more noticeable affect in terms of both training stability as well as final performance.
+
+additionally, we investigate the effect of the weight transform in a few-shot image classification setting. we use the 20-way 1-shot omniglot digit classification setup (lake et al., 2015), specifically the train/val split used by (vinyals et al., 2016) as implemented by (deleu et al., 2019). we compare three mlp models, all with 4 hidden layers:
+
+1. an mlp with weight transform layers of 128 hidden units and a latent layer dimension of 32 (4,866,048 parameters; weight transform in figure 7).  
+2. an mlp without weight transform layers, with 128 hidden units (152,596 parameters; no wt-equal width in figure 7)  
+3. an mlp without weight transform layers, with 1150 hidden units (4,896,720 parameters; no wt-equal params in figure 7)
+
+we find that the model with weight transform layers shows the best combination of fast convergence and good asymptotic performance compared with baselines with regular fully-connected layers. no wt-equal width has the same number of hidden units as the weight transform model (128), which means the model has fewer parameters in total (because the weight transform layers include a larger weight matrix). the no wt-equal params baseline uses wider hidden layers to equalize the number of parameters in the entire model with the weight transform model. somewhat surprisingly, the smaller baseline model (equal width) outperforms the larger baseline model (equal params).
+
+when using maml-style meta-learners, it is important to consider that adding parameters to the model affects the expressiveness of both the forward computation of the model and the updates computable with a finite number of steps of gradient descent.
+
+generally, increasing the number of parameters in the model should improve the model's ability to fit the training set (because the inner loop of maml is more expressive), which we observe here. increasing the expressiveness of the inner loop of maml can also speed convergence, which we also observe in figure 7. however, by simply adding neurons to a typical mlp, the post-adaptation model tends to overfit the training set more, as we see in figure 7. on the other hand, adding parameters through weight transformation layers increases expressiveness of the adaptation
+
+step by enabling weight updates with rank greater than 1 without changing the expressiveness of the forward computation of the model.
+
+# c.2. online fine-tuning for out-of-distribution test tasks
+
+in some cases, it may be necessary or desirable to perform online fine-tuning after the initial offline adaptation step. this is the fully offline meta-rl problem with online fine-tuning described in section 3, where an algorithm is given a small amount of initial adaptation data from the test task, just as in the fully offline setting, and then is able to interact with the environment to collect additional training data and perform on-policy updates. this ability to continually improve with additional training after the initial offline adaptation step is what makes a consistent meta-reinforcement learner advantageous.
+
+this hybrid setting (offline training with additional online fine-tuning) is known to be extremely challenging in traditional reinforcement learning. these difficulties are clearly documented by recent work (nair et al., 2020). in short, this setting is challenging in traditional rl because while offline pre-training might produce a policy that performs well, online fine-tuning often leads to a significant drop in initial performance, which can take a very long time to recover from (see (nair et al., 2020)). in many cases, online fine-tuning can take a very long time to recover the performance of the offline-only policy, if it does so at all. in offline meta-rl, we have a similar challenge; an offline meta-rl algorithm must not only meta-train for good performance on a single batch of offline test data, but it must also learn a set of parameters that enables fine-tuning to make productive updates to its policy and/or value function without completely destroying the meta-learned knowledge about the task distribution.
+
+in this section, we use a hybrid setting as described above to evaluate not only macaw's consistency (its ability to continue to improve after an initial offline adaptation step), but its ability to continue to improve even when the test task distribution differs from the train distribution. because significant distribution shift means that some train tasks are irrelevant, or even detrimental to test performance, this setting is very difficult. in order to make a meaningful comparison, we compare with an "offline pearl + fine-tuning" (offline pearl+ft) algorithm, which is also technically consistent (because it essentially performs the sac algorithm on the test task after the initial task inference step). however, we hypothesize that macaw will have an advantage over this offline pearl+ft algorithm because while both algorithms are consistent, macaw explicitly trains for good fine-tunability with gradient descent, unlike task inference-based meta-rl algorithms.
+
+![](images/2b4b609f2e0e78cb9d8b99141fa6e09e3a24f2ae50b76973b7f4e9f35c740516.jpg)  
+ablating the weight transformation in macaw
+
+![](images/be0da16e8eece26be774e5fb572090213ee9f94261cd7f27886305ecab98c61e.jpg)
+
+![](images/b4b33c7bc582231ce6bb58325a17255cfaebbb524b3f5595c20c80912aee4301.jpg)  
+figure 6: ablating the weight transformation in macaw on the mujoco benchmark environments. all networks have the same number of hidden units. although macaw is able to learn with regular fully-connected layers, the weight transformation significantly improves performance on all tasks that require adaptation to unseen tasks.
+
+![](images/d7d850a2e3b3be63d833f99f69ef36a35ec99fa3a7518af10c388acc2e55b11a.jpg)
+
+<table><tr><td rowspan="2">additional env. steps</td><td colspan="2">offline pearl+ft</td><td colspan="2">macaw</td></tr><tr><td>reward</td><td>improvement</td><td>reward</td><td>improvement</td></tr><tr><td>0</td><td>-553.4 (21.2)</td><td>-</td><td>-323.1 (42.9)</td><td>-</td></tr><tr><td>20k</td><td>-565.0 (4.7)</td><td>-11.5 (3.5)</td><td>-279.1 (16.8)</td><td>44.0 (14.5)</td></tr><tr><td>200k</td><td>-533.6 (19.8)</td><td>19.8 (3.7)</td><td>-272.0 (15.2)</td><td>51.1 (12.7)</td></tr></table>
+
+table 2: absolute reward as well as improvement (in terms of reward) of offline pearl+ft and macaw after 0, 20k, and 200k additional environment steps are gathered and used for online fine tuning. standard errors of the mean over the 13 test tasks are reported in parentheses. averages are taken over 10 rollouts of each policy. we find that macaw achieves both better out-of-distribution performance before online training as well as faster improvement during online fine-tuning. note that offline pearl+ft experiences an initial drop in average performance on the test task after 20k steps, compared with the performance of the policy conditioned only on the initial batch of offline data. a similar effect has been reported in recent work in offline rl (nair et al., 2020).
+
+![](images/f405225ccf4c41fe39823e48929776438575efbe8a8a3fe84a851b66da138bf2.jpg)  
+figure 7: faster convergence provided by the weight transform layer (orange) on omniglot 20-way 1-shot image classification (lake et al., 2015).
+
+the training procedure for offline pearl+ft is the same at the regular offline pearl training procedure. however, at test time, after receiving an initial small batch of offline data for task inference, we alternative between performing rollouts of the task-conditioned policy to collect additional data from the test task and perform gradient descent on the pearl policy and value function objectives with this off-policy data. similarly, for macaw test time involves first using the small batch of offline test task data to take an initial gradient step on the value and policy loss functions (eqns 2 and 3), then alternating between rolling out the adapted policy and taking more steps of gradient descent on the macaw losses.
+
+the specific experimental setup is as follows. we partition the individual tasks in the cheetah-vel problem such that training tasks correspond to target velocities in the range [0,2] and test tasks correspond to target velocities in the range [2,3]. after meta-training, for each test task, we provide the algorithm with a small batch of offline data for adaptation just as in the fully offline setting. however, we allow the algorithm to then collect and train on up to 200k additional interactions from the environment. both algorithms alternate between sampling a single trajectory (200 environment interactions) and performing 100 steps of gradient descent on the aggregate buffer of data for the test task, which contains both the initial offline batch of data as well as all online data collected so far. we evaluate both algorithms on their performance after 20k and 200k additional interactions with the environment. the results of this experiment are reported in table 2. we observe that macaw achieves both higher absolute reward on the ood test tasks as well as faster relative improvement over the offline-only adapted policy compared to the offline pearl+ft baseline.
+
+![](images/fa643f73ebbd51de103a120a09f37fbf12fccb5b4ab9dc014cc098c5d43ec721.jpg)  
+figure 8: average success rates of macaw, pearl, and mt + fine-tuning (with 20 fine-tuning steps) on the 5 test tasks the meta-world ml45 suite of continuous control tasks. dashed line shows final pearl average success rate after 10m training steps.
+
+# c.3. metaworld ml45 benchmark
+
+as an additional experiment, we test the training and generalization capabilities of macaw on a much broader distribution of tasks, and where test tasks differ significantly from training tasks (e.g. picking up an object as opposed to opening a window or hammering a nail). recently, yu et al. (2019) proposed the meta-world (yu et al., 2019) suite of continuous control benchmark environments as a more realistic distribution of tasks for multi-task and meta-learning algorithms. this benchmark includes 45 meta-training tasks and 5 meta-testing tasks. the results of this experiment are summarized in figure 8.
+
+we find that all methods are able to make meaningful progress on the test tasks, with gradient-based methods (macaw and mt + fine tune) learning much more quickly than pearl. macaw does achieve a quite high level of performance quite early on in training; however, it begins to overfit with further training. in the regime where periodic online evaluations are available for the purpose of early stopping, we could avoid this issue, in which case macaw would slightly underperform the multi-task learning baseline. a possible reason for some inconsistency between the performance of each algorithm on meta-world and the results reported in figure 3 is the difficult scaling of the rewards in the current version of the meta-world benchmark. rewards can vary by 5 orders of magnitude, from negative values to values on the order of 100,000. this has been documented to adversely impact training performance even in single-task rl and increase hyperparameter sensitivity (see https://github.com/rlworkgroup/metaworld/issues/226). because of the problems stemming from the current reward functions in meta-world, the maintainers of the benchmark are updating them for the next version of the benchmark, which has not been released
+
+as of january 2021.
+
+# d. experimental set-up and data collection
+
+# d.1. overview of problem settings
+
+the problems of interest include:
+
+1. half-cheetah direction train a simple cheetah to run in one of two directions: forward and backward. thus, there are no held-out test tasks for this problem, making it more 'proof of concept' than benchmark.  
+2. half-cheetah velocity train a cheetah to run at a desired velocity, which fully parameterizes each task. for our main experiment, values of the task parameters are sampled from a uniform interval of 40 velocities in the range [0, 3]. a subset of 5 target velocities is sampled randomly for evaluation. for task sparsity ablation experiments, we create successively sparser sets of training tasks by repeatedly removing half of the training tasks, rounding down the number of tasks to be removed.  
+3. ant-2d direction train a simulated ant with 8 articulated joints to run in a random 2d direction. for our experiments, we sample 50 random directions uniformly, holding out 5 for testing.  
+4. walker-2d params train a simulated agent to move forward, where different tasks correspond to different randomized dynamics parameters rather than reward functions. for our experiments, we sample 50 random sets of dynamics parameters, holding out 5 for testing.  
+5. meta-world ml45 train a simulated sawyer robot to complete 45 different robotics manipulation tasks (for training). 5 additional tasks are included for testing, making 50 tasks in total. tasks include opening a window, hammering a nail, pulling a lever, picking & placing an object. see yu et al. (2019) for more information. our experiments use a continuous space randomization for each task setup, unlike the experiments in (yu et al., 2019), which sample from a fixed number of task states. this creates a much more challenging environment, as seen in the success rate curves above.
+
+for the first 4 mujoco domains, each trajectory is 200 time steps (as in rakelly et al. (2019)); for meta-world, trajectories are 150 time steps long.
+
+# d.2. data collection
+
+we adapt each task to the offline setting by restricting the data sampling procedure to sample data only from a fixed
+
+offline buffer of data. for each task, we train a separate policy from scratch, using soft actor-critic (haarnoja et al., 2018) for all tasks except cheetah-velocity, for which we use td3 (fujimoto et al., 2018) as it proved more stable across the various cheetah-velocity tasks. we save complete replay buffers from the entire lifetime of training for each task, which includes 5m steps for meta-world, 2.5m steps for cheetah-velocity, 2.5m steps for cheetah-dir, 2m steps for ant-direction, and 1m steps for walker-params. we use these buffers of trajectories, one per task for each problem, to sample data in both the inner and outer loop of the algorithm during training. see figures 9 and 10 for the learning curves of the offline policies for each train and test task.
+
+# d.3. ablation experiments
+
+for the data quality experiment, we compare the post-adaptation performance when macaw is trained with 3 different sampling regimes for the cheetah-vel problem setting. bad, medium, and good data quality mean that adaptation data (during both training and evaluation) is drawn from the first, middle, and last 500 trajectories from the offline replay buffers. for the task quantity experiment, we order the tasks by the target velocity in ascending order, giving equally spaced tasks with target velocities  $g_{0} = 0.075$ ,  $g_{2} = 0.15$ , ...,  $g_{39} = 3.0$ . for the 20 task experiment, we use  $g_{i}$  with even  $i$  for training and odd  $i$  for testing. for the 10 task experiment, we move every other train task to the test set (e.g. tasks  $i = 2, 6, 10, \ldots$ ). for the 5 task experiment, we move every other remaining train task to the test set (e.g. tasks  $i = 4, 12, 20, \ldots$ ), and for the 3 task experiment, we again move every other task to the test set, so that the train set only contains tasks 0, 16, and 32. task selection was performed this way to ensure that even in sparse task environments, the train tasks provide coverage of most of the task space.
+
+# d.4. online fine-tuning experiments
+
+for these experiments, we evaluate each model after a total of 50 or 100 additional trajectories have been collected (with a trajectory length of 200 time steps, this corresponds to 10k or 20k total environment steps). after performing the initial offline adaptation step, we initialize a buffer of online data  $d_{\mathrm{online}}$  with the offline data  $d_{\mathrm{test}}$  (256 experience tuples). we then alternate between collecting a trajectory of data with the current policy, adding the trajectory to  $d_{\mathrm{online}}$ , and performing 100 gradient steps of training using the entire contents of  $d_{\mathrm{online}}$ . to avoid overfitting to a small buffer, we skip training until 5 online trajectories have been added to  $d_{\mathrm{online}}$ . we never remove experiences from the online replay buffer during online training. for macaw, we use learning rates and batch sizes equal to the outer loop learning rates and batch sizes given in table 5; for pearl, we use the learning rates and hyperparameters in table 3.
+
+![](images/505d3d5022d7d9333c3847606f1979fdc261f8e8b066a0a0904238361a39fb20.jpg)
+
+![](images/da8db504945ee0326a20c12c131a89893acbee400afe3c9fd73c03f18ab962ad.jpg)
+
+![](images/e10ae896ed43a80aa2043c154ab46fb39d0ab4d5cb7baf9c354f00662dac62f5.jpg)
+
+![](images/804d5184a8044c5c5526ec2fcbf679d2cc1d7c8ef87b1f8f1c85d73c2dd0bdec.jpg)
+
+![](images/072941fd53ea88963f35f2390e5ccfd3641385993c965b0976fe7361e8043c92.jpg)
+
+![](images/c5837739e35df24670293fbd2e2bd6a0a7b39e3bf7e52a169d21c14f825e3827.jpg)  
+figure 9: learning curves for offline policies for the 4 different mujoco environments used in the experimental evaluations. each curve corresponds to a policy trained on a unique task. various levels of smoothing are applied for the purpose of easier visualization.
+
+![](images/eec35136cf230a35fb6aa134b8a34c5d05a7995c15cbc51d4e3a5cc6986294f8.jpg)
+
+![](images/4a74a2a4bedf7f4265d098256375e7744ab803c36b31c4e495961c8f04b6c728.jpg)
+
+![](images/a020c97bd62c43e9da99e317a819ef50c0f3af97a5420a91c5742f4ba6e962d3.jpg)
+
+![](images/7a734a9d379bb42e94771e4ce511aad73b697e9cb1e25f656eba8ea708bae6cd.jpg)  
+figure 10: learning curves and success rates for all tasks in the metaworld 45 benchmark. each curve corresponds to a policy trained on a unique task. various levels of smoothing are applied for the purpose of plotting.
+
+![](images/8af3279a066c271b3997088bf21d2d0ed865dc3b7cc4de0448c186b00c291403.jpg)
+
+# e. implementation details and hyperparameters
+
+peng et al. (2019) note several strategies used to increase the stability of their advantage-weighted regression implementation. we normalize the advantage logits in the policy update step to have zero mean and unit standard deviation, as in peng et al. (2019). advantage weight logits are also clipped to avoid exploding gradients and numerical overflow. to train the value function, we use simple least squares regression onto monte carlo returns, rather than td( $\lambda$ ). finally, our policy is parameterized by a single gaussian with fixed variance of 0.04; our policy network thus predicts only the mean of the gaussian distribution.
+
+in addition to using weight transformation layers instead of regular fully-connected layers, we also learn learning rates for each layer of our network by gradient descent. to speed up training, we compute our loss using a 'task minibatch' of 5 tasks at each step of optimization, rather than using all of the training tasks. finally, specific to the rl setting, we sample experiences in contiguous chunks from the replay buffers during train-time adaptation and uniformly (noncontiguously) from the replay buffers for outer-loop updates and test-time adaptation. for outer loop updates, we sample data selectively towards the end of the replay buffers. we use the higher framework (grefenstette et al., 2019) for computing higher-order derivatives for meta-learning.
+
+# e.1. hyperparameters
+
+tables 3, 4, and 5 describe the hyperparameters used for each algorithm in our empirical evaluations. we performed some manual tuning of hyperparameters for all algorithms, but found that the performance was not significantly affected for environments other than meta-world, likely due to the difficult reward scaling in the current release of meta-world.
+
+<table><tr><td>parameter</td><td>standard configuration</td><td>meta-world</td></tr><tr><td>optimizer</td><td>adam</td><td>-</td></tr><tr><td>meta batch size</td><td>4-10</td><td>16</td></tr><tr><td>batch size</td><td>256</td><td>-</td></tr><tr><td>embedding batch size</td><td>100-256</td><td>750</td></tr><tr><td>kl penalty</td><td>0.1</td><td>-</td></tr><tr><td>hidden layers</td><td>3</td><td>-</td></tr><tr><td>neurons per hidden layer</td><td>300</td><td>512</td></tr><tr><td>latent space size</td><td>5</td><td>8</td></tr><tr><td>policy learning rate</td><td>3e-4</td><td>-</td></tr><tr><td>value function learning rate</td><td>3e-4</td><td>-</td></tr><tr><td>context embedding learning rate</td><td>3e-4</td><td>-</td></tr><tr><td>q-function learning rate</td><td>3e-4</td><td>-</td></tr><tr><td>reward scale</td><td>5.0</td><td>-</td></tr><tr><td>recurrent</td><td>false</td><td>-</td></tr></table>
+
+table 3: hyperparameters used for the pearl experiments. for the mujoco tasks, we generally used the same parameters as reported in (rakelly et al., 2019), with some minor modifications. the different parameters used for the metaworld ml45 environment are reported above.  
+
+<table><tr><td>parameter</td><td>standard configuration</td><td>meta-world</td></tr><tr><td>optimizer</td><td>adam</td><td>-</td></tr><tr><td>value learning rate</td><td>1e-4*</td><td>1e-6</td></tr><tr><td>policy learning rate</td><td>1e-4</td><td>-</td></tr><tr><td>value fine-tuning learning rate</td><td>1e-4</td><td>1e-6</td></tr><tr><td>policy fine-tuning learning rate</td><td>1e-3</td><td>-</td></tr><tr><td>train outer loop batch size</td><td>256</td><td>-</td></tr><tr><td>fine-tuning batch size</td><td>256</td><td>-</td></tr><tr><td>number of hidden layers</td><td>3</td><td>-</td></tr><tr><td>neurons per hidden layer</td><td>100</td><td>300</td></tr><tr><td>task batch size</td><td>5</td><td>-</td></tr><tr><td>max advantage clip</td><td>20</td><td>-</td></tr></table>
+
+table 4: hyperparameters used for the multi-task learning + fine tuning baseline. *for the walker environment, the value learning rate was 1e-5 for stability.
+
+<table><tr><td>parameter</td><td>standard configuration</td><td>meta-world</td></tr><tr><td>optimizer</td><td>adam</td><td>-</td></tr><tr><td>auxiliary advantage loss coefficient</td><td>1e-2</td><td>1e-3</td></tr><tr><td>outer value learning rate</td><td>1e-5</td><td>1e-6</td></tr><tr><td>outer policy learning rate</td><td>1e-4</td><td>-</td></tr><tr><td>inner policy learning rate</td><td>1e-3 (learned)</td><td>1e-2 (learned)</td></tr><tr><td>inner value learning rate</td><td>1e-3 (learned)</td><td>1e-4 (learned)</td></tr><tr><td>train outer loop batch size</td><td>256</td><td>-</td></tr><tr><td>train adaptation batch size</td><td>256</td><td>256</td></tr><tr><td>eval adaptation batch size</td><td>256</td><td>-</td></tr><tr><td>number of adaptation steps</td><td>1</td><td>-</td></tr><tr><td>learning rate for learnable learning rate</td><td>1e-3</td><td>-</td></tr><tr><td>number of hidden layers</td><td>3</td><td>-</td></tr><tr><td>neurons per hidden layer</td><td>100</td><td>300</td></tr><tr><td>task batch size</td><td>5</td><td>10</td></tr><tr><td>max advantage clip</td><td>20</td><td>-</td></tr><tr><td>awr policy temperature</td><td>1</td><td>-</td></tr></table>
+
+table 5: hyperparameters used for macaw. the standard configuration is used for all experiments and all environments except for meta-world (due to the extreme difference in magnitude of rewards in meta-world, which has typical rewards  $100 - 1000x$  larger than in the other tasks). for the meta-world configuration, only parameters that differ from the standard configuration are listed.

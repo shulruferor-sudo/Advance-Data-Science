@@ -1,0 +1,833 @@
+# binary-level directed fuzzing for use-after-free vulnerabilities
+
+manh-dung nguyen
+
+univ. paris-saclay, cea list, france
+
+manh-dung.nguyen@cea.fr
+
+sebastien bardin
+
+univ. paris-saclay, cea list, france
+
+sebastien.bardin@cea.fr
+
+richard bonichon
+
+tweag i/o, france
+
+richard.bonichon@tweag.io
+
+roland groz
+
+univ. grenoble alpes, france
+
+roland.groz@univ-grenoble-alpes.fr
+
+matthieu lemerre
+
+univ. paris-saclay, cea list, france
+
+matthieu.lemerre@cea.fr
+
+# abstract
+
+directed fuzzing focuses on automatically testing specific parts of the code by taking advantage of additional information such as (partial) bug stack trace, patches or risky operations. key applications include bug reproduction, patch testing and static analysis report verification. although directed fuzzing has received a lot of attention recently, hard-to-detect vulnerabilities such as use-after-free (uaf) are still not well addressed, especially at the binary level. we propose uafuzz, the first (binary-level) directed greybox fuzzer dedicated to uaf bugs. the technique features a fuzzing engine tailored to uaf specifics, a lightweight code instrumentation and an efficient bug triage step. experimental evaluation for bug reproduction on real cases demonstrates that uafuzz significantly outperforms state-of-the-art directed fuzzers in terms of fault detection rate, time to exposure and bug triaging. uafuzz has also been proven effective in patch testing, leading to the discovery of 30 new bugs (7 cves) in programs such as perl, gpac and gnu patch. finally, we provide to the community a large fuzzing benchmark dedicated to uaf, built on both real codes and real bugs.
+
+# 1 introduction
+
+context. finding bugs early is crucial in the vulnerability management process. the recent rise of fuzzing [52, 55] in both academia and industry, such as microsoft's springfield [54] and google's oss-fuzz [16], shows its ability to find various types of bugs in real-world applications. coverage-based greybox fuzzing (cgf), such as afl [1] and libfuzzer [15], leverages code coverage information in order to guide input generation toward new parts of the program under test (put), exploring as many program states as possible in the hope of triggering crashes. on the other hand, directed greybox fuzzing (dgf) [27, 30] aims to perform stress testing on pre-selected potentially vulnerable target locations, with applications to different security contexts: (1) bug reproduction [27, 30, 44, 63], (2) patch testing [27, 53, 61] or (3) static analysis report verification [33, 51]. depending on the application, target locations are originated from bug
+
+stack traces, patches or static analysis reports.
+
+we focus mainly on bug reproduction, which is the most common practical application of dgf [27, 30, 44, 51, 76]. it consists in generating proof-of-concept (poc) inputs of disclosed vulnerabilities given bug report information. it is especially needed since only  $54.9\%$  of usual bug reports can be reproduced due to missing information and users' privacy violation [56]. even with a poc provided in the bug report, developers may still need to consider all corner cases of the bug in order to avoid regression bugs or incomplete fixes. in this case, providing more bug-triggering inputs becomes important to facilitate and accelerate the repair process. bug stack traces, sequences of function calls at the time a bug is triggered, are widely used for guiding directed fuzzers [27, 30, 44, 51]. running a code on a poc input under profiling tools like addresssanitizer (asan) [67] or valgrind [57] will output such a bug stack trace.
+
+problem. despite tremendous progress in the past few years [5, 23, 25, 27, 30, 31, 41, 48, 49, 62, 64, 69, 75], current (directed or not) greybox fuzzers still have a hard time finding complex vulnerabilities such as use-after-free (uaf), non-interference or flaky bugs [26], which require bug-triggering paths satisfying very specific properties. for example, oss-fuzz [16, 17] or recent greybox fuzzers [27, 64, 75] only found a small number of uaf. actually, rode0day [18], a continuous bug finding competition, recognizes that fuzzers should aim to cover new bug classes like uaf in the future [39], moving further from the widely-used lava [38] bug corpora which only contains buffer overflows.
+
+we focus on uaf bugs. they appear when a heap element is used after having been freed. the numbers of uaf bugs has increased in the national vulnerability database (nvd) [22]. they are currently identified as one of the most critical exploitable vulnerabilities due to the lack of mitigation techniques compared to other types of bugs, and they may have serious consequences such as data corruption, information leaks and denial-of-service attacks.
+
+goal and challenges. we focus on the problem of designing an efficient directed fuzzing method tailored for uaf. the technique must also be able to work at binary-level (no source
+
+table 1: summary of existing greybox fuzzing techniques.  
+
+<table><tr><td></td><td>afl</td><td>aflgo</td><td>hawkeye</td><td>uafuzz</td></tr><tr><td>directed fuzzing approach</td><td>x</td><td>✓</td><td>✓</td><td>✓</td></tr><tr><td>support binary</td><td>✓</td><td>x</td><td>x</td><td>✓</td></tr><tr><td>uaf bugs oriented</td><td>x</td><td>x</td><td>x</td><td>✓</td></tr><tr><td>fast instrumentation</td><td>✓</td><td>x</td><td>x</td><td>✓</td></tr><tr><td>uaf bugs triage</td><td>x</td><td>x</td><td>x</td><td>✓</td></tr></table>
+
+level instrumentation), as source codes of security-critical programs are not always available or may rely partly on third-party libraries. however, fuzzers targeting the detection of uaf bugs confront themselves with the following challenges.
+
+c1. complexity - exercising uaf bugs require to generate inputs triggering a sequence of 3 events - alloc, free and use - on the same memory location, spanning multiple functions of the put, where buffer overflows only require a single out-of-bound memory access. this combination of both temporal and spatial constraints is extremely difficult to meet in practice;
+
+c2. silence - uaf bugs often have no observable effect, such as segmentation faults. in this case, fuzzers simply observing crashing behaviors do not detect that a test case triggered such a memory bug. sadly, popular profiling tools such as asan or valgrind cannot be used in a fuzzing context due to their high runtime overhead.
+
+actually, current state-of-the-art directed fuzzers, namely aflgo [27] and hawkeye [30], fail to address these challenges. first, they are too generic and therefore do not cope with the specificities of uaf such as temporality – their guidance metrics do not consider any notion of sequenceness. second, they are completely blind to uaf bugs, requiring to send all the many generated seeds to a profiling tool for an expensive extra check. finally, current implementations of source-based dgf fuzzers typically suffer from an expensive instrumentation step [3], e.g., aflgo spent nearly  $2h$  compiling and instrumenting cxxfilt (binutils).
+
+proposal. we propose uafuzz, the first (binary-level) directed greybox fuzzer tailored to uaf bugs. a quick comparison of uafuzz with existing greybox fuzzers in terms of uaf is presented in table 1. while we follow mostly the generic scheme of directed fuzzing, we carefully tune several of its key components to the specifics of uaf:
+
+- the distance metric favors shorter call chains leading to the target functions that are more likely to include both allocation and free functions – where sota directed fuzzers rely on a generic cfg-based distance;  
+- seed selection is now based on a sequenceness-aware target similarity metric - where sota directed fuzzers rely at best on target coverage;  
+- our power schedule benefits from these new metrics, plus another one called cut-edges favoring prefix paths more likely to reach the whole target.
+
+finally, the bug triaging step piggy-backs on our previous metrics to pre-identifies seeds as likely-bugs or not, sparing a huge amount of queries to the profiling tool for confirmation (valgrind in our implementation).
+
+# contributions. our contribution is the following:
+
+- we design the first directed greybox fuzzing technique tailored to uaf bugs (section 4). especially, we systematically revisit the three main ingredients of directed fuzzing (selection heuristic, power schedule, input metrics) and specialize them to uaf. these improvements are proven beneficial and complementary;  
+- we develop a toolchain [21] on top of the state-of-the-art greybox fuzzer afl [1] and the binary analysis platform binsec [4], named uafuzz, implementing the above method for uaf directed fuzzing over binary codes (section 5) and enjoying small overhead;  
+- we construct and openly release [20] the largest fuzzing benchmark dedicated to uaf, comprising 30 real bugs from 17 widely-used projects (including the few previous uaf bugs found by directed fuzzers), in the hope of facilitating future uaf fuzzing evaluation (appendix a);  
+we evaluate our technique and tool in a bug reproduction setting (section 6), demonstrating that uafuzz is highly effective and significantly outperforms state-of-the-art competitors:  $2 \times$  faster in average to trigger bugs (up to  $43 \times$ ),  $+34 \%$  more successful runs in average (up to  $+300 \%$  ) and  $17 \times$  faster in triaging bugs (up to  $130 \times$  with  $99 \%$  spare checks):  
+- finally, uafuzz is also proven effective in patch testing (§6.7), leading to the discovery of 30 unknown bugs (11 uafs, 7 cves) in projects like perl, gpac, mupdf and gnu patch (including 4 buggy patches). so far, 17 have been fixed.
+
+uafuzz is the first directed greybox fuzzing approach tailored to detecting uaf vulnerabilities (in binary) given only bug stack traces. uafuzz outperforms existing directed fuzzers on this class of vulnerabilities for bug reproduction and encouraging results have been obtained as well on patch testing. we believe that our approach may also be useful in slightly related contexts, for example partial bug reports from static analysis or other classes of vulnerabilities.
+
+# 2 background
+
+let us first clarify some notions used along the paper.
+
+# 2.1 use-after-free
+
+execution. an execution is the complete sequence of states executed by the program on an input. an execution trace crashes when it ends with a visible error. the standard goal of fuzzers is to find inputs leading to crashes, as crashes are the first step toward exploitable vulnerabilities.
+
+uaf bugs. use-after-free (uaf) bugs happen when dereferencing a pointer to a heap-allocated object which is no longer valid (i.e., the pointer is dangling). note that double-free (df) is a special case.
+
+uaf-triggering conditions. triggering a uaf bug requires to find an input whose execution covers in sequence three
+
+uaf events: an allocation (alloc), a free and a use (typically, a dereference), all three referring to the same memory object, as shown in listing 1.
+
+```c
+1 char *buf = (char *) malloc(buf_size);  
+2 free(buf); // pointer buf becomes dangling  
+3 ...  
+4 strncpy(buf, argv[1], buf_size-1); // use-after-free
+```
+
+listing 1: code snippet illustrating a uaf bug.
+
+furthermore, this last use generally does not make the execution immediately crash, as a memory violation crashes a process only when it accesses an address outside of the address space of the process, which is unlikely with a dangling pointer. thus, uaf bugs go often unnoticed and are a good vector of exploitation [47, 77].
+
+# 2.2 stack traces and bug traces
+
+by inspection of the state of a process we can extract a stack trace, i.e. the list of the function calls active in that state. stack traces are easily obtained from a process when it crashes. as they provide (partial) information about the sequence of program locations leading to a crash, they are extremely valuable for bug reproduction [27, 30, 44, 51].
+
+yet, as crashes caused by uaf bugs may happen long after the uaf happened, standard stack traces usually do not help in reproducing uaf bugs. hopefully, profiling tools for dynamically detecting memory corruptions, such as asan [67] or valgrind [57], record the stack traces of all memory-related events: when they detect that an object is used after being freed, they actually report three stack traces (when the object is allocated, when it is freed and when it is used after being freed). we call such a sequence of three stack traces a (uaf) bug trace. when we use a bug trace as an input to try to reproduce the bug, we call such a bug trace a target.
+
+```lisp
+// stack trace for the bad use  
+ $= = 4440 ==$  invalid read of size 1  
+ $= = 4440 ==$  at 0x40a838:vfprintf (vfprintf.c:1632)  
+ $= = 4440 ==$  by 0x40a8670:buffered_vfprintf (vfprintf.c:2320)  
+ $= = 4440 ==$  by 0x40a62d0:vfprintf (vfprintf.c:1293)  
+ $= = 4440 ==$  by 0x80aa58a: error (elfcomm.c:43)  
+ $= = 4440 ==$  by 0x8085384:process_archive (readelf.c:19063)  
+ $= = 4440 ==$  by 0x8085a57:process_file (readelf.c:19242)  
+ $= = 4440 ==$  by 0x8085c6e:main (readelf.c:19318)  
+// stack trace for the free  
+ $= = 4440 ==$  address 0x421fdc8 is 0 bytes inside a block of size 86 free'd  
+ $= = 4440 ==$  at 0x402d358:free (in vgppreload_memcheck-x86-linux.so)  
+ $= = 4440 ==$  by 0x80857b4:process_archive (readelf.c:19178)  
+ $= = 4440 ==$  by 0x8085a57:process_file (readelf.c:19242)  
+ $= = 4440 ==$  by 0x8085c6e: main (readelf.c:19318)
+```
+
+```txt
+// stack trace for the alloc  
+ $= = 4440 ==$  block was alloc'd at  
+ $= = 4440 ==$  at 0x402c17c: malloc (in vgppreload_memcheck-x86-linux.so)  
+ $= = 4440 ==$  by 0x80ac687: make_qualified_name (elfcomm.c:906)  
+ $= = 4440 ==$  by 0x80854bd: process_archive (readelf.c:19089)  
+ $= = 4440 ==$  by 0x8085a57: process_file (readelf.c:19242)  
+ $= = 4440 ==$  by 0x8085c6e: main (readelf.c:19318)
+```
+
+figure 1: bug trace of cve-2018-20623 (uaf) produced by valgrind.
+
+# 2.3 directed greybox fuzzing
+
+fuzzing [52, 55] consists in stressing a code under test through massive input generation in order to find bugs. recent coverage-based greybox fuzzers (cgf) [1, 15] rely on lightweight program analysis to guide the search – typically through coverage-based feedback. roughly speaking, a seed (input) is favored (selected) when it reaches under-explored parts of the code, and such favored seeds are then mutated to create new seeds for the code to be executed on. cgf is geared toward covering code in the large, in the hope of finding unknown vulnerabilities. on the other hand, directed greybox fuzzing (dgf) [27, 30] aims at reaching a pre-identified potentially buggy part of the code from a target (e.g., patch, static analysis report), as often and fast as possible. directed fuzzers follow the general principles and architecture as cgf, but adapt the key components to their goal, essentially favoring seeds “closer” to the target. overall directed fuzzers<sup>1</sup> are built upon three main steps: (1) instrumentation (distance pre-computation), (2) fuzzing (including seed selection, power schedule and seed mutation) and (3) triage.
+
+the standard core algorithm of dgf is presented in algorithm 1 (the parts we modify in uafuzz are in gray). given a program  $p$ , a set of initial seeds  $s_0$  and a target  $t$ , the algorithm outputs a set of bug-triggering inputs  $s'$ . the fuzzing queue  $s$  is initialized with the initial seeds in  $s_0$  (line 1).
+
+1. dgf first performs a static analysis (e.g., target distance computation for each basic block) and insert the instrumentation for dynamic coverage or distance information (line 2);  
+2. the fuzzer then repeatedly mutates inputs  $s$  chosen from the fuzzing queue  $s$  (line 4) until a timeout is reached. an input is selected either if it is favored (i.e., believed to be interesting) or with a small probability  $\alpha$  (line 5). subsequently, dgf assigns the energy (a.k.a, the number  $m$  of mutants to be created) to the selected seed  $s$  (line 6). then, the fuzzer generates  $m$  new inputs by randomly applying some predefined mutation operators on seed  $s$  (line 8) and monitors their executions (line 9). if the generated mutant  $s'$  crashes the program, it is added to the set  $s'$  of crashing inputs (line 11). also, newly generated mutants are added to the fuzzing queue $^2$  (line 13);  
+3. finally, dgf returns  $s'$  as the set of bug-triggering inputs (triage does nothing in standard dgf) (line 14).
+
+aflgo [27] was the first to propose a cfg-based distance to evaluate the proximity between a seed execution and multiple targets, together with a simulated annealing-based power schedule. hawkeye [30] keeps the cfg-based view but improves its accuracy<sup>3</sup>, brings a seed selection heuristic partly based on target coverage (seen as a set of locations) and proposes adaptive mutations.
+
+algorithm 1: directed greybox fuzzing  
+input: program  $p$ ; initial seeds  $s_0$ ; target locations  $t$   
+output: bug-triggering seeds  $s'$   
+1  $s' := 0$ ;  $s := s_0$ ;  $\triangleright s$ : the fuzzing queue  
+2  $p' \leftarrow \text{preprocess}(p, t)$ ;  $\triangleright$  phase 1: instrumentation  
+3 while timeout not exceeded do  $\triangleright$  phase 2: fuzzing  
+4 for  $s \in s$  do  
+5 if is_favored(s) or rand()  $\leq \alpha$  then  
+6  $\triangleright$  seed selection,  $\alpha$ : small probability  
+7 for  $i \in 1 \ldots m$  do  
+8  $\begin{array}{c} s' := \text{mutate_input}(s); \\ \text{res} := \text{run}(p', s', t); \\ \text{if is_crash(res) then} \\ \begin{array}{c} s' := s' \cup \{s'\}; \\ s := s \cup \{s'\}; \end{array} \end{array}$ $\triangleright$  seed mutation  
+9 else  
+10 return  $s'$ ;  $\triangleright$  phase 3: triage  
+11 return  $s'$ ;
+
+# 3 motivation
+
+the toy example in listing 2 contains a uaf bug due to a missing exit() call, a common root cause in such bugs (e.g., cve-2014-9296, cve-2015-7199). the program reads a file and copies its contents into a buffer buf. specifically, a memory chunk pointed at by p is allocated (line 12), then p alias and p become aliased (line 15). the memory pointed by both pointers is freed in function bad_func (line 10). the uaf bug occurs when the freed memory is dereferenced again via p (line 19).
+
+bug-triggering conditions. the uaf bug is triggered iff the first three bytes of the input are 'afu'. to quickly detect this bug, fuzzers need to explore the right path through the if part of conditional statements in lines 13, 5 and 18 in order to cover in sequence the three uaf events alloc, free and use respectively. it is worth noting that this uaf bug does not make the program crash, hence existing greybox fuzzers without sanitization will not detect this memory error.
+
+coverage-based greybox fuzzing. starting with an empty seed, afl quickly generates 3 new inputs (e.g., 'aaaa', 'ffff' and 'uuuu') triggering individually the 3 uaf events. none of these seeds triggers the bug. as the probability of generating an input starting with 'afu' from an empty seed is extremely small, the coverage-guided mechanism is not effective here in tracking a sequence of uaf events even though each individual event is easily triggered.
+
+directed greybox fuzzing. given a bug trace (14 – alloc, 17, 6, 3 – free, 19 – use) generated for example by asan, dgf prevents the fuzzer from exploring undesirable paths, e.g., the else part at line 7 in function func, in case the condition at line 5 is more complex. still, directed fuzzers have their own blind spots. for example, standard dgf seed selection
+
+int *p, *p alias;
+char buf[10];
+void bad_func(int *p) { free(p); } /* exit() is missing */
+void func()
+{
+    if (buf[1] == 'f')
+        bad_func(p);
+    else /* lots more code */
+}
+int main (int argc, char *argv[]) {
+    int f = open argv[1], 0_rdonly;
+    read(f, buf, 10);
+    p = malloc(sizeof(int));
+    if (buf[0] == 'a')
+        p alias = malloc(sizeof(int));
+    p = p alias;
+}
+func();
+if (buf[2] == 'u')
+* p = 1;
+return 0;
+}
+
+# listing 2: motivating example.
+
+mechanisms favor a seed whose execution trace covers many locations in targets, instead of trying to reach these locations in a given order. for example, regarding a target  $(a,f,u)$ , standard dgf distances [27,30] do not discriminate between an input  $s_1$  covering a path  $a\to f\to u$  and another input  $s_2$  covering  $u\rightarrow a\rightarrow f$ . the lack of ordering in exploring target locations makes uaf bug detection very challenging for existing directed fuzzers. another example: the power function proposed by hawkeye [30] may assign much energy to a seed whose trace does not reach the target function, implying that it could get lost on the toy example in the else part at line 7 in function func.
+
+a glimpse at uafuzz. we rely in particular on modifying the seed selection heuristic w.r.t. the number of targets covered by an execution trace (§4.2) and bringing target ordering-aware seed metrics to dgf (§4.3).
+
+on the toy example, uafuzz generates inputs to progress towards the expected target sequences. for example, in the same fuzzing queue containing 4 inputs, the mutant 'afaa', generated by mutating the seed 'aaaa', is discarded by afl as it does not increase code coverage. however, since it has maximum value of target similarity metric score (i.e., 4 targets including lines 14, 17, 6, 3) compared to all 4 previous inputs in the queue (their scores are 0 or 2), this mutant is selected by uafuzz for subsequent fuzzing campaigns. by continuing to fuzz 'afaa', uafuzz eventually produces a bug-triggering input, e.g., 'afua'.
+
+evaluation. aflgo (source-level) cannot detect the uaf bug within 2 hours $^{45}$ , while uafuzz (binary-level) is able to trigger it within 20 minutes. also, uafuzz sends a single input to valgrind for confirmation (the right poc input), while aflgo sends 120 inputs.
+
+# 4 the uafuzz approach
+
+uafuzz is made out of several components encompassing seed selection (§4.2), input metrics (§4.3), power schedule
+
+$(\s 4.4)$ , and seed triage  $(\s 4.5)$ . before detailing these aspects, let us start with an overview of the approach.
+
+![](images/717da0122062de7b1545d2b3fe7b4700cdc0fa85ce32b979a4f7e85fef13f86d.jpg)  
+figure 2: overview of uafuzz.
+
+we aim to find an input fulfilling both control-flow (temporal) and runtime (spatial) conditions to trigger the uaf bug. we solve this problem by bringing uaf characteristics into dgf in order to generate more potential inputs reaching targets in sequence w.r.t. the uaf expected bug trace. figure 2 depicts the general picture. especially:
+
+- we propose three dynamic seed metrics specialized for uaf vulnerabilities detection. the distance metric approximates how close a seed is to all target locations (§4.3), and takes into account the need for the seed execution trace to cover the three uaf events in order. the cut-edge coverage metric (§4.4.1) measures the ability of a seed to take the correct decision at important decision nodes. finally, the target similarity metric concretely assesses how many targets a seed execution trace covers at runtime (§4.2.2);  
+- our seed selection strategy (\$4.2) favors seeds covering more targets at runtime. the power scheduler determining the energy for each selected seed based on its metric scores during the fuzzing process is detailed in  $\s 4.4$ ;  
+- finally, we take advantage of our previous metrics to pre-identify likely-poc inputs that are sent to a profiling tool (here valgrind) for bug confirmation, avoiding many useless checks ( §4.5).
+
+# 4.1 bug trace flattening
+
+a bug trace (§2.2) is a sequence of stack traces, i.e. it is a large object not fit for the lightweight instrumentation required by greybox fuzzing. the most valuable information that we need
+
+![](images/6cb708552491018fbf2e1f740d8032cd86eff0b25914a56e8b4ffe4c7ae3e7bb.jpg)  
+figure 3: reconstructed tree from cve-2018-20623 (bug trace from figure 1). the preorder traversal of this tree is simply  $0 \to 1 \to 2 \to 3(n_{alloc}) \to 4(n_{free}) \to 5 \to 6(n_{use})$ .
+
+to extract from a bug trace is the sequence of basic blocks (and functions) that were traversed, which is an easier object to work with. we call this extraction bug trace flattening.
+
+the operation works as follows. first, each of the three stack-traces is seen as a path in a call tree; we thus merge all the stack traces to re-create that tree. some of the nodes in the tree have several children; we make sure that the children are ordered according to the ordering of the uaf events (i.e. the child coming from the alloc event comes before the child coming from the free event). figure 3 shows an example of tree for the bug trace given in figure 1.
+
+finally, we perform a preorder traversal of this tree to get a sequence of target locations (and their associated functions), which we will use in the following algorithms.
+
+# 4.2 seed selection based on target similarity
+
+fuzzers generate a large number of inputs so that smartly selecting the seed from the fuzzing queue to be mutated in the next fuzzing campaign is crucial for effectiveness. our seed selection algorithm is based on two insights. first, we should prioritize seeds that are most similar to the target bug trace, as the goal of a directed fuzzer is to find bugs covering the target bug trace. second, target similarity should take ordering (a.k.a. sequenceness) into account, as traces covering sequentially a number of locations in the target bug trace are closer to the target than traces covering the same locations in an arbitrary order.
+
+# 4.2.1 seed selection
+
+definition 1. a max-reaching input is an input  $s$  whose execution trace is the most similar to the target bug trace  $t$  so far, where most similar means "having the highest value as compared by a target similarity metric  $t(s,t)$ ".
+
+algorithm 2: is_favored  
+input : a seed s output: true if s is favored, otherwise false global  $t_{max} = 0$  ;  $\triangleright$  maximum target similar metric score if  $t(s)\geq t_{max}$  then  $t_{max} = t(s)$  ; return true; update  $t_{max}$  else if new_cov(s) then return true; increase coverage else return false;
+
+we mostly select and mutate max-reaching inputs during the fuzzing process. nevertheless, we also need to improve code coverage, thus uafuzz also selects inputs that cover new paths, with a small probability  $\alpha$  (algorithm 1). in our experiments, the probability of selecting the remaining inputs in the fuzzing queue that are less favored is  $1\%$  like afl [1].
+
+# 4.2.2 target similarity metrics
+
+a target similarity metric  $t(s, t)$  measures the similarity between the execution of a seed  $s$  and the target uaf bug trace  $t$ . we define 4 such metrics, based on whether we consider ordering of the covered targets in the bug trace  $(p)$ , or not  $(b)$ .
+
+-  $p$  stands for prefix,  $b$  for bag; and whether we consider the full trace, or only the three uaf events (3t):
+
+- target prefix  $t_p(s, t)$ : locations in  $t$  covered in sequence by executing  $s$  until first divergence;  
+- uaf prefix  $t_{3tp}(s,t)$ : uaf events of  $t$  covered in sequence by executing  $s$  until first divergence;  
+- target bag  $t_b(s,t)$ : locations in  $t$  covered by executing  $s$ ;  
+- uaf bag  $t_{3tb}(s,t)$ : uaf events of  $t$  covered by  $s$ .
+
+for example, using listing 2, the 4 metric values of a seed  $s$  'abua' w.r.t. the uaf bug trace  $t$  are:
+
+$t_p(s,t) = 2,t_{3pt}(s,t) = 1,t_b(s,t) = 3$  and  $t_{3tb}(s,t) = 2$
+
+these 4 metrics have different degrees of precision. a metric  $t$  is said more precise than a metric  $t'$  if, for any two seeds  $s_1$  and  $s_2$ :  $t(s_1, t) \geq t(s_2, t) \rightarrow t'(s_1, t) \geq t'(s_2, t)$ . figure 4 compares our 4 metrics w.r.t their relative precision.
+
+![](images/567c699ccc0db58975a8800d61159c32a3fafe819d56d14d66bc958a833d1791.jpg)  
+figure 4: precision lattice for target similarity metrics
+
+# 4.2.3 combining target similarity metrics
+
+using a precise metric such as  $p$  allows to better assess progression towards the goal. in particular,  $p$  can distinguish seeds that match the target bug trace from those that do not, while other metrics cannot. on the other hand, a less precise metric provides information that precise metrics do not have. for instance,  $p$  does not measure any difference between traces whose suffix would match the target bug trace, but who would diverge from the target trace on the first locations (like 'uuu' and 'ufu' on listing 2), while  $b$  can.
+
+to take benefit from both precise and imprecise metrics, we combine them using a lexicographical order. hence, the  $p$ -3tp- $b$  metric is defined as:
+
+$$
+t _ {p - 3 t p - b} (s, t) \triangleq \langle t _ {p} (s, t), t _ {3 t p} (s, t), t _ {b} (s, t) \rangle
+$$
+
+this combination favors first seeds that cover the most locations in the prefix, then (in case of tie) those reaching the most number of uaf events in sequence, and finally (in case of tie) those that reach the most locations in the target. based on preliminary investigation, we default to  $p - 3tp - b$  for seed selection in uafuzz.
+
+# 4.3 uaf-based distance
+
+one of the main component of directed greybox fuzzers is the computation of a seed distance, which is an evaluation of a distance from the execution trace of a seed  $s$  to the target. the main heuristic here is that if the execution trace of  $s$  is close to the target, then  $s$  is close to an input that would cover the target, which makes  $s$  an interesting seed. in existing directed greybox fuzzers [2, 30], the seed distance is computed to a
+
+target which is a single location or a set of locations. this is not appropriate for the reproduction of uaf bugs, that must go through 3 different locations in sequence. thus, we propose to modify the seed distance computation to take into account the need to reach the locations in order.
+
+# 4.3.1 zoom: background on seed distances
+
+existing directed greybox fuzzers [2,30] compute the distance  $d(s,t)$  from a seed  $s$  to a target  $t$  as follows.
+
+aflgo's seed distance [2]. the seed distance  $d(s,t)$  is defined as the (arithmetic) mean of the basic-block distances  $d_{b}(m,t)$ , for each basic block  $m$  in the execution trace of  $s$ .
+
+the basic-block distance  $d_b(m, t)$  is defined using the length of the intra-procedural shortest path from  $m$  to the basic block of a "call" instruction, using the cfg of the function containing  $m$ ; and the length of the inter-procedural shortest path from the function containing  $m$  to the target functions  $t_f$  (in our case,  $t_f$  is the function where the use event happens), using the call graph.
+
+hawkeye's enhancement [30]. the main factor in this seed distance computation is computing distance between functions in the call graph. to compute this, aflgo uses the original call graph with every edge having weight 1. hawkeye improves this computation by proposing the augmented adjacent-function distance (aafd), which changes the edge weight from a caller function  $f_{a}$  and a callee  $f_{b}$  to  $w_{hawkeye}(f_{a},f_{b})$ . the idea is to favor edges in the call graph where the callee can be called in a variety of situations, i.e. appear several times at different locations.
+
+# 4.3.2 our uaf-based seed distance
+
+previous seed distances [2, 30] do not account for any order among the target locations, while it is essential for uaf. we address this issue by modifying the distance between functions in the call graph to favor paths that sequentially go through the three uaf events alloc, free and use of the bug trace. this is done by decreasing the weight of the edges in the call graph that are likely to be between these events, using lightweight static analysis.
+
+this analysis first computes  $r_{alloc}, r_{free}$ , and  $r_{use}$ , i.e., the sets of functions that can call respectively the alloc, free, or use function in the bug trace – the use function is the one where the use event happens. then, we consider each call edge between  $f_a$  and  $f_b$  as indicating a direction: either downward ( $f_a$  executes, then calls  $f_b$ ), or upward ( $f_b$  is called, then  $f_a$  is executed). using this we compute, for each direction, how many events in sequence can be covered by going through the edge in that direction. for instance, if  $f_a \in r_{alloc}$  and  $f_b \in r_{free} \cap r_{use}$ , then taking the  $f_a \to f_b$  call edge possibly allows to cover the three uaf events in sequence. to find double free, we also include, in this computation, call edges that allow to reach two free events in sequence.
+
+then, we favor a call edge from  $f_{a}$  to  $f_{b}$  by decreasing its weight, based on how many events in sequence the edge
+
+![](images/433fc02d61176d105d18d6b0bae02212af900d475cddd9db07c709ab0d41c3c7.jpg)  
+figure 5: example of a call graph. favored edges are in red.
+
+allows to cover. in our experiments, we use the following  $\theta_{uaf}(f_a,f_b)$  function, with a value of  $\beta = 0.25$ :
+
+$$
+\theta_ {u a f} \left(f _ {a}, f _ {b}\right) \triangleq \left\{\begin{array}{l l}\beta&\text {i f} f _ {a} \rightarrow f _ {b} \quad \text {c o v e r s m o r e t h a n}\\&2 \text {u a f e v e n t s i n s e q u e n c e}\\1&\text {o t h e r w i s e}\end{array}\right.
+$$
+
+figure 5 presents an example of call graph with edges favored using the above  $\theta_{uaf}$  function.
+
+finally, we combine our edge weight modification with that of hawkeye:
+
+$$
+w _ {u a f u z z} \left(f _ {a}, f _ {b}\right) \triangleq w _ {h a w k e y e} \left(f _ {a}, f _ {b}\right). \theta_ {u a f} \left(f _ {a}, f _ {b}\right)
+$$
+
+like aflgo, we favor the shortest path leading to the targets, since it is more likely to involve only a small number of control flow constraints, making it easier to cover by fuzzing. our distance-based technique therefore considers both calling relations in general, via  $w_{\text{hawkeye}}$ , and calling relations covering uaf events in sequence, via  $\theta_{uaf}$ .
+
+# 4.4 power schedule
+
+coverage-guided fuzzers employ a power schedule (or energy assignment) to determine the number of extra inputs to generate from a selected input, which is called the energy of the seed. it measures how long we should spend fuzzing a particular seed. while afl [1] mainly uses execution trace characteristics such as trace size, execution speed of the put and time added to the fuzzing queue for seed energy allocation, recent work [28, 50, 64] including both directed and coverage-guided fuzzing propose different power schedules. aflgo employs simulated annealing to assign more energy for seeds closer to target locations (using the seed distance), while hawkeye accounts for both shorter and longer traces leading to the targets via a power schedule based on trace distance and similarity at function level.
+
+we propose here a new power schedule using the intuitions that we should assign more energy to seeds in these cases:
+
+- seeds that are closer (using the seed distance, section 4.3.2);  
+- seeds that are more similar to the target (using the target similarity, section 4.2.2);  
+- seeds that make better decisions at critical code junctions.
+
+we define hereafter a new metric to evaluate the latter case.
+
+# 4.4.1 cut-edge coverage metric
+
+to track progress of a seed during the fuzzing process, a fine-grained approach would consist in instrumenting the execution to compare the similarity of the execution trace of the
+
+current seed with the target bug trace, at the basic block level. but this method would slow down the fuzzing process due to high runtime overhead, especially for large programs. a more coarse-grained approach, on the other hand, is to measure the similarity at function level as proposed in hawkeye [30]. however, a callee can occur multiple times from different locations of single caller. also, reaching a target function does not mean reaching the target basic blocks in this function.
+
+thus, we propose the lightweight cut-edge coverage metric, hitting a middle ground between the two aforementioned approaches by measuring progress at the edge level but on the critical decision nodes only.
+
+algorithm 3: accumulating cut edges  
+input: program  $p$ ; dynamic calling tree  $t$  of a bug trace  
+output: set of cut edges  $e_{cut}$   
+1  $e_{cut} \gets \emptyset$ ;  
+2 nodes  $\leftarrow$  flatten(t);  
+3 for  $n \in$  nodes  $\land$  pn the node before  $n$  in  $t$  do  
+4 if  $n.\text{func} == pn.\text{func}$  then  
+5  $\begin{array}{r}\lfloor ce \leftarrow \mathsf{calculate\_cut\_edges}(n.\text{func},pn.bb,n.bb)\end{array}$   
+6 else if  $pn$  is a call to  $n.\text{func}$  then  
+7  $\begin{array}{r}\lfloor ce \leftarrow \mathsf{calculate\_cut\_edges}(n.\text{func},n.\text{func}.entry_bb,n.bb)\end{array}$   
+8  $e_{cut} \leftarrow e_{cut} \cup ce;$   
+9 return  $e_{cut}$ ;
+
+algorithm 4: calculate_cut_edge inside a function  
+input : a function  $f$  ; two basic blocks  $bb_{source}$  and  $bb_{sink}$  in  $f$  output: set of cut edges ce   
+1 ce  $\leftarrow \emptyset$  .   
+2cfg  $\leftarrow$  get_cfg(f);   
+3 decision_nodes  $\leftarrow \{dn:\exists$  a path  $bb_{source}\rightarrow^{*}dn\rightarrow^{*}bb_{sink}$  in cfg}   
+4 for dn  $\in$  decision_nodes do   
+5 outgoing_edge  $\leftarrow$  get_outgoing_edge(cfg, dn);   
+6 for edge  $\in$  outgoing_edge do   
+7 if reachable(cfg, edge,  $bb_{sink})$  then   
+8 ce  $\leftarrow$  ceu{edge};   
+9 return ce;
+
+definition 2. a cut edge between two basic blocks source and sink is an outgoing edge of a decision node so that there exists a path starting from source, going through this edge and reaching sink. a non-cut edge is an edge which is not a cut-edge, i.e. for which there is no path from source to sink that goes through this edge.
+
+algorithm 3 shows how cut/non-cut edges are identified in uafuzz given a tested binary program and an expected uaf bug trace. the main idea is to identify and accumulate the cut edges between all consecutive nodes in the (flattened) bug trace. for instance in the bug trace of figure 3, we would first compute the cut edges between 0 and 1, then those between 1 and 2, etc. as the bug trace is a sequence of stack traces, most of the locations in the trace are "call" events, and we compute the cut edge from the function entry point to the call event in that function. however, because of the flattening, sometimes we have to compute the cut edges between different points in
+
+the same function (e.g. if in the bug trace the same function is calling alloc and free, we would have to compute the edge from the call to alloc to the call to free).
+
+algorithm 4 describes how cut-edges are computed inside a single function. first we have to collect the decision nodes, i.e. conditional jumps between the source and sink basic blocks. this can be achieved using a simple data-flow analysis. for each outgoing edge of the decision node, we check whether they allow to reach the sink basic block; those that can are cut edges, and the others are non-cut edges. note that this program analysis is intra-procedural, so that we do not need construct an inter-procedural cfg.
+
+our heuristic is that an input exercising more cut edges and fewer non-cut edges is more likely to cover more locations of the target.
+
+let  $e_{cut}(t)$  be the set of all cut edges of a program given the expected uaf bug trace  $t$ . we define the cut-edge score  $e_s(s,t)$  of seed  $s$  as
+
+$$
+e _ {s} (s, t) \triangleq \sum_ {e \in e _ {c u t} (t)} \left\lfloor \left(\log_ {2} h i t (e) + 1\right) \right\rfloor - \delta * \sum_ {e \notin e _ {c u t} (t)} \left\lfloor \left(\log_ {2} h i t (e) + 1\right) \right\rfloor
+$$
+
+where  $hit(e)$  denotes the number of times an edge  $e$  is exercised, and  $\delta \in (0,1)$  is the weight penalizing seeds covering non-cut edges. in our main experiments, we use  $\delta = 0.5$  according to our preliminary experiments. to deal with the path explosion induced by loops, we use bucketing [1]: the hit count is bucketized to small powers of two.
+
+# 4.4.2 energy assignment
+
+we propose a power schedule function that assigns energy to a seed using a combination of the three metrics that we have proposed: the prefix target similarity metric  $t_p(s,t)$  (section 4.2.2), the uaf-based seed distance  $d(s,t)$  (section 4.3.2), and the cut-edge coverage metric  $e_s(s,t)$  (section 4.4.1). the idea of our power schedule is to assign energy to a seed  $s$  proportionally to the number of targets covered in sequence  $t_p(s,t)$ , with a corrective factor based on seed distance  $d$  and cut-edge coverage  $e_s$ . indeed, our power function (corresponding to assign_energy in algorithm 1) is defined as:
+
+$$
+p (s, t) \triangleq \left(1 + t _ {p} (s, t)\right) \times \tilde {e} _ {s} (s, t) \times \left(1 - \tilde {d} _ {s} (s, t)\right)
+$$
+
+because their actual value is not as meaningful as the length of the covered prefix, but they allow to rank the seeds, we apply a min-max normalization [2] to get a normalized seed distance  $(\tilde{d}_s(s,t))$  and normalized cut-edge score  $(\tilde{e}_s(s,t))$ . for example,  $\tilde{d}_s(s,t) = \frac{d_s(s,t) - \min d}{\max d - \min d}$  where  $\min d$ ,  $\max d$  denote the minimum and maximum value of seed distance so far. note that both metric scores are in  $(0,1)$ , i.e. can only reduce the assigned energy when their score is bad.
+
+# 4.5 postprocess and bug triage
+
+since uaf bugs are often silent, all seeds generated by a directed fuzzer must a priori be sent to a bug triager (typically, a profiling tool such as valgrind) in order to confirm
+
+whether they are bug triggering input or not. yet, this can be extremely expensive as fuzzers generate a huge amount of seeds and bug triagers are expensive.
+
+fortunately, the target similarity metric allows uafuzz to compute the sequence of covered targets of each fuzzed input at runtime. this information is available for free for each seed once it has been created and executed. we capitalize on it in order to pre-identify likely-bug triggering seeds, i.e. seeds that indeed cover the three uaf events in sequence. then, the bug triager is run only over these pre-identified seeds, the other ones being simply discarded - potentially saving a huge amount of time in bug triaging.
+
+# 5 implementation
+
+![](images/857be21472cafd66ff0e2bfb54f943a578e0fa994165702d2801747e5313824e.jpg)  
+figure 6: overview of uafuzz workflow.
+
+we implement our results in a uaf-oriented binary-level directed fuzzer named uafuzz. figure 6 depicts an overview of the main components of uafuzz. the input of the overall system are a set of initial seeds, the put in binary and target locations extracted from the bug trace. the output is a set of unique bug-triggering inputs. the prototype is built upon afl 2.52b [1] and qemu 2.10.0 for fuzzing, and the binary analysis platform binsec [4] for (lightweight) static analysis. these two components share information such as target locations, time budget and fuzzing status. more details in appendix b.
+
+# 6 experimental evaluation
+
+# 6.1 research questions
+
+to evaluate the effectiveness and efficiency of our approach, we investigate four principal research questions:
+
+rq1. uaf bug-reproducing ability can uafuzz outperform other directed fuzzing techniques in terms of uaf bug reproduction in executables?  
+rq2. uaf overhead how does uafuzz compare to other directed fuzzing approaches w.r.t. instrumentation time and runtime overheads?  
+rq3. uaf triage how much does uafuzz reduce the number of inputs to be sent to the bug triage step?  
+rq4. individual contribution how much does each ua-fuzz component contribute to the overall results?
+
+we will also evaluate uafuzz in the context of patch testing, another important application of directed fuzzing [27, 30, 61].
+
+# 6.2 evaluation setup
+
+evaluation fuzzers. we aim to compare uafuzz with state-of-the-art directed fuzzers, namely aflgo [2] and hawkeye [30], using afl-qemu as a baseline (binary-level coverage-based fuzzing). unfortunately, both aflgo and hawkeye work on source code, and while aflgo is open source, hawkeye is not available. hence, we implemented binary-level versions of aflgo and hawkeye, coined as aflgob and hawkeyeb. we closely follow the original papers, and, for aflgo, use the source code as a reference. aflgob and hawkeyeb are implemented on top of aflqemu, following the generic architecture of uafuzz but with dedicated distance, seed selection and power schedule mechanisms. table 2 summarizes our different fuzzer implementations and a comparison with their original counterparts.
+
+table 2: overview of main techniques of greybox fuzzers. our own implementations are marked with \*  
+
+<table><tr><td>fuzzer</td><td>directed</td><td>binary?</td><td>distance</td><td>seed selection</td><td>power schedule</td><td>mutation</td></tr><tr><td>afl-qemu</td><td>x</td><td>✓</td><td>-</td><td>afl</td><td>afl</td><td>afl</td></tr><tr><td>aflgo</td><td>✓</td><td>x</td><td>cfg-based</td><td>~ afl</td><td>annealing</td><td>~ afl</td></tr><tr><td>aflgob*</td><td>✓</td><td>✓</td><td>~ aflgo</td><td>~ aflgo</td><td>~ aflgo</td><td>~ aflgo</td></tr><tr><td>hawkeye</td><td>✓</td><td>x</td><td>aafd</td><td>distance-based</td><td>trace fairness</td><td>adaptive</td></tr><tr><td>hawkeyeb*</td><td>✓</td><td>✓</td><td>~ hawkeye</td><td>~ hawkeye</td><td>≈ hawkeye</td><td>~ aflgo</td></tr><tr><td>uafuzz*</td><td>✓</td><td>✓</td><td>uaf-based</td><td>targets-based</td><td>uaf-based</td><td>~ aflgo</td></tr></table>
+
+we evaluate the implementation of aflgob (appendix d, appendix) and find it very close to the original aflgo after accounting for emulation overhead.
+
+uaf fuzzing benchmark. the standard uaf micro benchmark juliet test suite [58] for static analyzers is too simple for fuzzing. no macro benchmark actually assesses the effectiveness of uaf detectors – the widely used lava [38] only contains buffer overflows. thus, we construct a new uaf benchmark according to the following rationale:
+
+1. the subjects are real-world popular and fairly large security-critical programs;  
+2. the benchmark includes uaf bugs found by existing fuzzers from the fuzzing literature [1, 28, 30, 42] or collected from nvd [22]. especially, we include all uaf bugs found by directed fuzzers;  
+3. the bug report provides detailed information (e.g., buggy version and the stack trace), so that we can identify target locations for fuzzers.
+
+in summary, we have 13 known uaf vulnerabilities (2 from directed fuzzers) over 11 real-world c programs whose sizes vary from  $26\mathrm{kb}$  to  $3.8\mathrm{mb}$ . furthermore, selected programs range from image processing to data archiving, video processing and web development. our benchmark is therefore representative of different uaf vulnerabilities of real-world programs. table 3 presents our evaluation benchmark.
+
+evaluation configurations. we follow the recommendations for fuzzing evaluations [45] and use the same fuzzing
+
+table 3: overview of our evaluation benchmark  
+
+<table><tr><td rowspan="2">bug id</td><td colspan="2">program</td><td colspan="2">bug</td><td rowspan="2">#targets in trace</td></tr><tr><td>project</td><td>size</td><td>type</td><td>crash</td></tr><tr><td>giflib-bug-74</td><td>giflib</td><td>59 kb</td><td>df</td><td>x</td><td>7</td></tr><tr><td>cve-2018-11496</td><td>lrzip</td><td>581 kb</td><td>uaf</td><td>x</td><td>12</td></tr><tr><td>yasm-issue-91</td><td>yasm</td><td>1.4 mb</td><td>uaf</td><td>x</td><td>19</td></tr><tr><td>cve-2016-4487</td><td>binutils</td><td>3.8 mb</td><td>uaf</td><td>✓</td><td>7</td></tr><tr><td>cve-2018-11416</td><td>jpegoptim</td><td>62 kb</td><td>df</td><td>x</td><td>5</td></tr><tr><td>mjs-issue-78</td><td>mjs</td><td>255 kb</td><td>uaf</td><td>x</td><td>19</td></tr><tr><td>mjs-issue-73</td><td>mjs</td><td>254 kb</td><td>uaf</td><td>x</td><td>28</td></tr><tr><td>cve-2018-10685</td><td>lrzip</td><td>576 kb</td><td>uaf</td><td>x</td><td>7</td></tr><tr><td>cve-2019-6455</td><td>recutils</td><td>604 kb</td><td>df</td><td>x</td><td>15</td></tr><tr><td>cve-2017-10686</td><td>nasm</td><td>1.8 mb</td><td>uaf</td><td>✓</td><td>10</td></tr><tr><td>gifsicle-issue-122</td><td>gifsicle</td><td>374 kb</td><td>df</td><td>x</td><td>11</td></tr><tr><td>cve-2016-3189</td><td>bzip2</td><td>26 kb</td><td>uaf</td><td>✓</td><td>5</td></tr><tr><td>cve-2018-20623</td><td>binutils</td><td>1.0 mb</td><td>uaf</td><td>x</td><td>7</td></tr></table>
+
+![](images/5f90d63b0ddcc717335e8db99ab9b9de30bbde2af77a4fe281a38fa4d8f1ece0.jpg)  
+figure 7: summary of fuzzing performance (rq1)
+
+configurations and hardware resources for all experiments. experiments are conducted 10 times with a time budget depending on the put as shown in table 4. we use as input seed either an empty file or existing valid files provided by developers. we do not use any token dictionary. all experiments were carried out on an intel xeon cpu e3-1505m v6 @ 3.00ghz cpu with 32gb ram and ubuntu 16.04 64-bit.
+
+# 6.3 uaf bug-reproducing ability (rq1)
+
+protocol. we compare the different fuzzers on our 13 uaf vulnerabilities using time-to-exposure (tte), i.e. the time elapsed until first bug-triggering input, and number of success runs in which a fuzzer triggers the bug. in case a fuzzer cannot detect the bug within the time budget, the run's tte is set to the time budget. following existing work [27, 30], we use the varga-delaney statistic  $(\hat{a}_{12})$  metric [71] to assess the confidence that one tool outperforms another. code coverage is not relevant for directed fuzzers.
+
+results. figure 7 presents a consolidated view of the results (total success runs and tte – we denote by  $\mu$ tte the average tte observed for each sample over 10 runs). appendix c contains additional information: detailed statistics per benchmark sample (table 9) and consolidated varga-delaney statistics (table 7).
+
+figure 7 (and tables 7 and 9) show that uafuzz clearly outperforms the other fuzzers both in total success runs (vs. 2nd best aflgob:  $+34\%$  in total, up to  $+300\%$ ) and in tte (vs. 2nd best aflgob, total:  $2.0\times$ , avg:  $6.7\times$ , max:  $43\times$ ). in some specific cases (see table 9), uafuzz saves
+
+![](images/d0a444514e6d800c6b89a36f8b2f36a661fb20c3931020f41824454ea2f69434.jpg)  
+figure 8: global overhead (rq2)
+
+roughly 10,000s of tte over aflgob or goes from 0/10 successes to 7/10. the  $\hat{a}_{12}$  value of uafuzz against other fuzzers is also significantly above the conventional large effect size 0.71 [71], as shown in table 7 (vs. 2nd best aflgob, avg: 0.78, median: 0.80, min: 0.52).
+
+uafuzz significantly outperforms state-of-the-art directed fuzzers in terms of uaf bugs reproduction with a high confidence level.
+
+note that performance of aflgob and hawkeyeb w.r.t. their original source-level counterparts are representative (cf. appendix d).
+
+# 6.4 uaf overhead (rq2)
+
+protocol. we are interested in both (1) instrumentation-time overhead and (2) runtime overhead. for (1), we simply compute the total instrumentation time of uafuzz and we compare it to the instrumentation time of aflgo. for (2), we compute the total number of executions per second of uafuzz and compare it afl-qemu taken as a baseline.
+
+results. consolidated results for both instrumentation-time and runtime overhead are presented in figure 8 (number of executions per second is replaced by the total number of executions performed in the same time budget). this figure shows that uafuzz is an order of magnitude faster than the state-of-the-art source-based directed fuzzer aflgo in the instrumentation phase, and has almost the same total number of executions per second as afl-qemu. appendix e contains additional results with detailed instrumentation time (figure 13) and runtime statistics (figure 15), as well as instrumentation time for aflgob and hawkeyeb (figure 14).
+
+uafuzz enjoys both a lightweight instrumentation time and a minimal runtime overhead.
+
+# 6.5 uaf triage (rq3)
+
+protocol. we consider the total number of triaging inputs (number of inputs sent to the triaging step), the triaging inputs rate tir (ratio between the total number of generated inputs and those sent to triaging) and the total triaging time (time spent within the triaging step). since other fuzzers cannot identify inputs reaching targets during the fuzzing process,
+
+![](images/753b62b604b50079979b9bf8f32cd1224d85cc2becca8c5e826d5458f0ac6c32.jpg)  
+figure 9: summary of bugs triage (rq3)
+
+![](images/2a5760194300433915120326df650971779c093d9bf773634c426e87d6c391af.jpg)  
+figure 10: impact of each components (rq4)
+
+we conservatively analyze all inputs generated by the these fuzzers in the bug triage step  $(\mathrm{tir} = 1)$ .
+
+results. consolidated results are presented in figure 9, detailed results in appendix f, table 11 and figure 16.
+
+- the tir of uafuzz is  $9.2\%$  in total (avg:  $7.25\%$ , median:  $3.14\%$ , best:  $0.24\%$ , worst:  $30.22\%$ ) - sparing up to  $99.76\%$  of input seeds for confirmation, and is always less than  $9\%$  except for sample mjs;  
+- figure 16 shows that uafuzz spends the smallest amount of time in bug triage, i.e. 75s (avg: 6s, min: 1s, max: 24s) for a total speedup of  $17 \times$  over aflgob (max:  $130 \times$ , avg:  $39 \times$ ).
+
+uafuzz reduces a large portion (i.e., more than  $90\%$ ) of triaging inputs in the post-processing phase. subsequently, uafuzz only spends several seconds in this step, winning an order of magnitude compared to standard directed fuzzers.
+
+# 6.6 individual contribution (rq4)
+
+protocol. we compare four different versions of our prototype, representing a continuum between aflgo and uafuzz: (1) the basic aflgo represented by aflgob, (2) aflgob-ss adds our seed selection metric to aflgob, (3) aflgob-ds adds the uaf-based function distance to aflgob-ss, and finally (4) uafuzz adds our dedicated power schedule to aflgob-ds. we consider the previous rq1 metrics: number of success runs, tte and varga-delaney. our goal is to assess whether or not these technical improvements do lead to fuzzing performance improvements.
+
+results. consolidated results for success runs and tte are represented in figure 10. appendix g includes detailed results plus varga-halley metric (table 12).
+
+as summarized in figure 10, we can observe that each new component does improve both tte and number of success
+
+runs, leading indeed to fuzzing improvement. detailed results in table 12 with  $\hat{a}_{12}$  values show the same clear trend.
+
+the uaf-based distance computation, the power scheduling and the seed selection heuristic individually contribute to improve fuzzing performance, and combining them yield even further improvements, demonstrating their interest and complementarity.
+
+# 6.7 patch testing & zero-days
+
+patch testing. the idea is to use bug stack traces of known uaf bugs to guide testing on the patched version of the put – instead of the buggy version as in bug reproduction. the benefit from the bug hunting point of view [19] is both to try finding buggy or incomplete patches and to focus testing on a priori fragile parts of the code, possibly discovering bugs unrelated to the patch itself.
+
+how to. we follow bug hunting practice [19]. starting from the recent publicly disclosed uaf bugs of open source programs, we manually identify addresses of relevant call instructions in the reported bug stack traces since the code has been evolved. we focus mainly on 3 widely-used programs that have been well fuzzed and maintained by the developers, namely gnu patch, gpac and perl 5 (737k lines of c code and 5 known bug traces in total). we also consider 3 other codes: mupdf, boolector and fontforge  $(+1,196\mathrm{kloc})$
+
+results. overall uafuzz has found and reported 30 new bugs, including 11 new uaf bugs and 7 new cve (details in appendix h, table 13). at this time, 17 bugs have been fixed by the vendors. interestingly, the bugs found in gnu patch (appendix h) and gpac were actually buggy patches.
+
+uafuzz has been proven effective in a patch testing setting, allowing to find 30 new bugs (incl. 7 new cve) in 6 widely-used programs.
+
+# 6.8 threats to validity
+
+implementation. our prototype is implemented as part of the binary-level code analysis framework binsec [36, 37], whose efficiency and robustness have been demonstrated in prior large scale studies on both adversarial code and managed code [24,35,65], and on top of the popular fuzzer afl-qemu. effectiveness and correctness of uafuzz have been assessed on several bug traces from real programs, as well as on small samples from the juliet test suite. all reported uaf bugs have been manually checked.
+
+benchmark. our benchmark is built on both real codes and real bugs, and encompasses several bugs found by recent fuzzing techniques of well-known open source codes (including all uaf bugs found by directed fuzzers).
+
+competitors. we consider the best state-of-the-art techniques in directed fuzzing, namely aflgo [27] and hawkeye [30]. unfortunately, hawkeye is not available and aflgo works on source code only. thus, we re-implement these technologies in our own framework. we followed the available information (article, source code if any) as close as possible, and did our best to get precise implementations. they have both been checked on real programs and small samples, and the comparison against aflgo source (appendix d) and our own aflgob implementation is conclusive.
+
+# 7 related work
+
+directed greybox fuzzing. aflgo [27] and hawkeye [30] have already been discussed. lolly [51] provides a lightweight instrumentation to measure the sequence basic block coverage of inputs, yet, at the price of a large runtime overhead. seededfuzz [73] seeks to generate a set of initial seeds that improves directed fuzzing performance. semfuzz [76] leverages vulnerability-related texts such as cve reports to guide fuzzing. 1dvul [61] discovers 1-day vulnerabilities via binary patches.
+
+uafuzz is the first directed fuzzer tailored to uaf bugs, and one of the very few [61] able to handle binary code.
+
+coverage-based greybox fuzzing. afl [1] is the seminal coverage-guided greybox fuzzer. substantial efforts have been conducted in the last few years to improve over it [28, 42, 48]. also, many efforts have been fruitfully invested in combining fuzzing with other approaches, such as static analysis [42, 49], dynamic taint analysis [31, 32, 64], symbolic execution [60, 69, 78] or machine learning [43, 68].
+
+recently, uafl [72] - another independent research effort on the same problem, specialized coverage-guided fuzzing to detect uafs by finding operation sequences potentially violating a typestate property and then guiding the fuzzing process to trigger property violations. however, this approach relies heavily on the static analysis of source code, therefore is not applicable at binary-level.
+
+our technique is orthogonal to all these improvements, they could be reused within uafuzz as is.
+
+uaf detection. precise static uaf detection is difficult. gueb [13] is the only binary-level static analyzer for uaf. the technique can be combined with dynamic symbolic execution to generate poc inputs [40], yet with scalability issues. on the other hand, several uaf source-level static detectors exist, based on abstract interpretation [34], pointer analysis [74], pattern matching [59], model checking [46] or demand-driven pointer analysis [70]. a common weakness of all static detectors is their inability to infer triggering input – they rather prove their absence. dynamic uaf detectors mainly rely on heavyweight instrumentation [9, 29, 57] and result in high runtime overhead, even more for closed source programs. asan [67] performs lightweight instrumentation, but at source level only.
+
+uaf fuzzing benchmark. while the juliet test suite [58]
+
+(cwe-415, cwe-416)<sup>7</sup> contains only too small programs, popular fuzzing benchmarks [7, 12, 18, 38, 66] comprise only very few uaf bugs. moreover, many of these benchmarks contain either artificial bugs [7, 18, 38, 66] or artificial programs [58].
+
+merging our evaluation benchmark (known uaf) and our new uaf bugs, we provide the largest fuzzing benchmark dedicated to uaf - 17 real codes and 30 real bugs (appendix a).
+
+# 8 conclusion
+
+uafuzz is the first directed greybox fuzzing approach tailored to detecting uaf vulnerabilities (in binary) given only the bug stack trace. uafuzz outperforms existing directed fuzzers, both in terms of time to bug exposure and number of successful runs. uafuzz has been proven effective in both bug reproduction and patch testing.
+
+we release the source code of uafuzz and the uaf fuzzing benchmark at:
+
+https://github.com/strongcourage/uafuzz  
+https://github.com/strongcourage/uafbench
+
+# acknowledgement
+
+this work was supported by the h2020 project c4iiot under the grant agreement no 833828 and fui caesar.
+
+# references
+
+[1]afl. http://lcamtuf.coredump.cx/afl/,2020.  
+[2]aflgo.https://github.com/aflgo/aflgo,2020.  
+[3] aflgo's issues. https://github.com/aflgo/aflgo/issues, 2020.  
+[4] binsec. https://binsec.github.io/, 2020.  
+[5] circumventing fuzzing roadblocks with compiler transformations. https://lafintel.wordpress.com/2016/08/15/circumventing-fuzzing-roadblocks-with-compiler-transforma2020.  
+[6] cve-2018-6952. https://savannah.gnu.org/bugs/index.php? 53133, 2020.  
+[7] darpa cgc corpus. http://www.lungetech.com/2017/04/24/cgc-corpus/, 2020.  
+[8] double free in gmail patch. https://savannahgmail.org/bugs/index.php?56683, 2020.  
+[9] dr-memory. https://www.drmemory.org/, 2020.  
+[10] fuzzbench - fuzzer benchmarking as a service. https://github.com/google/fuzzbench, 2020.  
+[11] gnu patch. https://savannah.gnu.org/projects/patch/, 2020.  
+[12] google fuzzer testsuite. https://github.com/google/fuzzer-test-suite, 2020.  
+[13] gueb: static analyzer detecting use-after-free on binary. https://github.com/montyly/gueb, 2020.  
+[14] ida pro. https://www.hex-rays.com/products/ida/, 2020.  
+[15] libfuzzer. https://llvm.org/docs/libfuzzer.html, 2020.  
+[16] oss-fuzz: continuous fuzzing framework for open-source projects. https://github.com/google/oss-fuzz/, 2020.
+
+[17] oss-fuzz: five months later, and rewarding projects. https://opensource.googleblog.com/2017/05/oss-fuzz-five-months-later-and.html, 2020.  
+[18] rode0day. https://rode0day.mit.edu/, 2020.  
+[19] sockpuppet: a walkthrough of a kernel exploit for ios 12.4. https://googleprojectzero.blogspot.com/2019/12/sockpuppet-walkthrough-of-kernel.html, 2020.  
+[20] uaf fuzzing benchmark. https://github.com/strongcourage/ uafbench, 2020.  
+[21] uafuzz. https://github.com/strongcourage/ufuzz, 2020.  
+[22] us national vulnerability database. https://nvd.nist.gov/vuln/search, 2020.  
+[23] cornelius aschermann, sergej schumilo, tim blazytko, robert gawlik, and thorsten holz. redqueen: fuzzing with input-to-state correspondence. in 26th annual network and distributed system security symposium, ndss, 2019.  
+[24] sébastien bardin, robin david, and jean-yves marion. backward-bounded dse: targeting infeasibility questions on obfuscated codes. 2017.  
+[25] tim blazytko, cornelius aschermann, moritz schlögel, ali abbasi, sergej schumilo, simon wörner, and thorsten holz. grimoire: synthesizing structure while fuzzing. in usenix security symposium (usenix security 19), 2019.  
+[26] marcel böhme. assurance in software testing: a roadmap. in proceedings of the 41st international conference on software engineering: new ideas and emerging results, icse-nier '19, 2019.  
+[27] marcel böhme, van-thuan pham, manh-dung nguyen, and abhik roychoudhury. directed greybox fuzzing. in proceedings of the 2017 acm sigsac conference on computer and communications security (ccs'17), 2017.  
+[28] marcel böhme, van-thuan pham, and abhik roychoudhury. coverage-based greybox fuzzing as markov chain. in proceedings of the 2016 acm sigsac conference on computer and communications security, 2016.  
+[29] juan caballero, gustavo grieco, mark marron, and antonio nappa. undangle: early detection of dangling pointers in use-after-free and double-free vulnerabilities. in proceedings of the 2012 international symposium on software testing and analysis, 2012.  
+[30]. hongxu chen, yinxing xue, yuekang li, bihuan chen, xiaofei xie, xiuheng wu, and yang liu. hawkeye: towards a desired directed grey-box fuzzer. in proceedings of the 2018 acm sigsac conference on computer and communications security, 2018.  
+[31] p. chen and h. chen. angora: efficient fuzzing by principled search. in 2018 ieee symposium on security and privacy (sp), 2018.  
+[32] peng chen, jianzhong liu, and hao chen. matryoshka: fuzzing deeply nested branches. arxiv preprint arxiv:1905.12228, 2019.  
+[33] maria christakis, peter müller, and valentin wüstholz. guiding dynamic symbolic execution toward unverified program executions. in proceedings of the 38th international conference on software engineering, 2016.  
+[34] pascal cuoq, florent kirchner, nikolai kosmatov, virgile prevosto, julien signoles, and boris yakobowski. frama-c. in international conference on software engineering and formal methods, 2012.  
+[35] robin david, sébastien bardin, josselin feist, laurent mounier, marie-laure potet, thanh dinh ta, and jean-yves marion. specification of concretization and symbolization policies in symbolic execution. in issta, 2016.  
+[36] robin david, sébastien bardin, thanh dinh ta, laurent mounier, josselin feist, marie-laure potet, and jean-yves marion. binsec/se: a dynamic symbolic execution toolkit for binary-level analysis. in software analysis, evolution, and reengineering (saner), 2016 ieee 23rd international conference on, 2016.
+
+[37] adel djoudi and sébastien bardin. binsec: binary code analysis with low-level regions. in tacas, 2015.  
+[38] brendan dolan-gavitt, patrick hulin, engin kirda, tim leek, andrea mambretti, wil robertson, frederick ulrich, and ryan whelan. lava: large-scale automated vulnerability addition. in security and privacy (sp), 2016 ieee symposium on, 2016.  
+[39] andrew fasano, tim leek, brendan dolan-gavitt, and josh bundt. the rode0day to less-buggy programs. ieee security & privacy, 2019.  
+[40] josselin feist, laurent mounier, sébastien bardin, robin david, and marie-laure potet. finding the needle in the heap: combining static analysis and dynamic symbolic execution to trigger use-after-free. in proceedings of the 6th workshop on software security, protection, and reverse engineering, 2016.  
+[41] andrea fioraldi, daniele cono d'elia, and emilio coppa. weizz: automatic grey-box fuzzing for structured binary formats. in proceedings of the 29th acm sigsoft international symposium on software testing and analysis, issta 2020, 2020.  
+[42] s. gan, c. zhang, x. qin, x. tu, k. li, z. pei, and z. chen. collaft: path sensitive fuzzing. in 2018 ieee symposium on security and privacy (sp), 2018.  
+[43] patrice godefroid, hila peleg, and rishabh singh. learn&fuzz: machine learning for input fuzzing. in proceedings of the 32nd ieee/acm international conference on automated software engineering, 2017.  
+[44] wei jin and alessandro orso. bugredux: reproducing field failures for in-house debugging. in 2012 34th international conference on software engineering (icse), 2012.  
+[45] george klees, andrew ruef, benji cooper, shiyi wei, and michael hicks. evaluating fuzz testing. in proceedings of the 2018 acm sigsac conference on computer and communications security, 2018.  
+[46] daniel kroening and michael tautschnig. cbmc-c bounded model checker. in international conference on tools and algorithms for the construction and analysis of systems, 2014.  
+[47] byoungyoung lee, chengyu song, yeongjin jang, tielei wang, taesoo kim, long lu, and wenke lee. preventing use-after-free with dangling pointers nullification. in ndss, 2015.  
+[48] caroline lemieux and koushik sen. fairfuzz: a targeted mutation strategy for increasing greybox fuzz testing coverage. in proceedings of the 33rd acm/ieee international conference on automated software engineering, 2018.  
+[49] yuekang li, bihuan chen, mahinthan chandramohan, shang-wei lin, yang liu, and alwen tiu. steelix: program-state based binary fuzzing. in proceedings of the 2017 11th joint meeting on foundations of software engineering, 2017.  
+[50] yuekang li, yinxing xue, hongxu chen, xiuheng wu, cen zhang, xiaofei xie, haijun wang, and yang liu. cerebro: context-aware adaptive fuzzing for effective vulnerability detection. in proceedings of the 2019 27th acm joint meeting on european software engineering conference and symposium on the foundations of software engineering, 2019.  
+[51] hongliang liang, yini zhang, yue yu, zhuosi xie, and lin jiang. sequence coverage directed greybox fuzzing. in proceedings of the 27th international conference on program comprehension, 2019.  
+[52] valentin jean marie manes, hyungseok han, choongwoo han, sang kil cha, manuel egele, edward j schwartz, and maverick woo. the art, science, and engineering of fuzzing: a survey. ieee transactions on software engineering, 2019.  
+[53] paul dan marinescu and cristian cadar. katch: high-coverage testing of software patches. in proceedings of the 2013 9th joint meeting on foundations of software engineering, 2013.  
+[54] microsoft. project springfield. https://www.microsoft.com/en-us/security-risk-detection/, 2020.  
+[55] barton p miller, louis fredriksen, and bryan so. an empirical study of the reliability of unix utilities. communications of the acm, 1990.
+
+[56] dongliang mu, alejandro cuevas, limin yang, hang hu, xinyu xing, bing mao, and gang wang. understanding the reproducibility of crowd-reported security vulnerabilities. in 27th usenix security symposium (usenix security 18), 2018.  
+[57] nicholas nethercote and julian seward. valgrind: a framework for heavyweight dynamic binary instrumentation. in acm sigplan, 2007.  
+[58] nist. juliet test suite for c/c++. https://samate.nist.gov/sard/testsuite.php, 2020.  
+[59] mads chr olesen, rené rydhof hansen, julia l lawall, and nicolas palix. coccinelle: tool support for automated cert c secure coding standard certification. science of computer programming, 2014.  
+[60] hui peng, yan shoshitaishvili, and mathias payer. t-fuzz: fuzzing by program transformation. in 2018 ieee symposium on security and privacy (sp), 2018.  
+[61] jiaqi peng, feng li, bingchang liu, lili xu, binghong liu, kai chen, and wei huo. 1dvul: discovering 1-day vulnerabilities through binary patches. in 2019 49th annual ieee/ifip international conference on dependable systems and networks (dsn), 2019.  
+[62] van-thuan pham, marcel böhme, andrew edward santosa, alexandru razvan caciulescu, and abhik roychoudhury. smart greybox fuzzing. ieee transactions on software engineering, 2019.  
+[63] van-thuan pham, wei boon ng, konstantin rubinov, and abhik roychoudhury. hercules: reproducing crashes in real-world application binaries. in 2015 ieee/acm 37th ieee international conference on software engineering, 2015.  
+[64] sanjay rawat, vivek jain, ashish kumar, lucian cojocar, cristiano giuffrida, and herbert bos. vuzzer: application-aware evolutionary fuzzing. in proceedings of the network and distributed system security symposium (ndss), 2017.  
+[65] frédéric recoules, sébastien bardin, richard bonichon bonichon, laurent mounier, and marie-laure potet. get rid of inline assembly through verification-oriented lifting. in ase, 2019.  
+[66] subhajit roy, awanish pandey, brendan dolan-gavitt, and yu hu. bug synthesis: challenging bug-finding tools with deep faults. in proceedings of the 2018 26th acm joint meeting on european software engineering conference and symposium on the foundations of software engineering, 2018.  
+[67] konstantin serebryany, derek bruening, alexander potapenko, and dmitriy vyukov. addresssanitizer: a fast address sanity checker. in usenix annual technical conference, 2012.  
+[68] dongdong she, kexin pei, dave epstein, junfeng yang, baishakhi ray, and suman jana. neuzz: efficient fuzzing with neural program learning. arxiv preprint arxiv:1807.05620, 2018.  
+[69] nick stephens, john grosen, christopher salls, andrew dutcher, ruoyu wang, jacopo corbetta, yan shoshitaishvili, christopher kruegel, and giovanni vigna. driller: augmenting fuzzing through selective symbolic execution. in ndss, 2016.  
+[70] yulei sui and jingling xue. on-demand strong update analysis via value-flow refinement. in proceedings of the 2016 24th acm sigsoft international symposium on foundations of software engineering, 2016.  
+[71] andrás vargha and harold d delaney. a critique and improvement of the cl common language effect size statistics of mcgraw and wong. journal of educational and behavioral statistics, 2000.  
+[72] hajunj wang, xiaofei xie, yi li, cheng wen, yuekang li, yang liu, shengchao qin, hongxu chen, and yulei sui. typestate-guided fuzzer for discovering use-after-free vulnerabilities. in 42nd international conference on software engineering, 2020.  
+[73] weiguang wang, hao sun, and qingkai zeng. seededfuzz: selecting and generating seeds for directed fuzzing. in 2016 10th international symposium on theoretical aspects of software engineering (tase), 2016.
+
+table 4: detailed view of our evaluation benchmark  
+
+<table><tr><td rowspan="2">bug id</td><td colspan="3">program</td><td colspan="3">bug</td><td colspan="4">fuzzing configuration</td></tr><tr><td>project</td><td>size</td><td>commit</td><td>type</td><td>crash</td><td>found by</td><td>test driver</td><td>seeds</td><td>timeout</td><td># targets</td></tr><tr><td>giflib-bug-74</td><td>giflib</td><td>59 kb</td><td>72e31ff</td><td>df</td><td>x</td><td>-</td><td>gif sponge &lt;@@</td><td>&quot;gif&quot;</td><td>30m</td><td>7</td></tr><tr><td>cve-2018-11496</td><td>irzip</td><td>581 kb</td><td>ed51e14</td><td>uaf</td><td>x</td><td>-</td><td>lrzip -t @@</td><td>lrz files</td><td>15m</td><td>12</td></tr><tr><td>yasm-issue-91</td><td>yasm</td><td>1.4 mb</td><td>6caf151</td><td>uaf</td><td>x</td><td>afl</td><td>yasm @@</td><td>asm files</td><td>1h</td><td>19</td></tr><tr><td>cve-2016-4487</td><td>binutils</td><td>3.8 mb</td><td>2c49145</td><td>uaf</td><td>✓</td><td>aflfast</td><td>cxxfilt &lt;@@</td><td>empty file</td><td>1h</td><td>7</td></tr><tr><td>cve-2018-11416</td><td>jpegoptim</td><td>62 kb</td><td>d23abf2</td><td>df</td><td>x</td><td>-</td><td>jpegoptim @@</td><td>jpeg files</td><td>30m</td><td>5</td></tr><tr><td>mjs-issue-78</td><td>mjs</td><td>255 kb</td><td>9eae0e6</td><td>uaf</td><td>x</td><td>hawkeye</td><td>mjs -f @@</td><td>js files</td><td>3h</td><td>19</td></tr><tr><td>mjs-issue-73</td><td>mjs</td><td>254 kb</td><td>e4ea33a</td><td>uaf</td><td>x</td><td>hawkeye</td><td>mjs -f @@</td><td>js files</td><td>3h</td><td>28</td></tr><tr><td>cve-2018-10685</td><td>irzip</td><td>576 kb</td><td>9de7ccb</td><td>uaf</td><td>x</td><td>afl</td><td>lrzip -t @@</td><td>lrz files</td><td>15m</td><td>7</td></tr><tr><td>cve-2019-6455</td><td>recutils</td><td>604 kb</td><td>97d20cc</td><td>df</td><td>x</td><td>-</td><td>rec2csv @@</td><td>empty file</td><td>30m</td><td>15</td></tr><tr><td>cve-2017-10686</td><td>nasm</td><td>1.8 mb</td><td>7a81ead</td><td>uaf</td><td>✓</td><td>collafl</td><td>nasm -f bin @@ -o /dev/null</td><td>asm files</td><td>6h</td><td>10</td></tr><tr><td>gifscicle-issue-122</td><td>gifsicle</td><td>374 kb</td><td>fad477c</td><td>df</td><td>x</td><td>eclipser</td><td>gifscicle @@ test.gif -o /dev/null</td><td>&quot;gif&quot;</td><td>4h</td><td>11</td></tr><tr><td>cve-2016-3189</td><td>bzip2</td><td>26 kb</td><td>962d606</td><td>uaf</td><td>✓</td><td>-</td><td>bzip2recover @@</td><td>bz2 files</td><td>30m</td><td>5</td></tr><tr><td>cve-2018-20623</td><td>binutils</td><td>1.0 mb</td><td>923c6a7</td><td>uaf</td><td>x</td><td>afl</td><td>readelf -a @@</td><td>binary files</td><td>1h</td><td>7</td></tr></table>
+
+[74] hua yan, yulei sui, shiping chen, and jingling xue. spatio-temporal context reduction: a pointer-analysis-based static approach for detecting use-after-free vulnerabilities. in 2018 ieee/acm 40th international conference on software engineering (icse), 2018.  
+[75] wei you, xueqiang wang, shiqing ma, jianjun huang, xiangyu zhang, xiaofeng wang, and bin liang. profuzzer: on-the-fly input type probing for better zero-day vulnerability discovery. in ieee symposium on security and privacy (sp), 2019.  
+[76] wei you, peiyuan zong, kai chen, xiaofeng wang, xiaojing liao, pan bian, and bin liang. semfuzz: semantics-based automatic generation of proof-of-concept exploits. in proceedings of the 2017 acm sigsac conference on computer and communications security, 2017.  
+[77] yves younan. freesentry: protecting against use-after-free vulnerabilities due to dangling pointers. in ndss, 2015.  
+[78] insu yun, sangho lee, meng xu, yeongjin jang, and taesoo kim. qsym: a practical concolic execution engine tailored for hybrid fuzzing. in 27th usenix security symposium (usenix security 18), 2018.
+
+# a uaf fuzzing benchmark
+
+table 4 provides additional details about our evaluation benchmark, including program executables under test, buggy commits and fuzzing configurations (test driver, seeds and timeout). table 5 presents our full uaf-oriented fuzzing benchmark, incorporating both our evaluation benchmark (bug reproduction) and all cves and new bugs used and found during patch testing. the benchmark is available [20]. finally, table 6 compares our uaf fuzzing benchmarks to existing fuzzing benchmarks.
+
+# b implementation
+
+we provide here additional details about the implementation:
+
+- we have implemented a binsec plugin computing statically distance and cut-edge information, consequently used in the instrumentation of uafuzz - note that call graph and cfg are retrieved from the ida pro binary database (ida pro version 6.9 [14]);  
+- on the dynamic side, we have modified afl-qemu to track covered targets, dynamically compute seed scores and power functions;  
+- in the end, a small script automates bug triaging.
+
+table 5: full uaf fuzzing benchmark  
+
+<table><tr><td rowspan="2">bug id</td><td colspan="2">program</td><td colspan="2">bug</td></tr><tr><td>project</td><td>size</td><td>type</td><td>crash</td></tr><tr><td>giflib-bug-74</td><td>giflib</td><td>59 kb</td><td>df</td><td>x</td></tr><tr><td>cve-2018-11496</td><td>lrzip</td><td>581 kb</td><td>uaf</td><td>x</td></tr><tr><td>yasm-issue-91</td><td>yasm</td><td>1.4 mb</td><td>uaf</td><td>x</td></tr><tr><td>cve-2016-4487</td><td>binutils</td><td>3.8 mb</td><td>uaf</td><td>✓</td></tr><tr><td>cve-2018-11416</td><td>jpegoptim</td><td>62 kb</td><td>df</td><td>x</td></tr><tr><td>mjs-issue-78</td><td>mjs</td><td>255 kb</td><td>uaf</td><td>x</td></tr><tr><td>mjs-issue-73</td><td>mjs</td><td>254 kb</td><td>uaf</td><td>x</td></tr><tr><td>cve-2018-10685</td><td>lrzip</td><td>576 kb</td><td>uaf</td><td>x</td></tr><tr><td>cve-2019-6455</td><td>recutils</td><td>604 kb</td><td>df</td><td>x</td></tr><tr><td>cve-2017-10686</td><td>nasm</td><td>1.8 mb</td><td>uaf</td><td>✓</td></tr><tr><td>gifsicle-issue-122</td><td>gifsicle</td><td>374 kb</td><td>df</td><td>x</td></tr><tr><td>cve-2016-3189</td><td>bzip2</td><td>26 kb</td><td>uaf</td><td>✓</td></tr><tr><td>cve-2016-20623</td><td>binutils</td><td>1.0 mb</td><td>uaf</td><td>x</td></tr><tr><td>cve-2018-6952</td><td>gnu patch</td><td>406 kb</td><td>df</td><td>x</td></tr><tr><td>cve-2019-20633</td><td>gnu patch</td><td>406 kb</td><td>df</td><td>x</td></tr><tr><td>gpac-issue-1340</td><td>gpac</td><td>19.0 mb</td><td>uaf</td><td>✓</td></tr><tr><td>cve-2019-20628</td><td>gpac</td><td>14.7 mb</td><td>uaf</td><td>✓</td></tr><tr><td>cve-2020-11558</td><td>gpac</td><td>19.0 mb</td><td>uaf</td><td>✓</td></tr><tr><td>gpac-issue-1440b</td><td>gpac</td><td>19.0 mb</td><td>uaf</td><td>✓</td></tr><tr><td>gpac-issue-1440c</td><td>gpac</td><td>19.0 mb</td><td>uaf</td><td>✓</td></tr><tr><td>gpac-issue-1427</td><td>gpac</td><td>19.0 mb</td><td>uaf</td><td>✓</td></tr><tr><td>perl-1</td><td>perl 5</td><td>8.7 mb</td><td>uaf</td><td>✓</td></tr><tr><td>perl-2</td><td>perl 5</td><td>8.7 mb</td><td>uaf</td><td>✓</td></tr><tr><td>perl-3</td><td>perl 5</td><td>8.7 mb</td><td>uaf</td><td>✓</td></tr><tr><td>perl-4</td><td>perl 5</td><td>8.7 mb</td><td>uaf</td><td>✓</td></tr><tr><td>mupdf-issue-701294</td><td>mupdf</td><td>37.6 mb</td><td>uaf</td><td>✓</td></tr><tr><td>mupdf-issue-702253</td><td>mupdf</td><td>43.3 mb</td><td>uaf</td><td>✓</td></tr><tr><td>fontforgessue-4084</td><td>fontforge</td><td>12.4 mb</td><td>uaf</td><td>✓</td></tr><tr><td>fontforgessue-4266</td><td>fontforge</td><td>12.6 mb</td><td>uaf</td><td>✓</td></tr><tr><td>boolean-issue-41</td><td>boolean</td><td>6.9 mb</td><td>uaf</td><td>✓</td></tr></table>
+
+memory overhead. uafuzz uses 20 additional bytes of shared memory at runtime (per execution): like state-of-the-art source-based dgf we use 8 bytes to accumulate the distance values and 8 bytes to record the number of exercised basic blocks to store the current seed distance, plus 4 extra bytes for the current seed target trace.
+
+# c uaf bug-reproducing ability (rq1)
+
+we present in this section additional results regarding rq1, including more detailed experimental reports and the in-depth discussion of two notable bugs: yasm-issue-91 and cve-2017-10686 of nasm.
+
+table 6: summary of existing benchmarks.  
+$\sim$  : darpa cgc features crafted codes and bugs, yet they are supposed to be realistic.  
+
+<table><tr><td rowspan="2">benchmark</td><td colspan="2">realistic</td><td rowspan="2">#programs</td><td rowspan="2">#bugs</td><td rowspan="2">#uaf</td></tr><tr><td>program</td><td>bug</td></tr><tr><td>juliet test suite [58]</td><td>x</td><td>x</td><td>366</td><td>366</td><td>366</td></tr><tr><td>lava-1 [38]</td><td>✓</td><td>x</td><td>1</td><td>69</td><td>0</td></tr><tr><td>lava-m [38]</td><td>✓</td><td>x</td><td>4</td><td>2265</td><td>0</td></tr><tr><td>apocalypse [66]</td><td>✓</td><td>x</td><td>30</td><td>30</td><td>0</td></tr><tr><td>rode0day [18,39]</td><td>✓</td><td>x</td><td>44</td><td>2103</td><td>0</td></tr><tr><td>google fuzzer testsuite [12]</td><td>✓</td><td>✓</td><td>24</td><td>46</td><td>3</td></tr><tr><td>fuzzbench [10]</td><td>✓</td><td>✓</td><td>23</td><td>23</td><td>0</td></tr><tr><td>darpa cgc [7]</td><td>~</td><td>~</td><td>296</td><td>248</td><td>10</td></tr><tr><td>uafuzz benchmark (evaluation) [20]</td><td>✓</td><td>✓</td><td>11</td><td>13</td><td>13</td></tr><tr><td>uafuzz benchmark (full) [20]</td><td>✓</td><td>✓</td><td>17</td><td>30</td><td>30</td></tr></table>
+
+experimental results. table 7 summarizes the fuzzing performance (details in table 9) of 4 binary-based fuzzers against our benchmark by providing the total number of covered paths, the total number of success runs and the max/min/average/median values of  $factor$  and  $\hat{a}_{12}$ . table 10 compares our fuzzer uafuzz with several variants of directed fuzzers aflgo.
+
+table 7: summary of bug reproduction of uafuzz compared to other fuzzers against our fuzzing benchmark. statistically significant results  $\hat{a}_{12} \geq 0.71$  are marked as bold.  
+
+<table><tr><td rowspan="2">fuzzer</td><td rowspan="2">total avg paths</td><td rowspan="2">success runs</td><td colspan="4">factor</td><td colspan="4">\( a_{12} \)</td></tr><tr><td>mdn</td><td>avg</td><td>min</td><td>max</td><td>mdn</td><td>avg</td><td>min</td><td>max</td></tr><tr><td>afl-qemu</td><td>10.6k</td><td>85 (+40%)</td><td>2.01</td><td>6.66</td><td>0.60</td><td>46.63</td><td>0.82</td><td>0.78</td><td>0.29</td><td>1.00</td></tr><tr><td>aflglob</td><td>11.1k</td><td>89 (+34%)</td><td>1.96</td><td>6.73</td><td>0.96</td><td>43.34</td><td>0.80</td><td>0.78</td><td>0.52</td><td>1.00</td></tr><tr><td>hawkeyeb</td><td>7.3k</td><td>67 (+78%)</td><td>2.90</td><td>8.96</td><td>1.21</td><td>64.29</td><td>0.88</td><td>0.86</td><td>0.56</td><td>1.00</td></tr><tr><td>uafuzz</td><td>8.2k</td><td>119</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr></table>
+
+table 8: bug reproduction of aflgo against our benchmark except cve-2017-10686 due to compilation issues of aflgo. numbers in red are the best  $\mu$ ttes.  
+
+<table><tr><td rowspan="2">bug id</td><td colspan="2">aflgo (source)</td><td colspan="2">\( \mathbf{{aflg}{o}_{f}\left( {source}\right) } \)</td><td colspan="2">aflgob</td><td colspan="2">uafuzz</td></tr><tr><td>runs</td><td>\( \mu \) tte(s)</td><td>runs</td><td>\( \mu \) tte(s)</td><td>runs</td><td>\( \mu \) tte(s)</td><td>runs</td><td>\( \mu \) tte(s)</td></tr><tr><td>giflib-bug-74</td><td>10</td><td>62</td><td>10</td><td>281</td><td>9</td><td>478</td><td>10</td><td>209</td></tr><tr><td>cve-2018-11496</td><td>10</td><td>2</td><td>10</td><td>38</td><td>10</td><td>22</td><td>10</td><td>14</td></tr><tr><td>yasm-issue-91</td><td>10</td><td>307</td><td>8</td><td>2935</td><td>8</td><td>2427</td><td>10</td><td>56</td></tr><tr><td>cve-2016-4487</td><td>10</td><td>676</td><td>10</td><td>1386</td><td>6</td><td>2427</td><td>6</td><td>2110</td></tr><tr><td>cve-2018-11416</td><td>10</td><td>78</td><td>7</td><td>1219</td><td>10</td><td>303</td><td>10</td><td>235</td></tr><tr><td>mjs-issue-78</td><td>10</td><td>1417</td><td>3</td><td>9706</td><td>4</td><td>8755</td><td>9</td><td>4197</td></tr><tr><td>mjs-issue-73</td><td>9</td><td>5207</td><td>3</td><td>34210</td><td>0</td><td>10800</td><td>7</td><td>4881</td></tr><tr><td>cve-2018-10685</td><td>10</td><td>74</td><td>9</td><td>1072</td><td>9</td><td>305</td><td>10</td><td>156</td></tr><tr><td>cve-2019-6455</td><td>5</td><td>1090</td><td>0</td><td>20296</td><td>5</td><td>1213</td><td>10</td><td>438</td></tr><tr><td>gifscicle-issue-122</td><td>8</td><td>4161</td><td>7</td><td>25881</td><td>6</td><td>9811</td><td>7</td><td>9853</td></tr><tr><td>cve-2016-3189</td><td>10</td><td>72</td><td>10</td><td>206</td><td>10</td><td>158</td><td>10</td><td>141</td></tr><tr><td>cve-2018-20623</td><td>10</td><td>177</td><td>10</td><td>1329</td><td>9</td><td>3169</td><td>10</td><td>128</td></tr><tr><td>total success runs</td><td colspan="2">112</td><td colspan="2">87</td><td colspan="2">86</td><td colspan="2">109</td></tr><tr><td>total \( \mu \) tte(h)</td><td colspan="2">3.7</td><td colspan="2">27.4</td><td colspan="2">10.1</td><td colspan="2">6.2</td></tr></table>
+
+zoom on two bugs. we discuss the case of yasm-issue-91, where in all 10 runs, uafuzz needs only in a few seconds to reproduce the bug, thus gains a speedup of  $43 \times$  over the second best tool aflgob with a high confidence (i.e.,  $\hat{a}_{12}$  is 1 against other fuzzers). figure 11 depicts the fuzzing queue of our fuzzer uafuzz for the case study in one run. we can see that our seed selection heuristic first selects the most promising inputs among the set of initial test suite (i.e., the most left circle point). as this input also has the biggest cut-edge score among the initial seeds, uafuzz spends enough long time to mutate this input and thus eventually discovers the first potential input whose execution trace is similar to the expected trace. then, two first potential inputs covering in sequence all 19 targets are selected to be mutated by uafuzz during
+
+table 9: bug reproduction on 4 fuzzers against our benchmark. statistically significant results  $\hat{a}_{12} \geq 0.71$  are marked as bold. factor measures the performance gain as the  $\mu\mathrm{tte}$  of other fuzzers divided by the  $\mu\mathrm{tte}$  of uafuzz.  
+
+<table><tr><td>bug id</td><td>fuzzer</td><td>paths</td><td>runs</td><td>μtte(s)</td><td>factor</td><td>\( \hat{a}_{12} \)</td></tr><tr><td rowspan="4">giflib-bug-74</td><td>afl-qemu</td><td>196.0</td><td>10</td><td>290</td><td>1.39</td><td>0.64</td></tr><tr><td>aflgob</td><td>172.9</td><td>9</td><td>478</td><td>2.29</td><td>0.70</td></tr><tr><td>hawkeyeb</td><td>135.8</td><td>7</td><td>677</td><td>3.24</td><td>0.62</td></tr><tr><td>uafuzz</td><td>184.0</td><td>10</td><td>209</td><td>-</td><td>-</td></tr><tr><td rowspan="4">cve-2018-11496</td><td>afl-qemu</td><td>404.0</td><td>10</td><td>19</td><td>1.36</td><td>0.81</td></tr><tr><td>aflgob</td><td>339.8</td><td>10</td><td>22</td><td>1.57</td><td>0.92</td></tr><tr><td>hawkeyeb</td><td>323.6</td><td>10</td><td>57</td><td>4.07</td><td>1.00</td></tr><tr><td>uafuzz</td><td>434.4</td><td>10</td><td>14</td><td>-</td><td>-</td></tr><tr><td rowspan="4">yasm-issue-91</td><td>afl-qemu</td><td>2110.0</td><td>8</td><td>2611</td><td>46.63</td><td>1.00</td></tr><tr><td>aflgob</td><td>2018.3</td><td>8</td><td>2427</td><td>43.34</td><td>1.00</td></tr><tr><td>hawkeyeb</td><td>323.2</td><td>0</td><td>3600</td><td>64.29</td><td>1.00</td></tr><tr><td>uafuzz</td><td>1364.1</td><td>10</td><td>56</td><td>-</td><td>-</td></tr><tr><td rowspan="4">cve-2016-4487</td><td>afl-qemu</td><td>931.0</td><td>4</td><td>2661</td><td>1.26</td><td>0.62</td></tr><tr><td>aflgob</td><td>1359.7</td><td>6</td><td>2427</td><td>1.15</td><td>0.57</td></tr><tr><td>hawkeyeb</td><td>895.6</td><td>7</td><td>2559</td><td>1.21</td><td>0.56</td></tr><tr><td>uafuzz</td><td>1043.1</td><td>6</td><td>2110</td><td>-</td><td>-</td></tr><tr><td rowspan="4">cve-2018-11416</td><td>afl-qemu</td><td>21.5</td><td>8</td><td>744</td><td>3.17</td><td>0.96</td></tr><tr><td>aflgob</td><td>21.0</td><td>10</td><td>303</td><td>1.29</td><td>0.78</td></tr><tr><td>hawkeyeb</td><td>21.0</td><td>10</td><td>338</td><td>1.44</td><td>0.88</td></tr><tr><td>uafuzz</td><td>21.0</td><td>10</td><td>235</td><td>-</td><td>-</td></tr><tr><td rowspan="4">mjs-issue-78</td><td>afl-qemu</td><td>1202.4</td><td>0</td><td>10800</td><td>2.57</td><td>0.95</td></tr><tr><td>aflgob</td><td>1479.4</td><td>4</td><td>8755</td><td>2.09</td><td>0.80</td></tr><tr><td>hawkeyeb</td><td>730.5</td><td>0</td><td>10800</td><td>2.57</td><td>0.95</td></tr><tr><td>uafuzz</td><td>867.9</td><td>9</td><td>4197</td><td>-</td><td>-</td></tr><tr><td rowspan="4">mjs-issue-73</td><td>afl-qemu</td><td>1462.5</td><td>1</td><td>9833</td><td>2.01</td><td>0.82</td></tr><tr><td>aflgob</td><td>1314.3</td><td>0</td><td>10800</td><td>2.21</td><td>0.85</td></tr><tr><td>hawkeyeb</td><td>741.6</td><td>0</td><td>10800</td><td>2.21</td><td>0.85</td></tr><tr><td>uafuzz</td><td>862.4</td><td>7</td><td>4881</td><td>-</td><td>-</td></tr><tr><td rowspan="4">cve-2018-10685</td><td>afl-qemu</td><td>400.3</td><td>9</td><td>232</td><td>1.49</td><td>0.60</td></tr><tr><td>aflgob</td><td>388.1</td><td>9</td><td>305</td><td>1.96</td><td>0.55</td></tr><tr><td>hawkeyeb</td><td>316.6</td><td>5</td><td>500</td><td>3.21</td><td>0.85</td></tr><tr><td>uafuzz</td><td>352.7</td><td>10</td><td>156</td><td>-</td><td>-</td></tr><tr><td rowspan="4">cve-2019-6455</td><td>afl-qemu</td><td>240.3</td><td>6</td><td>1149</td><td>2.62</td><td>0.86</td></tr><tr><td>aflgob</td><td>206.0</td><td>5</td><td>1213</td><td>2.77</td><td>0.81</td></tr><tr><td>hawkeyeb</td><td>205.7</td><td>5</td><td>1270</td><td>2.90</td><td>0.86</td></tr><tr><td>uafuzz</td><td>169.3</td><td>10</td><td>438</td><td>-</td><td>-</td></tr><tr><td rowspan="4">cve-2017-10686</td><td>afl-qemu</td><td>2403.5</td><td>1</td><td>20905</td><td>2.08</td><td>1.00</td></tr><tr><td>aflgob</td><td>2549.9</td><td>3</td><td>19721</td><td>1.96</td><td>0.99</td></tr><tr><td>hawkeyeb</td><td>1937.4</td><td>1</td><td>20134</td><td>2.00</td><td>0.99</td></tr><tr><td>uafuzz</td><td>2190.3</td><td>10</td><td>10040</td><td>-</td><td>-</td></tr><tr><td rowspan="4">gifsicle-issue-122</td><td>afl-qemu</td><td>367.1</td><td>8</td><td>5938</td><td>0.60</td><td>0.29</td></tr><tr><td>aflgob</td><td>383.4</td><td>6</td><td>9811</td><td>0.96</td><td>0.52</td></tr><tr><td>hawkeyeb</td><td>256.4</td><td>4</td><td>12473</td><td>1.26</td><td>0.67</td></tr><tr><td>uafuzz</td><td>242.4</td><td>7</td><td>9853</td><td>-</td><td>-</td></tr><tr><td rowspan="4">cve-2016-3189</td><td>afl-qemu</td><td>117.0</td><td>10</td><td>149</td><td>1.06</td><td>0.59</td></tr><tr><td>aflgob</td><td>125.1</td><td>10</td><td>158</td><td>1.12</td><td>0.66</td></tr><tr><td>hawkeyeb</td><td>67.4</td><td>10</td><td>770</td><td>5.46</td><td>1.00</td></tr><tr><td>uafuzz</td><td>100.1</td><td>10</td><td>141</td><td>-</td><td>-</td></tr><tr><td rowspan="4">cve-2018-20623</td><td>afl-qemu</td><td>804.0</td><td>10</td><td>2604</td><td>20.34</td><td>1.00</td></tr><tr><td>aflgob</td><td>724.2</td><td>9</td><td>3169</td><td>24.76</td><td>1.00</td></tr><tr><td>hawkeyeb</td><td>625.1</td><td>8</td><td>2889</td><td>22.57</td><td>1.00</td></tr><tr><td>uafuzz</td><td>388.6</td><td>10</td><td>128</td><td>-</td><td>-</td></tr></table>
+
+fuzzing. consequently, uafuzz could trigger the bug at the third potential input (i.e., the 954th input in the fuzzing queue). overall in 10 runs the first bug-triggering input of uafuzz is the 1019th on average, while for afl-qemu and aflgob they detect the bug much slower, at the 2026th and 1908th input respectively. the main reason is that other tools spend more time on increasing the code coverage by going through all initial seeds in the fuzzing queue. in particular, as aflgob aims to first explore more paths in the exploration phase, it is more likely that directed fuzzers that are mainly based on the seed distance metric like aflgob skip or select the input after long time. although both afl-qemu and aflgob could find the bug in 8 and 10 runs and discover substantially more paths than our fuzzer, the tte values of these tools are clearly much more larger
+
+![](images/e849e414ab5df9977be114e9dcdbe8ed8f687c99352ea87dae7bc75643f074c2.jpg)  
+figure 11: fuzzing queue of uafuzz for yasm-issue-91. selected inputs to be mutated are highlighted in brown. potential inputs are in the horizontal dashed line.
+
+![](images/9504086a9f08e7dec2db1a202e84950ce3164018146e55e44e8bf71d81fe0e3f.jpg)  
+figure 12: summary of fuzzing performance of 4 fuzzers against our benchmark, except cve-2017-10686 due to compilation issues of aflgo.
+
+# than uafuzz's tte.
+
+another interesting case study illustrating the effectiveness of our technique is cve-2017-10686 of the program nasm version 2.14rc0, reported by collafl [42]. when assembling the input text file, nasm converts each line into tokens that are allocated in function new_token and then freed in function detoken to detokenize the line and emit it. however, the buggy version of nasm also frees token's text even when the text has not been modified before, causing the uaf bug. while uafuzz found the uaf bug in all 10 runs, aflqemu and aflgob only produced the bug-triggering input in 1 and 3 runs respectively. overall uafuzz significantly outperforms other fuzzers and achieves a strong confidence of being faster ( $\hat{a}_{12}$  is 0.99 against aflgob and 1 against the rest). specifically, uafuzz saves roughly 10,000s to reproduce this bug.
+
+# d regarding implementations of aflgob and hawkeyeb
+
+# comparison between aflgob and source-based aflgo.
+
+we want to evaluate how close our implementation of aflgob is from the original aflgo, in order to assess the degree of confidence we can have in our results - we do not do it for hawkeyeb as hawkeye is not available.
+
+aflgo unsurprisingly performs better than aflgob and uafuzz (figure 12, table 10 in appendix). this is largely due to the emulation runtime overhead of qemu, a well-documented fact. still, surprisingly enough, uafuzz can
+
+find the bugs faster than aflgo in 4 samples, demonstrating its efficiency.
+
+yet, more interestingly, figure 12 also shows that once emulation overhead is taken into account (yielding  $\mathrm{aflgo}_f$ , the expected binary-level performance of aflgo), then aflgob is in line with  $\mathrm{aflgo}_f$  (and even shows better tte) - uafuzz even significantly outperforms  $\mathrm{aflgo}_f$ .
+
+table 10: bug reproduction of aflgo against our benchmark except cve-2017-10686 due to compilation issues of aflgo. numbers in red are the best  $\mu$ ttes.
+
+<table><tr><td rowspan="2">bug id</td><td colspan="2">aflgo (source)</td><td colspan="2">\( aflgo_f \)(source)</td><td colspan="2">aflgob</td><td colspan="2">uafuzz</td></tr><tr><td>runs</td><td>\( \mu tte(s) \)</td><td>runs</td><td>\( \mu tte(s) \)</td><td>runs</td><td>\( \mu tte(s) \)</td><td>runs</td><td>\( \mu tte(s) \)</td></tr><tr><td>qgifib-bug-74</td><td>10</td><td>62</td><td>10</td><td>281</td><td>9</td><td>478</td><td>10</td><td>209</td></tr><tr><td>cve-2018-11496</td><td>10</td><td>2</td><td>10</td><td>38</td><td>10</td><td>22</td><td>10</td><td>14</td></tr><tr><td>yasm-issue-91</td><td>10</td><td>307</td><td>8</td><td>2935</td><td>8</td><td>2427</td><td>10</td><td>56</td></tr><tr><td>cve-2016-4487</td><td>10</td><td>676</td><td>10</td><td>1386</td><td>6</td><td>2427</td><td>6</td><td>2110</td></tr><tr><td>cve-2018-11416</td><td>10</td><td>78</td><td>7</td><td>1219</td><td>10</td><td>303</td><td>10</td><td>235</td></tr><tr><td>mjs-issue-78</td><td>10</td><td>1417</td><td>3</td><td>9706</td><td>4</td><td>8755</td><td>9</td><td>4197</td></tr><tr><td>mjs-issue-73</td><td>9</td><td>5207</td><td>3</td><td>34210</td><td>0</td><td>10800</td><td>7</td><td>4881</td></tr><tr><td>cve-2018-10685</td><td>10</td><td>74</td><td>9</td><td>1072</td><td>9</td><td>305</td><td>10</td><td>156</td></tr><tr><td>cve-2019-6455</td><td>5</td><td>1090</td><td>0</td><td>20296</td><td>5</td><td>1213</td><td>10</td><td>438</td></tr><tr><td>gifsicle-issue-122</td><td>8</td><td>4161</td><td>7</td><td>25881</td><td>6</td><td>9811</td><td>7</td><td>9853</td></tr><tr><td>cve-2016-3189</td><td>10</td><td>72</td><td>10</td><td>206</td><td>10</td><td>158</td><td>10</td><td>141</td></tr><tr><td>cve-2018-20623</td><td>10</td><td>177</td><td>10</td><td>1329</td><td>9</td><td>3169</td><td>10</td><td>128</td></tr><tr><td>total success runs</td><td colspan="2">112</td><td colspan="2">87</td><td colspan="2">86</td><td colspan="2">109</td></tr><tr><td>total \( \mu tte(h) \)</td><td colspan="2">3.7</td><td colspan="2">27.4</td><td colspan="2">10.1</td><td colspan="2">6.2</td></tr></table>
+
+performance of aflgob is in line with the original aflgo once qemu overhead is taken into account, allowing a fair comparison with uafuzz. uafuzz nonetheless performs relatively well on uaf compared with the source-based directed fuzzer aflgo, demonstrating the benefit of our original fuzzing mechanisms.
+
+about performance of hawkeyeb in rq1. hawkeyeb performs significantly worse than aflgob and uafuzz in §6.3. we cannot compare hawkeyeb with hawkeye as hawkeye is not available. still, we investigate that issue and found that this is mostly due to a large runtime overhead spent calculating the target similarity metric. indeed, according to the hawkeye original paper [30], this computation involves some quadratic computation over the total number of functions in the code under test. on our samples this number quickly becomes important (up to 772) while the number of targets (uafuzz) remains small (up to 28). a few examples: cve-2017-10686: 772 functions vs 10 targets; gifsicle-issue-122: 516 functions vs 11 targets; mjs-issue-78: 450 functions vs 19 targets. hence, we can conclude that on our samples the performance of hawkeyeb are in line with what is expected from hawkeye algorithm.
+
+# e uaf overhead (rq2)
+
+additional data. we first provide additional results for rq2. figures 13 and 14 compare the average instrumentation time between, respectively, uafuzz and the source-based directed
+
+![](images/0419e20c5da5642ecef69123e23e276594cfd94738b894b4f351204c2041633c.jpg)  
+figure 13: average instrumentation time in seconds (except cve-2017-10686 due to compilation issues of aflgo).
+
+fuzzer aflgo; and uafuzz and the two binary-based directed fuzzers aflgob and hawkeyeb. figure 15 shows the total execution done of afl-qemu and uafuzz for each subject in our benchmark.
+
+detailed results. we now discuss experimental results regarding overhead in more depth than what was done in §6.4.
+
+- figures 8 and 13 show that uafuzz is an order of magnitude faster than the state-of-the-art source-based directed fuzzer aflgo in the instrumentation phase (14.7× faster in total). for example, uafuzz spends only 23s (i.e., 64× less than aflgo) in processing the large program readelf of binutils;  
+- figures 8 and 15 show that uafuzz has almost the same total number of executions per second as aflqemu (  $-4\%$  in total,  $-12\%$  in average), meaning that its overhead is negligible.  
+- figure 14 shows that hawkeyeb is sometimes significantly slower than uafuzz  $(2\times)$ . this is mainly because of the cost of target function trace closure calculation on large examples with many functions (cf. §6.3).
+
+![](images/9cef82fa4c0e6a36f2994028e2f9cc0da673b7a956265c41bf1725ea43e5d7df.jpg)  
+figure 14: average instrumentation time in seconds.
+
+![](images/972e548050d0f2c530d7cec0e7382d841939ad8e1c1ed94e1a3a9191a16d2a49.jpg)  
+figure 15: total executions done in all runs.
+
+# f uaf triage (rq3)
+
+we provide additional results for rq3: figure 16 and table 11 show the average triaging time and number of triaging inputs (including tir values for uafuzz) of 4 fuzzers against our benchmark.
+
+![](images/7151eb4f8e76520240a8a9645b3f2b74016d2621ad1426795ca965ac0b3d0f3d.jpg)  
+figure 16: average triaging time in seconds.
+
+table 11: average number of triaging inputs of 4 fuzzers against our tested subjects. for uafuzz, the tir values are in parentheses.  
+
+<table><tr><td>bug id</td><td>afl-qemu</td><td>aflgob</td><td>hawkeyeb</td><td>uafuzz</td></tr><tr><td>giflib-bug-74</td><td>200.9</td><td>177.0</td><td>139.9</td><td>10.0 (5.31%)</td></tr><tr><td>cve-2018-11496</td><td>409.6</td><td>351.7</td><td>332.5</td><td>5.4 (4.08%)</td></tr><tr><td>yasm-issue-91</td><td>2115.3</td><td>2023.0</td><td>326.6</td><td>37.4 (2.72%)</td></tr><tr><td>cve-2016-4487</td><td>933.1</td><td>1367.2</td><td>900.2</td><td>2.5 (0.24%)</td></tr><tr><td>cve-2018-11416</td><td>21.5</td><td>21.0</td><td>21.0</td><td>1.0 (4.76%)</td></tr><tr><td>mjs-issue-78</td><td>1226.9</td><td>1537.8</td><td>734.6</td><td>262.3 (30.22%)</td></tr><tr><td>mjs-issue-73</td><td>1505.6</td><td>1375.9</td><td>745.6</td><td>252.2 (29.25%)</td></tr><tr><td>cve-2018-10685</td><td>414.2</td><td>402.1</td><td>328.9</td><td>12.6 (3.14%)</td></tr><tr><td>cve-2019-6455</td><td>243.2</td><td>238.1</td><td>211.1</td><td>6.9 (1.57%)</td></tr><tr><td>cve-2017-10686</td><td>2416.9</td><td>2517.0</td><td>1765.2</td><td>214.3 (8.96%)</td></tr><tr><td>gifscicle-issue-122</td><td>405.0</td><td>431.7</td><td>378.5</td><td>3.3 (0.86%)</td></tr><tr><td>cve-2016-3189</td><td>377.9</td><td>764.7</td><td>126.4</td><td>7.1 (1.69%)</td></tr><tr><td>cve-2018-20623</td><td>804.0</td><td>724.2</td><td>625.1</td><td>5.4 (1.39%)</td></tr><tr><td>total</td><td>11.1k</td><td>11.9k</td><td>6.6k</td><td>820 (7.25%)</td></tr></table>
+
+# g individual contribution (rq4)
+
+we provide additional results for rq4. table 12 shows the fuzzing performance of 2 aflgob-based variants aflgob-ss and aflgob-ds compared to aflgob and our tool uafuzz against our benchmark.
+
+# h patch testing & zero-days
+
+we provide additional results for patch testing (table 13), as well as a detailed discussion on the gnu patch buggy patch.
+
+zoom: gnu patch buggy patch. we use cve-2018-6952 [6] to demonstrate the effectiveness of uafuzz in exposing unknown uaf vulnerabilities. gnu patch [11] takes a patch file containing a list of differences and applies them to the original file. listing 3 shows the code fragment of cve-2018-6952 which is a double free in the latest version 2.7.6 of gnu patch. interestingly, by using the stack trace of this cve as shown in figure 17, uafuzz successfully discovered an incomplete bug fix [8] in the latest commit 76e7758, with a slight difference of the bug stack trace (i.e., the call of savebuf() in another_hunk().
+
+table 12: bug reproduction on 4 fuzzers against our benchmark.  $\hat{a}_{12\mathrm{a}}$  and  $\hat{a}_{12\mathrm{u}}$  denote the varga-delaney values of aflgob and uafuzz. statistically significant results for  $\hat{a}_{12}$  (e.g.,  $\hat{a}_{12\mathrm{a}} \leq 0.29$  or  $\hat{a}_{12\mathrm{u}} \geq 0.71$ ) are in bold. numbers in red are the best  $\mu$ ttes.  
+
+<table><tr><td rowspan="2">bug id</td><td colspan="3">aflgob</td><td colspan="3">aflgob-ss</td><td colspan="3">aflgob-ds</td><td colspan="3">uafuzz</td></tr><tr><td>runs</td><td>μtte(s)</td><td>a12u</td><td>runs</td><td>μtte(s)</td><td>a12a</td><td>a12u</td><td>runs</td><td>μtte(s)</td><td>a12a</td><td>a12u</td><td>runs</td></tr><tr><td>giflib-bug-74</td><td>9</td><td>478</td><td>0.70</td><td>10</td><td>261</td><td>0.47</td><td>0.66</td><td>10</td><td>317</td><td>0.47</td><td>0.67</td><td>10</td></tr><tr><td>cve-2018-11496</td><td>10</td><td>22</td><td>0.92</td><td>10</td><td>14</td><td>0.06</td><td>0.44</td><td>10</td><td>23</td><td>0.52</td><td>1.00</td><td>10</td></tr><tr><td>yasm-issue-91</td><td>8</td><td>2427</td><td>1.00</td><td>10</td><td>37</td><td>0.00</td><td>0.44</td><td>10</td><td>99</td><td>0.00</td><td>0.47</td><td>10</td></tr><tr><td>cve-2016-4487</td><td>6</td><td>2427</td><td>0.57</td><td>5</td><td>2206</td><td>0.46</td><td>0.53</td><td>5</td><td>2494</td><td>0.51</td><td>0.59</td><td>6</td></tr><tr><td>cve-2018-11416</td><td>10</td><td>303</td><td>0.78</td><td>10</td><td>232</td><td>0.24</td><td>0.50</td><td>10</td><td>408</td><td>0.79</td><td>0.88</td><td>10</td></tr><tr><td>mjs-issue-78</td><td>4</td><td>8755</td><td>0.80</td><td>4</td><td>7454</td><td>0.47</td><td>0.72</td><td>9</td><td>3707</td><td>0.22</td><td>0.48</td><td>9</td></tr><tr><td>mjs-issue-73</td><td>0</td><td>10800</td><td>0.85</td><td>3</td><td>7651</td><td>0.35</td><td>0.68</td><td>6</td><td>5432</td><td>0.20</td><td>0.56</td><td>7</td></tr><tr><td>cve-2018-10685</td><td>9</td><td>305</td><td>0.57</td><td>10</td><td>128</td><td>0.43</td><td>0.47</td><td>10</td><td>160</td><td>0.54</td><td>0.67</td><td>10</td></tr><tr><td>cve-2019-6455</td><td>5</td><td>1213</td><td>0.81</td><td>10</td><td>407</td><td>0.19</td><td>0.48</td><td>9</td><td>981</td><td>0.37</td><td>0.75</td><td>10</td></tr><tr><td>cve-2017-10686</td><td>3</td><td>19721</td><td>0.99</td><td>10</td><td>12838</td><td>0.07</td><td>0.73</td><td>10</td><td>12484</td><td>0.07</td><td>0.69</td><td>10</td></tr><tr><td>gifsicle-issue-122</td><td>6</td><td>6210</td><td>0.52</td><td>3</td><td>12702</td><td>0.68</td><td>0.72</td><td>2</td><td>13443</td><td>0.72</td><td>0.77</td><td>7</td></tr><tr><td>cve-2016-3189</td><td>10</td><td>158</td><td>0.66</td><td>10</td><td>141</td><td>0.35</td><td>0.55</td><td>10</td><td>152</td><td>0.40</td><td>0.55</td><td>10</td></tr><tr><td>cve-2018-20623</td><td>9</td><td>3169</td><td>1.00</td><td>10</td><td>135</td><td>0.00</td><td>0.10</td><td>10</td><td>89</td><td>0.00</td><td>0.18</td><td>10</td></tr><tr><td>total success runs</td><td colspan="3">89</td><td colspan="3">105 (+18.0%)</td><td colspan="3">111 (+24.7%)</td><td colspan="3">119 (+33.7%)</td></tr><tr><td>total μtte (h)</td><td colspan="3">15.6</td><td colspan="3">12.3</td><td colspan="3">11.1</td><td colspan="3">9.0</td></tr><tr><td>average a12a</td><td colspan="3">-</td><td colspan="3">0.29</td><td colspan="3">0.37</td><td colspan="3">0.22</td></tr><tr><td>average a12u</td><td colspan="3">0.78</td><td colspan="3">0.54</td><td colspan="3">0.64</td><td colspan="3">-</td></tr></table>
+
+```c
+1 file: src/patch.c  
+2 int main (int argc, char **argv) {...  
+3 while  $(0 < (\text{got_hunk} = \text{another_hunk} (\text{diff_type}, \text{reverse}))\{\star \text{apply each hunk of patch */}\ldots\}$   
+4 ...}  
+5  
+6 file: src/pch.c  
+7 int another_hunk (enum diff difftype, bool rev) { ...  
+8 while (p_end >= 0) {  
+9 if (p_end == p_efake) p_end = p_bfake;  
+10 else free(p_line[p_end]); /* free and use event */  
+11 p_end--;  
+12 } ...  
+13 while (p_end < p_max) { ...  
+14 switch (*buf) { ...  
+15 case ':': case ':': /* our reported bug */ ...  
+16 p_line[p_end] = savebuf (s, chars_read);  
+17 case ':': /* cve-2018-6952 */ ...  
+18 p_line[p_end] = savebuf (s, chars_read);  
+19 }  
+20 ...}  
+21 ...}  
+22  
+23 file: src/util.c  
+24 /* allocate a unique area for a string. */  
+25 char *savebuf(char const *s, size_t size) { ...  
+26 rv = malloc (size); /* alloc event */ ...  
+27 memcpy (rv, s, size);  
+28 return rv;  
+29 }
+```
+
+listing 3: code fragment of gnu patch pertaining to the uaf vulnerability cve-2018-6952.
+
+technically, gnu patch takes an input patch file containing multiple hunks (line 3) that are split into multiple strings using special characters as delimiter via *buf in the switch case (line 14). gnu patch then reads and parses each string stored
+
+```txt
+$= = 330 = =$  invalid free() / delete / delete[] / realloc()   
+ $= = 330 = =$  at 0x402d358: free (in vgppreload_memcheck-x86-linux.so)   
+ $= = 330 = =$  by 0x8052e11: another_hunk(pch.c:1185)   
+ $= = 330 = =$  by 0x804c06c: main (patch.c:396)   
+ $= = 330 = =$  address 0x4283540 is 0 bytes inside a block of size 2 free'd   
+ $= = 330 = =$  at 0x402d358: free (in vgppreload_memcheck-x86-linux.so)   
+ $= = 330 = =$  by 0x8052e11: another_hunk(pch.c:1185)   
+ $= = 330 = =$  by 0x804c06c: main (patch.c :396)   
+ $= = 330 = =$  block was alloc'd at   
+ $= = 330 = =$  at 0x402c17c: malloc (in vgppreload_memcheck-x86-linux.so)   
+ $= = 330 = =$  by 0x805a821: savebuf (util.c:861)   
+ $= = 330 = =$  by 0x805423c: another_hunk (pch.c:1504)   
+ $= = 330 = =$  by 0x804c06c: main (patch.c:396)
+```
+
+figure 17: the bug trace of cve-2018-6952 produced by valgrind.
+
+in p_line that is dynamically allocated on the memory using malloc() in savebuf() (line 26) until the last line of this hunk has been processed. otherwise, gnu patch reallocates the most recently processed string using free() (line 10). our reported bug and cve-2018-6952 share the same free and use event, but have a different stack trace leading to the same alloc event. actually, while the poc input generated by uafuzz contains two characters ‘!’, the poc of cve-2018-6952 does not contain this character, consequently the case in line 16 was previously uncovered, and thus this cve had been incompletely fixed. this case study shows the importance of producing different unique bug-triggering inputs to favor the repair process and help complete bug fixing.
+
+table 13: summary of zero-day vulnerabilities reported by our fuzzzer.  
+
+<table><tr><td>program</td><td>code size</td><td>version (commit)</td><td>bug id</td><td>vulnerability type</td><td>crash</td><td>vulnerable function</td><td>status</td><td>cve</td></tr><tr><td rowspan="15">gpac</td><td rowspan="15">545k</td><td>0.7.1 (987169b)</td><td>#1269</td><td>user after free</td><td>x</td><td>gf_m2ts_process_pmt</td><td>fixed</td><td>cve-2019-20628</td></tr><tr><td>0.8.0 (56eaea8)</td><td>#1440-1</td><td>user after free</td><td>x</td><td>gf_isom_box_del</td><td>fixed</td><td>cve-2020-11558</td></tr><tr><td>0.8.0 (56eaea8)</td><td>#1440-2</td><td>user after free</td><td>x</td><td>gf_isom_box_del</td><td>fixed</td><td>pending</td></tr><tr><td>0.8.0 (56eaea8)</td><td>#1440-3</td><td>user after free</td><td>x</td><td>gf_isom_box_del</td><td>fixed</td><td>pending</td></tr><tr><td>0.8.0 (5b37b21)</td><td>#1427</td><td>user after free</td><td>✓</td><td>gf_m2ts_process_pmt</td><td></td><td></td></tr><tr><td>0.7.1 (987169b)</td><td>#1263</td><td>null pointer dereference</td><td>✓</td><td>ilst_item_read</td><td>fixed</td><td></td></tr><tr><td>0.7.1 (987169b)</td><td>#1264</td><td>heap buffer overflow</td><td>✓</td><td>gf_m2ts_process_pmt</td><td>fixed</td><td>cve-2019-20629</td></tr><tr><td>0.7.1 (987169b)</td><td>#1265</td><td>invalid read</td><td>✓</td><td>gf_m2ts_process_pmt</td><td>fixed</td><td></td></tr><tr><td>0.7.1 (987169b)</td><td>#1266</td><td>invalid read</td><td>✓</td><td>gf_m2ts_process_pmt</td><td>fixed</td><td></td></tr><tr><td>0.7.1 (987169b)</td><td>#1267</td><td>null pointer dereference</td><td>✓</td><td>gf_m2ts_process_pmt</td><td>fixed</td><td></td></tr><tr><td>0.7.1 (987169b)</td><td>#1268</td><td>heap buffer overflow</td><td>✓</td><td>bs_byte</td><td>fixed</td><td>cve-2019-20630</td></tr><tr><td>0.7.1 (987169b)</td><td>#1270</td><td>invalid read</td><td>✓</td><td>gf_list_count</td><td>fixed</td><td>cve-2019-20631</td></tr><tr><td>0.7.1 (987169b)</td><td>#1271</td><td>invalid read</td><td>✓</td><td>gf_olf_delete descriptor</td><td>fixed</td><td>cve-2019-20632</td></tr><tr><td>0.8.0 (5b37b21)</td><td>#1445</td><td>heap buffer overflow</td><td>✓</td><td>gf_bs_read_data</td><td>fixed</td><td></td></tr><tr><td>0.8.0 (5b37b21)</td><td>#1446</td><td>stack buffer overflow</td><td>✓</td><td>gf_m2ts_get_adaptation_field</td><td>fixed</td><td></td></tr><tr><td rowspan="3">gnu patch</td><td rowspan="3">7k</td><td>2.7.6 (76e7758)</td><td>#56683</td><td>double free</td><td>✓</td><td>another_hunk</td><td>confirmed</td><td>cve-2019-20633</td></tr><tr><td>2.7.6 (76e7758)</td><td>#56681</td><td>assertion failure</td><td>✓</td><td>pch_swap</td><td>confirmed</td><td></td></tr><tr><td>2.7.6 (76e7758)</td><td>#56684</td><td>memory leak</td><td>x</td><td>xmalloc</td><td>confirmed</td><td></td></tr><tr><td rowspan="8">perl 5</td><td rowspan="8">184k</td><td>5.31.3 (a3c7756)</td><td>#134324</td><td>use after free</td><td>✓</td><td>s_reg</td><td>confirmed</td><td></td></tr><tr><td>5.31.3 (a3c7756)</td><td>#134326</td><td>use after free</td><td>✓</td><td>perl_regnext</td><td>fixed</td><td></td></tr><tr><td>5.31.3 (a3c7756)</td><td>#134329</td><td>user after free</td><td>✓</td><td>perl_regnext</td><td>fixed</td><td></td></tr><tr><td>5.31.3 (a3c7756)</td><td>#134322</td><td>null pointer dereference</td><td>✓</td><td>doclean named_objs</td><td>confirmed</td><td></td></tr><tr><td>5.31.3 (a3c7756)</td><td>#134325</td><td>heap buffer overflow</td><td>✓</td><td>s_reg</td><td>fixed</td><td></td></tr><tr><td>5.31.3 (a3c7756)</td><td>#134327</td><td>invalid read</td><td>✓</td><td>s_regmatch</td><td>fixed</td><td></td></tr><tr><td>5.31.3 (a3c7756)</td><td>#134328</td><td>invalid read</td><td>✓</td><td>s_regmatch</td><td>fixed</td><td></td></tr><tr><td>5.31.3 (45f8e7b)</td><td>#134342</td><td>invalid read</td><td>✓</td><td>perl_mro isa changed_in</td><td>confirmed</td><td></td></tr><tr><td>mupdf</td><td>539k</td><td>1.16.1 (6566de7)</td><td>#702253</td><td>use after free</td><td>x</td><td>fz_drop_bandwriter</td><td>fixed</td><td></td></tr><tr><td>boolean</td><td>79k</td><td>3.2.1 (3249ae0 )</td><td>#90</td><td>null pointer dereference</td><td>✓</td><td>set_last_occurrence_ofsymbols</td><td>confirmed</td><td></td></tr><tr><td rowspan="2">fontforge</td><td rowspan="2">578k</td><td>20200314 (1604c74)</td><td>#4266</td><td>use after free</td><td>✓</td><td>sfdgetbitmapchar</td><td></td><td></td></tr><tr><td>20200314 (1604c74)</td><td>#4267</td><td>null pointer dereference</td><td>✓</td><td>sfdgetbitmapchar</td><td></td><td></td></tr></table>

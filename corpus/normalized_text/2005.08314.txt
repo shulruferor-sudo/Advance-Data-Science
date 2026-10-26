@@ -1,0 +1,368 @@
+# tabert: pretraining for joint understanding of textual and tabular data
+
+pengcheng yin* graham neubig
+
+carnegie mellon university
+
+{pcyin,gneubig}@cs.cmu.edu
+
+wen-tau yih sebastian riedel
+
+facebook ai research
+
+{scottyih,sriedel}@fb.com
+
+# abstract
+
+recent years have witnessed the burgeoning of pretrained language models (lms) for text-based natural language (nl) understanding tasks. such models are typically trained on free-form nl text, hence may not be suitable for tasks like semantic parsing over structured data, which require reasoning over both free-form nl questions and structured tabular data (e.g., database tables). in this paper we present tabert, a pretrained lm that jointly learns representations for nl sentences and (semi-)structured tables. tabert is trained on a large corpus of 26 million tables and their english contexts. in experiments, neural semantic parsers using tabert as feature representation layers achieve new best results on the challenging weakly-supervised semantic parsing benchmark wikitablequestions, while performing competitively on the text-to-sql dataset spider.
+
+# 1 introduction
+
+recent years have witnessed a rapid advance in the ability to understand and answer questions about free-form natural language (nl) text (rajpurkar et al., 2016), largely due to large-scale, pretrained language models (lms) like bert (devlin et al., 2019). these models allow us to capture the syntax and semantics of text via representations learned in an unsupervised manner, before fine-tuning the model to downstream tasks (melamud et al., 2016; mccann et al., 2017; peters et al., 2018; liu et al., 2019b; yang et al., 2019; goldberg, 2019). it is also relatively easy to apply such pretrained lms to comprehension tasks that are modeled as text span selection problems, where the boundary of an answer span can be predicted using a simple classifier on top of the lm (joshi et al., 2019).
+
+however, it is less clear how one could pretrain and fine-tune such models for other qa tasks that involve joint reasoning over both free-form nl text and structured data. one example task is semantic parsing for access to databases (dbs) (zelle and mooney, 1996; berant et al., 2013; yih et al., 2015), the task of transducing an nl utterance (e.g., "which country has the largest gdp?") into a structured query over db tables (e.g., sql querying a database of economics). a key challenge in this scenario is understanding the structured schema of db tables (e.g., the name, data type, and stored values of columns), and more importantly, the alignment between the input text and the schema (e.g., the token "gdp" refers to the gross domestic product column), which is essential for inferring the correct db query (berant and liang, 2014).
+
+neural semantic parsers tailored to this task therefore attempt to learn joint representations of nl utterances and the (semi-)structured schema of db tables (e.g., representations of its columns or cell values, as in krishnamurthy et al. (2017); boin et al. (2019b); wang et al. (2019a), inter alia). however, this unique setting poses several challenges in applying pretrained lms. first, information stored in db tables exhibit strong underlying structure, while existing lms (e.g., bert) are solely trained for encoding free-form text. second, a db table could potentially have a large number of rows, and naively encoding all of them using a resource-heavy lm is computationally intractable. finally, unlike most text-based qa tasks (e.g., squad, rajpurkar et al. (2016)) which could be formulated as a generic answer span selection problem and solved by a pretrained model with additional classification layers, semantic parsing is highly domain-specific, and the architecture of a neural parser is strongly coupled with the structure of its underlying db (e.g., systems for sql-based and other types of dbs use different encoder mod
+
+els). in fact, existing systems have attempted to leverage bert, but each with their own domain-specific, in-house strategies to encode the structured information in the db (guo et al., 2019; zhang et al., 2019a; hwang et al., 2019), and importantly, without pretraining representations on structured data. these challenges call for development of general-purpose pretraining approaches tailored to learning representations for both nl utterances and structured db tables.
+
+in this paper we present tabert, a pretraining approach for joint understanding of nl text and (semi-)structured tabular data (§ 3). tabert is built on top of bert, and jointly learns contextual representations for utterances and the structured schema of db tables (e.g., a vector for each utterance token and table column). specifically, tabert linearizes the structure of tables to be compatible with a transformer-based bert model. to cope with large tables, we propose content snapshots, a method to encode a subset of table content most relevant to the input utterance. this strategy is further combined with a vertical attention mechanism to share information among cell representations in different rows (§ 3.1). to capture the association between tabular data and related nl text, tabert is pretrained on a parallel corpus of 26 million tables and english paragraphs (§ 3.2).
+
+tabert can be plugged into a neural semantic parser as a general-purpose encoder to compute representations for utterances and tables. our key insight is that although semantic parsers are highly domain-specific, most systems rely on representations of input utterances and the table schemas to facilitate subsequent generation of db queries, and these representations can be provided by tabert, regardless of the domain of the parsing task.
+
+we apply tabert to two different semantic parsing paradigms: (1) a classical supervised learning setting on the spider text-to-sql dataset (yu et al., 2018c), where tabert is fine-tuned together with a task-specific parser using parallel nl utterances and labeled db queries (§ 4.1); and (2) a challenging weakly-supervised learning benchmark wikitablequestions (pasupat and liang, 2015), where a system has to infer latent db queries from its execution results (§ 4.2). we demonstrate tabert is effective in both scenarios, showing that it is a drop-in replacement of a parser's original encoder for computing contextual representations of nl utterances and db tables.
+
+specifically, systems augmented with tabert outperforms their counterparts using bert, registering state-of-the-art performance on wikitable-questions, while performing competitively on spider (§ 5).
+
+# 2 background
+
+semantic parsing over tables semantic parsing tackles the task of translating an nl utterance  $\pmb{u}$  into a formal meaning representation (mr)  $\pmb{z}$ . specifically, we focus on parsing utterances to access database tables, where  $\pmb{z}$  is a structured query (e.g., an sql query) executable on a set of relational db tables  $\mathcal{t} = \{t_t\}$ . a relational table  $t$  is a listing of  $n$  rows  $\{r_i\}_{i=1}^n$  of data, with each row  $r_i$  consisting of  $m$  cells  $\{s_{\langle i,j\rangle}\}_{j=1}^m$ , one for each column  $c_j$ . each cell  $s_{\langle i,j\rangle}$  contains a list of tokens.
+
+depending on the underlying data representation schema used by the db, a table could either be fully structured with strongly-typed and normalized contents (e.g., a table column named distance has a unit of kilometers, with all of its cell values, like 200, bearing the same unit), as is commonly the case for sql-based dbs (§ 4.1). alternatively, it could be semi-structured with unnormalized, textual cell values (e.g., 200 km, § 4.2). the query language could also take a variety of forms, from general-purpose db access languages like sql to domain-specific ones tailored to a particular task.
+
+given an utterance and its associated tables, a neural semantic parser generates a db query from the vector representations of the utterance tokens and the structured schema of tables. in this paper we refer schema as the set of columns in a table, and its representation as the list of vectors that represent its columns<sup>2</sup>. we will introduce how tabert computes these representations in § 3.1.
+
+masked language models given a sequence of nl tokens  $\pmb{x} = x_{1},x_{2},\dots ,x_{n}$ , a masked language model (e.g., bert) is an lm trained using the masked language modeling objective, which aims to recover the original tokens in  $\pmb{x}$  from a "corrupted" context created by randomly masking out certain tokens in  $\pmb{x}$ . specifically, let  $\pmb{x}_{m} = \{x_{i_{1}},\ldots ,x_{i_{m}}\}$  be the subset of tokens in  $\pmb{x}$  selected to be masked out, and  $\widetilde{\pmb{x}}$  denote the masked sequence with tokens in  $\pmb{x}_{m}$  replaced by a [mask] symbol. a masked lm defines a distribu
+
+in which city did piotr's last 1st place finish occur?
+
+<table><tr><td>year</td><td>venue</td><td>position</td><td>event</td></tr><tr><td>2003</td><td>tampere</td><td>3rd</td><td>eu junior championship</td></tr><tr><td>2005</td><td>erfurt</td><td>1st</td><td>eu u23 championship</td></tr><tr><td>2005</td><td>izmir</td><td>1st</td><td>universiade</td></tr><tr><td>2006</td><td>moscow</td><td>2nd</td><td>world indoor championship</td></tr><tr><td>2007</td><td>bangkok</td><td>1st</td><td>universiade</td></tr></table>
+
+selected rows as content snapshot:  $\{r_2,r_3,r_5\}$
+
+(a) content snapshot from input table
+
+![](images/260fc3601ade2f8c4876aba4cd98245fbdc1428408999dbe446b6a5ab8b635dc.jpg)
+
+(b) per-row encoding (for each row in content snapshot, using  $r_{2}$  as an example)
+
+![](images/3d2069d411066746e944a8f2cb6ac2befbb6a2ecb8cf75ec1d7923c739cf0404.jpg)  
+figure 1: overview of tabert for learning representations of utterances and table schemas with an example from wikitable-questions<sup>3</sup>. (a) a content snapshot of the table is created based on the input nl utterance. (b) each row in the snapshot is encoded by a transformer (only  $r_{2}$  is shown), producing row-wise encodings for utterance tokens and cells. (c) all row-wise encodings are aligned and processed by  $v$  vertical self-attention layers, generating utterance and column representations.
+
+r [cls] in which city did piotr's ... [sep] year | real | 2005 [sep] venue | text | erfurt [sep] position | text | 1st [sep] ...
+
+tion  $p_{\theta}(\pmb{x}_m|\widetilde{\pmb{x}})$  over the target tokens  $\pmb{x}_m$  given the masked context  $\widetilde{\pmb{x}}$ .
+
+bert parameterizes  $p_{\theta}(\pmb{x}_m|\widetilde{\pmb{x}})$  using a transformer model. during the pretraining phase, bert maximizes  $p_{\theta}(\pmb{x}_m|\widetilde{\pmb{x}})$  on large-scale textual corpora. in the fine-tuning phase, the pretrained model is used as an encoder to compute representations of input nl tokens, and its parameters are jointly tuned with other task-specific neural components.
+
+# 3 tabert: learning joint representations over textual and tabular data
+
+we first present how tabert computes representations for nl utterances and table schemas (§ 3.1), and then describe the pretraining procedure (§ 3.2).
+
+# 3.1 computing representations for nl utterances and table schemas
+
+fig. 1 presents a schematic overview of tabert. given an utterance  $\mathbf{u}$  and a table  $t$ , tabert first creates a content snapshot of  $t$ . this snapshot consists of sampled rows that summarize the information in  $t$  most relevant to the input utterance. the model then linearizes each row in the snapshot, concatenates each linearized row with the utterance, and uses the concatenated string as input to a transformer (e.g., bert) model, which outputs row-wise encoding vectors of utterance tokens and cells. the encodings for all the rows in
+
+the snapshot are fed into a series of vertical self-attention layers, where a cell representation (or an utterance token representation) is computed by attending to vertically-aligned vectors of the same column (or the same nl token). finally, representations for each utterance token and column are generated from a pooling layer.
+
+content snapshot one major feature of tabert is its use of the table contents, as opposed to just using the column names, in encoding the table schema. this is motivated by the fact that contents provide more detail about the semantics of a column than just the column's name, which might be ambiguous. for instance, the venue column in fig. 1 which is used to answer the example question actually refers to host cities, and encoding the sampled cell values while creating its representation may help match the term "city" in the input utterance to this column.
+
+however, a db table could potentially have a large number of rows, with only few of them actually relevant to answering the input utterance. encoding all of the contents using a resource-heavy transformer is both computationally intractable and likely not necessary. thus, we instead use a content snapshot consisting of only a few rows that are most relevant to the input utterance, providing an efficient approach to calculate content-sensitive column representations from cell values.
+
+we use a simple strategy to create content snap
+
+shots of  $k$  rows based on the relevance between the utterance and a row. for  $k > 1$ , we select the top- $k$  rows in the input table that have the highest  $n$ -gram overlap ratio with the utterance. $^{4}$  for  $k = 1$ , to include in the snapshot as much information relevant to the utterance as possible, we create a synthetic row by selecting the cell values from each column that have the highest  $n$ -gram overlap with the utterance. using synthetic rows in this restricted setting is motivated by the fact that cell values most relevant to answer the utterance could come from multiple rows. as an example, consider the utterance "how many more participants were there in 2008 than in the london olympics?", and an associating table with columns year, host city and number of participants, the most relevant cells to the utterance, 2008 (from year) and london (from host city), are from different rows, which could be included in a single synthetic row. in the initial experiments we found synthetic rows also help stabilize learning.
+
+row linearization tabert creates a linearized sequence for each row in the content snapshot as input to the transformer model. fig. 1(b) depicts the linearization for  $r_{2}$ , which consists of a concatenation of the utterance, columns, and their cell values. specifically, each cell is represented by the name and data type of the column, together with its actual value, separated by a vertical bar. as an example, the cell  $s_{\langle 2,1\rangle}$  valued 2005 in  $r_{2}$  in fig. 1 is encoded as
+
+year real 2005 column name column type cell value
+
+the linearization of a row is then formed by concatenating the above string encodings of all the cells, separated by the [sep] symbol. we then prefix the row linearization with utterance tokens as input sequence to the transformer.
+
+existing works have applied different linearization strategies to encode tables with transformers (hwang et al., 2019; chen et al., 2019), while our row approach is specifically designed for encoding content snapshots. we present in §5 results with different linearization choices.
+
+vertical self-attention mechanism the base transformer model in tabert outputs vector encodings of utterance and cell tokens for each row. these row-level vectors are computed separately and therefore independent of each other. to allow for information flow across cell representations of different rows, we propose vertical self-attention, a self-attention mechanism that operates over vertically aligned vectors from different rows.
+
+as in fig. 1(c), tabert has  $v$  stacked vertical-level self-attention layers. to generate aligned inputs for vertical attention, we first compute a fixed-length initial vector for each cell at position  $\langle i,j\rangle$ , which is given by mean-pooling over the sequence of the transformer's output vectors that correspond to its variable-length linearization as in eq. (1). next, the sequence of word vectors for the nl utterance (from the base transformer model) are concatenated with the cell vectors as initial inputs to the vertical attention layer.
+
+each vertical attention layer has the same parameterization as the transformer layer in (vaswani et al., 2017), but operates on vertically aligned elements, i.e., utterance and cell vectors that correspond to the same question token and column, respectively. this vertical self-attention mechanism enables the model to aggregate information from different rows in the content snapshot, allowing tabert to capture cross-row dependencies on cell values.
+
+utterance and column representations a representation  $\mathbf{c}_j$  is computed for each column  $c_j$  by mean-pooling over its vertically aligned cell vectors,  $\{\mathbf{s}_{\langle i,j\rangle}:r_i$  in content snapshot}, from the last vertical layer. a representation for each utterance token,  $\mathbf{x}_j$ , is computed similarly over the vertically aligned token vectors. these representations will be used by downstream neural semantic parsers. tabert also outputs an optional fixed-length table representation  $\mathbf{t}$  using the representation of the prefixed [cls] symbol, which is useful for parsers that operate on multiple db tables.
+
+# 3.2 pretraining procedure
+
+training data since there is no large-scale, high-quality parallel corpus of nl text and structured tables, we instead use semi-structured tables that commonly exist on the web as a surrogate data source. as a first step in this line, we focus on collecting parallel data in english, while extending to multilingual scenarios would be an
+
+interesting avenue for future work. specifically, we collect tables and their surrounding nl text from english wikipedia and the wdc webtable corpus (lehmberg et al., 2016), a large-scale table collection from commoncrawl. the raw data is extremely noisy, and we apply aggressive cleaning heuristics to filter out invalid examples (e.g., examples with html snippets or in foreign languages, and non-relational tables without headers). see appendix § a.1 for details of data pre-processing. the pre-processed corpus contains 26.6 million parallel examples of tables and nl sentences. we perform sub-tokenization using the wordpiece tokenizer shipped with bert.
+
+unsupervised learning objectives we apply different objectives for learning representations of the nl context and structured tables. for nl contexts, we use the standard masked language modeling (mlm) objective (devlin et al., 2019), with a masking rate of  $15\%$  sub-tokens in an nl context.
+
+for learning column representations, we design two objectives motivated by the intuition that a column representation should contain both the general information of the column (e.g., its name and data type), and representative cell values relevant to the nl context. first, a masked column prediction (mcp) objective encourages the model to recover the names and data types of masked columns. specifically, we randomly select  $20\%$  of the columns in an input table, masking their names and data types in each row linearization (e.g., if the column year in fig. 1 is selected, the tokens year and real in eq. (1) will be masked). given the column representation  $\mathbf{c}_j$ , tabert is trained to predict the bag of masked (name and type) tokens from  $\mathbf{c}_j$  using a multi-label classification objective. intuitively, mcp encourages the model to recover column information from its contexts.
+
+next, we use an auxiliary cell value recovery (cvr) objective to ensure information of representative cell values in content snapshots is retained after additional layers of vertical self-attention. specifically, for each masked column  $c_{j}$  in the above mcp objective, cvr predicts the original tokens of each cell  $s_{\langle i,j\rangle}$  (of  $c_{j}$ ) in the content snapshot conditioned on its cell vector  $\mathbf{s}_{\langle i,j\rangle}$ . for instance, for the example cell  $s_{\langle 2,1\rangle}$  in eq. (1), we predict its value 2005 from  $\mathbf{s}_{\langle 2,1\rangle}$ . since a cell
+
+could have multiple value tokens, we apply the span-based prediction objective (joshi et al., 2019). specifically, to predict a cell token  $s_{\langle i,j\rangle_k} \in s_{\langle i,j\rangle}$ , its positional embedding  $\mathbf{e}_k$  and the cell representations  $\mathbf{s}_{\langle i,j\rangle}$  are fed into a two-layer network  $f(\cdot)$  with gelu activations (hendrycks and gimpel, 2016). the output of  $f(\cdot)$  is then used to predict the original value token  $s_{\langle i,j\rangle_k}$  from a softmax layer.
+
+# 4 example application: semantic parsing over tables
+
+we apply tabert for representation learning on two semantic parsing paradigms, a classical supervised text-to-sql task over structured dbs (§ 4.1), and a weakly supervised parsing problem on semistructured web tables (§ 4.2).
+
+# 4.1 supervised semantic parsing
+
+benchmark dataset supervised learning is the typical scenario of learning a parser using parallel data of utterances and queries. we use spider (yu et al., 2018c), a text-to-sql dataset with 10,181 examples across 200 dbs. each example consists of an utterance (e.g., "what is the total number of languages used in aruba?"), a db with one or more tables, and an annotated sql query, which typically involves joining multiple tables to get the answer (e.g., select count(*) from country join lang on country.code = lang.countrycode where name = 'aruba').
+
+base semantic parser we aim to show tabert could help improve upon an already strong parser. unfortunately, at the time of writing, none of the top systems on spider were publicly available. to establish a reasonable testbed, we developed our in-house system based on tranx (yin and neubig, 2018), an open-source general-purpose semantic parser. tranx translates an nl utterance into an intermediate meaning representation guided by a user-defined grammar. the generated intermediate mr could then be deterministically converted to domain-specific query languages (e.g., sql).
+
+we use tabert as encoder of utterances and table schemas. specifically, for a given utterance  $\mathbf{u}$  and a db with a set of tables  $\mathcal{t} = \{t_t\}$ , we first pair  $\mathbf{u}$  with each table  $t_{t}$  in  $\mathcal{t}$  as inputs to tabert, which generates  $|\mathcal{t}|$  sets of table-specific representations of utterances and columns. at each time step, an lstm decoder performs hierarchical attention (libovický and helcl, 2017) over the list of table-specific representations, constructing an
+
+mr based on the predefined grammar. following the irnet model (guo et al., 2019) which achieved the best performance on spider, we use semql, a simplified version of the sql, as the underlying grammar. we refer interested readers to appendix § b.1 for details of our system.
+
+# 4.2 weakly supervised semantic parsing
+
+benchmark dataset weakly supervised semantic parsing considers the reinforcement learning task of inferring the correct query from its execution results (i.e., whether the answer is correct). compared to supervised learning, weakly supervised parsing is significantly more challenging, as the parser does not have access to the labeled query, and has to explore the exponentially large search space of possible queries guided by the noisy binary reward signal of execution results.
+
+wikitablequestions (pasupat and liang, 2015) is a popular dataset for weakly supervised semantic parsing, which has 22,033 utterances and 2,108 semi-structured web tables from wikipedia. compared to spider, examples in this dataset do not involve joining multiple tables, but typically require compositional, multi-hop reasoning over a series of entries in the given table (e.g., to answer the example in fig. 1 the parser needs to reason over the row set  $\{r_2,r_3,r_5\}$ , locating the venue field with the largest value of year).
+
+base semantic parser mapo (liang et al., 2018) is a strong system for weakly supervised semantic parsing. it improves the sample efficiency of the reinforce algorithm by biasing the exploration of queries towards the high-rewarding ones already discovered by the model. mapo uses a domain-specific query language tailored to answering compositional questions on single tables, and its utterances and column representations are derived from an lstm encoder, which we replaced with our tabert model. see appendix § b.2 for details of mapo and our adaptation.
+
+# 5 experiments
+
+in this section we evaluate tabert on downstream tasks of semantic parsing to db tables.
+
+pretraining configuration we train two variants of the model,  $\mathrm{tabert_{base}}$  and  $\mathrm{tabert_{large}}$ ,
+
+with the underlying transformer model initialized with the uncased versions of  $\mathrm{bert_{base}}$  and  $\mathrm{bert}_{\mathrm{large}}$ , respectively. during pretraining, for each table and its associated nl context in the corpus, we create a series of training instances of paired nl sentences (as synthetically generated utterances) and tables (as content snapshots) by (1) sliding a (non-overlapping) context window of sentences with a maximum length of 128 tokens, and (2) using the nl tokens in the window as the utterance, and pairing it with randomly sampled rows from the table as content snapshots. tabert is implemented in pytorch using distributed training. refer to appendix § a.2 for details of pretraining.
+
+comparing models we mainly present results for two variants of tabert by varying the size of content snapshots  $k$ . tabert( $\mathbf{k} = 3$ ) uses three rows from input tables as content snapshots and three vertical self-attention layers. tabert( $\mathbf{k} = 1$ ) uses one synthetically generated row as the content snapshot as described in § 3.1. since this model does not have multi-row input, we do not use additional vertical attention layers (and the cell value recovery learning objective). its column representation  $\mathbf{c}_j$  is defined by mean-pooling over the transformer's output encodings that correspond to the column name (e.g., the representation for the year column in fig. 1) is derived from the vector of the year token in eq. (1)). we find this strategy gives better results compared with using the cell representation  $\mathbf{s}_j$  as  $\mathbf{c}_j$ . we also compare with bert using the same row linearization and content snapshot approach as tabert( $\mathbf{k} = 1$ ), which reduces to a tabert( $\mathbf{k} = 1$ ) model without pretraining on tabular corpora.
+
+evaluation metrics as standard, we report execution accuracy on wikitablequestions and exact-match accuracy of db queries on spider.
+
+# 5.1 main results
+
+tab. 1 and tab. 2 summarize the end-to-end evaluation results on wikitablequestions and spider, respectively. first, comparing with existing strong semantic parsing systems, we found our parsers with tabert as the utterance and table encoder perform competitively. on the test set of
+
+<table><tr><td colspan="3">previous systems on wikitablequestions</td></tr><tr><td>model</td><td>dev</td><td>test</td></tr><tr><td>pasupat and liang (2015)</td><td>37.0</td><td>37.1</td></tr><tr><td>neelakantan et al. (2016)</td><td>34.1</td><td>34.2</td></tr><tr><td>ensemble 15 models</td><td>37.5</td><td>37.7</td></tr><tr><td>zhang et al. (2017)</td><td>40.6</td><td>43.7</td></tr><tr><td>dasigi et al. (2019)</td><td>43.1</td><td>44.3</td></tr><tr><td>agarwal et al. (2019)</td><td>43.2</td><td>44.1</td></tr><tr><td>ensemble 10 models</td><td>-</td><td>46.9</td></tr><tr><td>wang et al. (2019b)</td><td>43.7</td><td>44.5</td></tr></table>
+
+<table><tr><td colspan="5">our system based on mapo (liang et al., 2018)</td></tr><tr><td></td><td>dev</td><td>best</td><td>test</td><td>best</td></tr><tr><td>base parse†</td><td>42.3 ±0.3</td><td>42.7</td><td>43.1 ±0.5</td><td>43.8</td></tr><tr><td>w/ bertbase (k = 1)</td><td>49.6 ±0.5</td><td>50.4</td><td>49.4 ±0.5</td><td>49.2</td></tr><tr><td>- content snapshot</td><td>49.1 ±0.6</td><td>50.0</td><td>48.8 ±0.9</td><td>50.2</td></tr><tr><td>w/ tabertbase (k = 1)</td><td>51.2 ±0.5</td><td>51.6</td><td>50.4 ±0.5</td><td>51.2</td></tr><tr><td>- content snapshot</td><td>49.9 ±0.4</td><td>50.3</td><td>49.4 ±0.4</td><td>50.0</td></tr><tr><td>w/ tabertbase (k = 3)</td><td>51.6 ±0.5</td><td>52.4</td><td>51.4 ±0.3</td><td>51.3</td></tr><tr><td>w/ bertlarge (k = 1)</td><td>50.3 ±0.4</td><td>50.8</td><td>49.6 ±0.5</td><td>50.1</td></tr><tr><td>w/ tabertlarge (k = 1)</td><td>51.6 ±1.1</td><td>52.7</td><td>51.2 ±0.9</td><td>51.5</td></tr><tr><td>w/ tabertlarge (k = 3)</td><td>52.2 ±0.7</td><td>53.0</td><td>51.8 ±0.6</td><td>52.3</td></tr></table>
+
+wikitablequestions, mapo augmented with a  $\mathrm{tabertlarge}$  model with three-row content snapshots,  $\mathrm{tabertlarge}(\mathrm{k} = 3)$ , registers a single-model exact-match accuracy of  $52.3\%$ , surpassing the previously best ensemble system  $(46.9\%)$  from agarwal et al. (2019) by  $5.4\%$  absolute.
+
+on spider, our semantic parser based on tranx and sesml (§ 4.1) is conceptually similar to the base version of irnet as both systems use the sesml grammar, while our system has a simpler decoder. interestingly, we observe that its performance with bert<sub>base</sub> (61.8%) matches the full bert-augmented irnet model with a stronger decoder using augmented memory and coarse-to-fine decoding (61.9%). this confirms that our base parser is an effective baseline. augmented with representations produced by tabert<sub>large</sub>(k = 3), our parser achieves up to 65.2% exact-match accuracy, a 2.8% increase over the base model using bert<sub>base</sub>. note that while other competitive systems on the leaderboard use bert with more sophisticated semantic parsing models, our best dev. result is already close to the score registered by the best submission (ryansql+bert). this suggests that if they instead used tabert as the representation layer, they would see further gains.
+
+comparing semantic parsers augmented with tabert and bert, we found tabert is more effective across the board. we hypothesize that the
+
+table 1: execution accuracies on wikitablequestions. results from liang et al. (2018). (ta)bert models are evaluated with 10 random runs. we report mean, standard deviation and the best results. test  $\mapsto$  best refers to the result from the run with the best performance on dev. set.  
+
+<table><tr><td colspan="2">top-ranked systems on spider leaderboard</td></tr><tr><td>model</td><td>dev. acc.</td></tr><tr><td>global-gnn (bogin et al., 2019a)</td><td>52.7</td></tr><tr><td>editsql + bert (zhang et al., 2019a)</td><td>57.6</td></tr><tr><td>ratsql (wang et al., 2019a)</td><td>60.9</td></tr><tr><td>irnet + bert (guo et al., 2019)</td><td>60.3</td></tr><tr><td>+ memory + coarse-to-fine</td><td>61.9</td></tr><tr><td>irnet v2 + bert</td><td>63.9</td></tr><tr><td>ryansql + bert (choi et al., 2020)</td><td>66.6</td></tr></table>
+
+<table><tr><td colspan="3">our system based on tranx (yin and neubig, 2018)</td></tr><tr><td></td><td>mean</td><td>best</td></tr><tr><td>w/ bertbase (k = 1)</td><td>61.8 ±0.8</td><td>62.4</td></tr><tr><td>- content snapshot</td><td>59.6 ±0.7</td><td>60.3</td></tr><tr><td>w/ tabertbase (k = 1)</td><td>63.3 ±0.6</td><td>64.2</td></tr><tr><td>- content snapshot</td><td>60.4 ±1.3</td><td>61.8</td></tr><tr><td>w/ tabertbase (k = 3)</td><td>63.3 ±0.7</td><td>64.1</td></tr><tr><td>w/ bertlarge (k = 1)</td><td>61.3 ±1.2</td><td>62.9</td></tr><tr><td>w/ tabertlarge (k = 1)</td><td>64.0 ±0.4</td><td>64.4</td></tr><tr><td>w/ tabertlarge (k = 3)</td><td>64.5 ±0.6</td><td>65.2</td></tr></table>
+
+table 2: exact match accuracies on the public development set of spider. models are evaluated with 5 random runs.
+
+performance improvements would be attributed by two factors. first, pre-training on large parallel textual and tabular corpora helps tabert learn to encode structure-rich tabular inputs in their linearized form (eq. (1)), whose format is different from the ordinary natural language data that bert is trained on. second, pre-training on parallel data could also helps the model produce representations that better capture the alignment between an utterance and the relevant information presented in the structured schema, which is important for semantic parsing.
+
+overall, the results on the two benchmarks demonstrate that pretraining on aligned textual and tabular data is necessary for joint understanding of nl utterances and tables, and tabert works well with both structured (spider) and semi-structured (wikitablequestions) dbs, and agnostic of the task-specific structures of semantic parsers.
+
+effect of content snapshots in this paper we propose using content snapshots to capture the information in input db tables that is most relevant to answering the nl utterance. we therefore study the effectiveness of including content snapshots when generating schema representations. we include in tab. 1 and tab. 2 results of models without using content in row linearization ("content snapshot"). under this setting a column is represented as "column name | type" without cell values (c.f., eq. (1)). we find that content snap
+
+<table><tr><td colspan="4">u: how many years before was the film bacchae out before the watermelon?</td></tr><tr><td colspan="4">input to tabertlarge (k = 3) ▷ content snapshot with three rows</td></tr><tr><td>film</td><td>year</td><td>function</td><td>notes</td></tr><tr><td>the bacchae</td><td>2002</td><td>producer</td><td>screen adaptation of...</td></tr><tr><td>the trojan women</td><td>2004</td><td>producer/actress</td><td>documutary film...</td></tr><tr><td>the watermelon</td><td>2008</td><td>producer</td><td>oddball romantic comedy...</td></tr><tr><td colspan="4">input to tabertlarge (k = 1) ▷ content snapshot with one synthetic row</td></tr><tr><td>film</td><td>year</td><td>function</td><td>notes</td></tr><tr><td>the watermelon</td><td>2013</td><td>producer</td><td>screen adaptation of...</td></tr></table>
+
+shots are helpful for both bert and tabert, especially for tabert. as discussed in § 3.1, encoding sampled values from columns in learning their representations helps the model infer alignments between entity and relational phrases in the utterance and the corresponding column. this is particularly helpful for identifying relevant columns from a db table that is mentioned in the input utterance. as an example, empirically we observe that on spider our semantic parser with tabertbase using just one row of content snapshots  $(\mathrm{k} = 1)$  registers a higher accuracy of selecting the correct columns when generating sql queries (e.g., columns in select and where clauses), compared to the tabertbase model without encoding content information  $(87.4\%$  v.s.  $86.4\%)$ .
+
+additionally, comparing tabert using one synthetic row  $(\mathrm{k} = 1)$  and three rows from input tables  $(\mathrm{k} = 3)$  as content snapshots, the latter generally performs better. intuitively, encoding more table contents relevant to the input utterance could potentially help answer questions that involve reasoning over information across multiple rows in the table. tab. 3 shows such an example, and to answer this question a parser need to subtract the values of year in the rows for "the watermelon" and "the bacchae".  $\mathrm{tabertlarge}$ $(\mathrm{k} = 3)$  is able to capture the two target rows in its content snapshot and generates the correct db query, while the  $\mathrm{tabertlarge}$ $(\mathrm{k} = 1)$  model with only one row as content snapshot fails to answer this example.
+
+effect of row linearization tabert uses row linearization to represent a table row as sequential input to transformer. tab. 4 (upper half) presents results using various linearization methods. we find adding type information and content snapshots improves performance, as they provide more hints about the meaning of a column.
+
+we also compare with existing linearization methods in literature using a tabert<sub>base</sub> model,
+
+table 3: content snapshots generated by two models for a wikitablequestions dev. example. matched tokens between the question and content snapshots are underlined.  
+
+<table><tr><td colspan="2">cell linearization template</td><td>wikiq.</td><td>spider</td></tr><tr><td colspan="4">pretrained tabertbase models (k = 1)</td></tr><tr><td>column name</td><td></td><td>49.6 ±0.4</td><td>60.0 ±1.1</td></tr><tr><td>column name | type† (−content snap.)</td><td></td><td>49.9 ±0.4</td><td>60.4 ±1.3</td></tr><tr><td>column name | type | cell value†</td><td></td><td>51.2 ±0.5</td><td>63.3 ±0.6</td></tr><tr><td colspan="4">bertbase models</td></tr><tr><td>column name (hwang et al., 2019)</td><td></td><td>49.0 ±0.4</td><td>58.6 ±0.3</td></tr><tr><td>column name is cell value (chen19)</td><td></td><td>50.2 ±0.4</td><td>63.1 ±0.7</td></tr></table>
+
+table 4: performance of pretrained tabertbase models and bertbase on the dev. sets with different linearization methods. slot names are underlined. results copied from tab. 1 and tab. 2.  
+
+<table><tr><td>learning objective</td><td>wikiq.</td><td>spider</td></tr><tr><td>mcp only</td><td>51.6 ±0.7</td><td>62.6 ±0.7</td></tr><tr><td>mcp + cvr</td><td>51.6 ±0.5</td><td>63.3 ±0.7</td></tr></table>
+
+table 5: performance of pretrained  $\mathrm{tabert_{base}}(\mathrm{k} = 3)$  on dev. sets with different pretraining objectives.
+
+with results shown in tab. 4 (lower half). hwang et al. (2019) uses bert to encode concatenated column names to learn column representations. in line with our previous discussion on the effectiveness content snapshots, this simple strategy without encoding cell contents underperforms (although with  $\mathrm{tabert_{base}}$  pretrained on our tabular corpus the results become slightly better). additionally, we remark that linearizing table contents has also been applied to other bert-based tabular reasoning tasks. for instance, chen et al. (2019) propose a "natural" linearization approach for checking if an nl statement entails the factual information listed in a table using a binary classifier with representations from bert, where a table is linearized by concatenating the semicolon-separated cell linearization for all rows. each cell is represented by a phrase "column name is cell value". for completeness, we also tested this cell linearization approach, and find  $\mathrm{bert_{base}}$  achieved improved results. we leave pretraining tabert with this linearization strategy as promising future work.
+
+impact of pretraining objectives tabert uses two objectives (§ 3.2), a masked column prediction (mcp) and a cell value recovery (cvr) objective, to learn column representations that could capture both the general information of the column (via mcp) and its representative cell values related to the utterance (via cvr). tab. 5 shows ablation results of pretraining tabert with different objectives. we find tabert trained with both mcp and the auxiliary cvr objectives gets a slight advantage, suggesting cvr could potentially lead to more representative column representations with additional cell information.
+
+# 6 related works
+
+semantic parsing over tables tables are important media of world knowledge. semantic parsers have been adapted to operate over structured db tables (wang et al., 2015; xu et al., 2017; dong and lapata, 2018; yu et al., 2018b; shi et al., 2018; wang et al., 2018), and open-domain, semistructured web tables (pasupat and liang, 2015; sun et al., 2016; neelakantan et al., 2016). to improve representations of utterances and tables for neural semantic parsing, existing systems have applied pretrained word embeddings (e.g., glove, as in zhong et al. (2017); yu et al. (2018a); sun et al. (2018); liang et al. (2018)), and bert-family models for learning joint contextual representations of utterances and tables, but with domain-specific approaches to encode the structured information in tables (hwang et al., 2019; he et al., 2019; guo et al., 2019; zhang et al., 2019a). tabert advances this line of research by presenting a general-purpose, pretrained encoder over parallel corpora of web tables and nl context. another relevant direction is to augment representations of columns from an individual table with global information of its linked tables defined by the db schema (bogin et al., 2019a; wang et al., 2019a). tabert could also potentially improve performance of these systems with improved table-level representations.
+
+knowledge-enhanced pretraining recent pretraining models have incorporated structured information from knowledge bases (kbs) or other structured semantic annotations into training contextual word representations, either by fusing vector representations of entities and relations on kbs into word representations of lms (peters et al., 2019; zhang et al., 2019b,c), or by encouraging the lm to recover kb entities and relations from text (sun et al., 2019; liu et al., 2019a). tabert is broadly relevant to this line in that it also exposes an lm with structured data (i.e., tables), while aiming to learn joint representations for both textual and structured tabular data.
+
+# 7 conclusion and future work
+
+we present tabert, a pretrained encoder for joint understanding of textual and tabular data. we show that semantic parsers using tabert as a general-purpose feature representation layer achieved strong results on two benchmarks. this work also opens up several avenues for future work.
+
+first, we plan to evaluate tabert on other related tasks involving joint reasoning over textual and tabular data (e.g., table retrieval and table-to-text generation). second, following the discussions in § 5, we will explore other table linearization strategies with transformers, improving the quality of pretraining corpora, as well as novel unsupervised objectives. finally, to extend tabert to cross-lingual settings with utterances in foreign languages and structured schemas defined in english, we plan to apply more advanced semantic similarity metrics for creating content snapshots.
+
+# references
+
+rishabh agarwal, chen liang, dale schuurmans, and mohammad norouzi. 2019. learning to generalize from sparse and underspecified rewards. in icml.  
+jonathan berant, andrew chou, roy frostig, and percy liang. 2013. semantic parsing on freebase from question-answer pairs. in proceedings of emnlp.  
+jonathan berant and percy liang. 2014. semantic parsing via paraphrasing. in proceedings of acl.  
+ben boin, matt gardner, and jonathan berant. 2019a. global reasoning over database structures for text-tosql parsing. *arxiv*, abs/1908.11214.  
+ben bogin, matthew gardner, and jonathan berant. 2019b. representing schema structure with graph neural networks for text-to-sql parsing. in proceedings of acl.  
+wenhu chen, hongmin wang, jianshu chen, yunkai zhang, hong wang, shiyang li, xiyou zhou, and william yang wang. 2019. tabfact: a large-scale dataset for table-based fact verification. arxiv, abs/1909.02164.  
+donghyun choi, myeong cheol shin, eunggyun kim, and dong ryeol shin. 2020. *ryansql: recursively applying sketch-based slot fillings for complex text-to-sql in cross-domain databases.* arxiv, abs/2004.03125.  
+pradeep dasigi, matt gardner, shikhar murty, luke s. zettlemoyer, and eduard h. hovy. 2019. iterative search for weakly supervised semantic parsing. in proceedings of naacl-hlt.  
+jacob devlin, ming-wei chang, kenton lee, and kristina toutanova. 2019. bert: pre-training of deep bidirectional transformers for language understanding. in proceedings of naacl-hlt.  
+li dong and mirella lapata. 2018. coarse-to-fine decoding for neural semantic parsing. in proceedings of acl.
+
+yoav goldberg. 2019. assessing bert's syntactic abilities. arxiv, abs/1901.05287.  
+jiaqi guo, zecheng zhan, yan gao, yan xiao, jian-guang lou, ting liu, and dongmei zhang. 2019. towards complex text-to-sql in cross-domain database with intermediate representation. in proceedings of acl.  
+pengcheng he, yi mao, kaushik chakrabarti, and weizhu chen. 2019. x-sql: reinforce schema representation with context. arxiv, abs/1908.08113.  
+dan hendrycks and kevin gimpel. 2016. gaussian error linear units (gelus). arxiv, abs/1606.08415.  
+wonseok hwang, jinyeung yim, seunghyun park, and minjoon seo. 2019. a comprehensive exploration on wikisql with table-aware word contextualization. arxiv, abs/1902.01069.  
+mandar joshi, danqi chen, yinhan liu, daniel s. weld, luke s. zettlemoyer, and omer levy. 2019. spanbert: improving pre-training by representing and predicting spans. in proceedings of emnlp.  
+jayant krishnamurthy, pradeep dasigi, and matt gardner. 2017. neural semantic parsing with type constraints for semi-structured tables. in proceedings of emnlp.  
+oliver lehmberg, dominique ritze, robert meusel, and christian bizer. 2016. a large public corpus of web tables containing time and context metadata. in proceedings of www.  
+chen liang, mohammad norouzi, jonathan berant, quoc v le, and ni lao. 2018. memory augmented policy optimization for program synthesis and semantic parsing. in proceedings of nips.  
+jindrich libovicky and jindrich helcl. 2017. attention strategies for multi-source sequence-to-sequence learning. in proceedings of acl.  
+weijie liu, peng zhou, zhe zhao, zhiruo wang, qi ju, haotang deng, and ping wang. 2019a. k-bert: enabling language representation with knowledge graph. arxiv, abs/1909.07606.  
+yinhan liu, myle ott, naman goyal, jingfei du, mandar joshi, danqi chen, omer levy, mike lewis, luke s. zettlemoyer, and veselin stoyanov. 2019b. roberta: a robustly optimized bert pretraining approach. arxiv, abs/1907.11692.  
+bryan mccann, james bradbury, caiming xiong, and richard socher. 2017. learned in translation: contextualized word vectors. in proceedings of nips.  
+oren melamud, jacob goldberger, and ido dagan. 2016. context2vec: learning generic context embedding with bidirectional lstm. in proceedings of conll.
+
+arvind neelakantan, quoc v. le, and ilya sutskever. 2016. neural programmer: inducing latent programs with gradient descent. in proceedings of iclr.  
+panupong pasupat and percy liang. 2015. compositional semantic parsing on semi-structured tables. in proceedings of acl.  
+matthew e. peters, mark neumann, mohit iyyer, matt gardner, christopher clark, kenton lee, and luke s. zettlemoyer. 2018. deep contextualized word representations. in proceedings of naacl.  
+matthew e. peters, mark neumann, iv robertllogan, roy schwartz, vidur joshi, sameer singh, and noah a. smith. 2019. knowledge enhanced contextual word representations. in proceedings of emnlp.  
+pranav rajpurkar, jian zhang, konstantin lopyrev, and percy liang. 2016. squad: 100, 000+ questions for machine comprehension of text. in proceedings of emnlp.  
+tianze shi, kedar tatwawadi, kaushik chakrabarti, yi mao, oleksandr polozov, and weizhu chen. 2018. incsql: training incremental text-to-sql parsers with non-deterministic oracles. arxiv, abs/1809.05054.  
+huan sun, hao ma, xiaodong he, wen tau yih, yu su, and xifeng yan. 2016. table cell search for question answering. in proceedings of www.  
+yibo sun, duyu tang, nan duan, jianshu ji, guihong cao, xiaocheng feng, bing qin, ting liu, and ming zhou. 2018. semantic parsing with syntax- and table-aware sql generation. in proceedings of emnlp.  
+yu sun, shuohuan wang, yukun li, shikun feng, xuyi chen, han zhang, xin tian, danxiang zhu, hao tian, and hua wu. 2019. ernie: enhanced representation through knowledge integration. arxiv, abs/1904.09223.  
+ashish vaswani, noam shazeer, niki parmar, jakob uszkoreit, llion jones, aidan n. gomez, lukasz kaiser, and illia polosukhin. 2017. attention is all you need. in proceedings of nips.  
+bailin wang, richard shin, xiaodong liu, oleksandr polozov, and margot richardson. 2019a. rat-sql: relation-aware schema encoding and linking for text-to-sql parsers. arxiv, abs/1911.04942.  
+bailin wang, ivan titov, and mirella lapata. 2019b. learning semantic parsers from denotations with latent structured alignments and abstract programs. in emnlp/ijcnlp.  
+chenglong wang, kedar tatwawadi, marc brockschmidt, po-sen huang, yi xin mao, oleksandr polozov, and rishabh singh. 2018. robust text-to-sql generation with execution-guided decoding. arxiv, abs/1807.03100.
+
+daniel c. wang, andrew w. appel, jeffrey l. korn, and christopher s. serra. 1997. the zephyr abstract syntax description language. in proceedings of dsl.  
+yushi wang, jonathan berant, and percy liang. 2015. building a semantic parser overnight. in proceedings of acl.  
+xiaojun xu, chang liu, and dawn song. 2017. sql-net: generating structured queries from natural language without reinforcement learning. arxiv, abs/1711.04436.  
+zhilin yang, zihang dai, yiming yang, jaime g. carbonell, ruslan salakhutdinov, and quoc v. le. 2019. xlnet: generalized autoregressive pretraining for language understanding. in proceedings of nips.  
+wen-tau yih, ming-wei chang, xiaodong he, and jianfeng gao. 2015. semantic parsing via staged query graph generation: question answering with knowledge base. in proceedings of acl.  
+pengcheng yin and graham neubig. 2018. tranx: a transition-based neural abstract syntax parser for semantic parsing and code generation. in proceedings of emnlp demonstration track.  
+tao yu, zifan li, zilin zhang, rui zhang, and dragomir r. radev. 2018a. typesql: knowledge-based type-aware neural text-to-sql generation. in proceedings of naacl-hlt.  
+tao yu, michihiro yasunaga, kai yang, rui zhang, dongxu wang, zifan li, and dragomir r. radev. 2018b. syntaxsqlnet: syntax tree networks for complex and cross-domain text-to-sql task. in proceedings of emnlp.  
+tao yu, rui zhang, kai yang, michihiro yasunaga, dongxu wang, zifan li, james ma, irene li, qingning yao, shanelle roman, zilin zhang, and dragomir r. radev. 2018c. spider: a large-scale human-labeled dataset for complex and cross-domain semantic parsing and text-to-sql task. in proceedings of emnlp.  
+john m. zelle and raymond j. mooney. 1996. learning to parse database queries using inductive logic programming. in proceedings of aaai.  
+rui zhang, tao yu, he yang er, sungrok shim, eric xue, xi victoria lin, tianze shi, caiming xiong, richard socher, and dragomir r. radev. 2019a. editing-based sql query generation for cross-domain context-dependent questions. arxiv, abs/1909.00786.  
+yuchen zhang, panupong pasupat, and percy liang. 2017. macro grammars and holistic triggering for efficient semantic parsing. in proceedings of emnlp.  
+zhengyan zhang, xu han, zhiyuan liu, xin jiang, maosong sun, and qun liu. 2019b. ernie: enhanced language representation with informative entities. in proceedings of acl.
+
+zhuosheng zhang, yu-wei wu, hai zhao, zuchao li, shuaijiang zhang, xi zhou, and xiaodong zhou. 2019c. semantics-aware bert for language understanding. arxiv, abs/1909.02209.  
+victor zhong, caiming xiong, and richard socher. 2017. seq2sql: generating structured queries from natural language using reinforcement learning. arxiv, abs/1709.00103.
+
+# tabert: pretraining for joint understanding of textual and tabular data supplementary materials
+
+# a pretraining details
+
+# a.1 training data
+
+we collect parallel examples of tables and their surrounding nl sentences from two sources:
+
+wikipedia tables we extract all the tables on english wikipedia<sup>9</sup>. for each table, we use the preceding three paragraphs as the nl context, as we observe that most wiki tables are located after where they are described in the body text.
+
+wdc webtable corpus (lehmberg et al., 2016) is a large collection of web tables extracted from the common crawl web scrap $^{10}$ . we use its 2015 english-language relational subset, which consists of 50.8 million relational tables and their surrounding nl contexts.
+
+preprocessing our dataset is collected from arbitrary web tables, which are extremely noisy. we develop a set of heuristics to clean the data by: (1) removing columns whose names have more than 10 tokens; (2) filtering cells with more than two non-ascii characters or 20 tokens; (3) removing empty or repetitive rows and columns; (4) filtering tables with less than three rows and four columns, and (5) running spacy to identify the data type of columns (text or real value) by majority voting over the ner labels of column tokens, (6) rotating vertically oriented tables. we sub-tokenize the corpus using the wordpiece tokenizer in devlin et al. (2019). the pre-processing results in 1.3 million tables from wikipedia and 25.3 million tables from the wdc corpus.
+
+# a.2 pretraining setup
+
+as discussed in § 5, we create training instances of nl sentences (as synthetic utterances) and content snapshots from tables by sampling from the parallel corpus of nl contexts and tables. each epoch contains  $37.6m$  training instances. we train tabert for 10 epochs. tab. 6 lists the hyper-parameters used in training. learning rates are validated on the development set of wikitablequestions. we use a batch size of 512 for large models to reduce training time. the training objective is sum of the three pretraining objectives in § 3.2 (masked language modeling objective for utterance tokens, masked column prediction<sup>11</sup> and column value recovery objectives for columns and their cell values). our largest model  $\mathrm{tabert}_{\mathrm{large}}(\mathrm{k} = 3)$  takes six days to train for 10 epochs on 128 tesla v100 gpus using mixed precision training.
+
+<table><tr><td>parameter</td><td>tabertbase(k = 1)</td><td>tabertlarge(k = 1)</td><td>tabertbase(k = 3)</td><td>tabertlarge(k = 3)</td></tr><tr><td>batch size</td><td>256</td><td>512</td><td>512</td><td>512</td></tr><tr><td>learning rate</td><td>2 × 10-5</td><td>2 × 10-5</td><td>4 × 10-5</td><td>4 × 10-5</td></tr><tr><td>max epoch</td><td></td><td></td><td>10</td><td></td></tr><tr><td>weight decay</td><td></td><td></td><td>0.01</td><td></td></tr><tr><td>gradient norm clipping</td><td></td><td></td><td>1.0</td><td></td></tr></table>
+
+table 6: hyper-parameters using in pretraining
+
+# b semantic parsing
+
+# b.1 supervised parsing on spider
+
+model we develop our text-to-sql parser based on tranx (yin and neubig, 2018), which translates an nl utterance into a tree-structured abstract meaning representation following user-specified grammar, before deterministically convert the generated abstract mr into an sql query. tranx models the
+
+construction process of an abstract mr (tree-structured representation of an sql query) using a transition-based system, which decomposes its generation story into a sequence of actions following the user defined grammar.
+
+formally, given an input nl utterance  $\mathbf{u}$  and a database with a set of tables  $\mathcal{t} = \{t_i\}$ , the probability of generating of an sql query (i.e., its semantically equivalent mr)  $z$  is decomposed as the production of action probabilities:
+
+$$
+p (\boldsymbol {z} | \boldsymbol {u}, \mathcal {t}) = \prod p \left(a _ {t} \mid a _ {<   t}, \boldsymbol {u}, \mathcal {t}\right) \tag {2}
+$$
+
+where  $a_{t}$  is the action applied to the hypothesis at time stamp  $t$ .  $a_{<t}$  denote the previous action history. we refer readers to yin and neubig (2018) for details of the transition system and how individual action probabilities are computed. in our adaptation of tranx to text-to-sql parsing on spider, we follow guo et al. (2019) and use sesml as the underlying grammar, which is a simplification of the sql language. fig. 2 lists the sesml grammar specified using the abstract syntax description language (wang et al., 1997). intuitively, the generation starts from a tree-structured derivation with the root production rule select_stmt  $\mapsto$  selectstatement, which lays out overall the structure of an sql query. at each time step, the decoder algorithm locates the current opening node on the derivation tree, following a depth-first, left-to-right order. if the opening node is not a leaf node, the decoder invokes an action  $a_{t}$  which expands the opening node using a production rule with appropriate type. if the current opening node is a leaf node (e.g., a node denoting string literal), the decoder fills in the leaf node using actions that emit terminal values.
+
+to use such a transition system to generate sql queries, we extend its action space with two new types of actions, selecttable  $(t_{i})$  for node of type table_ref in fig. 2, which selects a table  $t_{i}$  (e.g., for predicting target tables for a from clause), and selectcolumn  $(t_{i}, c_{j})$  for node of type column_ref, which selects the column  $c_{j}$  from table  $t_{i}$  (e.g., for predicting a result column used in the select clause).
+
+as described in § 4.1, tabert produces a list of entries, with one entry  $\langle \mathbf{t}_i, \mathbf{x}_i, \mathbf{c}_i \rangle$  for each table  $t_i$ :
+
+$$
+\mathbb {m} = \left\{\langle \mathbf {t} _ {i}, \mathbf {x} _ {i} = \left\{\mathbf {x} _ {1}, \mathbf {x} _ {2}, \dots \right\}, \mathbf {c} _ {i} = \left\{\mathbf {c} _ {1}, \mathbf {c} _ {2}, \dots , \right\} \rangle_ {i} \right\} _ {i = 1} ^ {| \mathcal {t} |} \tag {3}
+$$
+
+where each entry  $\langle \mathbf{t}_i, \mathbf{x}_i, \mathbf{c}_i \rangle$  in  $\mathbb{m}$  consists of  $\mathbf{t}_i$ , the representation of table  $t_i$  given by the output vector of the prefixed [cls] symbol, the table-specific representations of utterance tokens  $\mathbf{x}_i = \{\mathbf{x}_1, \mathbf{x}_2, \ldots\}$ , and representations of columns in  $t_i$ ,  $\mathbf{c}_i = \{\mathbf{c}_1, \mathbf{c}_2, \ldots\}$ . at each time step  $t$ , the decoder in tranx performs hierarchical attention over representations in  $\mathbb{m}$  to compute a context vector. first, a table-wise attention score is computed using the lstm's previous state,  $\mathbf{state}_{t-1}$  with the set of table representations.
+
+$$
+\operatorname {s c o r e} \left(t _ {i}\right) = \operatorname {s o f t m a x} \left(\operatorname {d o t p r o d u c t} \left(\mathbf {s t a t e} _ {t - 1}, \operatorname {k e y} \left(\mathbf {t} _ {i}\right)\right)\right), \tag {4}
+$$
+
+where the linear projection  $\mathrm{key}(\cdot) \in \mathbb{r}^{256}$  projects the table representations to key space. next, for each table  $t_i \in \mathcal{t}$ , a table-wise context vector  $\mathbf{ctx}(t_i)$  is generated by attending over the union of vectors in utterance token representations  $\mathbf{x}_i$  and column representations  $\mathbf{c}_i$ :
+
+$$
+\mathbf {c t x} \left(t _ {i}\right) = \operatorname {d o t p r o d u c t a t t e n t i o n} \left(\mathbf {s t a t e} _ {t - 1}, \operatorname {k e y} \left(\mathbf {x} _ {i} \cup \mathbf {c} _ {i}\right), \operatorname {v a l u e} \left(\mathbf {x} _ {i} \cup \mathbf {c} _ {i}\right)\right), \tag {5}
+$$
+
+with the lstm state as the query,  $\mathrm{key}(\cdot)$  as the key, and another linear transformation value  $(\cdot) \in \mathbb{r}^{256}$  to project the representations to value vectors. the final context vector is then given by the weighted sum of these table-wise context vectors  $\mathbf{ctx}(t_i)$  ( $i \in \{1, \dots, |\mathcal{t}|\}$ ) weighted by the attention scores score  $(t_i)$ . the generated context vector is then used to update the state of the decoder lstm to  $\mathbf{state}_t$ .
+
+the updated decoder state is then used to compute the probability of carrying out the action defined at time step  $t$ ,  $a_{t}$ . for a selecttable( $t_{i}$ ) action, its probability of is defined similarly as eq. (4). for a selectcolumn( $t_{i}, c_{j}$ ) action, it is factorized as the probability of selecting the table  $t_{i}$  (given by eq. (4)), times the probability of selecting the column  $c_{j}$ . the latter is defined as
+
+$$
+\operatorname {s c o r e} \left(c _ {j}\right) = \operatorname {s o f t m a x} \left(\operatorname {d o t p r o d u c t} \left(\mathbf {s t a t e} _ {t}, \mathbf {c} _ {j}\right)\right). \tag {6}
+$$
+
+```sql
+select stmt = selectstatement( distinct distinct, # distinct keyword expr* result-columns, # columns in select clause expr? where_clause, # where clause order_by_clause? order_by_clause, # order by clause int? limit_value, # limit clause table_ref* join_with_tables, # tables in the join clause compound stmt? compound_statement # compound statements (e.g., union, except) )   
+distinct = none | distinct   
+order_by_clause = orderbyclause(expr* expr_list, order order)   
+order = asc | desc   
+expr = andexpr(expr* expr_list) orexpr(expr* expr_list) notexpr(expr expr) compareexpr(compare_op op, expr left_value, expr right_value) aggregateexpr(aggregate_op op, expr value, distinct distinct) binaryexpr(binary_op op, expr left_value, expr right_value) betweenexpr(expr field, expr left_value, expr right_value) inexpr(column_ref left_value, expr right_value) likeexpr(column_ref left_value, expr right_value) allrows(table_ref table_name) selectstmt literal(string value) columnreference(column_ref column_name)   
+aggregate_op = sum | max | min | count | avg   
+compare_op = lessthan | lessthanequal | greaterthan | greaterthanequal | equal | notequal   
+binary_op = add | sub | divide | multiply   
+compound stmt = compoundstatement(compound_op op, select stmt query)   
+compound_op = union | intersect | except
+```
+
+figure 2: asdl grammar of semql used in tranx
+
+we also add simple entity linking features to the representations in  $\mathbb{m}$ , defined by the following heuristics: (1) if an utterance token  $x \in u$  matches with the name of a table  $t$ , we concatenate a trainable embedding vector (table_match  $\in \mathbb{r}^{16}$ ) to the representations of  $x$  and  $t$ . (2) similarly, we concatenate an embedding vector (column_match  $\in \mathbb{r}^{16}$ ) to the representations of an utterance token and a column if their names match. (3) finally, we concatenate a zero-vector  $(0 \in \mathbb{r}^{16})$  to representations of all unmatched elements.
+
+configuration we use the default configuration of tranx. for tabert parameters, we use an adam optimizer with a learning rate of  $3e - 5$  and linearly decayed learning rate schedule, and another adam optimizer with a constant learning rate of  $1e - 3$  for all remaining parameters. during training, we update model parameters for 25000 iterations, and freeze the tabert parameters at the first 1000 update steps. we use a batch size of 30 and beam size of 3. we use gradient accumulation for large models to fit a batch into gpu memory.
+
+# b.2 weakly-supervised parsing on wikitablequestions
+
+model we use mapo (liang et al., 2018), a strong weakly-supervised semantic parser. the original mapo models comes with an lstm encoder, which generates utterance and column representations used by the decoder to predict table queries. we directly substitute the encoder with tabert, and project the utterance and table representations from tabert to the original embedding space using a linear
+
+transformation. mapo uses a domain-specific query language tailored to answer compositional questions on a single table. for instance, the example question in fig. 1 could be answered using the following query
+
+<table><tr><td>table.contains(column=position, value=1st)</td><td># get rows whose &#x27;position&#x27; field contains &#x27;1st&#x27;</td></tr><tr><td>argon(order_by=year)</td><td># get the row which has the largest &#x27;year&#x27; field</td></tr><tr><td>.hop(column=venue)</td><td># select the value of &#x27;venue&#x27; in the result row</td></tr></table>
+
+mapo is written in tensorflow. in our experiments we use an optimized re-implementation in pytorch, which yields  $4 \times$  training speedup.
+
+configuration we use the same optimizer and learning rate schedule as in § b.1. we use a batch size of 10, and train the model for 20000 steps, with the tabert parameters frozen at the first 5000 steps. other hyper-parameters are kept the same as the original mapo system.

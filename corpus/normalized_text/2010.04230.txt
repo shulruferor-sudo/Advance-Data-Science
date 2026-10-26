@@ -1,0 +1,693 @@
+# no mcmc for me: amortized sampling for fast and stable training of energy-based models
+
+will grathwohl*
+
+university of toronto & vector institute
+
+google research
+
+wgrathwohl@cs.toronto.edu
+
+jacob kelly*
+
+university of toronto & vector institute
+
+jkelly@cs.toronto.edu
+
+milad hashemi
+
+google research
+
+miladh@google.com
+
+mohammad norouzi & kevin swersky
+
+google research
+
+{mnorouzi, kswersky}@google.com
+
+david duvenaud
+
+university of toronto & vector institute
+
+duvenaud@cs.toronto.edu
+
+# abstract
+
+energy-based models (ebms) present a flexible and appealing way to represent uncertainty. despite recent advances, training ebms on high-dimensional data remains a challenging problem as the state-of-the-art approaches are costly, unstable, and require considerable tuning and domain expertise to apply successfully. in this work we present a simple method for training ebms at scale which uses an entropy-regularized generator to amortize the mcmc sampling typically used in ebm training. we improve upon prior mcmc-based entropy regularization methods with a fast variational approximation. we demonstrate the effectiveness of our approach by using it to train tractable likelihood models. next, we apply our estimator to the recently proposed joint energy model (jem), where we match the original performance with faster and stable training. this allows us to extend jem models to semi-supervised classification on tabular data from a variety of continuous domains.
+
+# 1 introduction
+
+energy-based models (ebms) have recently regained popularity within machine learning, partly inspired by the impressive results of du & mordatch (2019) and song & ermon (2020) on large-scale image generation. beyond image generation, ebms have also been successfully applied to a wide variety of applications including: out-of-distribution detection (grathwohl et al., 2019; du & mordatch, 2019; song & ou, 2018), adversarial robustness (grathwohl et al., 2019; hill et al., 2020; du & mordatch, 2019), reliable classification (grathwohl et al., 2019; liu & abbeel, 2020) and semi-supervised learning (song & ou, 2018; zhao et al.). strikingly, these ebm approaches outperform alternative classes of generative models and rival hand-tailored solutions on each task.
+
+despite progress, training ebms is still a challenging task. as shown in table 1, existing training methods are all deficient in at least one important practical aspect. markov chain monte carlo (mcmc) methods are slow and unstable during training (nijkamp et al., 2019a; grathwohl et al., 2020). score matching mechanisms, which minimize alternative divergences are also unstable and most methods cannot work with discontinuous nonlinearities (such as relu) (song & ermon, 2019b; hyvarinen, 2005; song et al., 2020; pang et al., 2020b; grathwohl et al., 2020; vincent, 2011). noise contrastive approaches, which learn energy functions through density ratio estimation, typically don't scale well to high-dimensional data (gao et al., 2020; rhodes et al., 2020; gutmann & hyvarinen, 2010; ceylan & gutmann, 2018).
+
+<table><tr><td>training method</td><td>fast</td><td>stable training</td><td>high dimensions</td><td>no aux. model</td><td>unrestricted architecture</td><td>approximates likelihood</td></tr><tr><td>markov chain monte carlo</td><td>x</td><td>x</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr><tr><td>score matching approaches</td><td>✓</td><td>x</td><td>✓</td><td>✓</td><td>x</td><td>x</td></tr><tr><td>noise contrastive approaches</td><td>✓</td><td>✓</td><td>x</td><td>x</td><td>✓</td><td>x</td></tr><tr><td>vera (ours)</td><td>✓</td><td>✓</td><td>✓</td><td>x</td><td>✓</td><td>✓</td></tr></table>
+
+table 1: features of ebm training approaches. trade-offs must be made when training unnormalized models and no approach to date satisfies all of these properties.
+
+![](images/20157a37836b32c4de7c7399bea06f9d8bb9172c120b791efdc769c010aca610.jpg)  
+figure 1: comparison of ebms trained with vera and pcd. we see that as entropy regularization goes to 1, the density becomes more accurate. for pcd, all samplers produce high quality samples, but low-quality density models as the distribution of mcmc samples may be arbitrarily far away from the model density.
+
+in this work, we present a simple method for training ebms which performs as well as previous methods while being faster and substantially easier to tune. our method is based on reinterpreting maximum likelihood as a bi-level variational optimization problem, which has been explored in the past for ebm training (dai et al., 2019). this perspective allows us to amortize away mcmc sampling into a gan-style generator which is encouraged to have high entropy. we accomplish this with a novel approach to entropy regularization based on a fast variational approximation. this leads to the method we call variational entropy regularized approximate maximum likelihood (vera).
+
+concretely, we make the following contributions:
+
+- we improve the mcmc-based entropy regularizer of dieng et al. (2019) with a parallelizable variational approximation.  
+- we show that an entropy-regularized generator can be used to produce a variational bound on the ebm likelihood which can be optimized more easily than mcmc-based estimators.  
+- we demonstrate that models trained in this way achieve much higher likelihoods than methods trained with alternative ebm training procedures.  
+- we show that our approach stabilizes and accelerates the training of recently proposed joint energy models (grathwohl et al., 2019).  
+- we show that the stabilization of our approach allows us to use jem for semi-supervised learning, outperforming virtual adversarial training when little prior domain knowledge is available (e.g., for tabular data).
+
+# 2 energy based models
+
+an energy-based model (ebm) is any model which parameterizes a density as
+
+$$
+p _ {\theta} (x) = \frac {e ^ {f _ {\theta} (x)}}{z (\theta)} \tag {1}
+$$
+
+where  $f_{\theta}:\mathbb{r}^{d}\to \mathbb{r}$  and  $z(\theta) = \int e^{f_{\theta}(x)}\mathrm{d}x$  is the normalizing constant which is not explicitly modeled. any probability distribution can be represented in this way for some  $f_{\theta}$ . the energy-based
+
+parameterization has been used widely for its flexibility, ease of incorporating known structure, and relationship to physical systems common in chemistry, biology, and physics (ingraham et al., 2019; du et al., 2020; noé et al., 2019).
+
+the above properties make ebms an appealing model class, but because they are unnormalized many tasks which are simple for alternative model classes become challenging for ebms. for example, exact samples cannot be drawn and likelihoods cannot be exactly computed (or even lower-bounded). this makes training ebms challenging as we cannot simply train them to maximize likelihood. the most popular approach to train ebms is to approximate the gradient of the maximum likelihood objective. this gradient can be written as:
+
+$$
+\nabla_ {\theta} \log p _ {\theta} (x) = \nabla_ {\theta} f _ {\theta} (x) - \mathbb {e} _ {p _ {\theta} \left(x ^ {\prime}\right)} \left[ \nabla_ {\theta} f _ {\theta} \left(x ^ {\prime}\right) \right]. \tag {2}
+$$
+
+mcmc techniques are used to approximately generate samples from  $p_{\theta}(x)$  (tieleman, 2008). practically, this approach suffers from poor stability and computational challenges from sequential sampling. many tricks have been developed to overcome these issues (du & mordatch, 2019), but they largely still persist. alternative estimators have been proposed to circumvent these challenges, including score matching (hyvärinen, 2005), noise contrastive estimation (gutmann & hyvärinen, 2010), and variants thereof. these suffer from their own challenges in scaling to high dimensional data, and sacrifice the statistical efficiency of maximum likelihood.
+
+in figure 1 we visualize densities learned with our approach and persistent contrastive divergence (tieleman, 2008) (pcd) training. as we see, the sample quality of the pcd models is quite high but the learned density models do not match the true model. this is due to accrued bias in the gradient estimator from approximate mcmc sampling (grathwohl et al., 2020). prior work (nijkamp et al., 2019b) has argued that this objective actually encourages the approximate mcmc samples to match the data rather than the density model. conversely, we see that our approach (with proper entropy regularization) recovers a high quality model.
+
+# 3 variational maximum likelihood
+
+we seek the energy function which maximizes likelihood given in equation 1. we examine the intractable component of the log-likelihood, the log partition-function  $\log z(\theta) = \log \int e^{f_{\theta}(x)}\mathrm{d}x$ . we can re-write this quantity as the optimum of
+
+$$
+\log z (\theta) = \max  _ {q} \mathbb {e} _ {q (x)} [ f _ {\theta} (x) ] + h (q) \tag {3}
+$$
+
+where  $q$  is a distribution and  $h(q) = -\mathbb{e}_{q(x)}[\log q(x)]$  denotes its entropy (see the appendix a.1 for the derivation). plugging this into our original maximum likelihood statement we obtain:
+
+$$
+\hat {\theta} = \underset {\theta} {\operatorname {a r g m a x}} \left[ \mathbb {e} _ {p _ {\text {d a t a}} (x)} [ f _ {\theta} (x) ] - \underset {q} {\max } \left[ \mathbb {e} _ {q (x)} [ f _ {\theta} (x) ] + h (q) \right] \right] \tag {4}
+$$
+
+which gives us an alternative method for training ebms. we introduce an auxiliary sampler  $q_{\phi}$  which we train online to optimize the inner-loop of equation 4. this objective was used for ebm training in kumar et al. (2019); abbasnejad et al. (2019); dai et al. (2017), dai et al. (2019) (motivated by fenchel duality (wainwright & jordan, 2008)). abbasnejad et al. (2019) use an implicit generative model and dai et al. (2019) propose to use a sampler which is inspired by mcmc sampling from  $p_{\theta}(x)$  and whose entropy can be computed exactly.
+
+below we describe our approach which utilizes the same objective with a simpler sampler and a new approach to encourage high entropy. we note that when training  $p_{\theta}(x)$  and  $q(x)$  online together, the inner maximization will not be fully optimized. this leads our training objective for  $p_{\theta}(x)$  to be an upper bound on  $\log p_{\theta}(x)$ . in section 5.1 we explore the impact of this fact and find that the bound is tight enough to train models that achieve high likelihood on high-dimensional data.
+
+# 4 method
+
+we now present a method for training an ebm  $p_{\theta}(x) = e^{f_{\theta}(x)} / z(\theta)$  to optimize equation 4. we introduce a generator distribution of the form  $q_{\phi}(x) = \int_z q_{\phi}(x|z)q(z)\mathrm{d}z$  such that:
+
+$$
+q _ {\phi} (x \mid z) = \mathcal {n} \left(g _ {\psi} (z), \sigma^ {2} i\right), \quad q (z) = \mathcal {n} (0, i) \tag {5}
+$$
+
+where  $g_{\psi}$  is a neural network with parameters  $\psi$  and thus,  $\phi = \{\psi, \sigma^2\}$ . this is similar to the decoder of a variational autoencoder (kingma & welling, 2013). with this architecture it is easy to optimize the first and second terms of equation 4 with reparameterization, but the entropy term requires more care.
+
+# 4.1 entropy regularization
+
+estimating entropy or its gradients is a challenging task. multiple, distinct approaches have been proposed in recent years based on mutual information estimation (kumar et al., 2019), variational upper bounds (ranganath et al., 2016), denoising autoencoders (lim et al., 2020), and nearest neighbors (singh & poczos, 2016).
+
+the above methods require the training of additional auxiliary models or do not scale well to high dimensions. most relevant to this work are dieng et al. (2019); titsias & ruiz (2019) which present a method for encouraging generators such as ours to have high entropy by estimating  $\nabla_{\phi}h(q_{\phi})$ . the estimator takes the following form:
+
+$$
+\begin{array}{l} \nabla_ {\phi} h (q _ {\phi}) = \nabla_ {\phi} \mathbb {e} _ {q _ {\phi} (x)} [ \log q _ {\phi} (x) ] \\ = \nabla_ {\phi} \mathbb {e} _ {p (z) p (\epsilon)} [ \log q _ {\phi} (x (z, \epsilon)) ] \quad \text {(r e p a r a m e t e r i z e s a m p l i n g)} \\ = \mathbb {e} _ {p (z) p (\epsilon)} [ \nabla_ {\phi} \log q _ {\phi} (x (z, \epsilon)) ] \\ = \mathbb {e} _ {p (z) p (\epsilon)} \left[ \nabla_ {x} \log q _ {\phi} (x (z, \epsilon)) ^ {t} \nabla_ {\phi} x (z, \epsilon) \right] \quad \text {(c h a i n r u l e)} \tag {6} \\ \end{array}
+$$
+
+where we have written  $x(z,\epsilon) = g_{\psi}(z) + \sigma \epsilon$ . all quantities in equation 6 can be easily computed except for the score-function  $\nabla_x\log q_\phi (x)$ . the following estimator for this quantity can be easily derived (see appendix a.2):
+
+$$
+\nabla_ {x} \log q _ {\phi} (x) = \mathbb {e} _ {q _ {\phi} (z | x)} [ \nabla_ {x} \log q _ {\phi} (x | z) ] \tag {7}
+$$
+
+which requires samples from the posterior  $q_{\phi}(z|x)$  to estimate. dieng et al. (2019); titsias & ruiz (2019) generate these samples using hamiltonian monte carlo (hmc) (neal et al., 2011), a gradient-based mcmc algorithm. as used in dieng et al. (2019), 28 sequential gradient computations must be made per training iteration. since a key motivation of this work is to circumvent the costly sequential computation of mcmc sampling, this is not a favourable solution. in our work we propose a more efficient solution that we find works just as well empirically.
+
+# 4.2 variational approximation with importance sampling
+
+we propose to replace hmc sampling of  $q_{\phi}(z|x)$  with a variational approximation  $\xi(z|z_0) \approx q_{\phi}(z|x)$  where  $z_0$  is a conditioning variable we will define shortly. we can use this approximation with self-normalized importance sampling to estimate
+
+$$
+\begin{array}{l} \nabla_ {x} \log q _ {\phi} (x) = \mathbb {e} _ {q _ {\phi} (z | x)} [ \nabla_ {x} \log q _ {\phi} (x \mid z) ] \\ = \mathbb {e} _ {p (z _ {0}) q _ {\phi} (z | x)} [ \nabla_ {x} \log q _ {\phi} (x \mid z) ] \\ = \mathbb {e} _ {p (z _ {0}) \xi (z | z _ {0})} \left[ \frac {q _ {\phi} (z \mid x)}{\xi (z \mid z _ {0})} \nabla_ {x} \log q _ {\phi} (x \mid z) \right] \\ = \mathbb {e} _ {p (z _ {0}) \xi (z | z _ {0})} \left[ \frac {q _ {\phi} (z , x)}{q _ {\phi} (x) \xi (z | z _ {0})} \nabla_ {x} \log q _ {\phi} (x | z) \right] \\ \approx \sum_ {i = 1} ^ {k} \frac {w _ {i}}{\sum_ {j = 1} ^ {k} w _ {j}} \nabla_ {x} \log q _ {\phi} (x \mid z _ {i}) \equiv \widetilde {\nabla} _ {x} \log q _ {\phi} (x; \{z _ {i} \} _ {i = 1} ^ {k}, z _ {0}) \tag {8} \\ \end{array}
+$$
+
+where  $\{z_i\}_{i=1}^k \sim \xi(z \mid z_0)$  and  $w_i \equiv \frac{q_\phi(z_i, x)}{\xi(z_i \mid z_0)}$ . we use  $k = 20$  importance samples for all experiments in this work. this approximation holds for any conditioning information we would like to use.
+
+to choose this, let us consider how samples  $x \sim q_{\phi}(x)$  are drawn. we first sample  $z_0 \sim \mathcal{n}(0, i)$  and then  $x \sim q_{\phi}(x \mid z_0)$ . in our estimator we want a variational approximation to  $q_{\phi}(z \mid x)$  and by construction,  $z_0$  is a sample from this distribution. for this reason we let our variational approximation be
+
+$$
+\xi_ {\eta} (z \mid z _ {0}) = \mathcal {n} (z \mid z _ {0}, \eta^ {2} i), \tag {9}
+$$
+
+or simply a diagonal gaussian centered at the  $z_0$  which generated  $x$ . for this approximation to be useful we must tune the variance  $\eta^2$ . we do this by optimizing the standard evidence lower-bound at every training iteration
+
+$$
+\mathcal {l} _ {\mathrm {e l b o}} (\eta ; z _ {0}, x) = \mathbb {e} _ {\xi_ {\eta} (z | z _ {0})} \left[ \log \left(q _ {\phi} (x \mid z)\right) + \log \left(q _ {\phi} (z)\right) \right] + h \left(\xi_ {\eta} (z \mid z _ {0})\right). \tag {10}
+$$
+
+we then use  $\xi_{\eta}(z\mid z_0)$  to approximate  $\nabla_x\log q_\phi (x)$  which we plug into equation 6 to estimate  $\nabla_{\phi}h(q_{\phi})$  for training our generator. a full derivation and discussion can be found in appendix a.3.
+
+combining the tools presented above we arrive at our proposed method which we call variational entropy regularized approximate maximum likelihood (vera), outlined in algorithm 1. we found it helpful to further add an  $\ell_2$ -regularizer with weight 0.1 to the gradient of our model's likelihood as in kumar et al. (2019). in some of our larger-scale experiments we reduced the weight of the entropy regularizer as in dieng et al. (2019). we refer to the entropy regularizer weight as  $\lambda$ .
+
+algorithm 1: vera training  
+input: ebm  $p_{\theta}(x)\propto e^{f_{\theta}(x)}$  generator  $q_{\phi}(x,z)$  , approximate posterior  $\xi_{\eta}(z|z_0)$  entropy weight  $\lambda$  gradient penalty  $\gamma = .1$    
+output: parameters  $\theta$  such that  $p_{\theta}\approx p$    
+while true do sample mini-batch  $x$  , and generate mini-batch  $x_{g},z_{0}\sim q_{\phi}(x,z)$  compute  $\mathcal{l}_{\mathrm{elbo}}(\eta ;z_0,x_g)$  and update  $\eta$  // update posterior compute  $\log f_{\theta}(x) - \log f_{\theta}(x_g) + \gamma ||\nabla_x\log f_\theta (x)||^2$  and update  $\theta$  // update ebm sample  $\{z_i\}_{i = 1}^k\sim \xi_\eta (z|z_0)$  compute  $s = \tilde{\nabla}_x\log q_\phi (x;\{z_i\}_{i = 1}^k,z_0)$  // estimate score fn (eq.8) compute  $g = s^t\nabla_{\phi}x_{g}$  // estimate entropy gradient (eq.6) update  $\phi$  with  $\nabla_{\phi}\log f_{\theta}(x_{g}) + \lambda g$  // update generator
+
+# 5 ebm training experiments
+
+we present results training various models with vera and related approaches. in figure 1 we visualize the impact of our generator's entropy on the learned density model and compare this with mcmc sampling used in pcd learning. in section 5.1, we explore this quantitatively by training tractable models and evaluating with test-likelihood. in section 5.2 we explore the bias of our entropy gradient estimator and the estimator's effect on capturing modes.
+
+# 5.1 fitting tractable models
+
+optimizing the generator in vera training minimizes a variational upper bound on the likelihood of data under our model. if this bound is not sufficiently tight, then training the model to maximize this bound will not actually improve likelihood. to demonstrate the vera bound is tight enough to train large-scale models we train nice models (dinh et al., 2014) on the mnist dataset. nice is a normalizing flow (rezende & mohamed, 2015) model - a flexible density estimator which enables both exact likelihood computation and exact sampling. we can train this model with vera (which does not require either of these abilities), evaluate the learned model using likelihood, and generate exact samples from the trained models. full experimental details<sup>2</sup> can be found in appendix b.3 and additional results can be found in appendix c.1.
+
+we compare the performance of vera with maximum likelihood training as well as a number of approaches for training unnormalized models; maximum entropy generators (meg) (kumar et al., 2019), persistent contrastive divergence (pcd), sliced score matching (ssm) (song et al., 2020), denoising score matching (dsm) (vincent, 2011), curvature propagation (cp-sm) (martens et al., 2012), and coopnets (xie et al., 2018). as an ablation we also train vera with the hmc-based entropy regularizer of dieng et al. (2019), denoted vera-(hmc). table 2 shows that vera outperforms all approaches that do not require a normalized model.
+
+figure 2 shows exact samples from our nice models. for pcd we can see (as observed in figure 1) that while the approximate mcmc samples resemble the data distribution, the true samples from the model do not. this is further reflected in the reported likelihood value which falls behind all methods besides dsm. coop-nets perform better than pcd, but exhibit the same behavior of generator samples resembling the data, but not matching true samples. we attribute this behavior to the method's reliance on mcmc sampling.
+
+conversely, models trained with vera generate coherent and diverse samples which reasonably capture the data distribution. we also see that the samples from the learned generator
+
+much more closely match true samples from the nice model than pcd and meg. when we remove the entropy regularizer from the generator  $(\lambda = 0.0)$  we observe a considerable decrease in likelihood and we find that the generator samples are far less diverse and do not match exact samples at all. intriguingly, entropy-free vera outperforms most other methods. we believe this is because even without the entropy regularizer we are still optimizing a (weak) bound on likelihood. conversely, the score-matching methods minimize an alternative divergence which will not necessarily correlate well with likelihood. further, figure 2 shows that meg performs on par with entropy-free vera indicating that the mutual information-based entropy estimator may not be accurate enough in high dimensions to encourage high entropy generators.
+
+![](images/d0f2d8ebcf521237861f2044418fd400cd743a4d1a40232834b1fba857f5fdcf.jpg)  
+figure 2: left: exact samples from nice model trained with various methods. right: approximate samples used for training. for vera, meg, and coopnet, these come from the generator, for pcd these are approximate mcmc samples.
+
+<table><tr><td>maximum likelihood</td><td colspan="2">vera λ = 1.0 λ = 0.0</td><td colspan="2">vera (hmc) λ = 1.0</td><td>meg</td><td>pcd</td><td>ssm</td><td>dsm</td><td>cp-sm</td><td>coopnet</td></tr><tr><td>-791</td><td>-1138</td><td>-1214</td><td>-1165</td><td>-1219</td><td>-4207</td><td>-2039</td><td>-4363</td><td>-1517</td><td>-1465</td><td></td></tr></table>
+
+table 2: fitting nice models using various learning approaches for unnormalized models. results for ssm, dcm, cp-sm taken from song et al. (2020).
+
+# 5.2 understanding our entropy regularizer
+
+in figure 3, we explore the quality of our score function estimator on a pca (tipping & bishop, 1999) model fit to mnist, a setting where we can compute the score function exactly (see appendix b.4 for details). the importance sampling estimator (with 20 importance samples) has somewhat larger variance than the hmc-based estimator but has a notably lower bias of .12. the hmc estimator using 2 burn-in steps (recommended in dieng et al. (2019)) has a bias of .48. increasing the burn-in steps to 500 reduces the bias to .20 while increasing variance. we find the additional variance of our estimator is remedied by mini-batch averaging and the reduced bias helps explain the improved performance in table 2.
+
+further, we compute the effective sample size (kong, 1992) (ess) of our importance sampling proposal on our cifar10 and mnist models and achieve an ess of 1.32 and 1.29, respectively using 20 importance samples. when an uninformed proposal  $(\mathcal{n}(0,i))$  is used, the ess is 1.0 for both models. this indicates our gradient estimates are informative for training. more details can be found in appendix b.6.
+
+next, we count the number of modes captured on a dataset with 1,000 modes consisting of 3 mnist digits stacked on top of one another (dieng et al., 2019; kumar et al., 2019). we find that both vera and vera (hmc) recover 999 modes, but training with no entropy regularization recovers 998 modes. we conclude that entropy regularization is unnecessary for preventing mode collapse in this setting.
+
+# 6 applications to joint energy models
+
+joint energy models (jem) (grathwohl et al., 2019) are an exciting application of ebms. they reinterpret standard classifiers as ebms and train them as such to create powerful hybrid generative/discriminative models which improve upon purely-discriminative models at out-of-distribution detection, calibration, and adversarial robustness.
+
+traditionally, classification tasks are solved with a function  $f_{\theta}:\mathbb{r}^{d}\to \mathbb{r}^{k}$  which maps from the data to  $k$  unconstrained real-valued outputs (where  $k$  is the number of classes). this function parameterizes a distribution over labels  $y$  given data  $x$ :  $p_{\theta}(y|x) = e^{f(x)[y]} / \sum_{y'}e^{f_{\theta}(x)[y']}$ . the same function  $f_{\theta}$  can be used to define an ebm for the joint distribution over  $x$  and  $y$  as:  $p_{\theta}(x,y) = e^{f_{\theta}(x)[y]} / z(\theta)$ . the label  $y$  can be marginalized out to give an unconditional model  $p_{\theta}(x) = \sum_y e^{f_{\theta}(x)[y]} / z(\theta)$ . jem models are trained to maximize the factorized likelihood:
+
+$$
+\log p _ {\theta} (x, y) = \alpha \log p _ {\theta} (y | x) + \log p _ {\theta} (x) \tag {11}
+$$
+
+where  $\alpha$  is a scalar which weights the two terms. the first term is optimized with cross-entropy and the second term is optimized using ebm training methods. in grathwohl
+
+et al. (2019) pcd was used to train the second term. we train jem models on cifar10, cifar100, and svhn using vera instead of pcd. we examine how this change impacts accuracy, generation, training speed, and stability. full experimental details can be found in appendix b.7.
+
+![](images/fc1b3a6eb5e682aab587582673ea1ac0baeaac5010a6010954fe10e50ff47cc0.jpg)
+
+![](images/39750264378000287d9526a20954cc3c585c359258b33a115d73eaa9e39ff5e3.jpg)  
+figure 3: bias (top) and standard deviation (bottom), both per dimension, of the score function estimator using hmc and our proposed importance sampling scheme.
+
+speed and stability while the results presented in grathwohl et al. (2019) are promising, training models as presented in this work is challenging. mcmc sampling can be slow and training can easily diverge. our cifar10 models train 2.8x faster than the official jem implementation<sup>3</sup> with the default hyper-parameters. with these default parameters jem models would regularly diverge. to train for the reported 200 epochs training needed to be restarted multiple times and the number of mcmc steps needed to be quadrupled, greatly increasing run-time.
+
+conversely, we find that vera was much more stable and our models never diverged. this allowed us to remove the additive gaussian noise added to the data which is very important to stabilize mcmc training (grathwohl et al., 2019; nijkamp et al., 2019a; du & mordatch, 2019).
+
+hybrid modeling in tables 3 and 4 we compare the discriminative and generative performance of jem models trained with vera, pcd (jem), and hdge (liu & abbeel, 2020). with  $\alpha = 1$  we find that vera leads to models with poor classification performance but strong generation performance. with  $\alpha = 100$  vera obtains stronger classification performance than the original jem model while still having improved image generation over jem and hdge (evaluated with fid (heusel et al., 2017)).
+
+<table><tr><td>model</td><td>cifar10</td><td>cifar100</td><td>svhn</td></tr><tr><td>classifier</td><td>95.8</td><td>74.2</td><td>97.7</td></tr><tr><td>jem</td><td>92.9</td><td>72.2</td><td>96.6</td></tr><tr><td>hdge</td><td>96.7</td><td>74.5</td><td>n/a</td></tr><tr><td>vera α = 100</td><td>93.2</td><td>72.2</td><td>96.8</td></tr><tr><td>vera α = 1</td><td>76.1</td><td>48.7</td><td>94.2</td></tr></table>
+
+table 3: classification on image datasets.  
+
+<table><tr><td>model</td><td>fid ↓</td></tr><tr><td>jem</td><td>38.4</td></tr><tr><td>hdge</td><td>37.6</td></tr><tr><td>sngan (miyato et al., 2018)</td><td>25.50</td></tr><tr><td>ncsn (song &amp; ermon, 2019b)</td><td>23.52</td></tr><tr><td>vera α = 100</td><td>30.5</td></tr><tr><td>vera α = 1</td><td>27.5</td></tr></table>
+
+unconditional samples can be seen from our cifar10 and cifar100 models in figure 4. samples are refined through a simple iterative procedure using the latent space of our generator, explained in appendix b.7.1. additional conditional samples can be found in appendix c.5
+
+![](images/7c90b8f5d690a8ae6b325e5f872953ad1d10afae681b7d6e0ea4652bc156ade4.jpg)  
+figure 4: unconditional samples on cifar10 (left) and cifar100 (right).
+
+out-of-distribution detection jem is a powerful approach for out-of-distribution detection (ood), greatly outperforming tractable likelihood models like vaes and flows (nalisnick et al., 2018). in table 5, reporting auroc (hendrycks & gimpel, 2016), we see that for all but 1 dataset, vera outperforms jem with pcd training but under-performs contrastive training (hdge). intriguingly, vera performs poorly on celeba. this result, along with the unreliable performance of dsm models at this task (li et al., 2019) leads to questions regarding special benefits of mcmc training that are lost in our method as well as dsm. we leave this to future work.
+
+table 4: fid on cifar10.  
+
+<table><tr><td>model</td><td>svhn</td><td>cifar100</td><td>cifar10-interp</td><td>celeba</td></tr><tr><td>jem</td><td>0.67</td><td>0.67</td><td>0.65</td><td>0.75</td></tr><tr><td>hdge</td><td>0.96</td><td>0.91</td><td>0.82</td><td>0.80</td></tr><tr><td>glow</td><td>0.05</td><td>0.51</td><td>0.55</td><td>0.57</td></tr><tr><td>vera</td><td>0.83</td><td>0.73</td><td>0.86</td><td>0.33</td></tr></table>
+
+table 5: out-of-distribution detection. model trained on cifar10. values are auroc (↑).
+
+# 6.1 tabular data
+
+training with vera is much more stable and easy to apply to domains beyond images where ebm training has been extensively tuned. to demonstrate this we show that jem models trained with vera can provide a benefit to semi-supervised classification on datasets from a variety of domains. considerable progress has been made in semi-supervised learning but the most impressive results require considerable domain knowledge (chen et al., 2020). in domains like images, text, and audio such knowledge exists but for data from particle accelerators, gyroscopes, and satellites, such intuition may not be available and these techniques cannot be applied. in these settings there are far fewer options for semi-supervised learning.
+
+we present vera as one such option. we train semi-supervised jem models on data from a variety of continuous domains. we perform no data augmentation beyond removing redundant features and standardizing the remaining features. to further demonstrate the versatility of vera we use an identical network for each dataset and method. full experimental details can be found in appendix b.8.
+
+in table 6, we find on each dataset tested, we find that vera outperforms the supervised baseline and outperforms vat which is the strongest domain agnostic semi-supervised learning method we are aware of.
+
+# 7 related work
+
+kumar et al. (2019) train ebms using entropy-regularized generators, attempting to optimize the same objective as our own. the key difference is how the generator's entropy is regularized. kumar
+
+<table><tr><td>model</td><td>hepmass</td><td>crop</td><td>human</td><td>mnist4</td></tr><tr><td>supervised baseline</td><td>81.2</td><td>87.8</td><td>81.0</td><td>91.0</td></tr><tr><td>vat</td><td>86.7</td><td>94.5</td><td>84.0</td><td>98.6</td></tr><tr><td>meg</td><td>72.1</td><td>87.5</td><td>83.5</td><td>94.7</td></tr><tr><td>jem</td><td>54.2</td><td>18.5</td><td>77.2</td><td>10.2</td></tr><tr><td>vera</td><td>88.3</td><td>94.9</td><td>89.9</td><td>98.6</td></tr><tr><td>full-label</td><td>90.9</td><td>99.7</td><td>98.0</td><td>99.5</td></tr></table>
+
+table 6: accuracy of semi-supervised learning on tabular data with 10 labeled examples per class.
+
+et al. (2019) utilize a mutual information estimator to approximate the generator's entropy whereas we approximate the gradients of the entropy directly. the method of kumar et al. (2019) requires the training of an additional mi-estimation network, but our approach only requires the optimization of the posterior variance which has considerably fewer parameters. as demonstrated in section 5.1, their approach does not perform as well as vera for training nice models and their generator collapses to a single point. this is likely due to the notorious difficulty of estimating mi in high dimensions and the unreliability of current approaches for this task (mcallester & stratos, 2020; song & ermon, 2019a).
+
+dai et al. (2019) train ebms using the same objective as vera. the key difference here is in the architecture of the generator. dai et al. (2019) use generators with a restricted form, inspired by various mcmc sampling methods. in this setting, a convenient estimator for the generator's entropy can be derived. in contrast, our generators have an unconstrained architecture and we focus on entropy regularization in the unconstrained setting.
+
+abbasnejad et al. (2019) train ebms and generators as well to minimize the reverse kl-divergence. their method differs from ours in the architecture of the generator and the method for encouraging high entropy. their generator defines an implicit density (unlike ours which defines a latent-variable model). the entropy is maximized using a series approximation to the generator function's jacobian log-determinant which approximates the change-of-variables for injective functions.
+
+gao et al. (2020) train ebms using noise contrastive estimation where the noise distribution is a normalizing flow. their training objective differs from ours and their generator is restricted to having a normalizing flow architecture. these architectures do not scale as well as the gan-style architectures we use to large image datasets.
+
+as well there exist coopnets (xie et al., 2018) which cooperatively train an ebm and a generator network. architecturally, they are similar to vera but are trained quit differently. in coopnets, the generator is trained via maximum likelihood on its own samples refined using mcmc on the ebm. this maximum likelihood step requires mcmc as well to generate posterior samples as in pang et al. (2020a). in contrast, the generator in vera is trained to minimize the reverse kl-divergence. our method requires no mcmc and was specifically developed to alleviate the difficulties of mcmc sampling.
+
+the estimator of dieng et al. (2019) was very influential to our work. their work focused on applications to gans. our estimator could easily be applied in this setting and to implicit variational inference (titsias & ruiz, 2019) as well but we leave this for future work.
+
+# 8 conclusion
+
+in this work we have presented vera, a simple and easy-to-tune approach for training unnormalized density models. we have demonstrated our approach learns high quality energy functions and models with high likelihood (when available for evaluation). we have further demonstrated the superior stability and speed of vera compared to pcd training, enabling much faster training of jem (grathwohl et al., 2019) while retaining the performance of the original work. we have shown that vera can train models from multiple data domains with no additional tuning. this enables the applications of jem to semi-supervised classification on tabular data - outperforming a strong baseline method for this task and greatly outperforming jem with pcd training.
+
+# references
+
+m ehsan abbasnejad, qinfeng shi, anton van den hengel, and lingqiao liu. a generative adversarial density estimator. in proceedings of the ieee conference on computer vision and pattern recognition, pp. 10782-10791, 2019.  
+je besag. comments on "representations of knowledge in complex systems" by u. grenander and mi miller. j. roy. statist. soc. ser. b, 56:591-592, 1994.  
+ciwan ceylan and michael u gutmann. conditional noise-contrastive estimation of unnormalised models. arxiv preprint arxiv:1806.03664, 2018.  
+tong che, ruixiang zhang, jascha sohl-dickstein, hugo larochelle, liam paull, yuan cao, and yoshua bengio. your gan is secretly an energy-based model and you should use discriminator driven latent sampling. arxiv preprint arxiv:2003.06060, 2020.  
+ting chen, simon kornblith, mohammad norouzi, and geoffrey hinton. a simple framework for contrastive learning of visual representations. arxiv preprint arxiv:2002.05709, 2020.  
+bo dai, zhen liu, hanjun dai, niao he, arthur gretton, le song, and dale schuurmans. exponential family estimation via adversarial dynamics embedding. in advances in neural information processing systems, pp. 10979-10990, 2019.  
+zihang dai, amjad almahairi, philip bachman, eduard hovy, and aaron courville. calibrating energy-based generative adversarial networks. arxiv preprint arxiv:1702.01691, 2017.  
+adji b dieng, francisco jr ruiz, david m blei, and michalis k titsias. prescribed generative adversarial networks. arxiv preprint arxiv:1910.04302, 2019.  
+laurent dinh, david krueger, and yoshua bengio. nice: non-linear independent components estimation. arxiv preprint arxiv:1410.8516, 2014.  
+yilun du and igor mordatch. implicit generation and generalization in energy-based models. arxiv preprint arxiv:1903.08689, 2019.  
+yilun du, joshua meier, jerry ma, rob fergus, and alexander rives. energy-based models for atomic-resolution protein conformations. arxiv preprint arxiv:2004.13167, 2020.  
+ruiqi gao, erik nijkamp, diederik p kingma, zhen xu, andrew m dai, and ying nian wu. flow contrastive estimation of energy-based models. in proceedings of the ieee/cvf conference on computer vision and pattern recognition, pp. 7518-7528, 2020.  
+will grathwohl, kuan-chieh wang, jorn-henrik jacobsen, david duvenaud, mohammad norouzi, and kevin swersky. your classifier is secretly an energy based model and you should treat it like one. arxiv preprint arxiv:1912.03263, 2019.  
+will grathwohl, kuan-chieh wang, jorn-henrik jacobsen, david duvenaud, and richard zemel. learning the stein discrepancy for training and evaluating energy-based models without sampling. 2020.  
+michael gutmann and aapo hyvarinen. noise-contrastive estimation: a new estimation principle for unnormalized statistical models. in proceedings of the thirteenth international conference on artificial intelligence and statistics, pp. 297-304, 2010.  
+dan hendrycks and kevin gimpel. a baseline for detecting misclassified and out-of-distribution examples in neural networks. arxiv preprint arxiv:1610.02136, 2016.  
+martin heusel, hubert ramsauer, thomas unterthiner, bernhard nessler, and sepp hochreiter. gans trained by a two time-scale update rule converge to a local nash equilibrium. in advances in neural information processing systems, pp. 6626-6637, 2017.  
+mitch hill, jonathan mitchell, and song-chun zhu. stochastic security: adversarial defense using long-run dynamics of energy-based models. arxiv preprint arxiv:2005.13525, 2020.
+
+aapo hyvarinen. estimation of non-normalized statistical models by score matching. journal of machine learning research, 6(apr):695-709, 2005.  
+john ingraham, adam j riesselman, chris sander, and debora s marks. learning protein structure with a differentiable simulator. in iclr, 2019.  
+sergey ioffe and christian szegedy. batch normalization: accelerating deep network training by reducing internal covariate shift. arxiv preprint arxiv:1502.03167, 2015.  
+diederik p kingma and jimmy ba. adam: a method for stochastic optimization. arxiv preprint arxiv:1412.6980, 2014.  
+diederik p kingma and max welling. auto-encoding variational bayes. arxiv preprint arxiv:1312.6114, 2013.  
+durk p kingma and prafulla dhariwal. glow: generative flow with invertible  $1 \times 1$  convolutions. in advances in neural information processing systems, pp. 10215-10224, 2018.  
+augustine kong. a note on importance sampling using standardized weights. university of chicago, dept. of statistics, tech. rep, 348, 1992.  
+rithesh kumar, sherjil ozair, anirudh goyal, aaron courville, and yoshua bengio. maximum entropy generators for energy-based models. arxiv preprint arxiv:1901.08508, 2019.  
+zengyi li, yubei chen, and friedrich t sommer. annealed denoising score matching: learning energy-based models in high-dimensional spaces. arxiv preprint arxiv:1910.07762, 2019.  
+jae hyun lim, aaron courville, christopher pal, and chin-wei huang. ar-dae: towards unbiased neural entropy gradient estimation. arxiv preprint arxiv:2006.05164, 2020.  
+hao liu and pieter abbeel. hybrid discriminative-generative training via contrastive learning. arxiv preprint arxiv:2007.09070, 2020.  
+james martens, ilya sutskever, and kevin swersky. estimating the hessian by back-propagating curvature. arxiv preprint arxiv:1206.6464, 2012.  
+david mcallester and karl stratos. formal limitations on the measurement of mutual information. in international conference on artificial intelligence and statistics, pp. 875-884, 2020.  
+takeru miyato, toshiki kataoka, masanori koyama, and yuichi yoshida. spectral normalization for generative adversarial networks. arxiv preprint arxiv:1802.05957, 2018.  
+eric nalisnick, akihiro matsukawa, yee whye teh, dilan gorur, and balaji lakshminarayanan. do deep generative models know what they don't know? arxiv preprint arxiv:1810.09136, 2018.  
+radford m neal et al. mcmc using hamiltonian dynamics. handbook of markov chain monte carlo, 2(11):2, 2011.  
+erik nijkamp, mitch hill, tian han, song-chun zhu, and ying nian wu. on the anatomy of mcmc-based maximum likelihood learning of energy-based models. arxiv preprint arxiv:1903.12370, 2019a.  
+erik nijkamp, mitch hill, song-chun zhu, and ying nian wu. learning non-convergent non-persistent short-run mcmc toward energy-based model. in advances in neural information processing systems, pp. 5232-5242, 2019b.  
+frank noé, simon olsson, jonas köhler, and hao wu. boltzmann generators: sampling equilibrium states of many-body systems with deep learning. science, 365(6457):eaaw1147, 2019.  
+bo pang, tian han, erik nijkamp, song-chun zhu, and ying nian wu. learning latent space energy-based prior model. advances in neural information processing systems, 33, 2020a.  
+tianyu pang, kun xu, chongxuan li, yang song, stefano ermon, and jun zhu. efficient learning of generative models via finite-difference score matching. arxiv preprint arxiv:2007.03317, 2020b.
+
+alec radford, luke metz, and soumith chintala. unsupervised representation learning with deep convolutional generative adversarial networks. arxiv preprint arxiv:1511.06434, 2015.  
+rajesh ranganath, dustin tran, and david blei. hierarchical variational models. in international conference on machine learning, pp. 324-333, 2016.  
+danilo jimenez rezende and shakir mohamed. variational inference with normalizing flows. arxiv preprint arxiv:1505.05770, 2015.  
+benjamin rhodes, kai xu, and michael u gutmann. telescoping density-ratio estimation. arxiv preprint arxiv:2006.12204, 2020.  
+tim salimans, ian goodfellow, wojciech zaremba, vicki cheung, alec radford, and xi chen. improved techniques for training gans. in advances in neural information processing systems, pp. 2234-2242, 2016.  
+shashank singh and barnabás póczos. analysis of k-nearest neighbor distances with application to entropy estimation. arxiv preprint arxiv:1603.08578, 2016.  
+jiaming song and stefano ermon. understanding the limitations of variational mutual information estimators. arxiv preprint arxiv:1910.06222, 2019a.  
+yang song and stefano ermon. generative modeling by estimating gradients of the data distribution. in advances in neural information processing systems, pp. 11918-11930, 2019b.  
+yang song and stefano ermon. improved techniques for training score-based generative models. arxiv preprint arxiv:2006.09011, 2020.  
+yang song, sahaj garg, jiaxin shi, and stefano ermon. sliced score matching: a scalable approach to density and score estimation. in uncertainty in artificial intelligence, pp. 574-584. pmlr, 2020.  
+yunfu song and zhijian ou. learning neural random fields with inclusive auxiliary generators. arxiv preprint arxiv:1806.00271, 2018.  
+tijmen tieleman. training restricted boltzmann machines using approximations to the likelihood gradient. in international conference on machine learning, pp. 1064-1071, 2008.  
+michael e tipping and christopher m bishop. probabilistic principal component analysis. journal of the royal statistical society: series b (statistical methodology), 61(3):611-622, 1999.  
+michalis k titsias and francisco ruiz. unbiased implicit variational inference. in the 22nd international conference on artificial intelligence and statistics, pp. 167-176, 2019.  
+pascal vincent. a connection between score matching and denoising autoencoders. *neural computation*, 23(7):1661-1674, 2011.  
+martin j wainwright and michael irwin jordan. graphical models, exponential families, and variational inference. now publishers inc, 2008.  
+max welling and yee w teh. bayesian learning via stochastic gradient langevin dynamics. in proceedings of the 28th international conference on machine learning (icml-11), pp. 681-688, 2011.  
+jianwen xie, yang lu, ruiqi gao, song-chun zhu, and ying nian wu. cooperative training of descriptor and generator networks. ieee transactions on pattern analysis and machine intelligence, 42(1):27-45, 2018.  
+sergey zagoruyko and nikos komodakis. wide residual networks. arxiv preprint arxiv:1605.07146, 2016.  
+stephen zhao, jorn-henrik jacobsen, and will grathwohl. joint energy-based models for semi-supervised classification.
+
+# a key derivations
+
+# a.1 derivation of variational log-partition function
+
+here we show that the variational optimization given in equation 3 recovers  $\log z(\theta)$ .
+
+$$
+\begin{array}{l} \max  _ {q} \mathbb {e} _ {q (x)} [ f _ {\theta} (x) ] + h (q) \\ = \max  _ {q} \int_ {x} q (x) f _ {\theta} (x) d x - \int_ {x} q (x) \log (q (x)) d x \\ = \max  _ {q} \int_ {x} q (x) \log \left(\frac {\exp \left(f _ {\theta} (x)\right)}{q (x)}\right) d x \\ = \max  _ {q} \int_ {x} q (x) \log \left(\frac {\exp \left(f _ {\theta} (x)\right)}{q (x)}\right) d x - \log z (\theta) + \log z (\theta) \\ = \max  _ {q} \int_ {x} q (x) \log \left(\frac {\exp \left(f _ {\theta} (x)\right) / z (\theta)}{q (x)}\right) d x + \log z (\theta) \\ = \max  _ {q} - \operatorname {k l} (q (x) \| p _ {\theta} (x)) + \log z (\theta) \\ = \log z (\theta). \\ \end{array}
+$$
+
+# a.2 score function estimator
+
+here we derive the equivalent expression for  $\nabla_{x}\log q_{\phi}(x)$  given in equation 7.
+
+$$
+\begin{array}{l} \nabla_ {x} \log q _ {\phi} (x) = \frac {\nabla_ {x} q _ {\phi} (x)}{q _ {\phi} (x)} \\ = \frac {\nabla_ {x} \int_ {z} q _ {\phi} (x , z) d z}{q _ {\phi} (x)} \\ = \frac {\int_ {z} \nabla_ {x} q _ {\phi} (x , z) d z}{q _ {\phi} (x)} \\ = \int_ {z} \frac {\nabla_ {x} q _ {\phi} (x , z)}{q _ {\phi} (x)} d z \\ = \int_ {z} \frac {\nabla_ {x} q _ {\phi} (x \mid z) q _ {\phi} (z)}{q _ {\phi} (x)} d z \\ = \int_ {z} \frac {\left(\nabla_ {x} \log q _ {\phi} (x \mid z)\right) q _ {\phi} (x \mid z) q _ {\phi} (z)}{q _ {\phi} (x)} d z \\ = \mathbb {e} _ {q _ {\phi} (z | x)} [ \nabla_ {x} \log q _ {\phi} (x | z) ]. \\ \end{array}
+$$
+
+# a.3 entropy gradient estimator
+
+from equation 6 we have
+
+$$
+\nabla_ {\phi} h (q _ {\phi}) = \mathbb {e} _ {p (z _ {0}) p (\epsilon)} [ \nabla_ {x} \log q _ {\phi} (x) ^ {t} \nabla_ {\phi} x (z _ {0}, \epsilon) ].
+$$
+
+plugging in our score function estimator gives
+
+$$
+\begin{array}{l} \nabla_ {\phi} h \left(q _ {\phi}\right) = \mathbb {e} _ {p \left(z _ {0}\right) p (\epsilon)} \left[ \nabla_ {x} \log q _ {\phi} (x) ^ {t} \nabla_ {\phi} x \left(z _ {0}, \epsilon\right) \right] \tag {12} \\ = \mathbb {e} _ {p (z _ {0}) p (\epsilon)} \left[ \mathbb {e} _ {q _ {\phi} (z | x)} \left[ \nabla_ {x} \log q _ {\phi} (x \mid z) \right] ^ {t} \nabla_ {\phi} x (z _ {0}, \epsilon) \right] \\ = \mathbb {e} _ {p (z _ {0}) p (\epsilon)} \left[ \mathbb {e} _ {\xi_ {\eta} (z | z _ {0})} \left[ \frac {q _ {\phi} (z \mid x)}{\xi_ {\eta} (z \mid z _ {0})} \nabla_ {x} \log q _ {\phi} (x \mid z) \right] ^ {t} \nabla_ {\phi} x (z _ {0}, \epsilon) \right] \\ = \mathbb {e} _ {p (z _ {0}) p (\epsilon)} \left[ \mathbb {e} _ {\xi_ {\eta} (z | z _ {0})} \left[ \frac {q _ {\phi} (x , z)}{q _ {\phi} (x) \xi_ {\eta} (z | z _ {0})} \nabla_ {x} \log q _ {\phi} (x | z) \right] ^ {t} \nabla_ {\phi} x (z _ {0}, \epsilon) \right] \\ \approx \mathbb {e} _ {p (z _ {0}) p (\epsilon)} \left[ \left[ \sum_ {i = 1} ^ {k} \frac {w _ {i}}{\sum_ {j = 1} ^ {k} w _ {j}} \nabla_ {x} \log q _ {\phi} (x \mid z _ {i}) \right] ^ {t} \nabla_ {\phi} x (z _ {0}, \epsilon) \right] \\ \end{array}
+$$
+
+where  $\{z_i\}_{i = 1}^k\sim \xi (z\mid z_0)$  and  $w_{i}\equiv \frac{q_{\phi}(z_{i},x)}{\xi(z_{i}|z_{0})}$
+
+# a.3.1 discussion
+
+we discuss when the approximations in equation 13 will hold. the importance sampling estimator will be biased when  $q_{\psi}(z \mid x)$  differs greatly from  $\xi(z \mid z_0)$ . since the generator function  $g_{\psi}(z)$  is a smooth, lipschitz function (as are most neural networks) and the output gaussian noise is small, the space of  $z$  values which could have generated  $x$  should be concentrated near  $z_0$ . in these settings,  $z_0$  should be useful for predicting  $q(z|x)$ .
+
+the accuracy of this approximation is based on the dimension of  $z$  compared to  $x$  and the lipschitz constant of  $g_{\psi}$ . in all settings we tested,  $\dim(z) \ll \dim(x)$  where this approximation should hold. if  $\dim(z) \gg \dim(x)$  the curse of dimensionality would take effect and  $z_0$  would be less and less informative about  $q(z|x)$ . in settings such as these, we do not believe our approach would be as effective. thankfully, almost all generator architectures we are aware of have  $\dim(z) \ll \dim(x)$ . the approximation could also break down if the lipschitz constant blew up. we find this does not happen in practice, but this can be addressed with many forms of regularization and normalization.
+
+# b experimental details
+
+b.1 hyperparameter recommendations  
+
+<table><tr><td>type</td><td>hyperparameter</td><td>value</td></tr><tr><td rowspan="5">optimization</td><td>β1(adam)</td><td>0</td></tr><tr><td>β2(adam)</td><td>0.9</td></tr><tr><td>learning rate (energy)</td><td>10-4*</td></tr><tr><td>learning rate (generator)</td><td>2·10-4*</td></tr><tr><td>learning rate (posterior)</td><td>2·10-4*</td></tr><tr><td rowspan="2">regularization</td><td>λ (entropy regularization weight)</td><td>10-4†</td></tr><tr><td>γ (gradient norm penalty)</td><td>0.1</td></tr><tr><td rowspan="2">jem</td><td>α (classification weight)</td><td>{1, 10, 30, 100}∗</td></tr><tr><td>β (classification entropy)</td><td>{1, 0.1 * α, α}</td></tr></table>
+
+table 7: hyperparameters for vera.
+
+*when  $\alpha  > 1$  ,learning rates were divided by  $\alpha$  .
+
+$^{\dagger}$ we found  $\lambda = 10^{-4}$  to work best on large image datasets, but in general we recommend starting with  $\lambda = 1$  and trying successively smaller values of  $\lambda$  until training is stable.
+
+we give some general tips on how to set hyperparameters when training vera in table 7. in all vera experiments, we use the gradient norm penalty with weight 0.1. this was not tuned during our experiments. when using vera and meg we train with adam (kingma & ba, 2014) and set  $\beta_{1} = 0$ ,  $\beta_{2} = .9$  as is standard in the gan literature (miyato et al., 2018). in general, we recommend setting the learning rate for the generator to twice the learning rate of the energy function and equal to the learning rate of the approximate posterior sampler.
+
+# b.1.1 impact of  $\lambda$
+
+let us rewrite the generator's training objective
+
+$$
+\mathcal {l} (q; \lambda) = e _ {q (x)} [ f _ {\theta} (x) ] + \lambda h (q). \tag {13}
+$$
+
+we can easily see that this objective is equivalent (up to a multiplicative constant) to
+
+$$
+e _ {q (x)} \left[ \frac {f _ {\theta} (x)}{\lambda} \right] + h (q). \tag {14}
+$$
+
+from this, it is clear that maximizing equation 14 is the same as minimizing the kl-divergence between  $q$  and a tempered version of  $p_{\theta}(x)$  defined as
+
+$$
+\frac {e ^ {f _ {\theta} (x) / \lambda}}{z}. \tag {15}
+$$
+
+tempering like this is standard practice in ebm training and is done in many recent works. tempering has the effect of increasing the weight of the gradient signal in sgld sampling relative to the added gaussian noise. in all of du & mordatch (2019); grathwohl et al. (2019); nijkamp et al. (2019a;b) the sgld samplers used a temperature of  $1 / \lambda = 20,000$ . this value is near the value of 10,000 that we use in this work.
+
+thus we can see that our most important hyper-parameter is actually the temperature of the sampler's target distribution. ideally this temperature would be set to 1, but this can lead to unstable training (as it does with sgld). to train high quality models, we recommend setting  $\lambda$  as close to 1 as possible, decreasing if training becomes unstable.
+
+# b.2 toy data visualizations
+
+we train simple energy functions on a 2d toy data. the ebm is a 2-layer mlp with 100 hidden units per layer using the leaky-relu nonlinearity with negative slope .2. the generator is a 2-layer
+
+mlp with 100 hidden units per layer and uses batch normalization (ioffe & szegedy, 2015) with relu nonlinearities. all models were trained for 100,000 iterations with all learning rates set to .001 and used the adam optimizer (kingma & ba, 2014).
+
+the pcd models were trained using an sgld sampler and a replay buffer with 10,000 examples, reinitialized every iteration with  $5\%$  probability. we used 20 steps of sgld per training iteration to make runtime consistent with vera. we tested  $\sigma$  values outside of the presented range but smaller values did not produce decent samples or energy functions and for larger values, training diverged.
+
+# b.3 training nice models
+
+the nice models were exactly as in song et al. (2020). they have 4 coupling layers and each coupling layer had 5 hidden layers. each hidden layer has 1000 units and uses the softplus nonlinearity. we preprocessed the data as in song et al. (2020) by scaling the data to the range [0, 1], adding uniform noise in the range  $[-1/512, 1/512]$ , clipping to the range [.001, .999] and applying the logit transform  $\log(x) - \log(1 - x)$ . all models were trained for 400 epochs with the adam optimizer (kingma & ba, 2014) with  $\beta_{1} = 0$  and  $\beta_{2} = .9$ . we use a batch size of 128 for all models. we re-ran the score matching model of song et al. (2020) to train for 400 epochs as well and found it did not improve performance as its best test performance happens very early in training.
+
+for all generator-based training methods we use the same fixed generator architecture. the generator has a latent-dimension of 100 and 2 hidden layers with 500 units each. we use the softplus nonlinearity and batch-normalization (ioffe & szegedy, 2015) as is common with generator networks.
+
+for vera the hyper-parameters we searched over were the learning rates for the nice model and for the generator. compared to song et al. (2020) we needed to use much lower learning rates. we searched over learning rates in  $\{.0003, .00003, .000003\}$  for both the generator and energy function. we found .000003 to work best for the energy function and .0003 to work best for the generator. this makes intuitive sense since the generator needs to be fully optimized for the bound on likelihood to be tight. when equal learning rates were used (.0003, .0003) we observed high sample quality from the generator but exact samples and likelihoods from the nice model were very poor.
+
+for pcd we search over learning rates in  $\{.0003, .00003, .000003\}$ , the number of mcmc steps in  $\{20, 40\}$  and the sgld noise standard-deviation in  $\{1.0, 0.1\}$ . all models with 20 steps and sgld standard-deviation 1.0 quickly diverged. our best model used learning rate .000003, step-size 0.1, and 40 steps. we tested the gradient-norm regularizer from kumar et al. (2019) and found it decreased performance for pcd trained models. most models with 20 mcmc steps diverged early in training.
+
+for review the mcmc sampler we use is stochastic gradient langevin dynamics (welling & teh, 2011). this sampler updates its samples by
+
+$$
+x _ {t} = x _ {t - 1} + \frac {\sigma^ {2}}{2} \nabla_ {x} f _ {\theta} (x) + \epsilon \sigma , \quad \epsilon \sim \mathcal {n} (0, i) \tag {16}
+$$
+
+where  $\sigma$  is the noise standard-deviation and is a parameter of the sampler.
+
+for maximum entropy generators (meg) (kumar et al., 2019) we must choose a mutual-information estimation network. we follow their work and use an mlp with leakyrelu nonlinearities with negative slope .2. our network mirrors the generator and has 3 hidden layers with 500 units each. we searched over the same hyper-parameters as vera. we found meg to perform almost identically to training with no entropy regularization at all. we believe this has to do with the challenges of estimating mi in high dimensions song & ermon (2019a).
+
+for coopnets (xie et al., 2018) we use the same flow and generator architectures as vera. following the mnist experiments in xie et al. (2018) we train using 10 sgld steps per iteration. we tried the recommended learning rates of .007 and .0001 for the flow and generator, respectively but found this to lead quick divergence. for this reason, we search over learning rates for the flow and generator from  $\{.0003, .00003, .000003\}$  as we did for vera and found the best combination to be .000003 for the flow and .0003 for the generator. other combinations resulted in higher quality generator samples but much worse likelihood values. we tested the recommended sgld step-size of .002 and found this to lead to divergence as well in this setup. thus, we searched over larger values of  $\{.002, .02, .1\}$  found .1 to perform the best, as with pcd.
+
+# b.4 estimation of bias of entropy regularizer
+
+if we restrict the form of our generator to a linear function
+
+$$
+x = w z + \mu + \sigma \epsilon , \quad z, \epsilon \sim \mathcal {n} (0, i)
+$$
+
+then we have
+
+$$
+q (x | z) = \mathcal {n} (w z + \mu , \sigma^ {2} i), \quad q (x) = \mathcal {n} (\mu , w ^ {t} w + \sigma^ {2} i)
+$$
+
+meaning we can exactly compute  $\log q(x)$ , and  $\nabla_{x}\log q(x)$  which is the quantity that vera (hmc) approximates with the hmc estimator from dieng et al. (2019) and we approximate with vera. to explore this, we fit a pca model on mnist and recover the parameters  $w,\mu$  of the linear generator and the noise parameter  $\sigma$ . samples from this model can be seen in figure 5.
+
+both vera and vera (hmc) have some parameters which are tuned automatically to improve the estimator throughout training. for vera this is the posterior variance which is optimized according to equation 10 with adam with default hyperparameters. for vera (hmc) this is the stepsize of hmc which is tuned automatically as outlined in (dieng et al., 2019). both estimators were trained with a learning rate of .01 for 500 iterations with a batch size of 5000. samples from the estimators during training were taken with the default parameters, in particular the number of burn-in steps or the number of importance samples was not varied as they were during evaluation.
+
+the bias of the estimators were evaluated on a batch of 10 samples from the generator. for each example in the batch, 5000 estimates were taken from the estimator and averaged to be taken as an estimate of the score function for this batch example. this estimate of the score function was subtracted from the true score function and then averaged over all dimensions and examples in the batch and taken as an estimate of the bias per dimension.
+
+for vera (hmc) we varied the number of burn-in steps used for samples to evaluate the bias of the estimator. we also tried to increase the number of posterior samples taken off the chain, but we found that this did not clearly reduce the bias of this estimator as the number of samples increased. for vera we computed the bias on the default of 20 importance samples.
+
+![](images/d58e2bc7250ec354ec7e5fb59b6d604ef53a393f5e181534a37bed6cc61e1517.jpg)  
+figure 5: samples from linear model trained with pca on mnist.
+
+# b.5 mode counting
+
+we train vera without labels on the stackedmnist dataset. this dataset consists of 60,000 examples of 3 stacked mnist images sampled with replacement from the original 60,000 mnist train set. as in (dieng et al., 2019) we resize the images to  $64 \times 64$  and use the dcgan (radford et al., 2015) architecture for both the energy-function and generator. we use a latent code of 100 dimensions. we train for 17 epochs with a learning rate of .001 and batch size 100.
+
+we estimate the number of modes captured by taking  $s = 10,000$  samples as in (dieng et al., 2019) and classifying each digit of the 3 stacked images separately with a pre-trained classifier on mnist.
+
+# b.6 effective sample size
+
+when performing importance sampling, the quality of the proposal distribution has a large impact. if the proposal is chosen poorly, then typically 1 sample will dominate in the expectation. this can
+
+be quantified using the effective sample size (kong, 1992) (ess) which is defined as
+
+$$
+w _ {i} = \frac {p (x)}{q (x)}
+$$
+
+$$
+\tilde {w} _ {i} = \frac {w _ {i}}{\sum_ {j = 1} ^ {n} w _ {j}}
+$$
+
+$$
+\mathrm {e s s} = \frac {1}{\sum_ {i = 1} ^ {n} \tilde {w} _ {i} {} ^ {2}} \tag {17}
+$$
+
+where  $p(x)$  is the target distribution,  $q(x)$  is the proposal distribution and  $n$  is the number of samples. if the self-normalized importance weights are dominated by one weight close to 1 then the ess will be 1. if the proposal distribution is identical to the target, so that the self-normalized importance weights are then uniform, then the ess will be  $n$ . when  $\mathrm{ess} = n$ , importance sampling is as efficient as using the target distribution.
+
+to understand the effect of the proposal distribution on ess we plot the ess when doing importance sampling with 20 importance samples from a 128-dimensional gaussian target distribution with  $\mu = 0$  and  $\sigma = i$ . we use a proposal which is a 128-dimensional gaussian with  $\mu$  increasing from 0 to 5. results can be seen in figure 6. we see when the means differ by greater than 2, the ess is approximately 1.0 and importance sampling has effectively failed.
+
+![](images/00c14b12f017144de422650334090b10cf6e21cde61b6c9052a4525cd4070c31.jpg)  
+figure 6: effective sample size of importance sampling as the proposal degrades.
+
+# b.7 jem models
+
+our energy function used the same architecture as in grathwohl et al. (2019); liu & abbeel (2020), a wide resnet zagoruyko & komodakis (2016) 28-10 with batch-norm removed and with dropout. our generator architecture is identical to miyato et al. (2018). as in grathwohl et al. (2019); liu & abbeel (2020) we set the learning rate for the energy function equal to 0.0001. we set the learning rate for the generator equal to 0.0002. we train for 200 epochs using the adam optimizer with  $\beta_{1} = 0$  and  $\beta_{2} = .9$ . we set the batch size to 64. results presented are from the models after 200 epochs with no early stopping. we believe better results could be obtained from further training.
+
+we trained models with  $\alpha \in \{1,30,100\}$  and found classification to be best with  $\alpha = 100$  and generation to be best with  $\alpha = 1$ .
+
+prior work on pcd ebm training (grathwohl et al., 2019; du & mordatch, 2019; nijkamp et al., 2019a;b) recommends adding gaussian noise to the data to stabilize training. without this, pcd training of jem models very quickly diverges. early in our experiments we found training with vera was stable without the addition of gaussian noise so we do not use it.
+
+as mentioned in dieng et al. (2019), when the strength of the entropy regularizer  $\lambda$  is too high, the generator may fall into a degenerate optimum where it just outputs high-entropy gaussian noise. to combat this, as suggested in dieng et al. (2019), we decrease the strength of  $\lambda$  to .0001 for all jem experiments. this value was chosen by decreasing  $\lambda$  from 1.0 by factors of 10 until learning took place (quantified by classification accuracy).
+
+# b.7.1 mcmc sample refinement
+
+our generator  $q_{\phi}(x)$  is trained to approximate our ebm  $p_{\theta}(x)$ . after training, the samples from the generator are of high quality (see figures 9 and 10, left) but they are not exactly samples from  $p_{\theta}(x)$ . we can use mcmc sampling to improve the quality of these samples. we use a simple mcmc refinement procedure based on the metropolis adjusted langevin algorithm (besag, 1994) applied to an expanded state-space defined by our generator and perform the accept/reject step in the data space.
+
+we can reparameterize a generator sample  $x \sim q_{\phi}(x)$  as a function  $x(z, \epsilon) = g_{\psi}(z) + \epsilon \sigma$ , and we can define an unnormalized density over  $\{z, \epsilon\}$ ,  $\log h(z, \epsilon) \equiv f_{\theta}(g_{\psi}(z) + \epsilon \sigma) - \log z(\theta, \phi)$  which is the density (under  $p_{\theta}(x)$ ) of the generator sample.
+
+starting with an initial sample  $z_0, \epsilon_0 \sim \mathcal{n}(0, i)$  we define the proposal distribution
+
+$$
+p \left(z _ {t} \mid z _ {t - 1}, \epsilon_ {t - 1}\right) = \mathcal {n} \left(z _ {t - 1} + \frac {\delta}{2} \nabla_ {z _ {t - 1}} \log h \left(z _ {t - 1}, \epsilon_ {t - 1}\right), \delta^ {2} i\right)
+$$
+
+$$
+p \left(\epsilon_ {t} \mid z _ {t - 1}, \epsilon_ {t - 1}\right) = \mathcal {n} \left(z _ {t - 1} + \frac {\delta}{2} \nabla_ {\epsilon_ {t - 1}} \log h \left(z _ {t - 1}, \epsilon_ {t - 1}\right), \delta^ {2} i\right)
+$$
+
+$$
+p \left(z _ {t}, \epsilon_ {t} \mid z _ {t - 1}, \epsilon_ {t - 1}\right) = p \left(z _ {t} \mid z _ {t - 1}, \epsilon_ {t - 1}\right) p \left(\epsilon_ {t} \mid z _ {t - 1}, \epsilon_ {t - 1}\right)
+$$
+
+and accept a new sample with probability
+
+$$
+\min  \left[ \frac {h \left(z _ {t} , \epsilon_ {t}\right) p \left(z _ {t} , \epsilon_ {t} \mid z _ {t - 1} , \epsilon_ {t - 1}\right)}{h \left(z _ {t - 1} , \epsilon_ {t}\right) p \left(z _ {t - 1} , \epsilon_ {t - 1} \mid z _ {t} , \epsilon_ {t}\right)}, 1 \right].
+$$
+
+here,  $\delta$  is the step-size and is a parameter of the sampler. we tune  $\delta$  with a burn-in period to target an acceptance rate of 0.57.
+
+a similar sampling procedure was proposed in kumar et al. (2019) and che et al. (2020) and in both works was found to improve sample quality. in all experiments,
+
+we clarify that this procedure is not a valid mcmc sampler for  $p_{\theta}(x)$  due to the augmented variables and the change in density of  $g_{\psi}$  which are not corrected for. the density of the samples will be a combination of  $p_{\theta}(x)$  and  $q_{\phi}(x)$ . as the focus of this work was training and not sampling/generation, we leave the development of more correct generator mcmc-sampling to future work. regardless, we find this procedure to improve visual sample quality. in figure 7 we visualize a sampling chain using the above method applied to our jem model trained on svhn.
+
+![](images/daf5f6eaf623a057652abeb4443ec12adb07b8a4a8ec3afdb79105d8c81865d7.jpg)  
+figure 7: visualization of our mala-inspired sample refinement procedure. samples come from jem model trained on svhn. chains progress to the right and down. each image is a consecutive step, no sub-sampling is done.
+
+![](images/493a7054d4a241b9d68d068ab13031118a5e449b79551978e28dd45d25a53a49.jpg)
+
+# b.7.2 image quality metrics
+
+we present results on inception score (salimans et al., 2016) and frechet inception distance (heusel et al., 2017). these metrics are notoriously fickle and different repositories are known to give very different results (grathwohl et al., 2019). for these evaluations we generate 12,800 samples from the model and (unless otherwise stated) refine the samples with 100 steps of our latent-space mala procedure (appendix b.7.1). the code to generate our reported fid comes from this publicly available repository. the code to generate our reported inception score can be found here.
+
+# b.8 semi-supervised learning on tabular data
+
+# b.8.1 data
+
+we provide details about each of the datasets used for the experiments in section 6.1. hepmass<sup>5</sup> is a dataset obtained from a particle accelerator where we must classify signal from background noise. crop<sup>6</sup> is a dataset for classifying crop types from optical and radar sensor data. human<sup>7</sup> is a dataset for human activity classification from gyroscope data. mnist is an image dataset of handwritten images, treated here as tabular data.
+
+<table><tr><td>dataset</td><td>hepmass</td><td>crop</td><td>human</td><td>mnist</td></tr><tr><td>features</td><td>15</td><td>174</td><td>523</td><td>784</td></tr><tr><td>examples</td><td>6,300,000</td><td>263,926</td><td>6,617</td><td>60,000</td></tr><tr><td>classes</td><td>2</td><td>7</td><td>6</td><td>10</td></tr><tr><td>max class %</td><td>50.0</td><td>26.1</td><td>19.4</td><td>11.2</td></tr></table>
+
+table 8: basic information about each tabular dataset.
+
+for hepmass and human data we remove features which repeat the same exact same value more than 5 times. for crop data we remove features which have covariation greater than 1.01. for mnist we linearly standardize features to the interval  $[-1, 1]$ .
+
+we take a random  $10\%$  subset of the data to use as a validation set.
+
+# b.8.2 training
+
+we use the same architecture for all experiments and baselines. it has 6 layers of hidden units with dimensions [1000, 500, 500, 250, 250, 250] and a leaky-relu nonlinearity with negative-slope .2 between each layer of hidden units. the only layers which change between datasets are the input layer and the output layer which change according to the number of features and number of classes respectively.
+
+the training process for semi-supervised learning is similar to jem with an additional objective commonly used in semi-supervised learning:
+
+$$
+\log p _ {\theta} (x, y) = \alpha \log p _ {\theta} (y \mid x) + \log p _ {\theta} (x) + \beta h \left(p _ {\theta} (y \mid x)\right) \tag {18}
+$$
+
+where  $h(p(y|x))$  is the entropy of the predictive distribution over the labels.
+
+for all models we report the accuracy the model converged to on the held-out validation set. we report the average taken over three training runs with different seeds.
+
+we use equal learning rates for the energy model, generator, and the entropy estimator. we tune the learning rate and decay schedule for supervised models on the full-set of labels and 10 labels per class.
+
+on vera we tune the learning rate and decay schedule, the weighting of the entropy regularization  $\lambda$  and the weighting of the entropy of classification outputs  $\beta$ .
+
+for vat we tune the perturbation size  $\epsilon \in \{.01, .1, 1, 3, 10\}$ . all other hyperparameters were fixed according to tuning on vera.
+
+for meg we used the hyperparameters tuned according to vera.
+
+for jem we tune the number of mcmc steps in the range  $\kappa \in \{20,40,80\}$ . we generate samples using sgld with stepsize 1 and noise standard deviation 0.01 as in grathwohl et al. (2019).
+
+<table><tr><td>dataset</td><td>hepmass</td><td>crop</td><td>human</td><td>mnist</td></tr><tr><td>learning rate</td><td>10-5</td><td>10-4</td><td>10-5</td><td>10-5</td></tr><tr><td>number of epochs</td><td>1</td><td>20</td><td>800</td><td>200</td></tr><tr><td>batch size</td><td>64</td><td>64</td><td>64</td><td>64</td></tr><tr><td>decay rate</td><td>.3</td><td>.3</td><td>.3</td><td>.3</td></tr><tr><td>decay epochs</td><td>{.05, .1}</td><td>{15, 17}</td><td>{200, 300, 400, 600}</td><td>{150, 175}</td></tr><tr><td>z (latent) dimension</td><td>10</td><td>128</td><td>128</td><td>128</td></tr><tr><td>λ</td><td>10-4</td><td>10-4</td><td>10-4</td><td>10-4</td></tr><tr><td>α</td><td>1</td><td>1</td><td>10</td><td>1</td></tr><tr><td>β</td><td>1</td><td>1</td><td>1</td><td>1</td></tr><tr><td>ε (vat)</td><td>.1</td><td>3</td><td>.1</td><td>3</td></tr><tr><td>κ (jem)</td><td>20</td><td>20</td><td>40</td><td>80</td></tr></table>
+
+table 9: hyperparameters for semi-supervised learning on tabular data
+
+# c additional results
+
+# c.1 training mixtures of gaussians
+
+we present additional results training mixture of gaussian models using vera and pcd. each model consists of 100 diagonal gaussians and mixing weights. our experimental setup and hyperparameter search was identical to that presented in appendix b.2. we see in table 10 that vera outperforms pcd.
+
+<table><tr><td rowspan="2"></td><td rowspan="2">max. likelihood</td><td colspan="4">vera</td><td rowspan="2">pcd</td></tr><tr><td>λ = 0.0</td><td>λ = .01</td><td>λ = 0.1</td><td>λ = 1.0</td></tr><tr><td>moons</td><td>-2.32</td><td>-3.87</td><td>-3.63</td><td>-3.10</td><td>-2.58</td><td>-3.82</td></tr><tr><td>circles</td><td>-3.17</td><td>-3.58</td><td>-3.64</td><td>-3.74</td><td>-3.40</td><td>-4.24</td></tr><tr><td>rings</td><td>-2.83</td><td>-3.5</td><td>-3.44</td><td>-3.24</td><td>-3.17</td><td>-4.13</td></tr></table>
+
+# c.2 samples from ssl models
+
+we present some samples from our semi-supervised mnist models in figure 8.
+
+![](images/47057b45e9a9c2e7db140468c4838aab5c4b88a13924c7b2923471eae7c385dc.jpg)  
+figure 8: unconditional mnist samples. left: samples from the generator and right: samples after 100 steps if mcmc refinement using mala.
+
+![](images/19b1bf0edb1ec9d97887f6e7da2b4d3186adbc85ee1ccd87cc9bcd775584519e.jpg)
+
+# c.3 hybrid modeling
+
+we present an extended table 4 with inception score salimans et al. (2016) and which includes more comparisons.
+
+table 10: fitting a mixture of 100 diagonal gaussians using ml, mcmc approximate ml and generator approximate ml.  
+
+<table><tr><td>model</td><td>fid</td><td>is</td></tr><tr><td>jem</td><td>38.4</td><td>8.76</td></tr><tr><td>hdge</td><td>37.6</td><td>9.19</td></tr><tr><td>sngan (miyato et al., 2018)</td><td>25.50</td><td>8.59</td></tr><tr><td>ncsn (song &amp; ermon, 2019b)</td><td>23.52</td><td>8.91</td></tr><tr><td>ade (dai et al., 2019)</td><td>n/a</td><td>7.55</td></tr><tr><td>igebm (du &amp; mordatch, 2019)</td><td>37.9</td><td>8.30</td></tr><tr><td>glow (kingma &amp; dhariwal, 2018)</td><td>48.9</td><td>3.92</td></tr><tr><td>fce (gao et al., 2020)</td><td>37.3</td><td>n/a</td></tr><tr><td>vera α = 100</td><td>30.5</td><td>8.11</td></tr><tr><td>vera α = 1</td><td>27.5</td><td>8.00</td></tr><tr><td>vera α = 1 (generator samples)</td><td>32.4</td><td>7.34</td></tr></table>
+
+# c.4 unconditional image generation: cifar10
+
+![](images/c62e6964c675e75901aa340cd24175a5297e0cd2f6bf4b642eae36d4b85dbcce.jpg)  
+figure 9: unconditional cifar10 samples. left: samples from the generator and right: samples after 100 steps if mcmc refinement using mala.
+
+![](images/9893013d7c812a723607f8aadc58c938da217e7647d238eeb6af4d4a88318934.jpg)
+
+# c.5 unconditional image generation: cifar100
+
+![](images/f37106e5f41db3c5ba0d649f328ef2f05b0a6dbd99d3a1ba9a0b8f3fa2801c0b.jpg)  
+figure 10: unconditional cifar100 samples. left: samples from the generator and right: samples after 100 steps if mcmc refinement using mala.
+
+![](images/ef3ba38874ea6b9cbded3d216a984bd775cf127a3fe983fc667793796fe61cb2.jpg)
+
+# c.6 conditional image generation: cifar10 and cifar100
+
+![](images/574611a03a053c274772d9803d4ca1ada4d53f0b7f697da30400305be64cf5ca.jpg)  
+figure 11: class-conditional samples from cifar10
+
+![](images/c1f6fce1212dbd4571416ac2276572ebdb2e61aace8bc823464851c940c0a3ab.jpg)  
+figure 12: class-conditional samples from cifar10
+
+![](images/4f424c34c879f8a9ce8048a5f9e41c68cc9e3c58c19a44dc6c5a1f7fc87faf71.jpg)  
+figure 13: class-conditional samples from cifar10
+
+![](images/54d1ece4338e6fdb3e11ae8e8fe6b89e70a8fa3b698cd80995176ca8dd7d1583.jpg)  
+figure 14: class-conditional samples from cifar10
+
+![](images/2d2d6754731879add5bbda1656f87c36c65c0879060302bb1f35979bf53cfca2.jpg)  
+figure 15: class-conditional samples from cifar10
+
+![](images/09850ebdf41a9e891b3e01e18e93185fb20910110d360ed4154f7996953e0dab.jpg)  
+figure 16: class-conditional samples from cifar10
+
+![](images/09affe7ab8da06397a7fa61ba171aa447b25bef617fe24dc471d127842aabb13.jpg)  
+figure 17: class-conditional samples from cifar10
+
+![](images/2205c18316adcbfe99bfb3d7e9f2190347adb86ba6b44010534faee19b0f32b1.jpg)  
+figure 18: class-conditional samples from cifar10
+
+![](images/db41b82455e7725b13d3f1c47bcdd7796e7d7d01f2c4e5085b51d14b309ad438.jpg)  
+figure 19: class-conditional samples from cifar10
+
+![](images/d219c13a070c1ce269c5c083ac2faae51eb61133548cbd418f9f28dad8ffcdb5.jpg)  
+figure 20: class-conditional samples from cifar10
+
+![](images/00c8e48eecd23da127848668374fabcf2467f57e8df4328ee4400739b2fffd5d.jpg)  
+figure 21: class-conditional samples from cifar100
+
+![](images/bbc9d6661e2fbe66abf539783a7cc1e5fb65585a78a6f3300760a780cdca86d9.jpg)
+
+![](images/830fdbf8a74cc5fe3a5a2c7f0ac3a8f94bbf701ff282189059f3710b483f480b.jpg)  
+figure 22: class-conditional samples from cifar100
+
+![](images/c10657dec9ccd236ef13648505db62da3de638516d550d2639a19e4ad63affcb.jpg)
+
+![](images/48c3eb76e3555ea05cf7242c493c4a8c142a0f2600a916f1afc641105a6ff901.jpg)  
+figure 23: class-conditional samples from cifar100
+
+![](images/8193b0238364ef2d7341aefa86a2ece1c73752e74ffe4ca19cbb0f4ca1e43f21.jpg)
+
+![](images/69f00ff086c39d9be3fe512e7da750d9a797010b467c9e26ce37eb9e5508db60.jpg)  
+figure 24: class-conditional samples from cifar100
+
+![](images/8ea69bb380be944f96f14129fae43c15b0b84dab19421d4ab9febf07100874a8.jpg)
+
+![](images/1b98c4769bb148c37ae45548d179388a66a45cb69660e006a35d341f34b1ea40.jpg)  
+figure 25: class-conditional samples from cifar100
+
+![](images/3c2c8f5dd8d42a5dd713faf69904fb7115a3510b9f3d5aa5ee9eb00e6cb1b246.jpg)
+
+![](images/01af9ec31158eac8febb17027ac5fac13890228dfbbaabd07fc18a423c59ecea.jpg)  
+figure 26: class-conditional samples from cifar100
+
+![](images/a258ced73462d75a766020e28e331956de3d3ac76eb0f7b9eb76500fc9560fca.jpg)
+
+![](images/e12bf3208b66376063b6362fbc4b8ddc3a213ce4b9ced290126e17bbae992dbd.jpg)  
+figure 27: class-conditional samples from cifar100
+
+![](images/f40ebbd872d83d9c6f4157bc34dfd34063dd5ab27dc0697588fef38f06cd30ab.jpg)

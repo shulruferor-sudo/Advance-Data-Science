@@ -1,0 +1,730 @@
+# microsecond consensus for microsecond applications
+
+marcos k. aguilera  
+vmware research
+
+naama ben-david
+vmware research
+
+athanasios xygkis epfl
+
+rachid guerraoui epfl
+
+igor zablotchi epfl
+
+virendra j. marathe oracle labs
+
+# abstract
+
+we consider the problem of making apps fault-tolerant through replication, when apps operate at the microsecond scale, as in finance, embedded computing, and microservices apps. these apps need a replication scheme that also operates at the microsecond scale, otherwise replication becomes a burden. we propose mu, a system that takes less than 1.3 microseconds to replicate a (small) request in memory, and less than a millisecond to fail-over the system—this cuts the replication and fail-over latencies of the prior systems by at least  $61\%$  and  $90\%$ . mu implements bona fide state machine replication/consensus (smr) with strong consistency for a generic app, but it really shines on microsecond apps, where even the smallest overhead is significant. to provide this performance, mu introduces a new smr protocol that carefully leverages rdma. roughly, in mu a leader replicates a request by simply writing it directly to the log of other replicas using rdma, without any additional communication. doing so, however, introduces the challenge of handling concurrent leaders, changing leaders, garbage collecting the logs, and more—challenges that we address in this paper through a judicious combination of rdma permissions and distributed algorithmic design. we implemented mu and used it to replicate several systems: a financial exchange app called liquibook, redis, memcached, and herd [32]. our evaluation shows that mu incurs a small replication latency, in some cases being the only viable replication system that incurs an acceptable overhead.
+
+# 1 introduction
+
+enabled by modern technologies such as rdma, microsecond-scale computing is emerging as a must [6]. a microsecond app might be expected to process a request in 10 microseconds. areas where software systems care about microsecond performance include finance (e.g., trading systems), embedded computing (e.g., control systems), and microservices (e.g., key-value stores). some of these areas
+
+are critical and it is desirable to replicate their microsecond apps across many hosts to provide high availability, due to economic, safety, or robustness reasons. typically, a system may have hundreds of microservice apps [24], some of which are stateful and can disrupt a global execution if they fail (e.g., key-value stores)—these apps should be replicated for the sake of the whole system.
+
+the golden standard to replicate an app is state machine replication (smr) [67], whereby replicas execute requests in the same total order determined by a consensus protocol. unfortunately, traditional smr systems add hundreds of microseconds of overhead even on a fast network [27]. recent work explores modern hardware in order to improve the performance of replication [29, 31, 35, 37, 60, 70]. the fastest of these (e.g., hermes [35], dare [60], and hovercraft [37]) induce however an overhead of several microseconds, which is clearly high for apps that themselves take few microseconds. furthermore, when a failure occurs, prior systems incur a prohibitively large fail-over time in the tens of milliseconds (not microseconds). for instance, hovercraft takes 10 milliseconds, dare 30 milliseconds, and hermes at least 150 milliseconds. the rationale for such large latencies are timeouts that account for the natural fluctuations in the latency of modern networks. improving replication and fail-over latencies requires fundamentally new techniques.
+
+we propose mu, a new smr system that adds less than 1.3 microseconds to replicate a (small) app request, with the 99th-percentile at 1.6 microseconds. although mu is a general-purpose smr scheme for a generic app, mu really shines with microsecond apps, where even the smallest replication overhead is significant. compared to the fastest prior system, mu is able to cut  $61\%$  of its latency. this is the smallest latency possible with current rdma hardware, as it corresponds to one round of one-sided communication.
+
+to achieve this performance, mu introduces how rdma can be leveraged for replication. our protocol reaches consensus and replicates a request with just one round of parallel rdma write operations on a majority of replicas. this is in contrast to
+
+prior approaches, which take multiple rounds [29,60,70] or resort to two-sided communication [27, 31, 38, 52]. roughly, in mu the leader replicates a request by simply using rdma to write it to the log of each replica, without additional rounds of communication. doing this correctly is challenging because concurrent leaders may try to write to the logs simultaneously. in fact, the hardest part of most replication protocols is the mechanism to protect against races of concurrent leaders (e.g., paxos proposal numbers [39]). traditional replication implements this mechanism using send-receive communication (two-sided operations) or multiple rounds of communication. instead, mu uses rdma write permissions to guarantee that a replica's log can be written by only one leader. critical to correctness are the mechanisms to change leaders and garbage collect logs, as we describe in the paper.
+
+mu also improves fail-over time to just 873 microseconds, with the 99-th percentile at 945 microseconds, which cuts fail-over time of prior systems by an order of magnitude. the fact that mu significantly improves both replication overhead and fail-over latency is perhaps surprising: folklore suggests a trade-off between the latencies of replication in the fast path, and fail-over in the slow path.
+
+the fail-over time of mu has two parts: failure detection and leader change. for failure detection, traditional smr systems typically use a timeout on heartbeat messages from the leader. due to large variances in network latencies, timeout values are in the 10–100ms even with the fastest networks. this is clearly high for microsecond apps. mu uses a conceptually different method based on a pull-score mechanism over rdma. the leader increments a heartbeat counter in its local memory, while other replicas use rdma to periodically read the counter and calculate a badness score. the score is the number of successive reads that returned the same value. replicas declare a failure if the score is above a threshold, corresponding to a timeout. different from the traditional heartbeats, this method can use an aggressively small timeout without false positives because network delays slow down the reads rather than the heartbeat. in this way, mu detects failures usually within  $\sim 600$  microseconds. this is bottlenecked by variances in process scheduling, as we discuss later.
+
+for leader change, the latency comes from the cost of changing rdma write permissions, which with current nics are hundreds of microseconds. this is higher than we expected: it is far slower than rdma reads and writes, which go over the network. we attribute this delay to a lack of hardware optimization. rdma has many methods to change permissions: (1) re-register memory regions, (2) change queue-pair access flags, or (3) close and reopen queue pairs. we carefully evaluate the speed of each method and propose a scheme that combines two of them using a fast-slow path to minimize latency. despite our efforts, the best way to cut this latency further is to improve the nic hardware.
+
+we prove that mu provides strong consistency in the form of linearizability [25], despite crashes and asynchrony, and it
+
+ensures liveness under the same assumptions as paxos [39].
+
+we implemented mu and used it to replicate several apps: a financial exchange app called liquibook [49], redis, memcached, and an rdma-based key-value stored called herd [32].
+
+we evaluate mu extensively, by studying its replication latency stand-alone or integrated into each of the above apps. we find that, for some of these apps (liquibook, herd), mu is the only viable replication system that incurs a reasonable overhead. this is because mu's latency is significantly lower by a factor of at least  $2.7 \times$  compared to other replication systems. we also report on our study of mu's fail-over latency, with a breakdown of its components, suggesting ways to improve the infrastructure to further reduce the latency.
+
+mu has some limitations. first, mu relies on rdma and so it is suitable only for networks with rdma, such as local area networks, but not across the wide area. second, mu is an in-memory system that does not persist data in stable storage—doing so would add additional latency dependent on the device speed. however, we observe that the industry is working on extensions of rdma for persistent memory, whereby rdma writes can be flushed at a remote persistent memory with minimum latency [69]—once available, this extension will provide persistence for mu.
+
+to summarize, we make the following contributions:
+
+- we propose mu, a new smr system with low replication and fail-over latencies.  
+- to achieve its performance, mu leverages rdma permissions and a scoring mechanism over heartbeat counters.  
+- we give the complete correctness proof of mu.  
+- we implement mu, and evaluate both its raw performance and its performance in microsecond apps. results show that mu significantly reduces replication latencies to an acceptable level for microsecond apps.  
+- mu's code is available at: https://github.com/lpd-epfl/mu.
+
+one might argue that mu is ahead of its time, as most apps today are not yet microsecond apps. however, this situation is changing. we already have important microsecond apps in areas such as trading, and more will come as existing timing requirements become stricter and new systems emerge as the composition of a large number of microservices (§2.1).
+
+# 2 background
+
+# 2.1 microsecond apps and computing
+
+apps that are consumed by humans typically work at the millisecond scale: to the human brain, the lowest reported perceptible latency is 13 milliseconds [61]. yet, we see the emergence of apps that are consumed not by humans but by other computing systems. an increasing number of such systems must operate at the microsecond scale, for competitive, physical, or composition reasons. schneider [66] speaks of a microsecond market where traders spend massive resources to gain a microsecond advantage in their high-frequency trading. industrial robots must orchestrate their motors with microsecond granularity for precise movements [5]. modern distributed systems are composed of hundreds [24] of stateless and stateful microservices, such as key-value stores, web servers, load balancers, and ad services—each operating as an independent app whose latency requirements are gradually decreasing to the microsecond level [8], as the number of composed services is increasing. with this trend, we already see the emergence of key-value stores with microsecond latency (e.g., [31, 54]).
+
+to operate at the microsecond scale, the computing ecosystem must be improved at many layers. this is happening gradually by various recent efforts. barroso et al [6] argue for better support of microsecond-scale events. the latest precision time protocol improves clock synchronization to achieve submicrosecond accuracy [3]. and other recent work improves cpu scheduling [8,57,62], thread management [64], power management [63], rpc handling [17, 31], and the network stack [57]—all at the microsecond scale. mu fits in this context, by providing microsecond smr.
+
+# 2.2 state machine replication
+
+state machine replication (smr) replicates a service (e.g., a key-value storage system) across multiple physical servers called replicas, such that the system remains available and consistent even if some servers fail. smr provides strong consistency in the form of linearizability [25]. a common way to implement smr, which we adopt in this paper, is as follows: each replica has a copy of the service software and a log. the log stores client requests. we consider nondurable smr systems [28, 30, 48, 51, 56, 58], which keep state in memory only, without logging updates to stable storage. such systems make an item of data reliable by keeping copies of it in the memory of several nodes. thus, the data remains recoverable as long as there are fewer simultaneous node failures than data copies [60].
+
+a consensus protocol ensures that all replicas agree on what request is stored in each slot of the log. replicas then apply the requests in the log (i.e., execute the corresponding operations), in log order. assuming that the service is deter
+
+ministic, this ensures all replicas remain in sync. we adopt a leader-based approach, in which a dynamically elected replica called the leader communicates with the clients and sends back responses after requests reach a majority of replicas. we assume a crash-failure model: servers may fail by crashing, after which they stop executing.
+
+a consensus protocol must ensure safety and liveness properties. safety here means (1) agreement (different replicas do not obtain different values for a given log slot) and (2) validity (replicas do not obtain spurious values). liveness means termination—every live replica eventually obtains a value. we guarantee agreement and validity in an asynchronous system, while termination requires eventual synchrony and a majority of non-crashed replicas, as in typical consensus protocols. in theory, it is possible to design systems that terminate under weaker synchrony [13], but this is not our goal.
+
+# 2.3 rdma
+
+remote direct memory access (rdma) allows a host to access the memory of another host without involving the processor at the other host. rdma enables low-latency communication by bypassing the os kernel and by implementing several layers of the network stack in hardware.
+
+rdma supports many operations: send/receive, write/read, and atomics (compare-and-swap, fetch-and-increment). because of their lower latency, we use only rdma writes and reads. rdma has several transports; we use reliable connection (rc) to provide in-order reliable delivery.
+
+rdma connection endpoints are called queue pairs (qps). each qp is associated to a completion queue (cq). operations are posted to qps as work requests (wrs). the rdma hardware consumes the wr, performs the operation, and posts a work completion (wc) to the cq. applications make local memory available for remote access by registering local virtual memory regions (mrs) with the rdma driver. both qps and mrs can have different access modes (e.g., read-only or read-write). the access mode is specified when initializing the qp or registering the mr, but can be changed later. mrs can overlap: the same memory can be registered multiple times, yielding multiple mrs, each with its own access mode. in this way, different remote machines can have different access rights to the same memory. the same effect can be obtained by using different access flags for the qps used to communicate with remote machines.
+
+# 3 overview of mu
+
+# 3.1 architecture
+
+figure 1 depicts the architecture of mu. at the top, a client sends requests to an application and receives a response. we
+
+![](images/195ff37d58044f2c0b4fe2473ef0939ab86c346922b1687970103a1f16f4a475.jpg)  
+figure 1: architecture of mu. grey color shows mu components. a replica is either a leader or a follower, with different behaviors. the leader captures client requests and writes them to the local logs of all replicas. followers replay the log to inject the client requests into the application. a leader election component includes a heartbeat and the identity of the current leader. a permission management component allows a leader to request write permission to the local log while revoking the permission from other nodes.
+
+are not particularly concerned about how the client communicates with the application: it can use a network, a local pipe, a function call, etc. we do assume however that this communication is amenable to being captured and injected. that is, there is a mechanism to capture requests from the client before they reach the application, so we can forward these requests to the replicas; a request is an opaque buffer that is not interpreted by mu. similarly, there is a mechanism to inject requests into the app. providing such mechanisms requires changing the application; however, in our experience, the changes are small and non-intrusive. these mechanisms are standard in any smr system.
+
+each replica has an idea of which replica is currently the leader. a replica that considers itself the leader assumes that role (left of figure); otherwise, it assumes the role of a follower (right of figure). each replica grants rdma write permission to its log for its current leader and no other replica. the replicas constantly monitor their current leader to check that it is still active. the replicas might not agree on who the current leader is. but in the common case, all replicas have the same leader, and that leader is active. when that happens, mu is simple and efficient. the leader captures a client request, uses an rdma write to append that request to the log of each follower, and then continues the application to process the request. when the followers detect a new request in their log, they inject the request into the application, thereby updating the replicas.
+
+the main challenge in the design of smr protocols is to handle leader failures. of particular concern is the case when a leader appears failed (due to intermittent network delays) so
+
+another leader takes over, but the original leader is still active.
+
+to detect failures in mu, the leader periodically increments a local counter: the followers periodically check the counter using an rdma read. if the followers do not detect an increment of the counter after a few tries, a new leader is elected.
+
+the new leader revokes a write permission by any old leaders, thereby ensuring that old leaders cannot interfere with the operation of the new leader [2]. the new leader also reconstructs any partial work left by prior leaders.
+
+both the leader and the followers are internally divided into two major parts: the replication plane and the background plane. roughly, the replication plane plays one of two mutually exclusive roles: the leader role, which is responsible for copying requests captured by the leader to the followers, or the follower role, which replays those requests to update the followers' replicas. the background plane monitors the health of the leader, determines and assigns the leader or follower role to the replication plane, and handles permission changes. each plane has its own threads and queue pairs. this is in order to improve parallelism and provide isolation of performance and functionality. more specifically, the following components exist in each of the planes.
+
+the replication plane has three components:
+
+- replicator. this component implements the main protocol to replicate a request from the leader to the followers, by writing the request in the followers' logs using rdma write.  
+replayer. this component replays entries from the lo
+
+cal log. this component and the replicator component are mutually exclusive; a replica only has one of these components active, depending on its role in the system.
+
+- logging. this component stores client requests to be replicated. each replica has its own local log, which may be written remotely by other replicas according to previously granted permissions. replicas also keep a copy of remote logs, which is used by a new leader to reconstruct partial log updates by older leaders.
+
+the background plane has two components:
+
+- leader election. this component detects failures of leaders and selects other replicas to become leader. this is what determines the role a replica plays.  
+- permission management. this component grants and revokes write access of local data by remote replicas. it maintains a permissions array, which stores access requests by remote replicas. basically, a remote replica uses rdma to store a 1 in this vector to request access.
+
+we describe these planes in more detail in  $\s 4$  and  $\s 5$ .
+
+# 3.2 rdma communication
+
+each replica has two qps for each remote replica: one qp for the replication plane and one for the background plane. the qps for the replication plane share a completion queue, while the qps for the background plane share another completion queue. the qps operate in reliable connection (rc) mode.
+
+each replica also maintains two mrs, one for each plane. the mr of the replication plane contains the consensus log and the mr of the background plane contains metadata for leader election (§5.1) and permission management (§5.2). during execution, replicas may change the level of access to their log that they give to each remote replica; this is done by changing qp access flags. note that all replicas always have remote read and write access permissions to the memory region in the background plane of each replica.
+
+# 4 replication plane
+
+the replication plane takes care of execution in the common case, but remains safe during leader changes. this is where we take care to optimize the latency of the common path. we do so by ensuring that, in the replication plane, only a leader replica communicates over the network, whereas all follower replicas are silent (i.e., only do local work).
+
+in this section, we discuss algorithmic details related to replication in mu. for pedagogical reasons, we first describe in §4.1 a basic version of the algorithm, which requires several round-trips to decide. later, in §4.2, we discuss how mu achieves its single round-trip complexity in the common
+
+case, as we present key extensions and optimizations to improve functionality and performance. we give an intuition of why the algorithm works in this section, and we provide the complete correctness argument in the appendix.
+
+# 4.1 basic algorithm
+
+the leader captures client requests, and calls propose to replicate these requests. it is simplest to understand our replication algorithm relative to the paxos algorithm, which we briefly summarize; for details, we refer the reader to [39]. in paxos, for each slot of the log, a leader first executes a prepare phase where it sends a proposal number to all replicas. a replica replies with either rack if it has seen a higher proposal number, or otherwise with the value with the highest proposal number that it has accepted. after getting a majority of replies, the leader adopts the value with the highest proposal number. if it got no values (only acks), it adopts its own proposal value. in the next phase, the accept phase, the leader sends its proposal number and adopted value to all replicas. a replica acks if it has not received any prepare phase message with a higher proposal number.
+
+in paxos, replicas actively reply to messages from the leader, but in our algorithm, replicas are silent and communicate information passively by publishing it to their memory. specifically, along with their log, a replica publishes a minproposal representing the minimum proposal number which it can accept. the correctness of our algorithm hinges on the leader reading and updating the minproposal number of each follower before updating anything in its log, and on updates on a replica's log happening in slot-order.
+
+however, this by itself is not enough; paxos relies on active participation from the followers not only for the data itself, but also to avoid races. simply publishing the relevant data on each replica is not enough, since two competing leaders could miss each other's updates. this can be avoided if each of the leaders rereads the value after writing it [23]. however, this requires more communication. to avoid this, we shift the focus from the communication itself to the prevention of bad communication. a leader  $\ell$  maintains a set of confirmed followers, which have granted write permission to  $\ell$  and revoked write permission from other leaders before  $\ell$  begins its operation. this is what prevents races among leaders in mu. we describe these mechanisms in more detail below.
+
+# log structure
+
+the main data structure used by the algorithm is the consensus log kept at each replica (listing 1). the log consists of (1) a minproposal number, representing the smallest proposal number with which a leader may enter the accept phase on this replica; (2) a first undecided offset (fuo), representing the
+
+lowest log index which this replica believes to be undecided; and (3) a sequence of slots—each slot is a (propnr, value) tuple.
+
+listing 1: log structure  
+```txt
+1 struct log {
+2     minproposal = 0,
+3         fuo = 0,
+4     slots[] = (0,⊥) for all slots
+5 }
+```
+
+# algorithm description
+
+each leader begins its propose call by constructing its confirmed followers set (listing 2, lines 9-12). this step is only necessary the first time a new leader invokes propose or immediately after an abort. this step is done by sending permission requests to all replicas and waiting for a majority of acks. when a replica acts, it means that this replica has granted write permission to this leader and revoked it from other replicas. the leader then adds this replica to its confirmed followers set. during execution, if the leader  $\ell$  fails to write to one of its confirmed followers, because that follower crashed or gave write access to another leader,  $\ell$  aborts and, if it still thinks it is the leader, it calls propose again.
+
+after establishing its confirmed followers set, the leader invokes the prepare phase. to do so, the leader reads the minproposal from its confirmed followers (line 19) and chooses a proposal number propnum which is larger than any that it has read or used before. then, the leader writes its proposal number into minproposal for each of its confirmed followers. recall that if this write fails at any follower, the leader aborts. it is safe to overwrite a follower  $f$ 's minproposal in line 22 because, if that write succeeds, then  $\ell$  has not lost its write permission since adding  $f$  to its confirmed followers set, meaning no other leader wrote to  $f$  since then. to complete its prepare phase, the leader reads the relevant log slot of all of its confirmed followers and, as in paxos, adopts either (a) the value with the highest proposal number, if it read any non-  $\bot$  values, or (b) its own initial value, otherwise.
+
+the leader  $\ell$  then enters the accept phase, in which it tries to commit its previously adopted value. to do so,  $\ell$  writes its adopted value to its confirmed followers. if these writes succeed, then  $\ell$  has succeeded in replicating its value. no new value or minproposal number could have been written on any of the confirmed followers in this case, because that would have involved a loss of write permission for  $\ell$ . since the confirmed followers set constitutes a majority of the replicas, this means that  $\ell$ 's replicated value now appears in the same slot at a majority.
+
+finally,  $\ell$  increments its own fuo to denote successfully replicating a value in this new slot. if the replicated value was  $\ell$ 's own proposed value, then it returns from the propose call; otherwise it continues with the prepare phase for the new fuo.
+
+listing 2: basic replication algorithm of mu  
+```txt
+propose (myvalue): done  $=$  false if i just became leader or i just aborted: for every process p in parallel: request permission from p if p acks: add p to confirmedfollowers until this has been done for a majority while not done: execute prepare phase execute accept phase   
+prepare phase: for every process p in confirmedfollowers: read minproposal from p's log pick a new proposal number, propnum, higher  $\rightarrow$  than any minproposal seen so far for every process p in confirmedfollowers: write propnum into log[p].minproposal read log[p].slots [myfuo] abort if any write fails if all entries read were empty: value  $=$  myvalue else: value  $=$  entry value with the largest  $\rightarrow$  proposal number of slots read   
+accept phase: for every process p in confirmedfollowers: write propnum, value to p in slot myfuo abort if any write fails if value  $= =$  myvalue: done  $=$  true locally increment myfuo
+```
+
+# 4.2 extensions
+
+the basic algorithm described so far is clear and concise, but it also has downsides related to functionality and performance. we now address these downsides with some extensions, all of which are standard for paxos-like algorithms; their correctness is discussed in the appendix.
+
+bringing stragglers up to date. in the basic algorithm, if a replica  $r$  is not included in some leader's confirmed followers set, then its log will lag behind. if  $r$  later becomes leader, it can catch up by proposing new values at its current fuo, discovering previously accepted values, and re-committing them. this is correct but inefficient. even worse, if  $r$  never becomes leader, then it will never recover the missing values. we address this problem by introducing an update phase for new leaders. after a replica becomes leader and establishes its confirmed followers set, but before attempting to replicate new values, the new leader (1) brings itself up to date with its highest-fuo confirmed follower (listing 3) and (2) brings its followers up to date (listing 4). this is done by copying the contents of the more up-to-date log to the less up-to-date log.
+
+listing 3: optimization: leader catch up  
+```txt
+1 for every process p in confirmedfollowers  
+2 read p's fuo  
+3 abort if any read fails  
+4 f = follower with max fuo  
+5 if f.fuo > myfuo:  
+6 copy f.log[myfuo: f.fuo] into my log  
+7 myfuo = f.fuo  
+8 abort if the read fails
+```
+
+listing 4: optimization: update followers  
+```txt
+1 for every process p in confirmed followers: copy mylog[p.fuo: myfuo] into p.log p.fuo  $=$  myfuo abort if any write fails
+```
+
+followers commit in background. in the basic algorithm, followers do not know when a value is committed and thus cannot replay the requests in the application. this is easily fixed without additional communication. since a leader will not start replicating in an index  $i$  before it knows index  $i - 1$  to be committed, followers can monitor their local logs and commit all values up to (but excluding) the highest non-empty log index. this is called commit piggybacking, since the commit message is folded into the next replicated value. as a result, followers replicate but do not commit the  $(i - 1)$ -st entry until either the  $i$ -th entry is proposed by the current leader, or a new leader is elected and brings its followers up to date, whichever happens first.
+
+omitting the prepare phase. once a leader finds only empty slots at a given index at all of its confirmed followers at line 23, then no higher index may contain an accepted value at any confirmed follower; thus, the leader may omit the prepare phase for higher indexes (until it aborts, after which the prepare phase becomes necessary again). this optimization concerns performance on the common path. with this optimization, the cost of a propose call becomes a single rdma write to a majority in the common case.
+
+growing confirmed followers. in the algorithm so far, the confirmed followers set remains fixed after the leader initially constructs it. this implies that processes outside the leader's confirmed followers set will miss updates, even if they are alive and timely, and that the leader will abort even if one of its followers crashes. to avoid this problem, we extend the algorithm to allow the leader to grow its confirmed followers set by briefly waiting for responses from all replicas during its initial request for permission. the leader can also add confirmed followers later, but must bring these replicas up to date (using the mechanism described above in bringing stragglers up to date) before adding them to its set. when its
+
+confirmed follower set is large, the leader cannot wait for its rdma reads and writes to complete at all of its confirmed followers before continuing, since we require the algorithm to continue operating despite the failure of a minority of the replicas; instead, the leader waits for just a majority of the replicas to complete.
+
+replayer. followers continually monitor the log for new entries. this creates a challenge: how to ensure that the follower does not read an incomplete entry that has not yet been fully written by the leader. we adopt a standard approach: we add an extra canary byte at the end of each log entry [50, 70]. before issuing an rdma write to replicate a log entry, the leader sets the entry's canary byte to a non-zero value. the follower first checks the canary and then the entry contents. in theory, it is possible that the canary gets written before the other contents under rdma semantics. in practice, however, nics provide left-to-right semantics in certain cases (e.g., the memory region is in the same numa domain as the nic), which ensures that the canary is written last. this assumption is made by other rdma systems [20, 21, 32, 50, 70]. alternatively, we could store a checksum of the data in the canary, and the follower could read the canary and wait for the checksum to match the data.
+
+# 5 background plane
+
+the background plane has two main roles: electing and monitoring the leader, and handling permission change requests. in this section, we describe these mechanisms.
+
+# 5.1 leader election
+
+the leader election component of the background plane maintains an estimate of the current leader, which it continually updates. the replication plane uses this estimate to determine whether to execute as leader or follower.
+
+each replica independently and locally decides who it considers to be leader. we opt for a simple rule: replica  $i$  decides that  $j$  is leader if  $j$  is the replica with the lowest id, among those that  $i$  considers to be alive.
+
+to know whether a replica has failed, we employ a pull-score mechanism, based on a local heartbeat counter. a leader election thread continually increments its own counter locally and uses rdma reads to read the counters (heartbeats) of other replicas and check whether they have been updated. it maintains a score for every other replica. if a replica has updated its counter since the last time it was read, we increment that replica's score; otherwise, we decrement it. the score is capped by configurable minimum and maximum values, chosen experimentally to be 0 and 15, respectively. once a replica's score drops below a failure threshold, we consider it to have failed; if its score goes above a recovery
+
+threshold, we consider it to be active and timely. to avoid oscillation, we have different failure and recovery thresholds, chosen experimentally to be 2 and 6, respectively, so as to avoid false positives.
+
+large network delays. mu employs two timeouts: a small timeout in our detection algorithm (scoring), and a longer timeout built into the rdma connection mechanism. the small timeout detects crashes quickly under common failures (process crashes, host crashes) without false positives. the longer rdma timeout fires only under larger network delays (connection breaks, counter-read failures). in theory, the rdma timeout could use exponential back-off to handle unknown delay bounds. in practice, however, that is not necessary, since we target datacenters with small delays.
+
+fate sharing. because replication and leader election run in independent threads, the replication thread could fail or be delayed, while the leader election thread remains active and timely. this scenario is problematic if it occurs on a leader, as the leader cannot commit new entries, and no other leader can be elected. to address this problem, every  $x = 10000$  iterations, the leader election thread checks the replication thread for activity; if the replication thread is stuck inside a call to propose, the replication thread stops incrementing the local counter, to allow a new leader to be elected.
+
+# 5.2 permission management
+
+the permission management module is used when changing leaders. each replica maintains the invariant that only one replica at a time has write permission on its log. as explained in section 4, when a leader changes in mu, the new leader must request write permission from all the other replicas; this is done through a simple rdma write to a permission request array on the remote side. when a replica  $r$  sees a permission request from a would-be leader  $\ell$ ,  $r$  revokes write access from the current holder, grants write access to  $\ell$ , and sends an ack to  $\ell$ .
+
+during the transition phase between leaders, it is possible that several replicas think themselves to be leader, and thus the permission request array may contain multiple entries. a permission management thread monitors and handles permission change requests one by one in order of requester id by spinning on the local permission request array.
+
+rdma provides multiple mechanisms to grant and revoke write access. the first mechanism is to register the consensus log as multiple, completely overlapping rdma memory regions (mrs), one per remote replica. in order to grant or revoke access from replica  $r$ , it suffices to re-register the mr corresponding to  $r$  with different access flags. the second mechanism is to revoke  $r$ 's write access by moving  $r$ 's qp to a non-operational state (e.g., init); granting  $r$  write access is then done by moving  $r$ 's qp back to the ready-to-receive
+
+![](images/a4ce2c1dc4de9d0a1229a811b52c790ac54ac41c50abccd91581bc810fc7108d.jpg)  
+figure 2: performance comparison of different permission switching mechanisms.  $qp$  flags: change the access flags on a qp;  $qp$  restart: cycle a qp through the reset, init, rtr and rts states; mr rereg: re-register an rdma mr with different access flags.
+
+(rtr) state. the third mechanism is to grant or revoke access from replica  $r$  by changing the access flags on  $r$ 's qp.
+
+we compare the performance of these three mechanisms in figure 2, as a function of the log size (which is the same as the rdma mr size). we observe that the time to re-register an rdma mr grows with the size of the mr, and can reach values close to  $100\mathrm{ms}$  for a log size of 4gb. on the other hand, the time to change a qps access flags or cycle it through different states is independent of the mr size, with the former being roughly 10 times faster than the latter. however, changing a qps access flags while rdma operations to that qp are in flight sometimes causes the qp to go into an error state. therefore, in mu we use a fast-slow path approach: we first optimistically try to change permissions using the faster qp access flag method and, if that leads to an error, switch to the slower, but robust, qp state method.
+
+# 5.3 log recycling
+
+conceptually, a log is an infinite data structure but in practice we need to implement a circular log with limited memory. this is done as follows. each follower has a local log head variable, pointing to the first entry not yet executed in its copy of the application. the replayer thread advances the log head each time it executes an entry in the application. periodically, the leader's background plane reads the log heads of all followers and computes minhead, the minimum of all log head pointers read from the followers. log entries up to the minhead can be reused. before these entries can be reused, they must be zeroed out to ensure the correct function of the canary byte mechanism. thus, the leader zeroes all follower logs after the leader's first undecided offset and before minhead, using an rdma write per follower. note that this means that a new leader must first execute all leader change
+
+actions, ensuring that its first undecided offset is higher than all followers' first undecided offsets, before it can recycle entries. to facilitate the implementation, we ensure that the log is never completely full.
+
+# 5.4 adding and removing replicas
+
+mu adopts a standard method to add or remove replicas: use consensus itself to inform replicas about the change [39]. more precisely, there is a special log entry that indicates that replicas have been removed or added. removing replicas is easy: once a replica sees it has been removed, it stops executing, while other replicas subsequently ignore any communication with it. adding replicas is more complicated because it requires copying the state of an existing replica into the new one. to do that, mu uses the standard approach of check-pointing state; we do so from one of the followers [70].
+
+# 6 implementation
+
+mu is implemented in 7157 lines of c++17 code (cloc [18]). it uses the `ibverbs` library for rdma over infiniband. we implement all features and extensions in sections 4 and 5, except adding/removing replicas and fate sharing. moreover, we implement some standard rdma optimizations to reduce latency. rdma writes and sends with payloads below a device-specific limit (256 bytes in our setup) are inclined: their payload is written directly to their work request. we pin threads to cores in the numa node of the nic.
+
+our implementation is modular. we create several modules on top of the ibverbs library, which we expose as conan [16] packages. our modules deal with common practical problems in rdma-based distributed computing (e.g., writing to all and waiting for a majority, gracefully handling broken rdma connections etc.). each abstraction is independently reusable. our implementation also provides a qp exchange layer, making it straightforward to create, manage, and communicate qp information.
+
+# 7 evaluation
+
+our goal is to evaluate whether mu indeed provides viable replication for microsecond computing. we aim to answer the following questions in our evaluation:
+
+- what is the replication latency of mu? how does it change with payload size and the application being replicated? how does mu compare to other solutions?  
+what is mu's fail-over time?  
+what is the throughput of mu?
+
+table 1: hardware details of machines.  
+
+<table><tr><td>cpu</td><td>2x intel xeon e5-2640 v4 @ 2.40ghz</td></tr><tr><td>memory</td><td>2x 128gib</td></tr><tr><td>nic</td><td>mellanox connect-x 4</td></tr><tr><td>links</td><td>100 gbps infiniband</td></tr><tr><td>switch</td><td>mellanox msb7700 edr 100 gbps</td></tr><tr><td>os</td><td>ubuntu 18.04.4 lts</td></tr><tr><td>kernel</td><td>4.15.0-72-generic</td></tr><tr><td>rdma driver</td><td>mellanox ofed 4.7-3.2.9.0</td></tr></table>
+
+we evaluate mu on a 4-node cluster, the details of which are given in table 1. all experiments show 3-way replication, which accounts for most real deployments [27].
+
+we compare against apus [70], dare [60], and hermes [35] where possible. the most recent system, hovercraft [37], also provides smr but its latency at 30-60 microseconds is substantially higher than the other systems, so we do not consider it further. for a fair comparison, we disable apus's persistence to stable storage, since mu, dare, and hermes all provide only in-memory replication.
+
+we measure time using the posix clock_gettime function, with the clock_monotonic parameter. in our deployment, the resolution and overhead of clock_gettime is around 16-20ns [19]. in our figures, we show bars labeled with the median latency, with error bars showing 99-percentile and 1-percentile latencies. these statistics are computed over 1 million samples with a payload of 64-bytes each, unless otherwise stated.
+
+applications. we use mu to replicate several microsecond apps: three key-value stores, as well as an order matching engine for a financial exchange.
+
+the key-value stores that we replicate with mu are redis [65], memcached [53], and herd [32]. for the first two, the client is assumed to be on a different cluster, and connects to the servers over tcp. in contrast, herd is a microsecond-scale rdma-based key-value store. we replicate it over rdma and use it as an example of a microsecond application. integration with the three applications requires 183, 228, and 196 additional lines of code, respectively.
+
+the other app is in the context of financial exchanges, in which parties unknown to each other submit buy and sell orders of stocks, commodities, derivatives, etc. at the heart of a financial exchange is an order matching engine [4], such as liquibook [49], which is responsible for matching the buy and sell orders of the parties. we use mu to replicate liquibook. liquibook's inputs are buy and sell orders. we created an unreplicated client-server version of liquibook using erpc [31], and then replicated this system using mu. the erpc integration and the replication required 611 lines of code in total.
+
+![](images/905519621dddd0836a7d252fe59cd341c1ba313485a8e0e21ce7b0e725b479ea.jpg)  
+figure 3: replication latency of mu integrated into different applications [memcached (mcd), liquibase (liq), redis (rds), herd] and payload sizes. bar height and numerical labels show median latency; error bars show 99-percentile and 1-percentile latencies.
+
+# 7.1 common-case replication latency
+
+we begin by testing the overhead that mu introduces in normal execution, when there is no leader failure. for these experiments, we first measure raw replication latency and compare mu to other replication systems, as well as to itself under different payloads and attached applications.
+
+effect of payload and application on latency we first study mu in isolation, to understand its replication latency under different conditions.
+
+we evaluate the raw replication latency of mu in two settings: standalone and attached. in the standalone setting, mu runs just the replication layer with no application and no client; the leader simply generates a random payload and invokes propose() in a tight loop. in the attached setting, mu is integrated into one of a number of applications; the application client produces a payload and invokes propose() on the leader. these settings could impact latency differently, mu and the application could interfere with each other.
+
+figure 3 compares standalone to attached runs as we vary payload size. liquibook and herd allow only one payload size (32 and 50 bytes), so they have only one bar each in the graph, while redis and memcached have many bars.
+
+we see that the standalone version slightly outperforms the attached runs, for all tested applications and payload sizes. this is due to processor cache effects; in standalone runs, replication state, such as log and queue pairs, are always in cache, and the requests themselves need not be fetched from memory. this is not the case when attaching to an application. additionally, in attached runs, the os can migrate application threads (even if mu's threads are pinned), leading to additional cache effects which can be detrimental to performance.
+
+mu supports two ways of attaching to an application, which have different processor cache sharing effects. the direct mode uses the same thread to run both the application and the replication, and so they share l1 and l2 caches. in contrast, the handover method places the application thread on a separate core from the replication thread, thus avoiding sharing l1 or l2 caches. because the application must communicate the request to the replication thread, the handover method requires a cache coherence miss per replicated request. this method consistently adds  $\approx 400\mathrm{ns}$  over the standalone method. for applications with large requests, this overhead might be preferable to the one caused by the direct method, where replication and application compete for cpu time. for lighter weight applications, the direct method is preferable. in our experiments, we measure both methods and show the best method for each application: liquibook and herd use the direct method, while redis and memcached use the handover method.
+
+we see that for payloads under 256 bytes, standalone latency remains constant despite increasing payload size. this is because we can rdma inline requests for these payload sizes, so the amount of work needed to send a request remains practically the same. at a payload of 256 bytes, the nic must do a dma itself to fetch the value to be sent, which incurs a gradual increase in overhead as the payload size increases. however, we see that mu still performs well even at larger payloads quite well; at 512b, the median latency is only  $35\%$  higher than the latency of inlined payloads.
+
+comparing mu to other replication systems. we now study the replication time of mu compared to other replication systems, for various applications. this comparison is not possible for every pair of replication system and application, because some replication systems are incompatible with certain applications. in particular, apus works only with socket-based applications (memcached and redis). in dare and hermes, the replication protocol is bolted onto a key-value store, so we cannot attach it to the apps we consider—instead, we report their performance with their key-value stores.
+
+figure 4 shows the replication latencies of these systems. mu's median latency outperforms all competitors by at least  $2.7 \times$ , outperforming apus on the same applications by  $4 \times$ . furthermore, mu has smaller tail variation, with a difference of at most 500ns between the 1-percentile and 99-percentile latency. in contrast, hermes and dare both varied by more than  $4 \mu s$  across our experiments, with apus exhibiting 99-percentile executions up to  $20 \mu s$  slower (cut off in the figure). we attribute this higher variance to two factors: the need to involve the cpu of many replicas in the critical path (hermes and apus), and sequentializing several rdma operations so that their variance aggregates (dare and apus).
+
+![](images/257fc21ced6aa83b27a63ce47fb843b9db41def8339c96587e3f2d3571504c15.jpg)  
+figure 4: replication latency of mu compared with other replication solutions: dare, hermes, apus on memcached (mcd), and apus on redis (rds). bar height and numerical labels show median latency; error bars show 99-percentile and 1-percentile latencies.
+
+# 7.2 end-to-end application latency
+
+figure 5 shows the end-to-end latency of our tested applications, which includes the latency incurred by the application and by replication (if enabled). we show the result in three graphs corresponding to three classes of applications.
+
+in all three graphs, we first focus on the unreplicated latency of these applications, so as to characterize the workload distribution. subsequently, we show the latency of the same applications under replication with mu and with competing systems, so as to exhibit the overhead of replication.
+
+the leftmost graph is for liquibook. the left bar is the unreplicated version, and the right bar is replicated with mu. we can see that the median latency of liquibook without replication is  $4.08\mu s$ , and therefore the overhead of replication is around  $35\%$ . there is a large variance in latency, even in the unreplicated system. this variance comes from the client-server communication of liquibook, which is based on erpc. this variance changes little with replication. the other replication systems cannot replicate liquibook (as noted before, dare and hermes are bolted onto their app, and apus can replicate only socket-based applications). however, extrapolating their latency from figure 4, they would add unacceptable overheads—over  $100\%$  overhead for the best alternative (hermes).
+
+the middle graph in figure 5 shows the client-to-client latency of replicated and unreplicated microsecond-scale key-value stores. the first bars in orange show herd unreplicated and herd replicated with mu. the green bar shows dare's key-value store with its own replication system. the median unreplicated latency of herd is  $2.25\mu s$ , and mu adds  $1.34\mu s$ . while this is a significant overhead (59% of the original latency), this overhead is lower than any alternative. we do not show hermes in this graph since hermes does not allow for a
+
+separate client, and only generates its requests on the servers themselves. herd replicated with mu is the best option for a replicated key-value store, with overall median latency  $2 \times$  lower than the next best option, and a much lower variance.
+
+the rightmost graph in figure 5 shows the replication of the traditional key-value stores, memcached and redis. the two leftmost bars show the client-to-client latencies of unreplicated memcached and redis, respectively. the four rightmost bars show the client-to-client latencies under replication with mu and apus. note that the scale starts at  $100\mu s$  to show better precision.
+
+mu incurs an overhead of around  $1.5\mu s$  to replicate these apps, which is about  $5\mu s$  faster than replicating with apus. for these tcp/ip key-value stores, client-to-client latency under replication with mu is around  $5\%$  lower than client-to-client latency under replication with apus. with a faster client-to-app network, this difference would be bigger. in either case, mu provides fault-tolerant replication with essentially no overhead for these applications.
+
+tail latency. from figures 4 and 5, we see that applications replicated with dare and apus show large tail latencies and a skew towards lower values (the median latency is closer to the 1-st percentile than the 99-th percentile). we believe this tail latency occurs because dare and apus must handle several successive rdma events on their critical path, where each event is susceptible to delay, thereby inflating the tail. because mu involves fewer rdma events, its tail is smaller.
+
+figure 5 shows an even greater tail for the end-to-end latency of replicated applications. liquibook has a large tail even in its unreplicated version, which we believe is due to its client-server communication, since the replication of liquibook with mu has a small tail (figure 4). for memcached and redis, additional sources of tail latency are cache effects and thread migration, as discussed in section 7.1. this effect is particularly pronounced when replicating with apus (third panel of figure 5), because the above contributors are compounded.
+
+# 7.3 fail-over time
+
+we now study mu's fail-over time. in these experiments, we run the system and subsequently introduce a leader failure. to get a thorough understanding of the fail-over time, we repeatedly introduce leader failures (1000 times) and plot a histogram of the fail-over times we observe. we also time the latency of permission switching, which corresponds to the time to change leaders after a failure is detected. the detection time is the difference between the total fail-over time and the permission switch time.
+
+we inject failures by delaying the leader, thus making it become temporarily unresponsive. this causes other replicas to observe that the leader's heartbeat has stopped changing, and thus detect a failure.
+
+![](images/6b27ee3c3a25e8e334737f70dbc24cdf23e329dedfa6efb08ad3a3dba658796e.jpg)  
+figure 5: end-to-end latencies of applications. the first graph shows a financial exchange app (liquibook) unreplicated and replicated with mu. the second graph shows microsecond key-value stores: herd unreplicated, herd replicated with mu, and dare. the third graph shows traditional key-value stores: memcached and redis, unreplicated, as well as replicated with mu and apus. bar height and numerical labels show median latency; error bars show 99-percentile and 1-percentile latencies.
+
+![](images/cc46ac77f7800a8a1418ef7c97634080ca946ab747dd6daea8e912be94261f8c.jpg)
+
+![](images/2d8c3d285a8c9f0b1fcedf1b084a39679e5e577ccfb449e53623aa779cfd77e5.jpg)
+
+![](images/e2bcafbb7c8035e8a0b686a310f4f0b5163994237728063b59fee2a36db2b6b7.jpg)
+
+![](images/6a57becd45445726af876db04c7b5e44566f3ad4b18e0ae72cb94f4ce62c7c15.jpg)  
+figure 6: fail-over time distribution.
+
+![](images/bdb8906a0c7a4b0ceee35e3bb7ad5e57fb16fad95536b5a60ced0f2959b7db71.jpg)
+
+figure 6 shows the results. we first note that the total fail-over time is quite low; the median fail-over time is  $873\mu s$  and the 99-percentile fail-over time is  $947\mu s$ , still below a millisecond. this represents an order of magnitude improvement over the best competitor at  $\approx 10$  ms (hovercraft [37]).
+
+the time to switch permissions constitutes about  $30\%$  of the total fail-over time, with mean latency at  $244\mu s$ , and 99-percentile at  $294\mu s$ . recall that this measurement in fact encompasses two changes of permission at each replica; one to revoke write permission from the old leader and one to grant it to the new leader. thus, improvements in the rdma permission change protocol would be doubly amplified in mu's fail-over time.
+
+the rest of the fail-over time is attributed to failure detection  $(\approx 600\mu s)$ . although our pull-score mechanism does not rely on network variance, there is still variance introduced by process scheduling (e.g., in rare cases, the leader
+
+process is descheduled by the os for tens of microseconds)—this is what prevented us from using smaller timeouts/scores and it is an area under active investigation for microsecond apps [8, 57, 62, 64].
+
+# 7.4 throughput
+
+while mu optimizes for low latency, in this section we evaluate the throughput of mu. in our experiment, we run a standalone microbenchmark (not attached to an application). we increase throughput in two ways: by batching requests together before replicating, and by allowing multiple outstanding requests at a time. in each experiment, we vary the maximum number of outstanding requests allowed at a time, and the batch sizes.
+
+figure 7 shows the results in a latency-throughput graph. each line represents a different max number of outstanding requests, and each data point represents a different batch size. as before, we use 64-byte requests.
+
+we see that mu reaches high throughput with this simple technique. at its highest point, the throughput reaches 47 ops/μs with a batch size of 128 and 8 concurrent outstanding requests, with per-operation median latency at  $17\mu s$ . since the leader is sending requests to two other replicas, this translates to a throughput of 48gbps, around half of the nic bandwidth.
+
+latency and throughput both increase as the batch size increases. median latency is also higher with more concurrent outstanding requests. however, the latency increases slowly, remaining at under  $10\mu s$  even with a batch size of 64 and 8 outstanding requests.
+
+there is a throughput wall at around  $45\mathrm{ops} / \mu s$ , with latency rising sharply. this can be traced to the transition between the client requests and the replication protocol at the leader replica. the leader must copy the request it receives
+
+![](images/080d43121bb0904381df4896817e6feaca75d9a62e55abc7e2d0e35fe7a36bf7.jpg)  
+figure 7: latency vs throughput. each line represents a different number of allowed concurrent outstanding requests. each point on the lines represents a different batch size. batch size shown as annotation close to each point.
+
+into a memory region prepared for its rdma write. this memory operation becomes a bottleneck. we could optimize throughput further by allowing direct contact between the client and the follower replicas. however, that may not be useful as the application itself might need some of the network bandwidth for its own operation, so the replication protocol should not saturate the network.
+
+increasing the number of outstanding requests while keeping the batch size constant substantially increases throughput at a small latency cost. the advantage of more outstanding requests is largest with two concurrent requests over one. regardless of batch size, this allows substantially higher throughput at a negligible latency increase: allowing two outstanding requests instead of one increases latency by at most  $400ns$  for up to a batch size of 32, and only  $1.1\mu s$  at a batch size of 128, while increasing throughput by  $20 - 50\%$  depending on batch size. this effect grows less pronounced with higher numbers of outstanding requests.
+
+similarly, increasing batch size increases throughput with a low latency hit for small batch sizes, but the latency hit grows for larger batches. notably, using 2 outstanding requests and a batch size of 32 keeps the median latency at only  $3.4\mu s$ , but achieves throughput of nearly 30 ops/ $\mu s$ .
+
+# 8 related work
+
+smr in general. state machine replication is a common technique for building fault-tolerant, highly available services [39, 67]. many practical smr protocols have been designed, addressing simplicity [7, 9, 27, 43, 55], cost [38, 42], and harsher failure assumptions [10, 11, 23, 38]. in the original scheme, which we follow, the order of all operations is agreed upon using consensus instances. at a high-level, our mu protocol resembles the classical paxos algorithm [39],
+
+but there are some important differences. in particular, we leverage rdma's ability to grant and revoke access permissions to ensure that two leader replicas cannot both write a value without recognizing each other's presence. this allows us to optimize out participation from the follower replicas, leading to better performance. furthermore, these dynamic permissions guide our unique leader changing mechanism.
+
+several implementations of multi-paxos avoid repeating paxos's prepare phase for every consensus instance, as long as the same leader remains [12, 40, 52]. piggybacking a commit message onto the next replicated request, as is done in mu, is also used as a latency-hiding mechanism in [52, 70].
+
+aguilera et al. [1] suggested the use of local heartbeats in a leader election algorithm designed for a theoretical message-and-memory model, in an approach similar to our pull-score mechanism. however, no system has so far implemented such local heartbeats for leader election in rdma.
+
+single round-trip replication has been achieved in several previous works using two-sided sends and receives [22, 35, 36, 38, 42]. theoretical work has shown that single-shot consensus can be achieved in a single one-sided round trip [2]. however, mu is the first system to put that idea to work and implement one-sided single round trip smr.
+
+alternative reliable replication schemes totally order only non-conflicting operations [15, 26, 35, 41, 58, 59, 68]. these schemes require opening the service being replicated to identify which operations commute. in contrast, we designed mu assuming the replicated service is a black box. if desired, several parallel instances of mu could be used to replicate concurrent operations that commute. this could be used to increase throughput in specific applications.
+
+it is also important to notice that we consider "crash" failures. in particular, we assume nodes cannot behave in a byzantine manner [10, 14, 38].
+
+improving the stack underlying smr. while we propose a new smr algorithm adapted to rdma in order to optimize latency, other systems keep a classical algorithm but improve the underlying communication stack [31, 47]. with this approach, somewhat orthogonal to ours, the best reported replication latency is  $5.5\mu s$  [31], almost  $5\times$  slower than mu. hovercraft [37] shifts the smr from the application layer to the transport layer to avoid io and cpu bottlenecks on the leader replica. however, their request latency is more than an order of magnitude more than that of mu, and they do not optimize fail-over time.
+
+some smr systems leverage recent technologies such as programmable switches and nics [28, 30, 48, 51]. however, programmable networks are not as widely available as rdma, which has been commoditized with technologies such as roce and iwarp.
+
+other rdma applications. more generally, rdma has recently been the focus of many data center system designs,
+
+including key-value stores [20, 32] and transactions [34, 71]. kalia et al. provide guidelines on the best ways to use rdma to enhance performance [33]. many of their suggested optimizations are employed by mu. kalia et al. also advocate the use of two-sided rdma verbs (sends/receives) instead of rdma reads in situations in which a single rdma read might not suffice. however, this does not apply to mu, since we know a priori which memory location should be read, and we rarely have to follow up with another read.
+
+failure detection. failure detection is typically done using timeouts. conventional wisdom is that timeouts must be large, in the seconds [46], though some systems report timeouts as low as 10 milliseconds [37]. it is possible to improve detection time using inside information [44, 46] or fine-grained reporting [45], which requires changes to apps and/or the infrastructure. this is orthogonal to our score-based mechanism and could be used to further improve mu.
+
+# similar rdma-based algorithms
+
+a few smr systems have recently been designed for rdma [29,60,70], but used rdma differently from mu.
+
+dare [60] is the first rdma-based smr system. similarly to mu, dare uses only one-sided rdma verbs executed by the leader to replicate the log in normal execution, and makes use of permissions when changing leaders. however, unlike mu, dare requires updating the tail pointer of each replica's log in a separate rdma write from the one that copies over the new value, which leads to more round-trips for replication. dare's use of permissions does not lead to a light-weight mechanism to block concurrent leaders, as in mu. dare has a heavier leader election protocol than mu's, similar to that of raft, in which care is taken to ensure that at most one process considers itself leader at any point in time.
+
+apus [70] improves upon dare's throughput. however, apus requires active participation from the follower replicas during the replication protocol, resulting in higher latencies. thus, it does not achieve the one-sided common-case communication of mu. similarly to dare and mu, apus uses transitions through queue pair states to allow or deny rdma access. however, like dare, it does not use this mechanism to achieve a single one-sided communication round.
+
+derecho [29] provides durable and non-durable smr, by combining a data movement protocol (smc or rdmc) with a shared-state table primitive (sst) for determining when it is safe to deliver messages. this design yields high throughput but also high latency: a minimum of  $10\mu s$  for non-durable smr [29, figure 12(b)] and more for durable smr. this latency results from a node delaying the delivery of a message until all nodes have confirmed its receipt using the sst, which
+
+takes additional rdma communication steps compared to mu. it would be interesting to explore how mu's protocol could improve derecho.
+
+aguilera et al [2] present a one-shot consensus algorithm based on rdma that solves consensus in a single one-sided communication round in the common case. they model rdma's one-sided verbs as shared memory primitives which operate only if granted appropriate permissions. their one-round communication complexity relies on changing permissions, an idea we use in mu. while that work focuses on a theoretical construction, mu is a fully fledged smr system that needs many other mechanisms, such as logging, managing state, coordinating instances, recycling instances, handling clients, and permission management. because these mechanisms are non-trivial, mu requires its own proof of correctness (see appendix). mu also provides an implementation and experimental evaluation not found in [2].
+
+# 9 conclusion
+
+computers have progressed from batch-processing systems that operate at the time scale of minutes, to progressively lower latencies in the seconds, then milliseconds, and now we are in the microsecond revolution. work has already started in this space at various layers of the computing stack. our contribution fits in this context, by providing generic microsecond replication for microsecond apps.
+
+mu is a state machine replication system that can replicate microsecond applications with little overhead. this involved two goals: achieving low latency on the common path, and minimizing fail-over time to maintain high availability. to reach these goals, mu relies on (a) rdma permissions to replicate a request with a single one-sided operation, as well as (b) a failure detection mechanism that does not incur false positives due to common network delays—a property that permits mu to use aggressively small timeout values.
+
+# references
+
+[1] marcos k. aguilera, naama ben-david, irina calciu, rachid guerraoui, erez petrank, and sam toueg. passing messages while sharing memory. in acm symposium on principles of distributed computing (podc), pages 51-60, july 2018.  
+[2] marcos k. aguilera, naama ben-david, rachid guerraoui, virendra j. marathe, and igor zablotchi. the impact of rdma on agreement. in acm symposium on principles of distributed computing (podc), pages 409-418, july 2019.  
+[3] anonymous. 1588-2019—ieee approved draft standard for a precision clock synchronization pro
+
+tocol for networked measurement and control systems. https://standards.ieee.org/content/iee-standard/s/en/standard/1588-2019.html.  
+[4] order matching system. https://en.wikipedia.org/wiki/order_matching_system.  
+[5] anonymous. when microseconds count: fast current loop innovation helps motors work smarter, not harder. http://e2e.ti.com/blogs_/b/thinkinnovate/archive/2017/11/14/when-microseconds-count-fast-current-loop-innovation-helps-motors-work-smarter-not-harder.  
+[6] luiz barroso, mike marty, david patterson, and parthasarathy ranganathan. attack of the killer microseconds. communications of the acm, 60(4):48-54, april 2017.  
+[7] romain boichat, partha dutta, svend frølund, and rachid guerraoui. deconstructing paxos. acm sigact news, 34(1):47-67, march 2003.  
+[8] sol boucher, anuj kalia, and david g. andersen. putting the "micro" back in microservice. in usenix annual technical conference (atc), pages 645-650, july 2018.  
+[9] mike burrows. the chubby lock service for loosely-coupled distributed systems. in usenix symposium on operating system design and implementation (osdi), pages 335-350, november 2006.  
+[10] miguel castro and barbara liskov. practical byzantine fault tolerance. in usenix symposium on operating system design and implementation (osdi), pages 173-186, february 1999.  
+[11] miguel castro, rodrigo rodrigues, and barbara liskov. base: using abstraction to improve fault tolerance. acm transactions on computer systems (tocs), 21(3), august 2003.  
+[12] tushar deepak chandra, robert griesemer, and joshua redstone. paxos made live: an engineering perspective. in acm symposium on principles of distributed computing (podc), pages 398-407, august 2007.  
+[13] tushar deepak chandra, vassos hadzilacos, and sam toueg. the weakest failure detector for solving consensus. journal of the acm (jacm), 43(4):685-722, july 1996.  
+[14] allen clement, edmund l. wong, lorenzo alvisi, michael dahlin, and mirco marchetti. making byzantine fault tolerant systems tolerate byzantine faults. in usenix symposium on networked systems design and implementation (nsdi), pages 153-168, april 2009.
+
+[15] austin t. clements, m. frans kaashoek, nickolai zeldovich, robert tappan morris, and eddie kohler. the scalable commutativity rule: designing scalable software for multicore processors. in acm symposium on operating systems principles (sosp), pages 1-17, november 2013.  
+[16] conan, a c/c++ package manager. https://conan.io. accessed 2020-09-30.  
+[17] alexandros daglis, mark sutherland, and babak falsafi. rpcvalet: ni-driven tail-aware balancing of  $\mu s$ -scale rpcs. in international conference on architectural support for programming languages and operating systems (asplos), pages 35-48, april 2019.  
+[18] al danial. cloc: count lines of code. https://github.com/aldanial/cloc.  
+[19] travis downs. a benchmark for low-level cpu micro-architectural features. https://github.com/travisdowns/uarch-bench.  
+[20] aleksandar dragojevic, dushyanth narayanan, miguel castro, and orion hodson. farm: fast remote memory. in usenix symposium on networked systems design and implementation (nsdi), pages 401-414, april 2014.  
+[21] aleksandar dragojevic, dushyanth narayanan, ed nightingale, matthew renzelmann, alex shamis, anirudh badam, and miguel castro. no compromises: distributed transactions with consistency, availability, and performance. in acm symposium on operating systems principles (sosp), october 2015.  
+[22] partha dutta, rachid guerraoui, and leslie lamport. how fast can eventual synchrony lead to consensus? in international conference on dependable systems and networks (dsn), pages 22-27, june 2005.  
+[23] eli gafni and leslie lamport. disk paxos. distributed computing (dist), 16(1):1-20, february 2003.  
+[24] yu gan, yanqi zhang, dailun cheng, ankitha shetty, priyal rathi, nayan katarki, ariana bruno, justin hu, brian ritchken, brendon jackson, kelvin hu, meghna pancholi, yuan he, brett clancy, chris colen, fukang wen, catherine leung, siyuan wang, leon zaruvinsky, mateo espinosa, rick lin, zhongling liu, jake padilla, and christina delimitrou. an open-source benchmark suite for microservices and their hardware-software implications for cloud & edge systems. in international conference on architectural support for programming languages and operating systems (asplos), pages 3-18, april 2019.
+
+[25] maurice p. herlihy and jeannette m. wing. linearizability: a correctness condition for concurrent objects. acm transactions on programming languages and systems (toplas), 12(3):463-492, january 1990.  
+[26] brandon holt, james bornholt, irene zhang, dan r. k. ports, mark oskin, and luis ceze. disciplined inconsistency with consistency types. in symposium on cloud computing (socc), pages 279–293, october 2016.  
+[27] patrick hunt, mahadev konar, flavio paiva junqueira, and benjamin reed. zookeeper: wait-free coordination for internet-scale systems. in usenix annual technical conference (atc), june 2010.  
+[28] zsolt istván, david sidler, gustavo alonso, and marko vukolic. consensus in a box: inexpensive coordination in hardware. in usenix symposium on networked systems design and implementation (nsdi), pages 425-438, march 2016.  
+[29] sagar jha, jonathan behrens, theo gkountouvas, matthew milano, weijia song, edward tremel, robert van renesse, sydney zink, and kenneth p. birman. derecho: fast state machine replication for cloud services. acm transactions on computer systems (tocs), 36(2), april 2019.  
+[30] xin jin, xiaozhou li, haoyu zhang, nate foster, jeongkeun lee, robert soule, changhoon kim, and ion stoica. netchain: scale-free sub-rtt coordination. in usenix symposium on networked systems design and implementation (nsdi), pages 35–49, april 2018.  
+[31] anuj kalia, michael kaminsky, and david andersen. datacenter rpcs can be general and fast. in usenix symposium on networked systems design and implementation (nsdi), pages 1-16, february 2019.  
+[32] anuj kalia, michael kaminsky, and david g andersen. using rdma efficiently for key-value services. in acm conference on sigcomm, pages 295-306, august 2014.  
+[33] anuj kalia, michael kaminsky, and david g andersen. design guidelines for high performance rdma systems. in usenix annual technical conference (atc), pages 437-450, june 2016.  
+[34] anuj kalia, michael kaminsky, and david g andersen. fasst: fast, scalable and simple distributed transactions with two-sided (rdma) datagram rpcs. in usenix symposium on operating system design and implementation (osdi), pages 185-201, november 2016.
+
+[35] antonios katsarakis, vasilis avrielatos, m r siavash katebzadeh, arpit joshi, aleksandar dragojevic, boris grot, and vijay nagarajan. hermes: a fast, fault-tolerant and linearizable replication protocol. in international conference on architectural support for programming languages and operating systems (asp-los), pages 201–217, march 2020.  
+[36] idit keidar and sergio rajsbaum. on the cost of fault-tolerant consensus when there are no faults: preliminary version. acm sigact news, 32(2):45-63, june 2001.  
+[37] marios kogias and edouard bugnion. hovercraft: achieving scalability and fault-tolerance for microsecond-scale datacenter services. in european conference on computer systems (eurosys), april 2020.  
+[38] ramakrishna kotla, lorenzo alvisi, mike dahlin, allen clement, and edmund wong. zyzzyva: speculative byzantine fault tolerance. in acm symposium on operating systems principles (sosp), pages 45-58, october 2007.  
+[39] leslie lamport. the part-time parliament. acm transactions on computer systems (tocs), 16:133-169, may 1998.  
+[40] leslie lamport. paxos made simple. acm sigact news, 32(4):18-25, june 2001.  
+[41] leslie lamport. generalized consensus and paxos. technical report msr-tr-2005-33, microsoft research, march 2005.  
+[42] leslie lamport. fast paxos. distributed computing (dist), 19(2):79-103, july 2006.  
+[43] butler w lampson. how to build a highly available system using consensus. in international workshop on distributed algorithms (wdag), pages 1-17, october 1996.  
+[44] joshua b. leners, trinabh gupta, marcos k. aguilera, and michael walfish. improving availability in distributed systems with failure informers. in usenix symposium on networked systems design and implementation (nsdi), april 2013.  
+[45] joshua b. leners, trinabh gupta, marcos k. aguilera, and michael walfish. taming uncertainty in distributed systems with help from the network. in european conference on computer systems (eurosys), april 2015.  
+[46] joshua b. leners, hao wu, wei-lun hung, marcos k. aguilera, and michael walfish. detecting failures in distributed systems with the falcon spy network. in acm symposium on operating systems principles (sosp), october 2011.
+
+[47] bojie li, tianyi cui, zibo wang, wei bai, and lintao zhang. socksdirect: datacenter sockets can be fast and compatible. in acm conference on sigcomm, pages 90–103, august 2019.  
+[48] jialin li, ellis michael, naveen kr sharma, adriana szekeres, and dan rk ports. just say no to paxos overhead: replacing consensus with network ordering. in usenix symposium on operating system design and implementation (osdi), pages 467-483, november 2016.  
+[49] liquibook. https://github.com/enewhuis/liquibook. accessed 2020-05-25.  
+[50] jiuxing liu, jiesheng wu, and dhabaleswar k. panda. high performance rdma-based mpi implementation over infiniband. international journal of parallel programming, 32(3):167-198, june 2004.  
+[51] ming liu, tianyi cui, henry schuh, arvind krishnamurthy, simon peter, and karan gupta. offloading distributed applications onto smartnics using ipipe. in acm conference on sigcomm, pages 318-333, august 2019.  
+[52] david mazieres. paxos made practical. https://www.scs.stanford.edu/~dm/home/papers/paxos.pdf, 2007.  
+[53] memcached. https://memcached.org/. accessed 2020-05-25.  
+[54] stanko novakovic, yizhou shan, aasheesh kolli, michael cui, yiying zhang, haggai eran, boris pismenny, liran liss, michael wei, dan tsafrir, and marcos k. aguilera. storm: a fast transactional dataplane for remote data structures. in acm international conference on systems and storage (systor), pages 97-108, may 2019.  
+[55] diego ongaro and john k ousterhout. in search of an understandable consensus algorithm. in usenix annual technical conference (atc), pages 305-319, june 2014.  
+[56] diego ongaro, stephen m. rumble, ryan stutsman, john ousterhout, and mendel rosenblum. fast crash recovery in ramcloud. in acm symposium on operating systems principles (sosp), pages 29-41, october 2011.  
+[57] amy ousterhout, joshua fried, jonathan behrens, adam belay, and hari balakrishnan. shenango: achieving high cpu efficiency for latency-sensitive datacenter workloads. in usenix symposium on networked systems design and implementation (nsdi), pages 361-378, february 2019.
+
+[58] seo jin park and john ousterhout. exploiting commutativity for practical fast replication. in usenix symposium on networked systems design and implementation (nsdi), pages 47-64, february 2019.  
+[59] fernando pedone and andré schiper. handling message semantics with generic broadcast protocols. distributed computing, 15(2):97-107, april 2002.  
+[60] marius poke and torsten hoefler. dare: high-performance state machine replication on rdma networks. in symposium on high-performance parallel and distributed computing (hpdc), pages 107-118. acm, june 2015.  
+[61] mary c. potter, brad wyble, carl erick hagemann, and emily sarah mccourt. detecting meaning in rsvp at 13 ms per picture. attention, perception, & psychophysics, 76(2):270-279, february 2014.  
+[62] george prekas, marios kogias, and edouard bugnion. zygos: achieving low tail latency for microsecond-scale networked tasks. in acm symposium on operating systems principles (sosp), pages 325-341, october 2017.  
+[63] george prekas, mia primorac, adam belay, christos kozyrakis, and edouard bugnion. energy proportionality and workload consolidation for latency-critical applications. in symposium on cloud computing (socc), pages 342-355, august 2015.  
+[64] henry qin, qian li, jacqueline speiser, peter kraft, and john ousterhout. arachne: core-aware thread management. in usenix symposium on operating system design and implementation (osdi), pages 145-160, october 2018.  
+[65] redis. https://redis.io/. accessed 2020-05-25.  
+[66] david schneider. the microsecond market. ieee spectrum, 49(6), june 2012.  
+[67] fred b schneider. implementing fault-tolerant services using the state machine approach: a tutorial. acm computing surveys (csur), 22(4):299-319, december 1990.  
+[68] marc shapiro, nuno preguiça, carlos baquero, and marek zawirski. conflict-free replicated data types. in international symposium on stabilization, safety, and security of distributed systems (sss), pages 386-400, october 2011.  
+[69] snia. extending rdma for persistent memory over fabrics. https://www.snia.org/sites/default/files/esf/extending-rdma-for-persistent-memory-over-fabrics-final.pdf.
+
+[70] cheng wang, jianyu jiang, xusheng chen, ning yi, and heming cui. apus: fast and scalable paxos on rdma. in symposium on cloud computing (socc), pages 94-107, september 2017.  
+[71] xingda wei, jiaxin shi, yanzhe chen, rong chen, and haibo chen. fast in-memory transaction processing using rdma and htm. in acm symposium on operating systems principles (sosp), pages 87-104, october 2015.
+
+# a appendix: proof of correctness
+
+# a.1 pseudocode of the basic version
+
+```txt
+1 propose(myvalue): done  $=$  false if i just became leader or i just aborted for every process p in parallel: request permission from p if packs, add p to  $\rightarrow$  confirmedfollowers until this has been done for a  $\rightarrow$  majority of processes while not done: execute prepare phase execute accept phase
+```
+
+```txt
+11 struct log {
+12 log[] = ⊥ for all slots
+13 minproposal = 0
+14 fuo = 0
+15 prepare phase:
+16 pick a new proposal number, propnum, that
+17 → is higher than any seen so far
+18 for every process p in confirmedfollowers:
+19 read minproposal from p's log
+20 abort if any read fails
+21 if propnum < some minproposal read, abort
+22 for every process p in confirmedfollowers:
+23 write propnum into log[p].minproposal
+24 read log[p].slots[myfuo]
+25 abort if any write or read fails
+26 if all entries read were empty:
+27 value = myvalue
+28 else:
+29 value = entry value with the largest
+30 → proposal number of slots read
+31 accept phase:
+32 for every process p in confirmedfollowers:
+33 write value, propnum to p in slot myfuo
+34 →
+35 abort if any write fails
+36 if value == myvalue:
+37 done = true
+38 locally increment myfuo
+```
+
+note that write permission can only be granted at most once per request; it is impossible to send a single permission request, be granted permission, lose permission and then regain it without issuing a new permission request. this is the way that permission requests work in our implementation, and is key for the correctness argument to go through; in particular, it is important that a leader cannot lose permission between two of its writes to the same follower without being aware that it lost permission.
+
+# a.2 definitions
+
+definition 1 (quorum). a quorum is any set that contains at least a majority of the processes.
+
+definition 2 (decided value). we say that a value  $v$  is decided at index  $i$  if there exists a quorum  $q$  such that for every process  $p \in q$ ,  $p$ 's log contains  $v$  at index  $i$ .
+
+definition 3 (committed value). we say that a value  $v$  is committed at process  $p$  at index  $i$  if  $p$ 's log contains  $v$  at index  $i$ , such that  $i$  is less than  $p$ 's fuo.
+
+# a.3 invariants
+
+# a.3.1 preliminary
+
+invariant a.1 (committed implies decided). if a value  $\nu$  is committed at some process  $p$  at index  $i$ , then  $\nu$  is decided at index  $i$ .
+
+proof. assume  $\nu$  is committed at some process  $p$  at index  $i$ . then  $p$  must have incremented its fuo past  $i$  at line 37, therefore  $p$  must have written  $\nu$  at a majority at line 33.  $\square$
+
+invariant a.2 (values are never erased). if a log slot contains a value at time  $t$ , that log slot will always contain some value after time  $t$ .
+
+proof. by construction of the algorithm, values are never erased (note: values can be overwritten, but only with a non-  $\perp$  value).
+
+# a.3.2 validity
+
+invariant a.3. if a log slot contains a value  $\nu \neq \bot$ , then  $\nu$  is the input of some process.
+
+proof. assume the contrary and let  $t$  be the earliest time when some log slot (call it  $l$ ) contained a non-input value (call it  $\nu$ ). in order for  $l$  to contain  $\nu$ , some process  $p$  must have written  $\nu$  into  $l$  at line 33. thus, either  $\nu$  was the input value of  $p$  (which would lead to a contradiction), or  $p$  adopted  $\nu$  at line 29, after reading it from some log slot  $l'$  at line 24. thus,  $l'$  must have contained  $\nu$  earlier than  $t$ , a contradiction of our choice of  $t$ .
+
+theorem a.4 (validity). if a value  $v$  is committed at some process, then  $v$  was the input value of some process.
+
+proof. follows immediately from invariant a.3 and the definition of being committed.  $\square$
+
+# a.3.3 agreement
+
+invariant a.5 (solo detection). if a process  $p$  writes to a process  $q$  in line 23 or in line 33, then no other process  $r$  wrote to  $q$  since  $p$  added  $q$  to its confirmed followers set.
+
+proof. assume the contrary:  $p$  added  $q$  to its confirmed followers set at time  $t_0$  and wrote to  $q$  at time  $t_2 > t_0$ ;  $r \neq p$  wrote to  $q$  at time  $t_1, t_0 < t_1 < t_2$ . then:
+
+1.  $r$  had write permission on  $q$  at  $t_1$ .
+
+2.  $p$  had write permission on  $q$  at  $t_2$ .
+
+3. (from (1) and (2))  $p$  must have obtained write permission on  $q$  between  $t_1$  and  $t_2$ . but this is impossible, since  $p$  added  $q$  to its confirmed followers set at  $t_0 < t_1$  and thus  $p$  must have obtained permission on  $q$  before  $t_0$ . by the algorithm,  $p$  did not request permission on  $q$  again since obtaining it, and by the way permission requests work, permission is granted at most once per request. we have reached a contradiction.
+
+invariant a.6. if some process  $p_1$  successfully writes value  $v_1$  and proposal number  $b_1$  to its confirmed followers in slot  $i$  at line 33, then any process  $p_2$  entering the accept phase with proposal number  $b_2 > b_1$  for slot  $i$  will do so with value  $v_1$ .
+
+proof. assume the contrary: some process enters the accept phase for slot  $i$  with a proposal number larger than  $b_{1}$ , with a value  $v_{2} \neq v_{1}$ . let  $p_{2}$  be the first such process to enter the accept phase.
+
+let  $c_1$  (resp.  $c_2$ ) be the confirmed followers set of  $p_1$  (resp.  $p_2$ ). since  $c_1$  and  $c_2$  are both quorums, they must intersect in at least one process, call it  $q$ . since  $q$  is in the confirmed followers set of both  $p_1$  and  $p_2$ , both must have read its minproposal (line 19), written its minproposal with their own proposal value (line 23) and read its  $i$ th log slot (line 24). furthermore,  $p_1$  must have written its new value into that slot (line 33). note that since  $p_1$  successfully wrote value  $v_1$  on  $q$ , by invariant a.5,  $p_2$  could not have written on  $q$  between the time at which  $p_1$  obtained its permission on it and the time of  $p_1$ 's write on  $q$ 's  $i$ th slot. thus,  $p_2$  either executed both of its writes on  $q$  before  $p_1$  obtained permissions on  $q$ , or after  $p_1$  wrote its value in  $q$ 's  $i$ th slot. if  $p_2$  executed its writes before  $p_1$ , then  $p_1$  must have seen  $p_2$ 's proposal number when reading  $q$ 's minproposal in line 19 (since  $p_1$  obtains permissions before executing this line). thus,  $p_1$  would have aborted its attempt and chosen a higher proposal number, contradicting the assumption that  $b_1 < b_2$ .
+
+thus,  $p_2$  must have executed its first write on  $q$  after  $p_1$  executed its write of  $\nu_1$  in  $q$ 's log. since  $p_2$ 's read of  $q$ 's slot happens after its first write (in line 24), this read must have happened after  $p_1$ 's write, and therefore  $p_2$  saw  $\nu_1, b_1$  in  $q$ 's  $i$ th slot. by assumption,  $p_2$  did not adopt  $\nu_1$ . by line 29, this means  $p_2$  read  $\nu_2$  with a higher proposal number than  $b_1$  from some other process in  $c_2$ . this contradicts the assumption that  $p_2$  was the first process to enter the accept phase with a value other than  $\nu_1$  and a proposal number higher than  $b_1$ . the figure below illustrates the timings of events in the execution.
+
+theorem a.7 (agreement). if  $\nu_{1}$  is committed at  $p_1$  at index  $i$  and  $\nu_{2}$  is committed at  $p_2$  at index  $i$ , then  $\nu_{1} = \nu_{2}$ .
+
+proof. in order for  $\nu_{1}$  (resp.  $\nu_{2}$ ) to be committed at  $p_{1}$  (resp.  $p_{2}$ ) at index  $i$ ,  $p_{1}$  (resp.  $p_{2}$ ) must have incremented its fuo
+
+past  $i$  and thus must have successfully written  $\nu_{1}$  (resp.  $\nu_{2}$ ) to its confirmed follower set at line 33. let  $b_{1}$  (resp.  $b_{2}$ ) be the proposal number  $p_{1}$  (resp.  $p_{2}$ ) used at line 33. assume without loss of generality that  $b_{1} < b_{2}$ . then, by invariant a.6,  $p_{2}$  must have entered its accept phase with value  $\nu_{1}$  and thus must have written  $\nu_{1}$  to its confirmed followers at line 33. therefore,  $\nu_{1} = \nu_{2}$ .
+
+# a.3.4 termination
+
+invariant a.8 (termination implies commitment.). if a process  $p$  calls propose with value  $v$  and returns from the propose call, then  $v$  is committed at  $p$ .
+
+proof. follows from the algorithm:  $p$  returns from the propose call only after it sees done to be true at line 8; for this to happen,  $p$  must set done to true at line 36 and increment its fuo at line 37. in order for  $p$  to set done to true,  $p$  must have successfully written some value val to its confirmed follower set at line 33 and val must be equal to  $v$  (check at line 35). thus, when  $p$  increments its fuo at line 37,  $v$  becomes committed at  $p$ .
+
+invariant a.9 (weak termination). if a correct process  $p$  invokes propose and does not abort, then  $p$  eventually returns from the call.
+
+proof. the algorithm does not have any blocking steps or goto statements, and has only one unbounded loop at line 8. thus, we show that  $p$  will eventually exit the loop at line 8.
+
+let  $t$  be the time immediately after  $p$  finishes constructing its confirmed followers set (lines 4-7). let  $i$  be the highest index such that one of  $p$ 's confirmed followers contains a value in its log at index  $i$  at time  $t$ . given that  $p$  does not abort, it must be that  $p$  does not lose write permission on any of its confirmed followers and thus has write permission on a quorum for the duration of its call. thus, after time  $t$  and until the end of  $p$ 's call, no process is able to write any new value at any of  $p$ 's confirmed followers  $[*\]$ .
+
+since  $p$  never aborts, it will repeatedly execute the accept phase and increment its fuo at line 37 until  $p$ 's fuo is larger than  $i$ . during its following prepare phase,  $p$  will find all slots to be empty (due to  $[*\])$  and adopt its own value  $\nu$  at line 27. since  $p$  does not abort,  $p$  must succeed in writing  $\nu$  to its confirmed followers at line 33 and set done to true in line 36. thus,  $p$  eventually exits the loop at line 8 and returns.
+
+theorem a.10 (termination). if eventually there is a unique non-faulty leader, then eventually every propose call returns.
+
+proof. we show that eventually  $p$  does not abort from any propose call and thus, by invariant a.9, eventually  $p$  returns from every propose call.
+
+consider a time  $t$  such that (1) no processes crash after  $t$  and (2) a unique process  $p$  considers itself leader forever after  $t$ .
+
+furthermore, by invariant a.9, by some time  $t' > t$  all correct processes will return or abort from any propose call they started before  $t$ ; no process apart from  $p$  will call propose again after  $t'$  since  $p$  is the unique leader.
+
+thus, in any propose call  $p$  starts after  $t'$ ,  $p$  will obtain permission from a quorum in lines 4-7 and will never lose any permissions (since no other process is requesting permissions). thus, all of  $p$ 's reads and writes will succeed, so  $p$  will not abort at lines 20, 25, or 34.
+
+furthermore, since no process invokes propose after  $t'$ , the minproposals of  $p$  confirmed followers do not change after this time. thus, by repeatedly increasing its minproposal at line 17,  $p$  will eventually have the highest proposal number among its confirmed followers, so  $p$  will not abort at line 21.
+
+therefore, by invariant a.9,  $p$  will eventually return from every propose call.
+
+we consider a notion of eventual synchrony, whereby after some unknown global stabilization time, all processes become timely. if this is the case, then mu's leader election mechanism ensures that eventually, a single correct leader is elected forever. this leader is the replica with the lowest id that did not crash: after the global stabilization point, this replica would be timely, and therefore would not miss a heartbeat. all other replicas would see its heartbeats increasing forever, and elect it as their leader. this guarantees that our algorithm terminates under this eventual synchrony condition.
+
+# a.4 optimizations & additions
+
+# a.4.1 new leader catch-up
+
+in the basic version of the algorithm described so far, it is possible for a new leader to miss decided entries from its log (e.g., if the new leader was not part of the previous leader's confirmed followers). the new leader can only catch up by attempting to propose new values at its current fuo, discovering previously accepted values, and re-committing them. this is correct but inefficient.
+
+we describe an extension that allows a new leader  $\ell$  to catch up faster: after constructing its confirmed followers set (lines 4-7),  $\ell$  can read the fuo of each of its confirmed followers, determine the follower  $f$  with the highest fuo, and bring its own log and fuo up to date with  $f$ . this is described in the pseudocode below:
+
+listing 5: optimization: leader catch up  
+```txt
+for every process p in confirmedfollowers read p's fuo abort if any read fails f = follower with max fuo if f.fuo > my_fuo: copy f.log[my_fuo: f.fuo] into my log myfuo  $=$  f.fuo abort if any read fails
+```
+
+we defer our correctness argument for this extension to section a.4.2.
+
+# a.4.2 update followers
+
+while the previous extension allows a new leader to catch up in case it does not have the latest committed values, followers' logs may still be left behind (e.g., for those followers that were not part of the leader's confirmed followers).
+
+as is standard for practical paxos implementations, we describe a mechanism for followers' logs to be updated so that they contain all committed entries that the leader is aware of. after a new leader  $\ell$  updates its own log as described in algorithm 5, it also updates its confirmed followers' logs and fuos:
+
+listing 6: optimization: update followers  
+```txt
+for every process p in confirmed followers  $\rightarrow$  : copy mylog[p.fuo: my_fuo] into p.log p.fuo  $=$  my_fuo abort if any write fails
+```
+
+we now argue the correctness of the update mechanisms in this and the preceding subsections. these approaches clearly do not violate termination. we now show that they preserve agreement and validity.
+
+validity. we extend the proof of invariant a.3 to also cover algorithms 5 and 6; the proof of theorem a.4 remains unchanged.
+
+assume by contradiction that some log slot  $l$  does not satisfy invariant a.3. without loss of generality, assume that  $l$  is the first log slot in the execution which stops satisfying invariant a.3. in order for  $l$  to contain  $\nu$ , either (i) some process  $q$  wrote  $\nu$  into  $l$  at line 33, or (ii)  $\nu$  was copied into  $l$  using algorithm 5 or 6. in case (i), either  $\nu$  was  $q$ 's input value (a contradiction), or  $q$  adopted  $\nu$  at line 29 after reading it from some log slot  $l' \neq l$ . in this case,  $l'$  must have contained  $\nu$  before  $l$  did, a contradiction of our choice of  $l$ . in case (ii), some log slot  $l''$  must have contained  $\nu$  before  $l$  did, again a contradiction.
+
+agreement. we extend the proof of a.7 to also cover algorithms 5 and 6. let  $t$  be the earliest time when agreement is broken; i.e.,  $t$  is the earliest time such that, by time  $t$ , some process  $p_1$  has committed  $\nu_1$  at  $i$  and some process  $p_2$  has committed  $\nu_2 \neq \nu_1$  at  $i$ . we can assume without loss of generality that  $p_1$  commits  $\nu_1$  at  $t_1 = t$  and  $p_2$  commits  $\nu_2$  at  $t_2 < t_1$ . we now consider three cases:
+
+1. both  $p_1$  and  $p_2$  commit normally by incrementing their fuo at line 37. then the proof of a.7 applies to  $p_1$  and  $p_2$ .  
+2.  $p_1$  commits normally by incrementing its fuo at line 37, while  $p_2$  commits with algorithm 5 or 6. then some
+
+process  $p_3$  must have committed  $v_2$  normally at line 37 and the proof of a.7 applies to  $p_1$  and  $p_3$ .
+
+3.  $p_1$  commits  $\nu_1$  using algorithm 5 or 6. then  $\nu_1$  was copied to  $p_1$ 's log from some other process  $p_3$ 's log, where  $\nu_1$  had already been committed. but then, agreement must have been broken earlier than  $t$  ( $\nu_1$  committed at  $p_3$ ,  $\nu_2$  committed at  $p_2$ ), a contradiction.
+
+# a.4.3 followers update their own fuo
+
+in the algorithm and optimizations presented so far, the only way for the fuo of a process  $p$  to be updated is by the leader; either by  $p$  being the leader and updating its own fuo, or by  $p$  being the follower of some leader that executes algorithm 6. however, in the steady state, when the leader doesn't change, it would be ideal for a follower to be able to update its own fuo. this is especially important in practice for smr, where each follower should be applying committed entries to its local state machine. thus, knowing which entries are committed as soon as possible is crucial. for this purpose, we introduce another simple optimization, whereby a follower updates its own fuo to  $i$  if it has a non-empty entry in some slot  $j \geq i$  and all slots  $k < i$  are populated.
+
+listing 7: optimization: followers update their own fuo  
+```txt
+if log[i]  $\neq$ ⊥&&my_fuo  $= =$  i-1 my_fu0=i
+```
+
+note that this optimization doesn't write any new values on any slot in the log, and therefore, cannot break validity. furthermore, since it does not introduce any waiting, it cannot break termination. we now prove that this doesn't break agreement.
+
+agreement. assume by contradiction that executing algorithm 7 can break agreement. let  $p$  be the first process whose execution of algorithm 7 breaks agreement, and let  $t$  be the time at which it changes its fuo to  $i$ , thereby breaking agreement.
+
+it must be the case that  $p$  has all slots up to and including  $i$  populated in its log. furthermore, since  $t$  is the first time at which disagreement happens, and  $p$ 's fuo was at  $i - 1$  before  $t$ , it must be the case that for all values in slots 1 to  $i - 2$  of  $p$ 's log, if any other process  $p'$  also has those slots committed, then it has the same values as  $p$  in those slots. let  $p$ 's value at slot  $i - 1$  be  $v$ . let  $\ell_1$  be the leader that populated slot  $i - 1$  for  $p$ , and let  $\ell_2$  be the leader the populated slot  $i$  for  $p$ . if  $\ell_1 = \ell_2$ , then  $p$ 's entry at  $i - 1$  must be committed at  $\ell_1$  before time  $t$ , since otherwise  $\ell_1$  would not have started replicating entry  $i$ . so, if at time  $t$ , some process  $q$  has a committed value  $v'$  in slot  $i - 1$  where  $v' \neq v$ , then this would have violated agreement with  $\ell_1$  before  $t$ , contradicting the assumption that  $t$  is the earliest time at which agreement is broken.
+
+now consider the case where  $\ell_1 \neq \ell_2$ . note that for  $\ell_2$  to replicate an entry at index  $i$ , it must have a value  $v'$  committed at entry  $i - 1$ . consider the last leader,  $\ell_3$ , who wrote a value on  $\ell_2$ 's  $i - 1$ th entry. if  $\ell_3 = \ell_1$ , then  $v' = v$ , since a single leader only ever writes one value on each index. thus, if agreement is broken by  $p$  at time  $t$ , then it must have also been broken at an earlier time by  $\ell_2$ , which had  $v$  committed at  $i - 1$  before time  $t$ . contradiction.
+
+if  $\ell_3 = \ell_2$ , we consider two cases, depending on whether or not  $p$  is part of  $\ell_2$ 's confirmed followers set. if  $p$  is not in the confirmed followers of  $\ell_2$ , then  $\ell_2$  could not have written a value on  $p$ 's  $i$ th log slot. therefore,  $p$  must have been a confirmed follower of  $\ell_2$ . if  $p$  was part of  $\ell_2$ 's quorum for committing entry  $i - 1$ , then  $\ell_2$  was the last leader to write  $p$ 's  $i - 1$ th slot, contradicting the assumption that  $\ell_1$  wrote it last. otherwise, if  $\ell_2$  did not use  $p$  as part of its quorum for committing, it still must have created a work request to write on  $p$ 's  $i - 1$ th entry before creating the work request to write on  $p$ 's  $i$ th entry. by the fifoness of rdma queue pairs,  $p$ 's  $i - 1$ th slot must therefore have been written by  $\ell_2$  before the  $i$ th slot was written by  $\ell_2$ , leading again to a contradiction.
+
+finally, consider the case where  $\ell_3 \neq \ell_1$  and  $\ell_3 \neq \ell_2$ . recall from the previous case that  $p$  must be in  $\ell_2$ 's confirmed followers set. then when  $\ell_2$  takes over as leader, it executes the update followers optimization presented in algorithm 6. by executing this, it must update  $p$  with its own committed value at  $i - 1$ , and update  $p$ 's fuo to  $i$ . however, this contradicts the assumption that  $p$ 's fuo was changed from  $i - 1$  to  $i$  by  $p$  itself using algorithm 7.
+
+# a.4.4 grow confirmed followers
+
+in our algorithm, the leader only writes to and reads from its confirmed followers set. so far, for a given leader  $\ell$ , this set is fixed and does not change after  $\ell$  initially constructs it in lines 4-7. this implies that processes outside of  $\ell$ 's confirmed followers set will remain behind and miss updates, even if they are alive and timely.
+
+we present an extension which allows such processes to join  $\ell$ 's confirmed followers set even if they are not part of the initial majority. every time propose is invoked,  $\ell$  will check to see if it received permission acts since the last propose call and if so, will add the corresponding processes to its confirmed followers set. this extension is compatible with those presented in the previous subsections: every time  $\ell$ 's confirmed followers set grows,  $\ell$  re-updates its own log from the new followers that joined (in case any of their logs is ahead of  $\ell$ 's), as well as updates the new followers' logs (in case any of their logs is behind  $\ell$ 's).
+
+one complication raised by this extension is that, if the number of confirmed followers is larger than a majority, then  $\ell$  can no longer wait for its reads and writes to complete at all of its confirmed followers before continuing execution, since that would interfere with termination in an asynchronous
+
+system.
+
+the solution is for the leader to issue reads and writes to all of its confirmed followers, but only wait for completion at a majority of them. one crucial observation about this solution is that confirmed followers cannot miss operations or have operations applied out-of-order, even if they are not consistently part of the majority that the leader waits for before continuing. this is due to rdma's fifo semantics.
+
+the correctness of this extension derives from the correctness of the algorithm in general; whenever a leader  $\ell$  adds some set  $s$  to its confirmed followers  $c$ , forming  $c' = c \cup s$ , the behavior is the same as if  $\ell$  just became leader and its initial confirmed followers set was  $c'$ .
+
+# a.4.5 omit prepare phase
+
+as is standard practice for paxos-derived implementations, the prepare phase can be omitted if there is no contention. more specifically, the leader executes the prepare phase until it finds no accepted values during its prepare phase (i.e., until the check at line 26 succeeds). afterwards, the leader omits the prepare phase until it either (a) aborts, or (b) grows its confirmed followers set; after (a) or (b), the leader executes the prepare phase until the check at line 26 succeeds again, and so on.
+
+this optimization concerns performance on the common path. with this optimization, the cost of a propose call becomes a single rdma write to a majority in the common case when there is a single leader.
+
+the correctness of this optimization follows from the following lemma, which states that no 'holes' can form in the log of any replica. that is, if there is a value written in slot  $i$  of process  $p$ 's log, then every slot  $j < i$  in  $p$ 's log has a value written in it.
+
+lemma a.11 (no holes). for any process  $p$ , if  $p$ 's log contains a value at index  $i$ , then  $p$ 's log contains a value at every index  $j$ ,  $0 \leq j \leq i$ .
+
+proof. assume by contradiction that the lemma does not hold. let  $p$  be a process whose slot  $j$  is empty, but slot  $j + 1$  has a value, for some  $j$ . let  $\ell$  be the leader that wrote the value on slot  $j + 1$  of  $p$ 's log, and let  $t$  be the last time at which  $\ell$  gained write permission to  $p$ 's log before writing the value in slot  $j + 1$ . note that after time  $t$  and as long as  $\ell$  is still leader,  $p$  is in  $\ell$ 's confirmed followers set. by algorithm 6,  $\ell$  must have copied a value into all slots of  $p$  that were after  $p$ 's fuo and before  $\ell$ 's fuo. by the way fuo is updated,  $p$ 's fuo cannot be past slot  $j$  at this time. therefore, if  $\ell$ 's fuo is past  $j$ , slot  $j$  would have been populated by  $\ell$  at this point in time. otherwise,  $\ell$  starts replicating values to all its confirmed followers, starting at its fuo, which we know is less than or equal to  $j$ . by the fifo order of rdma queue pairs,  $p$  cannot have missed updates written by  $\ell$ . therefore,
+
+since  $p$ 's  $j + 1$ th slot gets updated by  $\ell$ , so must its  $j$ th slot. contradiction.
+
+corollary a.12. once a leader reads no accepted values from a majority of the followers at slot  $i$ , it may safely skip the prepare phase for slots  $j > i$  as long as its confirmed followers set does not decrease to less than a majority.
+
+proof. let  $\ell$  be a leader and  $c$  be its confirmed follower set which is a quorum. assume that  $\ell$  executes line 27 for slot  $i$ ; that is, no follower  $p \in c$  had any value in slot  $i$ . then, by
+
+lemma a.11, no follower in  $c$  has any value for any slot  $j > i$ . since this constitutes a majority of the processes, no value is decided in any slot  $j > i$ , and by invariant a.1, no value is committed at any process at any slot  $j > i$ . furthermore, as long as  $\ell$  has the write permission at a majority of the processes,  $\ell$  is the only one that can commit new entries in these slots (by invariant a.5). thus,  $\ell$  cannot break agreement by skipping the prepare phase on the processes in its confirm followers set.

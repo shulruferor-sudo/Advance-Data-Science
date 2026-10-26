@@ -1,0 +1,723 @@
+# visual camera re-localization from rgb and rgb-d images using dsac
+
+eric brachmann and carsten rother
+
+abstract—we describe a learning-based system that estimates the camera position and orientation from a single input image relative to a known environment. the system is flexible w.r.t. the amount of information available at test and at training time, catering to different applications. input images can be rgb-d or rgb, and a 3d model of the environment can be utilized for training but is not necessary. in the minimal case, our system requires only rgb images and ground truth poses at training time, and it requires only a single rgb image at test time. the framework consists of a deep neural network and fully differentiable pose optimization. the neural network predicts so called scene coordinates, i.e. dense correspondences between the input image and 3d scene space of the environment. the pose optimization implements robust fitting of pose parameters using differentiable ransac (dsac) to facilitate end-to-end training. the system, an extension of dsac++ and referred to as dsac*, achieves state-of-the-art accuracy an various public datasets for rgb-based re-localization, and competitive accuracy for rgb-d based re-localization.
+
+index terms—camera re-localization, pose estimation, differentiable ransac, dsac, differentiable argmax, differentiable pnp
+
+# 1 introduction
+
+t he ability to re-localize ourselves has revolutionized our daily lives. gps-enabled smart phones already facilitate car navigation without a co-driver sweating over giant fold-out maps, or they enable the search for a rare vegetarian restaurant in the urban jungle of seoul. on the other hand, the limits of gps-based re-localization are clear to anyone getting lost in vast indoor spaces or in between sky scrapers. when the satellite signals are blocked or delayed, gps does not work or becomes inaccurate. at the same time, upcoming technical marvels, like autonomous driving [1] or impending updates of reality itself (i.e. augmented/extended/virtual reality [2]), call for reliable, high precision estimates of camera position and orientation.
+
+visual camera re-localization systems offer a viable alternative to gps by matching an image of the current environment, e.g. taken by a handheld device, with a database representation of said environment. from a single image, state-of-the-art visual re-localization methods estimate the camera position to the centimeter, and the camera orientation up to a fraction of a degree, both indoors and outdoors.
+
+existing re-localization approaches rely on varying types of information to solve the task, effectively catering to different application scenarios. some use rgb-d images as input which facilitates highest precision suitable for augmented reality [3], [4], [5], [6]. however, they require capturing devices with active or passive stereo capabilities, where the former only works indoors, and the latter requires a large stereo baseline for reliable depth estimates outdoors. approaches based on feature-matching use an rgb image as input and also offer high precision [7]. but they require a structure-from-motion (sfm) reconstruction [8], [9], [10]
+
+e. brachmann is with niantic. work done during his time at the visual learning lab, heidelberg university.  
+c. rother is with the visual learning lab, heidelberg university.
+
+this work has been submitted to the ieee for possible publication. copyright may be transferred without notice, after which this version may no longer be accessible.
+
+![](images/b5a56e23f070eff81c5c64678caaa52b8e91f392eb4bf6cc09e1fc7079915565.jpg)  
+fig. 1. top. our system accurately re-localizes within a known environment given a single image. we show estimated camera positions in purple and ground truth in cyan. in this instance, the system was trained using rgb images and associated ground truth poses, only (gray trajectory), in particular, the scene geometry, displayed as a 3d model, was discovered by the system, automatically. bottom. to visualize the relocalization quality, we render the learned 3d geometry using estimated poses over gray-scale input images.
+
+of the environment for re-localization. such reconstructions might be cumbersome to obtain indoors due to textureless surfaces and repeating structures obstructing reliable feature matching [11]. finally, approaches based on image retrieval or pose regression require only a database of rgb images and ground truth poses for re-localization, but suffer from low precision comparable to gps [12].
+
+in this work, we describe a versatile, learning-based framework for visual camera re-localization that covers all aforementioned scenarios. in the minimal case, it requires only a database of rgb images and ground truth poses of an environment for training, and re-localizes based on
+
+a single rgb image at test time with high precision. in such a scenario the system automatically discovers the 3d geometry of the environment during training, see fig. 1 for an example. if a 3d model of the scene exists, either as a sfm reconstruction or a 3d scan, we can utilize it to help the training process. the framework exploits depth information at training or test time if an rgb-d sensor is available.
+
+we base our approach on scene coordinate regression initially proposed by shotton et al. [3] for rgb-d-based camera re-localization. a learnable function, a random forest in [3], regresses for each pixel of an input image the corresponding 3d coordinate in the environment's reference frame. this induces a dense correspondence field between the image and the 3d scene that serves as basis for ransac-based pose optimization. in our work, we replace the random forest of [3] with a fully convolutional neural network [13], and derive differentiable approximations to all steps of pose optimization. most prominently, we derive a differentiable approximation of the ransac robust estimator, called differentiable sample consensus (dsac) [14]. additionally, we describe an efficient differentiable approximation for calculating gradients of the perspective-n-point problem [15]. these ingredients make our framework end-to-end trainable, ensuring that the neural network predicts scene coordinates that result in high precision camera poses.
+
+this article is a summary and extension of our previous work on camera re-localization published in [14] as dsac, and its follow-up dsac++ [15]. in particular, we describe an improved version under the name  $dsac^{*}$  with the following properties.
+
+- we extent dsac++ to optionally utilize rgb-d inputs. the corresponding pose solver is naturally differentiable, and other components require only minor adjustments. when using rgb-d, dsac* achieves accuracy comparable to state-of-the-art accuracy on standard indoor re-localization datasets.  
+- we propose a simplified training procedure which unifies the two separate initialization steps used in dsac++. as a result, the training time of dsac* reduces from 6 days to 2.5 days on identical hardware.  
+- the improved initialization also leads to better accuracy. particularly, when training without a 3d model, results improve significantly from  $53.1\%$  (dsac++) to  $80.7\%$  (dsac*) for indoor re-localization.  
+- we utilize an improved network architecture for scene coordinate regression which we introduced in [16], [17]. the architecture, based on resnet [18], reduces the memory footprint by  $75\%$  compared to the network of dsac++. a forward pass of the new network takes 50ms instead of 150ms on identical hardware. together with better pose optimization parameters we decrease the total inference time from 200ms for dsac++ to 75ms for dsac*.  
+- in new ablation studies, we investigate the impact of training data augmentation, the impact of the network's receptive field, as well as the impact of end-to-end training. we also analyze the scene compression properties of dsac*. furthermore, we provide extensive visualizations of our pose estimates, and of the 3d geometry that the network encodes.
+
+- we migrate our implementation of dsac++ from lua/torch to pytorch [19] and make it publicly available: https://github.com/vislearn/dsacstar
+
+this article is organized as follows: we give an overview of related work in sec. 2. in sec. 3, we formally introduce the task of camera re-localization and how we solve it via scene coordinate regression. in sec. 4, we discuss how to train the scene coordinate network using auxiliary losses defined on the scene coordinate output. in sec. 5, we discuss how to train the whole system end-to-end, optimizing a loss on the estimated camera pose. we present experiments for indoor and outdoor camera re-localization, including ablation studies in sec. 6. we conclude this article in sec. 7.
+
+# 2 related work
+
+in the following, we discuss the main strains of research for solving visual camera re-localization. we also discuss related work on differentiable robust estimators other than dsac.
+
+# 2.1 image retrieval and pose regression
+
+early examples of visual re-localization rely on efficient image retrieval [20]. the environment is represented as a collection of data base images with known camera poses. given a query image, we search for the most similar data base image by matching global image descriptors, such as densevlad [21], or its learned successor netvlad [22]. the metric to compare global descriptors can be learned as well [23]. the sampling density of data base images inherently limits the accuracy of retrieval-based system. however, they scale to very large environments, and can serve as an efficient initialization for local pose refinement [24], [25].
+
+absolute pose regression methods [11], [26], [27], [28], [29] aim at overcoming the precision limitation of image retrieval while preserving efficiency and scalability. interpreting the data base images as a training set, a neural network learns the relationship between image content and camera pose. in theory, the network could learn to interpolate poses of training images, or even generalize to novel view points. in practise, however, absolute pose regression fails to consistently outperform the accuracy of image retrieval methods [12].
+
+relative pose regression methods [30], [31] train a neural network to predict the relative transformation between the query image, and the most similar data base image found by image retrieval. initial relative pose regression methods suffered from similarly low accuracy as absolute pose regression [12]. however, recent work [32] suggests that relative pose regression can achieve accuracy comparable to structure-based methods which we discuss next.
+
+# 2.2 sparse feature matching
+
+the camera pose can be recovered by matching sparse, local features like sift [33] between the query image and database images [34]. for an efficient data base representation, sfm tools [9], [10] create a sparse 3d point cloud of an environment, where each 3d point has one or several feature
+
+descriptors attached to it. given a query image, feature matching established 2d-3d correspondences which can be utilized in ransac-based pose optimization to yield a very precise camera pose estimate [7]. work on feature-based re-localization has primarily focused on scaling to very large environments [24], [35], [36], [37], [38], [39] enabling city or even world scale re-localization. other authors worked on efficiency to run feature-based re-localization on mobile devices with low computational budget [40].
+
+while sparse feature matching can achieve high relocalization accuracy, hand-crafted features fail in certain scenarios. feature detectors have difficulty finding stable points under motion blur [26] and for texture-less areas [3]. also, sfm reconstructions tend to fail in indoor environments dominated by ambiguous, repeating structures [11]. learning-based sparse feature pipelines [41], [42], [43], [44] might ultimately be able to overcome these issues, but currently it is an open research question whether learned sparse features consistently exceed the capabilities of their hand-crafted predecessors [45], [46].
+
+state-of-the-art feature-based re-localization methods such as activesearch [7] offer no direct possibility to incorporate depth sensors when available at test time, neither do current state-of-the-art sfm tools like colmap [10] support depth sensors when creating the scene reconstruction.
+
+# 2.3 scene coordinate regression
+
+instead of relying on a feature detector to identify salient image structures suitable for discrete matching, scene coordinate regression [3] predicts the corresponding 3d scene point for a given 2d pixel location, directly. in these works, the environment is implicitly represented by a learnable function that can be evaluated for any image pixel to predict a dense correspondence field between image and scene. the correspondences serve as input for ransac-based pose optimization, similar to sparse feature techniques.
+
+originally, scene coordinate regression was proposed for rgb-d-based re-localization in indoor environments [3], [4], [47], [48]. the depth channel would serve as additional input to a scene coordinate regression forest, and be used in pose optimization by allowing to establish and resolve 3d-3d correspondences [49]. scene coordinate regression forests were later shown to also work well for rgb-based re-localization [5], [50].
+
+recent works on scene coordinate regression often replace the random forest regressor by a neural network while continuing to focus on rgb inputs [14], [15], [17], [51], [52]. in previous work, we have shown that the ransac-based pose optimization can be made differentiable to allow for end-to-end training of a scene coordinate regression pipeline [14], [15]. in particular, [14] introduced a differentiable approximation of ransac [53], and [15] described an efficient analytical approximation of calculating gradients for perspective-n-point solvers. furthermore, the predecessor of the current work, dsac++ [15], introduced the possibility to train scene coordinate regression solely from rgb images and ground truth poses, without the need for image depth or a 3d model of the scene. li et al. [52] improved on this initial effort by enforcing multi-view and photometric consistency throughout training. in a follow-up work, li et
+
+al. [54] introduce a joint classification-regression network architecture for predicting scene coordinate, and demonstrate the effectiveness of training data augmentation for large improvements on standard benchmarks.
+
+in this work, we describe several improvements to dsac++ that increase accuracy while reducing training and test time. we demonstrate that the dsac framework naturally exploits image depth if available, in an attempt to unify previously distinct strains of rgb- and rgb-d-based re-localization research. in summary, our method is more precise and more flexible than previous scene coordinate regression- and sparse feature-based re-localization systems. at the same time, it is as simple to deploy as absolute pose regression systems due to requiring only a set of rgb images with ground truth poses for training in the minimal setting.
+
+orthogonal to this work, we describe a scalable variant of dsac-based re-localization in [17]. yang et al. explore the possibility of allowing for scene-independent coordinate regression [55], and cavallari et al. adapt scene coordinate regression forests and networks on-the-fly for deployment as a re-localizer in simultaneous localization and mapping (slam) [56], [57], [58].
+
+# 2.4 differentiable robust estimators
+
+to allow for end-to-end training of our re-localization pipeline, we have introduced a differentiable approximation to the ransac [53] algorithm, called differentiable sample consensus (dsac). dsac relies on a formulation of ransac that reduces to a argmax operation over model parameters. instead of choosing model parameters with maximum consensus, we choose model parameters randomly with a probability proportional to consensus. this allows us to optimize the expected task loss for end-to-end training. a dsac variant using a soft argmax [59] does not work as well since it ignores potential multi-modality in the distribution of model parameters. recently, lee et al. proposed a kernel soft argmax as an alternative that is robust to multiple modes in the arguments [60]. however, their approximation effectively suppresses gradients of all but the main mode, while the dsac estimator utilizes gradients of all modes.
+
+alternatively to making ransac differentiable, some authors propose to replace ransac by a neural network [61], [62], [63], [64], [65]. in these works, the neural network acts as a classifier for model inliers, effectively acting as a robust estimator for model parameters. however, ng-ransac [16] demonstrates that the combination of an inlierscoring network and ransac achieves even higher accuracy. in [16], we also discuss a combination of ng-ransac and dsac for camera re-localization which leads to higher accuracy in outdoor re-localization by learning to focus on informative image areas.
+
+# 3 framework
+
+in this section, we introduce the task of camera relocalization, and the principle of scene coordinate regression [3]. we explain how to estimate the camera pose from scene coordinates using ransac [53] when the input is a single rgb or rgb-d image, respectively.
+
+![](images/06503182961248ce0224f5f6644a33ef11aaf18bb1122dbea70959067b12d825.jpg)  
+rgb images
+
+![](images/6794f82e962da67a41e64948d8b5d35ba5125df60901f5ff994079145a51ea0a.jpg)  
+ground truth scene coordinates
+
+![](images/013547123e9e76e6ba62c1805af70e516f6b21e9c69b3883792d3b249e06fc44.jpg)  
+fig. 2. scene coordinates [3]. top. every surface point in a 3d environment has a unique 3d coordinate in the local coordinate frame. we visualize 3d scene coordinates by mapping xyz to the rgb cube. bottom. a 3d scene model together with ground truth camera poses allows us to render ground truth scene coordinates for images, e.g. to serve as training targets. we can also create training targets from depth maps instead of a 3d model, or from ground truth poses alone by optimizing the re-projection error over multiple frames.
+
+given an image  $i$ , which can be either rgb or rgb-d, we aim at estimating camera pose parameters  $\mathbf{h}$  w.r.t. the reference coordinate frame of a known scene, a task called re-localization. we propose a learnable system to solve the task, which is trained for a specific scene to re-localize within that scene. the camera pose has 6 degrees of freedom (dof) corresponding to the 3d camera position  $\mathbf{t}$  and its 3d orientation  $\theta$ . in particular, we define the camera pose as the transformation that maps 3d points in the camera coordinate space, denoted as  $\mathbf{e}$  to 3d points in scene coordinate space, denoted as  $\mathbf{y}$ , i.e.
+
+$$
+\mathbf {y} _ {i} = \mathbf {h e} _ {i}, \tag {1}
+$$
+
+where  $i$  denotes the pixel index in image  $i$ . for notational simplicity, we assume a 4x4 matrix representation of the camera pose  $\mathbf{h}$  and homogeneous coordinates for all points where convenient.
+
+we denote the complete set of scene coordinates for a given image as  $\mathcal{v}$ , i.e.  $\mathbf{y}_i \in \mathcal{v}$ . see fig. 2 for an explanation and visualization of scene coordinates. originally proposed by shotton et al. [3], scene coordinates  $\mathcal{v}$  induce a dense correspondence field between camera coordinate space and scene coordinate space which we can use to solve for the camera pose. to estimate  $\mathcal{v}$  for a given image, we utilize a neural network  $f$  with learnable parameters  $\mathbf{w}$ :
+
+$$
+\mathcal {y} = f (i; \mathbf {w}). \tag {2}
+$$
+
+due to potential errors in the neural network prediction, we utilize a robust estimator, namely ransac [53], to recover  $\mathbf{h}$  from  $\mathcal{v}$ . our ransac-based pose optimization consists of the following steps:
+
+1) sample a set of camera pose hypotheses.  
+2) score each hypothesis and choose the best one.  
+3) refine the winning hypothesis.
+
+we show an overview of our system in fig. 3. in the following, we describe the three aforementioned steps for the general case, while we elaborate on concrete manifestations for rgb and rgb-d input images in sec. 3.1 and sec. 3.2, respectively.
+
+1) sample hypotheses. image  $i$  and scene coordinate prediction  $\mathcal{v}$  define a dense correspondence field  $\mathcal{c}$  over all image pixels  $i$ . we will specify the concrete nature of correspondences in sub-sections below because it differs for rgb and rgb-d inputs. as first step of robust pose optimization we randomly choose  $m$  subsets of correspondences,  $\mathcal{c}_j \subseteq \mathcal{c}$ , with  $0 \leq j < m$ . each correspondence subset  $\mathcal{c}_j$  corresponds to a camera pose hypothesis  $\mathbf{h}_j$ , which we recover using a pose solver  $g$ , i.e.
+
+$$
+\mathbf {h} _ {j} = g \left(\mathcal {c} _ {j}\right). \tag {3}
+$$
+
+the concrete manifestation of  $g(\cdot)$  differs for rgb and rgb-d inputs. note that the ransac algorithm [53] includes a way to adaptively choose the number of hypotheses  $m$  according to an online estimate of the outlier ratio in  $\mathcal{c}$ , i.e. the amount of erroneous correspondences. in this work, and our previous work [5], [14], [15], [16], [17], we choose a fixed  $m$  and train the system to adapt to this particular setting. thereby,  $m$  becomes a hyper-parameter that controls the allowance of the neural network  $f$  to make inaccurate predictions.
+
+2) choose best hypothesis. following ransac, we choose the hypothesis  $\mathbf{h}_j$  with maximum consensus among all scene coordinates  $\mathcal{v}$ , i.e.
+
+$$
+\tilde {\mathbf {h}} = \underset {\mathbf {h} _ {j}} {\operatorname {a r g m a x}} s \left(\mathbf {h} _ {j}, \mathcal {y}\right). \tag {4}
+$$
+
+we measure consensus by a scoring function  $s(\cdot)$  that is, by default, implemented as inlier counting:
+
+$$
+s (\mathbf {h}, \mathcal {y}) = \sum_ {\mathbf {y} _ {i} \in \mathcal {y}} \mathbb {1} [ r (\mathbf {y} _ {i}, \mathbf {h}) <   \tau ]. \tag {5}
+$$
+
+function  $r(\cdot)$  measures the residual between pose parameters  $\mathbf{h}$ , and a scene coordinate  $\mathbf{y}_i$ ,  $\mathbb{1}[\cdot]$  evaluates to one if the residual is smaller than an inlier threshold  $\tau$ .
+
+3) refine best hypothesis. we refine the chosen hypothesis  $\tilde{\mathbf{h}}$ , which was created from a small subset of correspondences, using all scene coordinates:
+
+$$
+\hat {\mathbf {h}} = \mathbf {r} (\tilde {\mathbf {h}}, \mathcal {y}). \tag {6}
+$$
+
+we implement refinement as re-solving for the pose parameters using the complete inlier set  $\mathcal{i}$  of hypothesis  $\tilde{\mathbf{h}}$ , i.e.
+
+$$
+\mathbf {r} (\tilde {\mathbf {h}}, \mathcal {y}) = g \left(\mathcal {c} _ {\mathcal {i}}\right) \text {w i t h} \mathcal {i} = \{i | r \left(\mathbf {y} _ {i}, \tilde {\mathbf {h}}\right) <   \tau \} \tag {7}
+$$
+
+in practise, we iterate refinement and re-calculation of the inlier set  $\mathcal{i}$  until convergence. we refer to the refined, chosen hypothesis as our final camera pose estimate  $\hat{\mathbf{h}}$ .
+
+next, we discuss particular choices for pose optimization components in case the input image is rgb or rgb-d.
+
+# 3.1 case rgb
+
+in case the input is an rgb image without a depth channel, correspondences  $\mathcal{c}$  manifest as 2d-3d correspondences between the image and 3d scene space:
+
+$$
+\mathcal {c} ^ {\mathrm {r g b}} = \left\{\left(\mathbf {p} _ {i}, \mathbf {y} _ {i}\right) \mid \mathbf {y} _ {i} \in \mathcal {y} \right\}, \tag {8}
+$$
+
+![](images/1c63b52b7d72a44b8d33f6e4ff081ce586316a8b169f461a8e744187a8e84dce.jpg)  
+fig. 3. system overview. the system consists of two stages: scene coordinate regression using a cnn (top) and differentiable pose estimation (bottom). the network is fully convolutional and produces a dense but sub-sampled output. pose estimation employs a minimal solver (pnp [66] for rgb images or kabsch [49] for rgb-d images) within a ransac [53] robust estimator. the final camera pose estimate is also refined. to allow for end-to-end training, all components need to be differentiable. while the kabsch solver is inherently differentiable, we describe differentiable approximations for pnp and ransac.
+
+where  $\mathbf{p}_i$  denotes the 2d image coordinate associated with pixel  $i$ . image coordinates and scene coordinates are related by
+
+$$
+\mathbf {p} _ {i} = k \mathbf {h} ^ {- 1} \mathbf {y} _ {i} \tag {9}
+$$
+
+where  $k$  denotes the camera calibration matrix, or internal calibration parameters of the camera. using this relation, perspective-n-point (pnp) solvers  $g(\cdot)$  [66], [67] recover the camera pose from at least four 2d-3d correspondences:  $|\mathcal{c}_j^{\mathrm{rgb}}| \geq 4$ . in practise, we use  $|\mathcal{c}_j^{\mathrm{rgb}}| = 4$  with the solver of gao et al. [66] when sampling pose hypotheses  $\mathbf{h}_j$ , and non-linear optimization of the re-projection error with levenberg-marquardt [68], [69] when refining the chosen hypothesis  $\mathbf{r}(\tilde{\mathbf{h}}, \mathcal{v})$  with  $|\mathcal{c}_{\mathcal{i}}| > 4$ . we utilize the implementation available in opencv [70] for all pnp solvers.
+
+as residual function  $r(\cdot)$  for determining the score  $s(\cdot)$  of a pose hypothesis  $\mathbf{h}_j$  in eq. 5, we calculate the re-projection error:
+
+$$
+r ^ {\mathrm {r g b}} \left(\mathbf {y} _ {i}, \mathbf {h}\right) = \left\| \mathbf {p} _ {i} - k \mathbf {h} ^ {- 1} \mathbf {y} _ {i} \right\|. \tag {10}
+$$
+
+# 3.2 case rgb-d
+
+in case the input is an rgb-d image, the known depth map allows us to recover the 3d coordinate corresponding to each pixel  $i$  in the coordinate frame of the camera, denoted as  $\mathbf{e}_i$ . together with the scene coordinate prediction  $\mathcal{v}$ , we have dense 3d-3d correspondences  $\mathcal{c}$  between camera space and scene space, i.e.
+
+$$
+\mathcal {c} ^ {\mathrm {r g b - d}} = \left\{\left(\mathbf {e} _ {i}, \mathbf {y} _ {i}\right) \mid \mathbf {y} _ {i} \in \mathcal {y} \right\}. \tag {11}
+$$
+
+to recover the camera pose from 3d-3d correspondences we utilize the kabsch algorithm [49], sometimes also called orthogonal procrustes, as pose solver  $g(\cdot)$ . for sampling pose hypotheses  $\mathbf{h}_j$ , we use  $|\mathcal{c}_j^{\mathrm{rgb - d}}| = 3$ , when refining the chosen hypothesis  $\mathbf{r}(\tilde{\mathbf{h}},\mathcal{y})$  we use  $|\mathcal{c}_{\mathcal{i}}| > 3$ .
+
+as residual function  $r(\cdot)$  for determining the score  $s(\cdot)$  of an hypothesis  $\mathbf{h}_j$  in eq. 5, we calculate the 3d euclidean distance:
+
+$$
+r ^ {\mathrm {r g b - d}} \left(\mathbf {y} _ {i}, \mathbf {h}\right) = \left\| \mathbf {e} _ {i} - \mathbf {h} ^ {- 1} \mathbf {y} _ {i} \right\|. \tag {12}
+$$
+
+# 4 deep scene coordinate regression
+
+in this section, we discuss the neural network architecture for scene coordinate regression, and how to train it using auxiliary losses defined on the scene coordinate output. these auxiliary losses serve as an initialization step prior to training the whole pipeline in an end-to-end fashion, see sec. 5. the initialization is necessary, since end-to-end training from scratch will converge to a local minimum without giving reasonable pose estimates.
+
+we implement scene coordinate regression  $f(\cdot)$  using a fully convolutional neural network [13] with skip connections [18] and learnable parameters  $\mathbf{w}$ . we depict the network architecture in fig. 3, top. the network takes a single channel grayscale image as input, and produces a dense scene coordinate prediction sub-sampled by the factor 8. sub-sampling, implemented with stride 2 convolutions, increases the receptive field associated with each pixel output while also enhancing efficiency. the total receptive field of each output scene coordinate is 81px. in experiments on various datasets, we found no advantage in providing the full rgb image as input, in contrast, conversion to grayscale slightly increases the robustness to non-linear lighting effects.
+
+relation to our previous work. in our first dsac-based relocalization pipeline [14] and in dsac++ [15], we utilized a vggnet-style architecture [71]. it had a larger memory footprint and slower runtime while offering similar accuracy. the receptive field was comparable with 79px. in the experiments of sec. 6, we conduct an empirical comparison of both architectures. we utilized our updated architecture already in our work on esac [17] and ng-ransac [16].
+
+in the following, we discuss different strategies on initializing the scene coordinate neural network, depending on what information is available for training. in particular, we discuss training from rgb-d images for rgb-d-based re-localization, training from rgb images and a 3d model of the scene for rgb-based re-localization as well as training from rgb images only for rgb-based re-localization. see table 1 for a schematic overview. other combinations are of course possible, e.g. training from rgb images only,
+
+table 1 information available at training and test time. "d" stands for depth channel, "poses" stands for ground truth camera poses. the 3d model of the scene may be a sparse point cloud, e.g. from a sfm reconstruction [9], [10], or a dense 3d scan [72], [73], [74].  
+
+<table><tr><td></td><td colspan="4">training</td><td colspan="2">test</td></tr><tr><td>setting</td><td>rgb</td><td>d</td><td>poses</td><td>3d model</td><td>rgb</td><td>d</td></tr><tr><td>rgb-d</td><td>✓</td><td>✓</td><td>✓</td><td></td><td>✓</td><td>✓</td></tr><tr><td>rgb + 3d model</td><td>✓</td><td></td><td>✓</td><td>✓</td><td>✓</td><td></td></tr><tr><td>rgb</td><td>✓</td><td></td><td>✓</td><td></td><td>✓</td><td></td></tr></table>
+
+but having rgb-d images at test time. however, we but restrict our discussion and experiments to the most common settings found in the literature [3], [5], [15].
+
+# 4.1 rgb-d
+
+for rgb-d-based pose estimation, we initialize our neural network by minimizing the euclidean distance between predicted scene coordinates  $\mathbf{y}_i$  and ground truth scene coordinates  $\mathbf{y}_i^*$ .
+
+$$
+\ell^ {\mathrm {r g b - d}} \left(\mathbf {y} _ {i}, \mathbf {y} _ {i} ^ {*}\right) = \left| \left| \mathbf {y} _ {i} ^ {*} - \mathbf {y} _ {i} \right| \right| \tag {13}
+$$
+
+we obtain ground truth scene coordinates  $\mathbf{y}_i^*$  by reprojecting depth channels of training images to obtain 3d points  $\mathbf{e}_i$  in the camera coordinate frame, and transforming them using the ground truth pose  $\mathbf{h}^*$ , i.e.  $\mathbf{y}_i^* = \mathbf{h}^*\mathbf{e}_i$ . we train the network using the average loss over all pixels of a training image:
+
+$$
+\mathcal {l} ^ {\mathrm {r g b - d}} (\mathcal {y}, \mathcal {y} ^ {*}) = \frac {1}{| \mathcal {y} |} \sum_ {\mathbf {y} _ {i} \in \mathcal {y}} \ell^ {\mathrm {r g b - d}} \left(\mathbf {y} _ {i}, \mathbf {y} _ {i} ^ {*}\right). \tag {14}
+$$
+
+we motivate optimizing the euclidean distance for rgb-d-based re-localization by the fact that the corresponding kabsch pose solver optimizes the pose over squared euclidean residuals between camera coordinates and scene coordinates. we found the plain, instead of the squared, euclidean distance in eq. 13 superior in [14] due to its robustness to outliers.
+
+# 4.2 rgb + 3d model
+
+in case the camera pose is to be estimated from an rgb image, the optimization of scene coordinates w.r.t. a 3d euclidean distance is not optimal. the pnp solver, which we utilize for pose sampling and pose refinement, optimizes the camera pose w.r.t. the re-projection error of scene coordinates. hence, for rgb-based pose estimation, we initialize the scene coordinate regression network by minimizing the re-projection error of its predictions, i.e.  $r^{\mathrm{rgb}}(\mathbf{y}_i,\mathbf{h}^*)$  where  $r^{\mathrm{rgb}}(\cdot)$  denotes the residual function defined for rgb in eq. 10, and  $\mathbf{h}^*$  denotes the ground truth camera pose.
+
+unfortunately, optimizing this objective from scratch fails since the re-projection error is ambiguous w.r.t. the viewing direction of the camera. however, if we assume a 3d model of the environment to be available, we may render ground truth scene coordinates  $\mathcal{y}^*$ , optimize the rgb-d objective of eq. 13 first, and switch to the re-projection error after a few training iterations:
+
+$$
+\ell^ {\mathrm {r g b} + \mathrm {m}} \left(\mathbf {y} _ {i}, \mathbf {y} _ {i} ^ {*}, \mathbf {h} ^ {*}\right) = \left\{ \begin{array}{l l} \hat {r} ^ {\mathrm {r g b}} \left(\mathbf {y} _ {i}, \mathbf {h} ^ {*}\right) & \text {i f} \mathbf {y} _ {i} \in \mathcal {v} ^ {\mathrm {r g b} + \mathrm {m}} \\ | | \mathbf {y} _ {i} ^ {*} - \mathbf {y} _ {i} | | & \text {o t h e r w i s e .} \end{array} \right. \tag {15}
+$$
+
+we define a set of valid scene coordinate predictions as  $\mathcal{v}^{\mathrm{rgb + m}}$  for which we optimize the re-projection error. if a scene coordinate does not qualify as valid yet, we optimize the euclidean distance, instead. a prediction  $\mathbf{y}_i$  is valid,  $\mathbf{y}_i\in \mathcal{v}^{\mathrm{rgb + m}}$  iff:
+
+1)  $(\mathbf{h}^{* - 1}\mathbf{y}_i)_z > 0.1\mathrm{m},$  i.e. it lies at least  $0.1\mathrm{m}$  in front of the ground truth image plane.  
+2) it has a maximum re-projection error of  $r^{\mathrm{rgb}}(\mathbf{y}_i, \mathbf{h}^*) < 1000\mathrm{px}$ .  
+3) it is within a maximum 3d distance w.r.t. to the rendered ground truth coordinate of  $||\mathbf{y}_i^* - \mathbf{y}_i|| < 0.1\mathrm{m}$ .
+
+the training objective is flexible w.r.t. to missing ground truth scene coordinates for certain pixels, i.e. if  $\mathbf{y}_i^* = \mathbf{0}$ . in this case, we only enforce constraint 1) and 2) for  $\nu^{\mathrm{rgb + m}}$ . this allows us to utilize dense 3d models of the scene, sparse sfm reconstructions as well as depth channels with missing measurements to generate  $\mathbf{y}_i^*$ . the training objective utilizes a robust version  $\hat{r}^{\mathrm{rgb}}(\mathbf{y}_i,\mathbf{h}^*)$  of the rgb residual function of eq. 10, i.e.
+
+$$
+\hat {r} ^ {\mathrm {r g b}} (\mathbf {y}, \mathbf {h}) = \left\{ \begin{array}{l l} r ^ {\mathrm {r g b}} (\mathbf {y}, \mathbf {h}) & \text {i f} r ^ {\mathrm {r g b}} (\mathbf {y}, \mathbf {h}) <   1 0 0 \mathrm {p x} \\ \sqrt {1 0 0 r ^ {\mathrm {r g b}} (\mathbf {y} , \mathbf {h})} & \text {o t h e r w i s e .} \end{array} \right. \tag {16}
+$$
+
+this formulation implements a soft clamping by using the square root of the re-projection residual after a threshold of 100px. to train the scene coordinate network, we optimize the average of eq. 15 over all pixels of a training image, similar to eq. 14.
+
+relation to our previous work. we introduced a combined training objective based on, firstly, minimizing the 3d distance to ground truth scene coordinates, and, secondly, minimizing the re-projection error in  $\mathrm{dsac}++$  [15]. however,  $\mathrm{dsac}++$  uses separate initialization stages for the two objectives, 3d distance and re-projection error, which is computationally wasteful. the network might concentrate on modelling fine details of the geometry in the first initialization stage which is potentially undone in the second initialization stage. also, pixels without a ground truth scene coordinate would receive no training signal in the first initialization stage of  $\mathrm{dsac}++$ . the new, combined training objective of  $\mathrm{dsac}^*$  in eq. 15 switches dynamically from optimizing the 3d distance to optimizing the re-projection error on a per-pixel basis. by using one combined initialization stage instead of two, we shorten the pre-training time of  $\mathrm{dsac}^*$  from 4 days to 2 days compared to  $\mathrm{dsac}++$  on identical hardware.
+
+# 4.3 rgb
+
+the previous rgb-based training objective of eq. 15 relies on the availability of a 3d model of the scene. when a dense 3d scan of an environment is unavailable, sfm tools like visualsfm [9] or colmap [10] offer workable solutions to create a (sparse) 3d model from a collection of rgb images, e.g. from the training set of a scene. however, for some environments, particularly indoors, a sfm reconstruction might fail due to texture-less areas or repeating structures. also, despite sfm tools having matured significantly over many years since the introduction of bundler [8] they still represent expert tools with their own set of hyperparameters to be tuned. therefore, it might be attractive to
+
+train a camera re-localization system from rgb images and ground truth poses alone, without resorting to an sfm tool for pre-processing. therefore, we introduce a variation on the rgb-based training objective of eq. 15 that substitutes ground truth scene coordinates  $\mathbf{y}_i^*$  with a heuristic scene coordinate target  $\bar{\mathbf{y}}_i$  combined with a robust  $l_{1}$  distance:
+
+$$
+\ell^ {\mathrm {r g b}} \left(\mathbf {y} _ {i}, \bar {\mathbf {y}} _ {i}, \mathbf {h} ^ {*}\right) = \left\{ \begin{array}{l l} \hat {r} ^ {\mathrm {r g b}} \left(\mathbf {y} _ {i}, \mathbf {h} ^ {*}\right) & \text {i f} \mathbf {y} _ {i} \in \mathcal {v} ^ {\mathrm {r g b}} \\ | \bar {\mathbf {y}} _ {i} - \mathbf {y} _ {i} | & \text {o t h e r w i s e .} \end{array} \right. \tag {17}
+$$
+
+we obtain heuristic targets  $\bar{\mathbf{y}}_i = \mathbf{h}^*\bar{\mathbf{e}}_i$  from the ground truth camera pose  $\mathbf{h}^*$  and hallucinated 3d camera coordinates  $\bar{\mathbf{e}}_i$  re-projected by assuming a constant image depth of  $10\mathrm{m}$ . the above formulation relies on switching from the heuristic target to the re-projection error as soon as possible. therefore, we formulate the following relaxed validity constraints for scene coordinate predictions  $\mathbf{y}_i$  to form the set  $\nu^{\mathrm{rgb}}$ :
+
+1)  $(\mathbf{h}^{* - 1}\mathbf{y}_i)_z > 0.1\mathrm{m}$ , i.e. it lies at least  $0.1\mathrm{m}$  in front of the ground truth image plane.  
+2)  $(\mathbf{h}^{*^{-1}}\mathbf{y}_i)_z < 1000\mathrm{m}$ , i.e. it lies at most  $1000\mathrm{m}$  in front of the ground truth image plane.  
+3) it has a maximum re-projection error of  $r^{\mathrm{rgb}}(\mathbf{y}_i, \mathbf{h}^*) < 1000\mathrm{px}$ .
+
+relation to our previous work. dsac++ [15] used two separate initialization stages for minimizing the distance to heuristic targets  $\bar{\mathbf{y}}_i$ , and optimization of the re-projection error, respectively. the first initialization stage was particularly cumbersome since the heuristic targets  $\bar{\mathbf{y}}_i$  are inconsistent w.r.t. the true 3d geometry of the scene. the neural network can easily overfit to  $\bar{\mathbf{y}}_i$  which we circumvent in dsac++ by early stopping and by using only a fraction of the full training data for the first initialization stage. the new, combined formulation of eq. 17 is more robust by only loosely enforcing the heuristic until the formulation adaptively switches to the re-projection error. also, as mentioned in the previous section, the new formulation is more efficient by combining two initialization stages into one, thus reducing training time.
+
+# 5 differentiable pose optimization
+
+our overall goal is training the complete pose estimation pipeline in an end-to-end fashion. that is, we wish to optimize the learnable parameters  $\mathbf{w}$  of scene coordinate prediction in a way that we obtain highly accuracy pose estimates  $\hat{\mathbf{h}}$  as per eq. 6 and eq. 4. due to the robust nature of our pose optimization, particularly due to deploying ransac to estimate model parameters, the relation of the quality of scene coordinates  $\mathcal{v}$  and the estimated pose  $\hat{\mathbf{h}}$  is nontrivial. for example, some predictions  $\mathbf{y}_i$  will be removed by ransac as outliers, hence they have no influence on  $\hat{\mathbf{h}}$ . we may neglect such outlier scene coordinates entirely in training without any deterioration in accuracy. to the contrary, it might be beneficial to decrease the accuracy of outlier scene coordinates further to make sure that ransac classifies them as outliers. however, we have no prior knowledge which exact predictions for an image should be inliers or outliers of the estimated model.
+
+in this work, we address this problem by making pose optimization itself differentiable, to include it in the training
+
+process. by training in an end-to-end fashion, the scene coordinate network may adjust its predictions in any way that results in accurate pose estimates. more formally, we define the following loss function on estimated poses:
+
+$$
+\ell^ {\text {p o s e}} \left(\hat {\mathbf {h}}, \mathbf {h} ^ {*}\right) = \left| \left| \hat {\mathbf {t}} - \mathbf {t} ^ {*} \right| \right| + \gamma \angle \left(\hat {\boldsymbol {\theta}}, \boldsymbol {\theta} ^ {*}\right), \tag {18}
+$$
+
+with  $\mathbf{h} = (\theta, \mathbf{t})$  consisting of translation parameters  $\mathbf{t}$  and rotation parameters  $\theta$ . we denote the ground truth pose parameters as  $\mathbf{t}^*$  and  $\theta^*$  respectively. the weighting factor  $\gamma$  controls the trade-off between translation and rotation accuracy. we use  $\gamma = 100$  in our work, comparing rotation in degree to translation in cm. similar to eq. 16, robustify the pose loss by soft clamping.
+
+$$
+\hat {\ell} ^ {\text {p o s e}} \left(\hat {\mathbf {h}}, \mathbf {h} ^ {*}\right) = \left\{ \begin{array}{l l} \ell^ {\text {p o s e}} \left(\hat {\mathbf {h}}, \mathbf {h} ^ {*}\right) & \text {i f} \ell^ {\text {p o s e}} \left(\hat {\mathbf {h}}, \mathbf {h} ^ {*}\right) <   1 0 0 \\ \sqrt {1 0 0 \ell^ {\text {p o s e}} \left(\hat {\mathbf {h}} , \mathbf {h} ^ {*}\right)} & \text {o t h e r w i s e .} \end{array} \right. \tag {19}
+$$
+
+the estimated camera pose  $\mathbf{h}$  depends on network parameters  $\mathbf{w}$  via the network prediction  $\mathcal{v}$  through robust pose optimization. in order to optimize the pose loss of eq. 19, each component involved in pose optimization needs to be differentiable. in the remainder of this section, we discuss the differentiability of each component and derive approximate gradients where necessary. we discuss the differentiability of the kabsch [49] pose solver for rgb-d images in sec. 5.1. we give an analytical approximation for gradients of pnp solvers for rgb-based pose estimation in sec. 5.2. in sec. 5.3, we explain how to approximate gradients of iterative pose refinement. we discuss differentiable pose scoring via soft inlier counting in sec. 5.4. finally, we present a differentiable version of ransac, called differentiable sample consensus (dsac) in sec. 5.5 which also defines our overall training objective.
+
+# 5.1 differentiating kabsch
+
+we utilize the kabsch pose solver when estimating poses from rgb-d inputs. in this setting, we have 3d-3d correspondences  $\mathcal{c}^{\mathrm{rgb - d}}(\mathcal{y})$  given between the 3d coordinates in camera space, defined by the given depth map, and 3d coordinates in scene space  $\mathcal{v}$  predicted by our neural network. in the following, we assume that we apply the kabsch solver  $g^{\mathrm{kabsch}}(\cdot)$  over a subset of correspondences  $\mathcal{c}_{\mathcal{i}}(\mathcal{y})$  either when sampling pose hypothesis from three correspondences, or refining the final pose estimate over an inlier set found by ransac:
+
+$$
+\mathbf {h} (\mathcal {y}) = g ^ {\text {k a b s c h}} \left(\mathcal {c} _ {\mathcal {i}} (\mathcal {y})\right) \text {w i t h} \mathcal {c} _ {\mathcal {i}} (\mathcal {y}) \subseteq \mathcal {c} ^ {\text {r g b - d}} (\mathcal {y}) \tag {20}
+$$
+
+here, and in the following, we make the dependence of a model hypothesis to the scene coordinate prediction explicit, i.e. we write  $\mathbf{h}(\mathcal{y})$ . the kabsch solver returns the pose that minimizes the squared residuals over all correspondences:
+
+$$
+g ^ {\text {k a b s c h}} \left(\mathcal {c} _ {\mathcal {i}} (\mathcal {y})\right) = \underset {\mathbf {h} ^ {\prime}} {\operatorname {a r g m i n}} \sum_ {\left(\mathbf {e} _ {i}, \mathbf {y} _ {i}\right) \in \mathcal {c} _ {\mathcal {i}} (\mathcal {y})} r ^ {\mathrm {r g b - d}} \left(\mathbf {y} _ {i}, \mathbf {h} ^ {\prime}\right) ^ {2}. \tag {21}
+$$
+
+the optimization can be solved in closed form by the following steps [49]. firstly, we calculate the covariance matrix  $\operatorname{cov}[\cdot]$  over the correspondence set:
+
+$$
+\operatorname {c o v} \left[ \mathcal {c} _ {\mathcal {i}} (\mathcal {y}) \right] = \sum_ {\left(\mathbf {e} _ {i}, \mathbf {y} _ {i}\right) \in \mathcal {c} _ {\mathcal {i}} (\mathcal {y})} \left(\mathbf {e} _ {i} - \bar {\mathbf {e}}\right) \left(\mathbf {y} _ {i} - \bar {\mathbf {y}}\right) ^ {t}, \tag {22}
+$$
+
+where  $\bar{\mathbf{e}}$  and  $\bar{\mathbf{y}}$  denote the mean over all 3d coordinates in the correspondence set in camera space and scene space, respectively. secondly, we apply a singular value decomposition (svd) to the covariance matrix:
+
+$$
+\operatorname {c o v} \left[ \mathcal {c} _ {\mathcal {i}} (\mathcal {y}) \right] = u \sigma v ^ {t}. \tag {23}
+$$
+
+we re-assemble the optimal rotation  $\theta$ , and, subsequently, recover the optimal translation  $t$ :
+
+$$
+\boldsymbol {\theta} = v \left[ \begin{array}{c c c} 1 & 0 & 0 \\ 0 & 1 & 0 \\ 0 & 0 & \det (v u ^ {t}) \end{array} \right] u ^ {t} \tag {24}
+$$
+
+$$
+\mathbf {t} = \bar {\mathbf {y}} - \boldsymbol {\theta} (\bar {\mathbf {e}})
+$$
+
+$$
+\mathbf {h} (\mathcal {y}) = (\boldsymbol {\theta}, \mathbf {t}).
+$$
+
+all operations involved in the calculation of  $g^{\mathrm{kabsch}}(\cdot)$  are differentiable, particularly the gradients of svd can be calculated according to [75], with current deep learning frameworks like pytorch [19] offering corresponding implementations. the differentiability of the kabsch algorithm has e.g. also been utilized in [76].
+
+# 5.2 differentiable pnp
+
+similar to the kabsch solver of the previous section, the pnp solver  $g^{\mathrm{pnp}}(\cdot)$  calculates a pose estimate over a subset  $\mathcal{c}_{\mathcal{i}}(\mathcal{y})$  of all correspondences  $\mathcal{c}^{\mathrm{rgb}}(\mathcal{y})$ , i.e.
+
+$$
+\mathbf {h} (\mathcal {y}) = g ^ {\mathrm {p n p}} \left(\mathcal {c} _ {\mathcal {i}} (\mathcal {y})\right) \text {w i t h} \mathcal {c} _ {\mathcal {i}} (\mathcal {y}) \subseteq \mathcal {c} ^ {\mathrm {r g b}} (\mathcal {y}). \tag {25}
+$$
+
+we utilize a pnp solver when estimating camera poses from rgb images, where 2d-3d correspondences are given between 2d image positions  $\mathbf{p}_i$  and 3d scene coordinate  $\mathbf{y}_i\in \mathcal{v}$ . a pnp solver optimizes pose parameters to minimize squared re-projection errors:
+
+$$
+g ^ {\mathrm {p n p}} \left(\mathcal {c} _ {\mathcal {i}} (\mathcal {y})\right) = \underset {\mathbf {h} ^ {\prime}} {\operatorname {a r g m i n}} \left\| \mathbf {r} _ {\mathcal {i}} \left(\mathcal {y}, \mathbf {h} ^ {\prime}\right) \right\| ^ {2}. \tag {26}
+$$
+
+we construct a residual vector  $\mathbf{r}_{\mathcal{i}}(\cdot)$  over all pixels associated with the current correspondence subset:
+
+$$
+\mathbf {r} _ {\mathcal {i}} (\mathcal {y}, \mathbf {h}) _ {i} = \left\{ \begin{array}{l l} r ^ {\mathrm {r g b}} \left(\mathbf {y} _ {i}, \mathbf {h}\right) & \text {i f} \left(\mathbf {p} _ {i}, \mathbf {y} _ {i}\right) \in \mathcal {c} _ {\mathcal {i}} (\mathcal {y}) \\ 0 & \text {o t h e r w i s e ,} \end{array} \right. \tag {27}
+$$
+
+where  $r^{\mathrm{rgb}}(\cdot)$  denotes a pixels re-projection error, cf. eq. 10.
+
+in contrast to the kabsch optimization objective, we cannot solve the pnp objective of eq. 26 in closed form. different pnp solvers have been proposed in the past with different algorithmic structures, e.g. [66], [77] or the levenberg-marquardt-based optimization in opencv [68], [69], [70]. instead of trying to propose a differentiable variant of the aforementioned pnp algorithms, we calculate an analytical approximation of pnp gradients derived from the objective function in eq. 26 [78]. we have introduced this way of differentiating pnp in the context of neural network training in dsac++ [15].
+
+given a proper initialization, e.g. by [66], [77], we can optimize eq. 26 iteratively using the gauss-newton method. since we are interested only in the gradients of the optimal pose parameters found at the end of optimization, we ignore the influence of initialization itself, avoiding to calculate
+
+gradients of complex minimal solvers like [66], [77]. we give the gauss-newton update step to model parameters as
+
+$$
+\mathbf {h} ^ {t + 1} = \mathbf {h} ^ {t} - j _ {\mathbf {r}} ^ {+} \mathbf {r} _ {\mathcal {i}} (\mathcal {y}, \mathbf {h} ^ {t}), \tag {28}
+$$
+
+where  $j_{\mathbf{r}}^{+} = (j_{\mathbf{r}}^{t}j_{\mathbf{r}})^{-1}j_{\mathbf{r}}^{t}$  is the pseudoinverse of the jacobean matrix  $j_{\mathbf{r}}$  of the residual vector  $\mathbf{r}_{\mathcal{i}}(\mathcal{v},\mathbf{h})$  defined in eq. 27. in particular, the jacobean matrix  $j_{\mathbf{r}}$  is comprised of the following partial derivatives:
+
+$$
+\left(j _ {\mathbf {r}}\right) _ {i j} = \frac {\partial \mathbf {r} _ {\mathcal {i}} \left(\mathcal {y} , \mathbf {h} ^ {t}\right) _ {i}}{\partial \mathbf {h} _ {j} ^ {t}}. \tag {29}
+$$
+
+as mentioned before, the initial pose  $\mathbf{h}^{t = 0}$  may be provided by an arbitrary, non-differentiable pnp algorithm [66], [77]. we define the pose estimate of the pnp solver as the pose parameters after convergence of the associated optimization problem.
+
+$$
+\mathbf {h} (\mathcal {y}) = g ^ {\mathrm {p n p}} \left(\mathcal {c} _ {\mathcal {i}} (\mathcal {y})\right) = \mathbf {h} ^ {t = \infty} \tag {30}
+$$
+
+thus, we may calculate approximate gradients of model parameters  $\mathbf{h}(\mathcal{v})$  w.r.t. scene coordinates  $\mathcal{v}$  by fixing the last optimization iteration around the final model parameters:
+
+$$
+\frac {\partial}{\partial \mathcal {y}} \mathbf {h} (\mathcal {y}) \approx - j _ {\mathbf {r}} ^ {+} \frac {\partial}{\partial \mathcal {y}} \mathbf {r} _ {\mathcal {i}} (\mathcal {y}, \mathbf {h} ^ {t = \infty}). \tag {31}
+$$
+
+# 5.3 differentiable refinement
+
+we refine given camera pose parameters  $\mathbf{h}$ , denoted as  $\mathbf{r}(\mathbf{h},\mathcal{y})$ , by iteratively re-solving for the pose using the set of all inliers  $\mathcal{i}$ , and updating the set of inliers with the new pose estimate:
+
+$$
+\mathbf {h} ^ {t + 1} = g \left(\mathcal {c} _ {\mathcal {i} ^ {t}}\right)
+$$
+
+$$
+\mathcal {i} ^ {t + 1} = \{i | r \left(\mathbf {y} _ {i}, \mathbf {h} ^ {t + 1}\right) <   \tau \} \tag {32}
+$$
+
+we repeat refinement until convergence, e.g. when the inlier set  $\mathcal{i}$  ceases to change, i.e.  $\mathbf{r}(\mathbf{h},\mathcal{y}) = g(\mathcal{c}_{\mathcal{i}^{t = \infty}})$  where  $\mathcal{i}^{t = \infty}$  corresponds to the final inlier set. similar to differentiating pnp in the previous section, we approximate gradients of iterative refinement by fixing the last refinement iteration.
+
+$$
+\frac {\partial}{\partial \mathcal {y}} \mathbf {r} (\mathbf {h}, \mathcal {y}) = \frac {\partial}{\partial \mathcal {y}} g \left(\mathcal {c} _ {\mathcal {i} ^ {t = \infty}}\right), \tag {33}
+$$
+
+where function  $g(\cdot)$  denotes either the kabsch solver or the pnp solver for rgb-d and rgb inputs, respectively. we discussed have the calculation of gradients for  $g(\cdot)$  already in the previous sections.
+
+# 5.4 differentiable inlier count
+
+we obtain a differentiable approximation of inlier counting of eq. 5 by substituting the hard comparison of a pixel's residual to an inlier threshold  $\tau$  with a sigmoid function  $\sigma[\cdot]$ :
+
+$$
+s (\mathbf {h}, \mathcal {y}) = \sum_ {\mathbf {y} _ {i} \in \mathcal {y}} \sigma [ \beta \tau - \beta r (\mathbf {y} _ {i}, \mathbf {h}) ]. \tag {34}
+$$
+
+for hyper-parameter  $\beta$ , which controls the softness of the sigmoid function, we use the following heuristic in dependence of the inlier threshold  $\tau$ :  $\beta = \frac{5}{\tau}$ .
+
+relation to our previous work. in the original dsac pipeline [14] we utilize a designated scoring cnn as a differentiable alternative to traditional inlier counting. however, our follow-up work on  $\mathrm{dsac}++$  [15] revealed that a scoring cnn is prone to overfitting, and does in general not exceed the accuracy of the simpler soft inlier count.
+
+![](images/67a0c01875a3505248321da3ab9df5249387f7cffd0b6f37a16f1d99ed48c63f.jpg)  
+fig. 4. dsac computation graph [79]. nodes without frames represent inputs to the system, nodes with square frames represent deterministic operations, nodes with circular frames represent sampling operations. arrows denote an input relation.
+
+# 5.5 differentiable ransac
+
+we can subsume the ransac algorithm [53] in the following three steps, as also discussed in sec. 3: firstly, generate model hypotheses by random sub-sampling of correspondences. secondly, choosing the best hypothesis according to a scoring function. lastly, refine the winning hypotheses using its inliers. we discussed the differentiability of most components involved in the previous sub-sections, e.g. calculating gradients of pose solvers used for hypothesis sampling and refinement, and differentiating the inlier count for hypothesis scoring. however, choosing the best hypothesis according to eq. 4 involves a non-differentiable argmax operation.
+
+in [14], we introduce a differentiable approximation of hypothesis selection in ransac, called differentiable sample consensus (dsac). in [14], we also argue, and show empirically, that a simple soft argmax approximation, a weighted average of arguments, does not work well. a soft argmax can be unstable when arguments have multi-modal structure, i.e. very different arguments have high weights in the average. a standard average might also be overly sensitive to outlier arguments.
+
+the dsac approximation relies on a probabilistic selection of a model hypothesis according to a probability distribution  $p(j|\mathcal{y})$  over the discrete set of sampled hypotheses with index  $j$ :
+
+$$
+\begin{array}{l} \tilde {\mathbf {h}} (\mathcal {y}) = \mathbf {h} _ {j} (\mathcal {y}) \text {w i t h} j \sim p (j | \mathcal {y}) \\ \hat {\hat {\mathbf {x}}} (\mathcal {y}) = \overline {{\hat {\mathbf {x}}}} (\tilde {\mathbf {x}}) \text {w i t h} \end{array} \tag {35}
+$$
+
+$$
+\hat {\mathbf {h}} (\mathcal {y}) = \mathbf {r} (\tilde {\mathbf {h}} (\mathcal {y}), \mathcal {y}),
+$$
+
+where  $\tilde{\mathbf{h}} (\mathcal{v})$  denotes the selected hypothesis, and  $\hat{\mathbf{h}} (\mathcal{v})$  denotes the final, refined estimate of our pipeline. the distribution guiding hypothesis selection is a softmax distribution over scores, i.e.
+
+$$
+p (j \mid \mathcal {y}) = \frac {\exp [ \alpha s (\mathbf {h} _ {j} (\mathcal {y}) , \mathcal {y}) ]}{\sum_ {k = 1} ^ {m} \exp [ \alpha s (\mathbf {h} _ {k} (\mathcal {y}), \mathcal {y}) ]}. \tag {36}
+$$
+
+the hyper-parameter  $\alpha$  corresponds to a temperature that controls the softness of the distribution. the larger  $\alpha$ , the more dsac will behave like ransac in always selecting the hypothesis with maximum score, while providing less signal for learning. in dsac++ [15], we present a schema to adjust  $\alpha$  automatically during learning. in this work, we treat  $\alpha$  as a hand-tuned and fixed hyper-parameter, as we found the camera re-localization problem not overly sensitive to the exact value of  $\alpha$ , and fixing it simplifies the software architecture of our pipeline.
+
+to learn the pipeline, we optimize the expectation of the pose loss  $\hat{\ell}^{\mathrm{pose}}$  of eq. 19 w.r.t. randomly selecting hypotheses:
+
+$$
+\mathcal {l} ^ {\text {p o s e}} (\mathcal {y}, \mathbf {h} ^ {*}) = \mathbb {e} _ {j \sim p (j | \mathcal {y})} \left[ \hat {\ell} ^ {\text {p o s e}} \left(\mathbf {r} (\cdot), \mathbf {h} ^ {*}\right) \right], \tag {37}
+$$
+
+where we abbreviate the final, refined camera pose  $\mathbf{r}(\mathbf{h}_j(\mathcal{v}),\mathcal{v})$  as  $\mathbf{r}(\cdot)$ . to minimize the expectation, the neural network should learn to predict scene coordinates  $\mathcal{v}$  that ensure the following two properties: firstly, hypotheses with a large loss after refinement should receive a low selection probability, i.e. a low soft inlier count. secondly, hypotheses with a high soft inlier count should receive a small loss after refinement. we present a schematic overview of all components involved in our dsac-based pipeline in fig. 4. the figure summarises dependencies between processing steps, and differentiates between deterministic functions and sampling operations. the graph structure illustrates the non-trivial relation between the scene coordinate prediction and pose quality, since scene coordinates directly influence pose hypotheses, scoring and refinement.
+
+the dsac training objective of eq. 37 is smooth and differentiable, and its gradients can be formulated as follows:
+
+$$
+\frac {\partial}{\partial \mathcal {y}} \mathcal {l} ^ {\text {p o s e}} (\cdot) = \mathbb {e} _ {j} \left[ \hat {\ell} ^ {\text {p o s e}} (\cdot) \frac {\partial}{\partial \mathcal {y}} \log p (j | \mathcal {y}) + \frac {\partial}{\partial \mathcal {y}} \hat {\ell} ^ {\text {p o s e}} (\cdot) \right], \tag {38}
+$$
+
+where we use  $\cdot$  as a stand-in for the respective function arguments in eq. 37, and abbreviate the expectation over  $p(j|\mathcal{v})$  as  $\mathbb{e}_j[\cdot]$ . we use eq. 38 to learn our system in an end-to-end fashion, updating neural network parameters  $\mathbf{w}$  of scene coordinate prediction  $\mathcal{v} = f(i,\mathbf{w})$ .
+
+# 6 experiments
+
+we evaluate our camera re-localization pipeline for two indoor datasets and one outdoor dataset. firstly, in sec. 6.1 we discuss our experimental setup, including datasets, training schedule, hyper-parameters and competitors. secondly, we report results on 3 different datasets in sections 6.2, 6.3 and 6.4, respectively. thirdly, we provide several ablation studies in sections 6.5, 6.6, 6.7 and 6.8, as well as visualizations of scene representations learned by our system in sec. 6.9. furthermore, we analyze the scene compression properties of dsac* in sec. 6.10.
+
+# 6.1 setup
+
+task variants. we deploy our system in several flavours, catering to different application scenarios where depth measurements or 3d scans of a scene might be available or not. specifically, we analyze the following settings:
+
+- rgb-d: we have rgb-d images for training as well as at test time. for initialization training, we render ground truth scene coordinates using 3d scans of each scene. for end-to-end training and at test time, we generate camera coordinates e from the rgb-d depth channels. we use a kabsch [49] pose solver for sampling hypotheses and for refining the final estimate.  
+rgb + 3d model: we have rgb images for training as well as at test time. we can render ground truth scene coordinates for training using a 3d model of
+
+the scene. the 3d model can either be a sparse sfm point cloud, or a dense 3d scan. we use the pnp solver of gao et al. [66] to sample camera pose hypotheses, and the levenberg-marquardt [68], [69] pnp optimizer of opencv [70] for final refinement.
+
+- rgb: same as the previous setting, but we have no information about the 3d geometry of a scene, only rgb images and ground truth poses for training. to initialize scene coordinate regression, we optimize the heuristic objective of eq. 13.
+
+hyper-parameters. we convert input images to grayscale and re-scale them to 480px height. for training, we follow li et al. [54] and apply data augmentation. we apply random adjustments of brightness and contrast of the input image within a  $\pm 10\%$  range. we randomly rotate images, ground truth scene coordinates and camera poses within a  $\pm 30^{\circ}$  range. we randomly re-scale images within  $66\%$  and  $150\%$ , and adjust the camera focal length accordingly. different from li et al. [54], we do not shear training images, since our simple pinhole camera models does not support this operation. we also do not shift training images, since for a patch-based network architecture, shifting by more than 4px would just increase the period of the input without any effect other than increasing boundary effects.
+
+we use an inlier threshold  $\tau = 10\mathrm{px}$  for rgb-based pose optimization, and  $\tau = 10\mathrm{cm}$  for rgb-d-based pose optimization. we sample  $m = 64$  ransac hypotheses. we reject an hypothesis if the corresponding minimal set of scene coordinates does not satisfy the inlier threshold [80], and sample again. we score hypotheses using a soft inlier count at training and test time. for training, we optimize the expectation over hypothesis selection according to the distribution of eq. 36 with a temperature of  $\alpha = \frac{100}{|\mathcal{v}|}$ , where  $|\mathcal{v}|$  corresponds to the number of scene coordinates predicted, resp. to the output resolution of the neural network. at test time, we resort to standard ransac, and choose the best hypothesis with highest score. we do at most 100 refinement iterations, but stop early if the inlier set converges which typically takes at most 10 iterations.
+
+we initialize the scene coordinate network for 1m iterations, a batch size of 1 image, and the adam optimizer [81] with a learning rate of  $10^{-4}$ . this stage takes approximately two days on a single tesla k80 gpu. we train the system end-to-end for another 100k iterations, and a learning rate of  $10^{-6}$ , which takes 12 hours on the same hardware. our implementation, based on pytorch [19], is publicly available: https://github.com/vislearn/dsacstar.
+
+datasets. we evaluate our pipeline on three standard camera re-localization datasets, both indoor and outdoor:
+
+- 7scenes [3]: a rgb-d indoor re-localization dataset of seven small indoor environments featuring difficult conditions such as motion blur, reflective surfaces, repeating structures and texture-less areas. images were recorded using kinectfusion [72] which also provides ground truth camera poses. for each scene, several thousand frames are available which the authors split into training and test sets. the depth channels of this dataset are not registered to the color images. we register them by projecting the depth maps to 3d points using the depth sensor calibration,
+
+and re-projecting them using the color sensor calibration while taking the relative transformation between depth and color sensor into account. a dense 3d scan of each scene is available for rendering ground truth coordinates for initialization training.
+
+- 12scenes [82]: a rgb-d indoor re-localization dataset similar to 7scenes, but containing twelve slightly larger indoor environments. each scene comes with several hundred frames, split by the authors into training and test sets. the depth maps provided by the authors are registered to the color images. a dense 3d scan of each scene is available as well, which we use to render ground truth scene coordinates for initialization training.
+
+- cambridge [26]: a rgb outdoor re-localization dataset of five landmarks in cambridge, uk. compared to the previous indoor datasets, each landmark spans an area of several hundred or thousand square meters. each scene comes with several hundred frames, split by the authors into training and test tests. the authors also provide ground truth camera poses re-constructed using a sfm tool. the sparse sfm point cloud is also available for each scene, which we use to render sparse scene coordinate ground truth for rgb-based re-localization. the dataset contains a sixth scene, an entire street scene, which me omit in our experiments. the corresponding reconstruction is of poor quality containing several outlier camera poses and 3d points as well as duplicated and diverging geometry. like in our previous work [15], [16] we were unable to achieve reasonable accuracy on the street scene.
+
+competitors. we compare to the following absolute pose regression networks: posenet (the updated version of 2017) [27], spatiallstm [11], mapnet [29] and svs-pose [28]. we compare to the following relative pose estimation approaches: anchornet [31], and retrieval-based inloc [25]. for feature-based competitors, we report results of the orb baseline used in [3] and [82], as well as the sift baseline used in [82]. for a state-of-the-art feature-based pipeline, we compare to activesearch [7]. several early scene coordinate regression works were based on random forests. we compare to scorf of shotton et al. [3], and its extension to multi-output forests (mo forests) [47] and forests predicting gaussian mixture models (gmm) of scene coordinates, in the variation of valentain et al. [4] for rgb-d (gmm f. (v)) and of brachmann et al. for rgb (gmm f. (b)). furthermore, we compare to the back-tracking forests of meng et al. [50] (btbrf), to the point-line forests of meng et al. [48] (plforests), and mng forests [82]. for cnn-based scene coordinate regression, we compare to forestnet [51], scene coordinate regression with an angle-based loss [52] (abr-loss), joint scene coordinate classification and regression [54] (scocr) and the visual descriptor learning approach of schmidt et al. [6] (ss-vdl). we also include results of the adaptive forests of cavallari et al. [56] (otf forests), comparing to their headline performance. finally, we compare to previous iterations of this pipeline, namely dsac [14] and dsac++ [15]. we denote our updated pipeline, described in this article, as dsac*.
+
+# 6.2 results for indoor localization (7scenes)
+
+we train one scene coordinate regression network per scene, and accept a pose estimate for a test image if its pose error is below  $5^{\circ}$  and  $5\mathrm{cm}$ . we calculate the accuracy per scene, and report the average accuracy over all 7scenes, see quantitative results in fig. 5, left.
+
+rgb. for training from rgb images and ground truth poses only, our new training procedure and network architecture increases accuracy significantly compared to dsac++  $(+27.6\%)$ . dsac* also achieves higher accuracy than the angle-based loss of li et al. [52], despite the latter incorporating multi-view constraints and a photometric loss. we attribute some (but not all) of the performance gain to using training data augmentation, see sec. 6.6 for a discussion.
+
+rgb + 3d model. when a 3d model is available to render ground truth scene coordinates for training, both dsac++ and dsac* benefit, with dsac* achieving highest accuracy with  $85.2\%$  of re-localized frames. also note that dsac* is trained for 2.5 days compared to 6 days for dsac++ on identical hardware. scocr [54] achieves similar accuracy but leverages a more complicated network architecture with multiple, hierarchical classification heads conditioning the scene coordinate regression head as well as higher model capacity (165mb vs. 28mb). note that scocr deploys training data augmentation similar to our setup.
+
+rgb-d. when dsac* estimates poses from rgb-d images, it achieves accuracy comparable to the state-of-the-art approach  $otf$  forests of cavallari et al. [57]. cavallari et al. [57] use an icp and rendering-based post-processing to achieve their top-accuracy. without post-processing, they report  $93.4\%$  on 7scenes, slightly lower than the accuracy of dsac*. note that the difference in accuracy for dsac* compared to the rgb setups solely stems from the use of kabsch as a pose solver, since our network still estimates scene coordinates from a grayscale image. the correct depth of image points allows a re-localization pipeline to trivially infer the distance between camera and scene. note that all rgb-d competitors model the uncertainty of scene coordinates in some form, i.e. predicting full distributions of image-to-scene correspondences. compared to this, the expressiveness of our framework is limited by only predicting scene coordinate point estimates.
+
+qualitative results. we visualize the estimated test trajectory, as well as the pose error, of dsac* for all scenes and all re-localization settings in fig. 6. estimated trajectories are predominately smooth, with outlier predictions concentrated on particular, presumably difficult, areas of each scene. to also visualize the re-localization quality in an augmented reality setup, we compare renderings of 3d models of each scene, using estimated camera poses, with the associated test image in fig. 7. to give an unbiased impression of the general re-localization quality, we selected the test frame with median pose error for each visualization.
+
+# 6.3 results for indoor localization (12scenes)
+
+we report quantitative results for 12scenes in fig. 5, right. dsac* achieves state-of-the-art accuracy in all settings for this dataset, consistently outperforming dsac++. in general, we would consider this dataset being solved, with multiple methods achieving an average accuracy of ≈99%
+
+for re-localization from rgb-d and rgb images, and in case of dsac* even from rgb images without a 3d model, the most difficult setting.
+
+# 6.4 results for outdoor localization (cambridge)
+
+we measure the re-localization quality on the cambridge dataset using the median pose error for each scene, see table 2. due to the ground truth for this dataset being recovered using a sfm tool, we report results with centimeter precision. we find the expressiveness of millimeter precision dubious given the nature of ground truth poses. given a 3d model for training, dsac* and dsac++ achieve similar accuracy, but dsac* trains significantly faster. for many scenes, ng-dsac++ [16], i.e. dsac++ with neural-guided ransac, achieves best results. in principle, we could extend dsac* to utilize neural guidance as well. neural guidance is designed to improve ransac in high outlier domains. we expect the benefit of coupling it with dsac* to be rather small, given the quality of results already.
+
+when training without a 3d model, the new training objective of dsac* achieves higher accuracy than dsac++ across all scenes. notably, dsac* trained without a 3d model achieves higher accuracy than any method (including dsac*) trained with a 3d model for the great court scene. great court is the largest landmark in the dataset. the associated sfm reconstruction contains a high outlier ratio, and might hinder the training process due to its low quality.
+
+we visualize the estimated test trajectories of dsac* in fig. 8. due to the very different scene sizes, we derive a scene-dependent threshold to color-code pose errors. the visualizations reveal that high localization error is correlated with the distance of the camera to the scene, particularly obvious for old hospital, but also king's college. in fig. 9, we depict the median pose error per scene, and observe a high visual quality of re-localization, suitable for augmented reality applications.
+
+# 6.5 network architecture and runtime
+
+as explained in sec. 4, we updated the network architecture compared to dsac++. to disambiguate the impact of the network, and of the updated training schedule, we conduct an ablation study, see table. 3. we trained both architectures using the updated training schedule of dsac* on the 7scenes dataset. both architectures benefit from the dsac* training settings. however, the dsac* architecture combined with dsac* training achieves best accuracy, despite faster run time and smaller memory footprint. together with the stream-lined pose optimization (e.g. using 64 ransac hypotheses instead of 256), we achieve a total runtime of the system of 75ms compared to 200ms for dsac++ on a single tesla k80 gpu.
+
+# 6.6 impact of data augmentation
+
+li et al. [54] demonstrated the effectiveness of simple geometric training data augmentation (random rotation and re-scaling) for rgb-based camera re-localization (w/ 3d model) on the 7scenes dataset. we confirm these results here, and show similar effects for rgb-d based re-localization, and rgb-only re-localization. see fig. 10 for
+
+![](images/ebac8aeb105c30026f6a45a05cff72905d73c8658216c3e4023f219ea2960777.jpg)  
+fig. 5. indoor localization accuracy. we report the average percentage of correctly re-localized frames below an error threshold of  $5\mathrm{cm}$  and  $5^{\circ}$  on the 7scenes [3] and 12scenes [82] datasets. we group methods by utilized data, i.e. rgb: neither a 3d model or depth maps at training and test time, rgb + 3d model: a 3d model or depth maps at training time but not at test time, rgb-d: depth maps at training time and at test time. see the main text for references to all methods.
+
+![](images/7cc2400818f3a39c03687ace8de79fa93167d620d1bc44186b84b058156d567a.jpg)
+
+![](images/ef65e5eca8a63c32017913de3f2a365e1b9c1b5d7983ff5cc702a52d3701a11e.jpg)  
+fig. 6. results for indoor scenes. first row: camera positions of training frames in gray and of test frames in cyan for all scenes of the 7scenes [3] dataset. remaining rows: estimated camera positions of test frames, color coded by position error. we also state the percentage of test frames with a pose error below  $5\mathrm{cm}$  and  $5^{\circ}$ . each row represents a different training setup. for a more informative visualization, we show the ground truth 3d scene model as a faint backdrop, and we connect consecutive frames within  $50\mathrm{cm}$  tolerance.
+
+quantitative and qualitative results. data augmentation results in significant improvement for dsac* on the 7scenes dataset with  $+9.1\%$ ,  $+7.7\%$  and  $4.1\%$  improvement depending on the setup. we see largest improvements on the 7scenes stairs sequence when training in rgb-only mode  $(+51.5\%)$ , see fig. 10, right. this scene is dominated by ambiguous, repeating structures and presumably data augmentation helps to resolve some of this ambiguity. on 12scenes, we observe an improvement for rgb-only relocalization  $(+8.6\%)$ , while the other results on this particular dataset are saturated also without data augmentation. for the cambridge landmarks dataset, we found no significant advantage in augmenting the training data. notably, dsac* achieves state-of-the-art accuracy across settings also without the use of data augmentation, cf. fig. 5.
+
+# 6.7 impact of the receptive field
+
+one important factor when designing an architecture for scene coordinate regression is the size of the receptive field.
+
+that is, what image area is taken into account for predicting a single scene coordinate, comparable to the image patch size for sparse feature matching. the architecture of dsac* has a receptive field size of 81px. by substituting individual 3x3 convolutions with 1x1 convolutions and vice versa (cf. fig. 3) we can increase and decrease the receptive field and study the change in accuracy. the change of the convolution kernel affects also the total count of learnable parameters of the network. to facilitate conclusions with regard to the receptive field alone, we scale the number of channels throughout the network to keep the number of free parameters constant. we report results in fig. 11, comparing dsac* with a receptive field of 81px (standard), 49px and 149px. we observe that the re-localization accuracy decreases with a large receptive field of 149px. while a larger receptive field incorporates more image context for predicting a scene coordinate, is also leads to generalization problems, even when using data augmentation during training. view point changes between training and test set
+
+![](images/5d356bd576f8bae96f1ef412eb962f8bfde6fe088f96305b8911e9626ceeb022.jpg)  
+fig. 7. median errors for indoor scenes. for all test sequences of the 7scenes [3] dataset, we select the frame with the median pose estimation error. we show the original input frame in gray scale, and a rendered overlay in color using the estimated pose, and the ground truth 3d model. we write the associated median pose error below each instance. each row represents a different training setup.
+
+table 2 outdoor localization accuracy. we report median errors on the cambridge landmarks [26] dataset as translation error (cm) / rotation error  $(^{\circ})$ $n / a$  denotes that a particular result was not reported, whereas a dash (-) indicates that a method does not support this particular setting, i.e. training with or without a 3d model, respectively. best results in bold per column, second best underlined. for dsac variants we additionally state, in brackets, the training time in days on identical hardware.  
+
+<table><tr><td rowspan="2" colspan="2">method</td><td colspan="5">rgb + 3d model</td><td colspan="5">rgb</td></tr><tr><td>church</td><td>court</td><td>hospital</td><td>college</td><td>shop</td><td>church</td><td>court</td><td>hospital</td><td>college</td><td>shop</td></tr><tr><td colspan="2">mapnet [29]</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>200/4.5</td><td>n/a</td><td>194/3.9</td><td>107/1.9</td><td>149/4.2</td></tr><tr><td colspan="2">spatiallstm [11]</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>152/6.7</td><td>n/a</td><td>151/4.3</td><td>99/1.0</td><td>118/7.4</td></tr><tr><td colspan="2">svs-pose [28]</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>211/8.1</td><td>n/a</td><td>150/4.0</td><td>106/2.8</td><td>63/5.7</td></tr><tr><td colspan="2">posenet17 [27]</td><td>149/3.4</td><td>700/3.7</td><td>217/2.9</td><td>99/1.1</td><td>105/4.0</td><td>157/3.2</td><td>683/3.5</td><td>320/3.3</td><td>88/1.0</td><td>88/3.8</td></tr><tr><td colspan="2">anchornet [31]</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>104/2.7</td><td>n/a</td><td>121/2.6</td><td>57/0.9</td><td>52/2.3</td></tr><tr><td colspan="2">inloc [25]</td><td>18/0.6</td><td>120/0.6</td><td>48/1.0</td><td>46/0.8</td><td>11/0.5</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr><tr><td colspan="2">active search [7]</td><td>19/0.5</td><td>n/a</td><td>44/1.0</td><td>42/0.6</td><td>12/0.4</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr><tr><td colspan="2">btbrf [50]</td><td>20/0.4</td><td>n/a</td><td>30/0.4</td><td>39/0.4</td><td>15/0.3</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr><tr><td colspan="2">sanet [55]</td><td>16/0.6</td><td>328/2.0</td><td>32/0.5</td><td>32/0.5</td><td>10/0.5</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr><tr><td>dsac [14]</td><td>(4d)</td><td>55/1.6</td><td>280/1.5</td><td>33/0.6</td><td>30/0.5</td><td>9/0.4</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr><tr><td>dsac++ [15]</td><td>(6d)</td><td>13/0.4</td><td>40/0.2</td><td>20/0.3</td><td>18/0.3</td><td>6/0.3</td><td>20/0.7</td><td>66/0.4</td><td>24/0.5</td><td>23/0.4</td><td>9/0.4</td></tr><tr><td>ng-dsac++ [16]</td><td>(6d)</td><td>10/0.3</td><td>35/0.2</td><td>22/0.4</td><td>13/0.2</td><td>6/0.3</td><td>n/a</td><td>n/a</td><td>n/a</td><td>n/a</td><td>n/a</td></tr><tr><td>dsac*</td><td>(2.5d)</td><td>13/0.4</td><td>49/0.3</td><td>21/0.4</td><td>15/0.3</td><td>5/0.3</td><td>15/0.6</td><td>34/0.2</td><td>21/0.4</td><td>18/0.3</td><td>5/0.3</td></tr></table>
+
+# table 3
+
+comparison of network architecture. we compare statistics of the network architecture of dsac* (this work) and dsac++ [15]. we train both architectures using the new training schedule of dsac* (2.5 days). we report accuracy on the 7scenes dataset for the rgb + 3d model setting.
+
+<table><tr><td>architecture</td><td>size</td><td>time</td><td>rf</td><td>training procedure</td><td>accuracy</td></tr><tr><td rowspan="2">dsac++ (vggnet)</td><td rowspan="2">104mb</td><td rowspan="2">150ms</td><td rowspan="2">73px</td><td>dsac++</td><td>74.4%</td></tr><tr><td>dsac*</td><td>82.0%</td></tr><tr><td>dsac* (resnet)</td><td>28mb</td><td>50ms</td><td>81px</td><td>dsac*</td><td>85.2%</td></tr></table>
+
+have a higher impact for larger receptive fields. making the receptive field smaller, with 49px, also decreases accuracy slightly. the effect of having less image context is counteracted by better generalization w.r.t. view point changes. for a more extreme argument in favor of architectures with limited receptive field, we conduct an experiment with an encoder-decoder architecture. such an architecture encodes the whole image into a global descriptor, and de-convolves it to a full resolution scene coordinate prediction. the receptive field of such an architecture is the whole image, and we ensure again to keep the number of learnable parameters identical. as depicted in fig. 11 a scene coordinate network with global receptive field achieves a disappointing relocalization accuracy. this indicates, that the receptive field might be another issue connected with the low accuracy
+
+![](images/7ad0d445aba8ea70eae7aaa93646ffb77ef704cbde02e2b240c5d66982fb9029.jpg)  
+fig. 8. results for outdoor scenes. first row: camera positions of training frames in gray and of test frames in cyan for scenes of the cambridge landmarks [26] dataset. remaining rows: estimated camera positions of test frames, color coded by position error. we also state the percentage of test frames with a position error below  $0.5\%$  of the scene size. we derive the threshold for each scene from the scene extent given in [26]. in particular, we use 35cm for st. mary's church, 45cm for great court, 22cm for old hospital, 38cm for king's college and 15cm for shop facade. each row represents a different training setup. for a more informative visualization, we show the ground truth 3d scene model as a faint backdrop, and we connect consecutive frames within 5m tolerance.
+
+![](images/05015855f1d0ab6848d4353ad7f9c3591f00ceac77542e17acca1c511bd265fa.jpg)  
+fig. 9. median errors for outdoor scenes. for all test sequences of the cambridge landmarks [26] dataset, we select the frame with the median pose estimation error. we show the original input frame in gray scale, and a rendered overlay in color using the estimated pose, and a 3d scene model generated from the ground truth structure-from-motion point cloud. we write the associated median pose error below each instance. each row represents a different training setup.
+
+of absolute pose regression methods, orthogonal to the explanations given by sattler et al. in their study of these methods [12].
+
+# 6.8 impact of end-to-end training
+
+we report report results before and after training our system in an end-to-end fashion in fig. 12. for the indoor datasets 7scenes and 12scenes we report accuracy using different threshold of  $5\mathrm{cm}5^{\circ}$ ,  $2\mathrm{cm}2^{\circ}$  and  $1\mathrm{cm}1^{\circ}$ . while the impact of end-to-end training for a coarse threshold is small, there are significant differences for the finer acceptance thresholds. end-to-end training increases the precision of successful pose estimates, but it does not necessarily decrease the failure rate. we see similar effects in outdoor re-localization for the cambridge dataset where the pose precision, expressed by the median pose error decreases by ca.  $30\%$ . we also provide a qualitative comparison of scene coordinate prediction before and after end-to-end training. particularly,
+
+we visualize areas of training images where the re-projection error increased or decreased due to end-to-end training. the system learns to focus on certain reliable structures. in general, we observe a tendency of the system to increase the scene coordinate quality for close objects. presumably such objects are more helpful than distant structures for estimating the camera pose precisely.
+
+# 6.9 learned 3d geometry
+
+scene coordinate regression methods utilize a learnable function to implicitly encode the map of an environment. we can generate an explicit map representation of the geometry encoded in a network. more precisely, we iterate over all training images, predicting scene coordinates to generate one point cloud of the scene. we can recover the color of each 3d point by reading out the associated color at the pixel position of the training image for which the scene coordinate was predicted. such a point cloud will in general feature
+
+![](images/e8bfe9c173f0286933e1cbd8ab4c45dc451082548930b8b60d028f02a562abcb.jpg)  
+fig. 10. effect of data augmentation. left: average percentage of correctly localized frames on 7scenes [3] and 12scenes [82], as well as average median translations errors for cambridge landmarks [26], with and without using geometric training data augmentation (random rotation and scaling). right: we show qualitative results on the 7scenes stairs sequence when training in rgb-only mode (i.e. without using a 3d model of the scene).
+
+![](images/baacccdb25f31e9d762e81570611c9ebf45836d98286cc76cf0304ca14cfcad7.jpg)
+
+![](images/d810967f1a270b74a936032c5abaa7c8a2dde3f50aa9a7e8134be50b5b884737.jpg)  
+fig. 11. receptive fields. we study the impact of the receptive field for dsac* by altering the underlying network architecture, see the main text for details. left. we visualize the different receptive field sizes of dsac* relative to a test image. right. we report the median localization errors and percentages of re-localized frames for the 7scenes dataset. global means a receptive field with the size of the whole image. densevlad [21] and posenet [27] also utilize a global receptive field. activesearch [7] utilizes a varying but limited receptive field.
+
+many outlier points that hinder visualization. therefore, we generate a mesh representation using poisson surface reconstruction [83]. we show the recovered 3d models in fig. 13 for 7scenes and in fig. 14 for cambridge. interestingly, our approach learns the complex 3d geometry of a scene, even when training solely from rgb images and ground truth poses. furthermore, we are able to recover a dense scene representation, even when training with sparse 3d models for the cambridge dataset.
+
+# 6.10 scene compression properties
+
+since scene coordinate regression methods encode the scene geometry within a neural network of fixed capacity, they represent a natural framework for scene compression. in table 4, we compare the memory demand and accuracy of several learning-based as well as classical re-localization methods. the cambridge landmarks [26] dataset is particularly interesting for this comparison, as it features scenes of varying sizes. with a memory footprint of 28mb, dsac* achieves highest average re-localization accuracy.
+
+the retrieval-based densevlad [21] as well as the feature-based hybrid compression schema of camposeco et al. [84] demand only very little memory but also suffer from low re-localization accuracy. to analyze the scene compression properties of dsac* further, we re-train our pipeline with a significantly leaner network architecture, called dsac* tiny. we clamp the number of channels per layer to 128 (cf. fig. 3) which results in a memory footprint of 4mb per scene. for this analysis, we train using the 3d scene model but without training data augmentation. we found data augmentation to deteriorate results for such a low-capacity network. while dsac* tiny has a memory demand in the same magnitude as the hybrid compression schema of [84], it achieves significantly higher accuracy. we find that the loss in accuracy compared to the full 28mb model grows with the scene size and complexity, see e.g. the results for st mary's church. for smaller scenes, such as shop facade, the loss in accuracy is negligible. we trained dsac* tiny also for the 7scenes and 12scenes datasets, and report an average re-localization accuracy of  $73.6\%$  and  $98.1\%$ , respectively. therefore, dsac* tiny is among the top-performing methods for indoor re-localization despite the small memory demand.
+
+# 7 conclusion
+
+we have presented dsac*, a versatile pipeline for single image camera re-localization based on scene coordinate regression and differentiable ransac. in this article, we have derived gradients for all steps of robust pose estimation, including pnp solvers. the resulting system supports rgb-d-based as well as rgb-based camera re-localization, and can be trained with or without a 3d model of a scene. compared to previous iterations of the system, dsac* trains faster, needs less memory and features low runtime. simultaneously, dsac* achieves state-of-the-art accuracy on various dataset, indoor and outdoor, and in various settings. we made the code of dsac* publicly available, and hope that it serves as a credible baseline in re-localization research.
+
+![](images/47c83ed5f4e80fdd9233547e0042c5b44888f3dfcb63c8bc52c4a099a24a5733.jpg)  
+fig. 12. effect of end-to-end training. left: we give the average percentage of correctly localized frames, on 7scenes [3] and 12scenes [82], before and after end-to-end training, denoted as init. and  $e2e$ , respectively. we break down accuracy corresponding to pose error thresholds of  $5\mathrm{cm} / 5^{\circ}$ ,  $2\mathrm{cm} / 2^{\circ}$  as well as  $1\mathrm{cm} / 1^{\circ}$ . colors in the bar chart indicate different training setups as also specified at the bottom. furthermore, we visualize the difference in re-projection error before and after end-to-end training for three training frames of 7scenes [3]. blue areas indicate that the re-projection error decreased due to end-to-end training, red areas indicate that the error increased. right: we show the median translation error, averaged over five scenes in cambridge landmarks [26], before and after end-to-end training, as well as a visualization of the change in re-projection error on training frames.
+
+![](images/36babd83e69d07eee5ce5a8ed5ec322f86a5731d11e1364fed18d1ba42c8e969.jpg)
+
+![](images/ac760ee8c97f15b1676a55e1eb249ecbb86cbbfdd6d573467c19f5063a2453f6.jpg)  
+cambridge landmarks
+
+![](images/09e7e405dd47f3b1b7eed52b01d88a5af5f875813aaa5f558e7f416ed3aea774.jpg)
+
+![](images/b7062a0c6684ff3b4f12e393e7e1cc2c9b52bea028249968eff434a85ab645d7.jpg)
+
+![](images/cd5320d966db84be6d8987e01a6d7efb90b14f619c70823d0473ba63b0f9b72c.jpg)  
+fig. 13. learned indoor geometries. we visualize the 3d scene geometry learned by the scene coordinate regression network for all scenes of the 7scenes [3] dataset. see the main text for details on how we generated these models. each row represents a different training setup. in particular, the last row, rgb, shows geometry discovered by the network automatically given only rgb images and ground truth poses. for a more informative visualization, we always show the ground truth model as a faint backdrop.
+
+# acknowledgments
+
+the authors would like to thank dehui lin for implementing an efficient version of the differentiable kabsch pose solver within the scope of his master thesis.
+
+this work was supported by the dfg grant covmap: intelligente karten mittels gemeinsamer gps- und videodatenanalyse (ro 4804/2-1 and ro 2497/12-2). this project has received funding from the european research council (erc) under the european unions horizon 2020 programme (grant no. 647769).
+
+the computations were performed on an hpc cluster at the center for information services and high performance computing (zih) at tu dresden.
+
+# references
+
+[1] a. geiger, p. lenz, and r. urtasun, "are we ready for autonomous driving? the kitti vision benchmark suite," in cvpr, 2012.  
+[2] s. mann, t. furness, y. yuan, j. iorio, and z. wang, "all reality: virtual, augmented, mixed (x), mediated (x, y), and multimediated reality," arxiv preprint, 2018.  
+[3] j. shotton, b. glocker, c. zach, s. izadi, a. criminisi, and a. fitzgibbon, "scene coordinate regression forests for camera relocalization in rgb-d images," in cvpr, 2013.  
+[4] j. valentin, m. nießner, j. shotton, a. fitzgibbon, s. izadi, and p. h. s. torr, “exploiting uncertainty in regression forests for accurate camera relocalization,” in cvpr, 2015.  
+[5] e. brachmann, f. michel, a. krull, m. y. yang, s. gumhold, and c. rother, "uncertainty-driven 6d pose estimation of objects and scenes from a single rgb image," in cvpr, 2016.  
+[6] t. schmidt, r. newcombe, and d. fox, "self-supervised visual descriptor learning for dense correspondence," ral, 2017.
+
+![](images/e2ba7947c4411536ca936f53b5db22f00ee3c9cc6eb51582dfcf8abf9992d794.jpg)  
+fig. 14. learned outdoor geometries. we visualize the 3d scene geometry learned by the scene coordinate regression network for scenes of the cambridge landmarks [26] dataset. see the main text for details on how we generated these models. each row represents a different training setup. in particular, the last row, rgb, shows geometry discovered by the network automatically given only rgb images and ground truth poses. for a more informative visualization, we always show the ground truth model as a faint backdrop. note that the ground truth models of this dataset are sparse point clouds created by structure-from-motion tools.
+
+<table><tr><td rowspan="2"></td><td colspan="2">king&#x27;s college</td><td colspan="2">old hospital</td><td colspan="2">shop facade</td><td colspan="2">st mary&#x27;s church</td><td colspan="2">average</td></tr><tr><td>mb used</td><td>median error (m)</td><td>mb used</td><td>median error (m)</td><td>mb used</td><td>median error (m)</td><td>mb used</td><td>median error (m)</td><td>mb used</td><td>median error (m)</td></tr><tr><td>active search [7]</td><td>275mb</td><td>0.57</td><td>140mb</td><td>0.52</td><td>39mb</td><td>0.12</td><td>359mb</td><td>0.22</td><td>203mb</td><td>0.36</td></tr><tr><td>hybridcompression [84]</td><td>1.0mb</td><td>0.81</td><td>0.6mb</td><td>0.75</td><td>0.2mb</td><td>0.19</td><td>1.3mb</td><td>0.50</td><td>0.8mb</td><td>0.56</td></tr><tr><td>densevlad [21]</td><td>10mb</td><td>2.8</td><td>14mb</td><td>4.0</td><td>3.6mb</td><td>1.1</td><td>23mb</td><td>2.3</td><td>13mb</td><td>2.6</td></tr><tr><td>posenet17 [27]</td><td>50mb</td><td>0.88</td><td>50mb</td><td>3.2</td><td>50mb</td><td>0.88</td><td>50mb</td><td>1.6</td><td>50mb</td><td>1.6</td></tr><tr><td>dsac++ [15]</td><td>104mb</td><td>0.18</td><td>104mb</td><td>0.20</td><td>104mb</td><td>0.06</td><td>104mb</td><td>0.13</td><td>104mb</td><td>0.14</td></tr><tr><td>dsac*</td><td>28mb</td><td>0.15</td><td>28mb</td><td>0.21</td><td>28mb</td><td>0.05</td><td>28mb</td><td>0.13</td><td>28mb</td><td>0.13</td></tr><tr><td>dsac* (tiny)</td><td>4mb</td><td>0.19</td><td>4mb</td><td>0.23</td><td>4mb</td><td>0.07</td><td>4mb</td><td>0.39</td><td>4mb</td><td>0.22</td></tr></table>
+
+table 4
+
+scene compression analysis. we compare memory demand and re-localization accuracy of several methods on the cambridge landmarks dataset [26]. information of competitors taken from [84]. dsac* (tiny) is a variant of our network architecture with a reduced number of channels per layer.
+
+[7] t. sattler, b. leibe, and l. kobbelt, "efficient & effective prioritized matching for large-scale image-based localization," tpami, 2016.  
+[8] n. snavely, s. m. seitz, and r. szeliski, "photo tourism: exploring photo collections in 3d," in siggraph, 2006.  
+[9] c. wu, "towards linear-time incremental structure from motion," in 3dv, 2013.  
+[10] j. l. schonberger and j.-m. frahm, "structure-from-motion revisited," in cvpr, 2016.  
+[11] f. walch, c. hazirbas, l. leal-taixe, t. sattler, s. hilsenbeck, and d. cremers, "image-based localization with spatial lstms," in iccv, 2017.  
+[12] t. sattler, q. zhou, m. pollefeys, and l. leal-taixe, "understanding the limitations of cnn-based absolute camera pose regression," in cvpr, 2019.  
+[13] j. long, e. shelhamer, and t. darrell, "fully convolutional networks for semantic segmentation," in cvpr, 2015.  
+[14] e. brachmann, a. krull, s. nowozin, j. shotton, f. michel, s. gumhold, and c. rother, "dsac-differentiable ransac for camera localization," in cvpr, 2017.  
+[15] e. brachmann and c. rother, "learning less is more-6d camera localization via 3d surface regression," in cvpr, 2018.  
+[16] ——, "neural-guided ransac: learning where to sample model hypotheses," in iccv, 2019.  
+[17] ——, "expert sample consensus applied to camera relocalization," in iccv, 2019.  
+[18] k. he, x. zhang, s. ren, and j. sun, "deep residual learning for image recognition," in cvpr, 2016.  
+[19] a. paszke, s. gross, s. chintala, g. chanan, e. yang, z. devito,
+
+z. lin, a. desmaison, l. antiga, and a. lerer, "automatic differentiation in pytorch," in nips-w, 2017.  
+[20] g. schindler, m. brown, and r. szeliski, "city-scale location recognition," in cvpr, 2007.  
+[21] a. torii, r. arandjelović, j. sivic, m. okutomi, and t. pajdla, “24/7 place recognition by view synthesis,” in cvpr, 2015.  
+[22] r. arandjelovic, p. gronat, a. torii, t. pajdla, and j. sivic, "netvlad: cnn architecture for weakly supervised place recognition," in cvpr, 2016.  
+[23] s. cao and n. snavely, "graph-based discriminative learning for location recognition," in cvpr, 2013.  
+[24] t. sattler, a. torii, j. sivic, m. pollefeys, h. taira, m. okutomi, and t. pajdla, "are large-scale 3d models really necessary for accurate visual localization?" in cvpr, 2017.  
+[25] h. taira, m. okutomi, t. sattler, m. cimpoi, m. pollefeys, j. sivic, t. pajdla, and a. torii, "inloc: indoor visual localization with dense matching and view synthesis," in cvpr, 2018.  
+[26] a. kendall, m. grimes, and r. cipolla, "posenet: a convolutional network for real-time 6-dof camera relocalization," in iccv, 2015.  
+[27] a. kendall and r. cipolla, "geometric loss functions for camera pose regression with deep learning," in cvpr, 2017.  
+[28] t. naseer and w. burgard, "deep regression for monocular camera-based 6-dof global localization in outdoor environments," in iros, 2017.  
+[29] s. brahmbhatt, j. gu, k. kim, j. hays, and j. kautz, "geometry-aware learning of maps for camera localization," in cvpr, 2018.  
+[30] v. balntas, s. li, and v. a. prisacariu, "relocnet: continuous metric learning relocalisation using neural nets," in eccv, 2018.
+
+[31] s. saha, g. varma, and c. v. jawahar, "improved visual relocalization by discovering anchor points," in bmvc, 2018.  
+[32] m. ding, z. wang, j. sun, j. shi, and p. luo, "camnet: coarse-to-fine retrieval for camera re-localization," in iccv, 2019.  
+[33] d. g. lowe, "distinctive image features from scale-invariant keypoints," ijcv, 2004.  
+[34] w. zhang and j. kosecka, "image based localization in urban environments," in 3dpvt, 2006.  
+[35] y. li, n. snavely, d. p. huttenlocher, and p. fua, "worldwide pose estimation using 3d point clouds," in eccv, 2012.  
+[36] l. svarm, o. enqvist, m. oskarsson, and f. kahl, "accurate localization and pose estimation for large 3d models," in cvpr, 2014.  
+[37] t. sattler, m. havlena, f. radenovic, k. schindler, and m. pollefeys, "hyperpoints and fine vocabularies for large-scale location recognition," in iccv, 2015.  
+[38] t. sattler, m. havlena, k. schindler, and m. pollefeys, "large-scale location recognition and the geometric burstiness problem," in cvpr, 2016.  
+[39] l. sväröm, o. enqvist, f. kahl, and m. oskarsson, "city-scale localization for cameras with known vertical direction," tpami, 2017.  
+[40] h. lim, s. n. sinha, m. f. cohen, and m. uytendaele, "real-time image-based 6-dof localization in large-scale environments," in cvpr, 2012.  
+[41] k. m. yi, e. trulls, v. lepetit, and p. fua, "lift: learned invariant feature transform," in eccv, 2016.  
+[42] d. detone, t. malisiewicz, and a. rabinovich, "superpoint: self-supervised interest point detection and description," in cvpr workshops, 2018.  
+[43] j. revaud, p. weinzaepfel, c. r. de souza, n. pion, g. csurka, y. cabon, and m. humenberger, "r2d2: repeatable and reliable detector and descriptor," in neurips, 2019.  
+[44] m. dusmanu, i. rocco, t. pajdla, m. pollefeys, j. sivic, a. torii, and t. sattler, "d2-net: a trainable cnn for joint detection and description of local features," in cvpr, 2019.  
+[45] j. l. schonberger, h. hardmeier, t. sattler, and m. pollefeys, "comparative evaluation of hand-crafted and learned local features," in cvpr, 2017.  
+[46] a. bhowmik, s. gumhold, c. rother, and e. brachmann, "reinforced feature points: optimizing feature detection and description for a high-level task," in cvpr, 2020.  
+[47] a. guzman-rivera, p. kohli, b. glocker, j. shotton, t. sharp, a. fitzgibbon, and s. izadi, "multi-output learning for camera relocalization," in cvpr, 2014.  
+[48] l. meng, f. tung, j. j. little, j. valentin, and c. w. de silva, "exploiting points and lines in regression forests for rgb-d camera relocalization," in iros, 2018.  
+[49] w. kabsch, "a solution for the best rotation to relate two sets of vectors," acta crystallographica section a: crystal physics, diffraction, theoretical and general crystallography, 1976.  
+[50] l. meng, j. chen, f. tung, j. j. little, j. valentin, and c. w. de silva, "backtracking regression forests for accurate camera relocalization," in iros, 2017.  
+[51] d. massiceti, a. krull, e. brachmann, c. rother, and p. h. s. torr, "random forests versus neural networks - what's best for camera localization?" in icra, 2017.  
+[52] x. li, j. ylioinas, j. verbeek, and j. kannala, "scene coordinate regression with angle-based reprojection loss for camera relocalization," in eccv workshops, 2018.  
+[53] m. a. fischler and r. c. bolles, "random sample consensus: a paradigm for model fitting with applications to image analysis and automated cartography," commun. acm, 1981.  
+[54] x. li, s. wang, y. zhao, j. verbeek, and j. kannala, "hierarchical scene coordinate classification and regression for visual localization," in cvpr, 2020.  
+[55] l. yang, z. bai, c. tang, h. li, y. furukawa, and p. tan, "sanet: scene agnostic network for camera localization," in iccv, 2019.  
+[56] t. cavallari, s. golodetz, n. a. lord, j. valentin, l. di stefano, and p. h. torr, "on-the-fly adaptation of regression forests for online camera relocalisation," in cvpr, 2017.  
+[57] t. cavallari, s. golodetz, n. lord, j. valentin, v. prisacariu, l. di stefano, and p. h. s. torr, "real-time rgb-d camera pose estimation in novel scenes using a relocalisation cascade," tpami, 2019.  
+[58] t. cavallari, l. bertinetto, j. mukhoti, p. torr, and s. golodetz, "let's take this online: adapting scene coordinate regression net
+
+work predictions for online rgb-d camera relocalisation," in 3dv, 2019.  
+[59] o. chapelle and m. wu, "gradient descent optimization of smoothed information retrieval metrics," information retrieval, 2010.  
+[60] j. lee, d. kim, j. ponce, and b. ham, "sfnet: learning object-aware semantic correspondence," in cvpr, 2019.  
+[61] k. m. yi, e. trulls, y. ono, v. lepetit, m. salzmann, and p. fua, "learning to find good correspondences," in cvpr, 2018.  
+[62] j. zhang, d. sun, z. luo, a. yao, l. zhou, t. shen, y. chen, l. quan, and h. liao, "learning two-view correspondences and geometry using order-aware network," in iccv, 2019.  
+[63] r. ranftl and v. koltun, "deep fundamental matrix estimation," in eccv, 2018.  
+[64] i. rocco, m. cimpoi, r. arandjelovic, a. torii, t. pajdla, and j. sivic, "neighbourhood consensus networks," in neurips, s. bengio, h. wallach, h. larochelle, k. grauman, n. cesa-bianchi, and r. garnett, eds., 2018.  
+[65] t. probst, d. p. paudel, a. chhatkuli, and l. v. gool, "unsupervised learning of consensus maximization for 3d vision problems," in cvpr, 2019.  
+[66] x.-s. gao, x.-r. hou, j. tang, and h.-f. cheng, "complete solution classification for the perspective-three-point problem," tpami, 2003.  
+[67] r. i. hartley and a. zisserman, multiple view geometry in computer vision. cambridge university press, 2004.  
+[68] k. levenberg, "a method for the solution of certain problems in least squares." quarterly journal on applied mathematics, 1944.  
+[69] d. w. marquardt, "an algorithm for least-squares estimation of nonlinear parameters," journal of the society for industrial and applied mathematics, 1963.  
+[70] g. bradski, "opencv," dr. dobb's journal of software tools, 2000.  
+[71] k. simonyan and a. zisserman, "very deep convolutional networks for large-scale image recognition," in iclr, 2015.  
+[72] s. izadi, d. kim, o. hilliges, d. molyneaux, r. newcombe, p. kohli, j. shotton, s. hodges, d. freeman, a. davison, and a. fitzgibbon, "kinectfusion: real-time 3d reconstruction and interaction using a moving depth camera," in proc. uist, 2011.  
+[73] r. newcombe, s. izadi, o. hilliges, d. molyneaux, d. kim, a. davison, p. kohli, j. shotton, s. hodges, and a. fitzgibbon, "kinectfusion: real-time dense surface mapping and tracking," in proc. ismar, 2011.  
+[74] a. dai, m. nießner, m. zollöfer, s. izadi, and c. theobalt, "bundle-fusion: real-time globally consistent 3d reconstruction using on-the-fly surface re-integration," tog, 2017.  
+[75] t. papadopoulos and m. i. a. lourakis, "estimating the jacobian of the singular value decomposition: theory and applications," in eccv, 2000.  
+[76] a. avetisyan, a. dai, and m. nießner, "end-to-end cad model retrieval and 9 dof alignment in 3d scans," in iccv, 2019.  
+[77] v. lepetit, f. moreno-noguer, and p. fua, "epnp: an accurate o(n) solution to the pnp problem," ijcv, 2009.  
+[78] w. förstner and b. p. wrobel, photogrammetric computer vision – statistics, geometry, orientation and reconstruction, 2016.  
+[79] j. schulman, n. heess, t. weber, and p. abbeel, "gradient estimation using stochastic computation graphs," in nips, 2015.  
+[80] o. chum and j. matas, "randomized ransac with td, d test," in bmvc, 2002.  
+[81] d. p. kingma and j. ba, "adam: a method for stochastic optimization," in iclr, 2015.  
+[82] j. valentin, a. dai, m. nießner, p. kohli, p. torr, s. izadi, and c. keskin, "learning to navigate the energy landscape," corr, 2016.  
+[83] m. kazhdan, m. bolitho, and h. hoppe, "poisson surface reconstruction," in sgp, 2006.  
+[84] f. camposeco, a. cohen, m. pollefeys, and t. sattler, "hybrid scene compression for visual localization," in cvpr, 2019.

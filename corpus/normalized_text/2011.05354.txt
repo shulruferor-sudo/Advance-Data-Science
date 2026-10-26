@@ -1,0 +1,456 @@
+# contrastive losses and solution caching for predict-and-optimize
+
+maxime mulamba<sup>1</sup>, jayanta mandi<sup>1</sup>, michelangelo diligenti<sup>2</sup>, michele lombardi<sup>3</sup>, victor bucarey<sup>1</sup>, tias guns<sup>1,4</sup>
+
+<sup>1</sup>data analytics laboratory, vrije universiteit brussel, belgium
+
+$^{2}$ department of information engineering and mathematical sciences, university of siena, italy
+
+$^{3}$ dipartimento di informatica - scienza e ingegneria, university of bologna, italy
+
+$^{4}$ department of computer science, ku leuven, belgium
+
+{maxime.mulamba, jayanta.mandi, victor.bucarey.lopez, tias.guns} @vub.be, diligmic@diism.unisi.it, michele.lombardi2@unibo.it
+
+# abstract
+
+many decision-making processes involve solving a combinatorial optimization problem with uncertain input that can be estimated from historic data. recently, problems in this class have been successfully addressed via end-to-end learning approaches, which rely on solving one optimization problem for each training instance at every epoch. in this context, we provide two distinct contributions. first, we use a noise contrastive approach to motivate a family of surrogate loss functions, based on viewing non-optimal solutions as negative examples. second, we address a major bottleneck of all predict-and-optimize approaches, i.e. the need to frequently recompute optimal solutions at training time. this is done via a solver-agnostic solution caching scheme, and by replacing optimization calls with a lookup in the solution cache. the method is formally based on an inner approximation of the feasible space and, combined with a cache lookup strategy, provides a controllable trade-off between training time and accuracy of the loss approximation. we empirically show that even a very slow growth rate is enough to match the quality of state-of-the-art methods, at a fraction of the computational cost.
+
+# 1 introduction
+
+many real-life decision-making problems can be formulated as combinatorial optimization problems. however, uncertainty in the input parameters is commonplace; an example being the day-ahead scheduling of tasks on machines, where future energy prices are uncertain. a predict-then-optimize [elmachtoub and grigas, 2021] approach is a widely-utilized industry practice, where first a machine learning (ml) model is trained to make a point estimate of the uncertain parameters and then the optimization problem is solved using the predictions.
+
+the ml models are trained to minimize prediction errors without taking into consideration their impacts on the downstream optimization problem. this often results in suboptimal decision performance. a more appropriate choice
+
+would be to integrate the prediction and the optimization task and train the ml model using a decision-focused loss [elmachtoub and grigas, 2021; wilder et al., 2019; demirovic et al., 2019a]. such predict-and-optimize approach is proven to be effective in various tasks [mandi et al., 2020; demirovic et al., 2019b; ferber et al., 2020].
+
+unfortunately, computational complexity and scalability are two major roadblocks for the predict-and-optimize approach involving np-hard combinatorial optimization problem. this is due to the fact that an np-hard optimization problem must be solved and differentiated for each training instance on each training epoch to find a gradient of the optimization task and backpropogating it during model training.
+
+a number of approaches [wilder et al., 2019; ferber et al., 2020; mandi and guns, 2020] consider problems formulated as integer linear program (ilp) and solve and differentiate the relaxed lp using interior point methods. on the other hand, the approaches from [mandi et al., 2020] and [pogančić et al., 2020] are solver-agnostic, because they compute a subgradient using solutions of any combinatorial solvers.
+
+here we propose an alternative approach, motivated by the literature of noise-contrastive estimation [gutmann and hyvarinen, 2010], which we use to develop a new family of surrogate loss functions based on viewing non-optimal solutions as negative examples. this necessitates building a cache of solutions, which we implement by storing previous solutions during training. we provide a formal interpretation of such a solution cache as an inner approximation of the convex-hull of feasible solutions. this is helpful whenever a linear cost vector is optimized over a discrete space. our second contribution is to propose a family of loss functions specific to combinatorial optimization problems with linear objectives. as an additional contribution, we extend the concept of discrete inner approximation to solver-agnostic approaches. in this way, we are able to overcome the training time bottleneck. finally, we empirically demonstrate that noise-contrastive estimation and solution caching produce predictions at the same quality or better than the state-of-the-art methods in the literature with a drastic decrease in computational times.
+
+# 2 related work
+
+noise-contrastive estimation (nce) performs tractable parameter optimization for many models requiring normalization of the probability distribution over a set of discrete assignments. this is a common element of many popular probabilistic logic frameworks like markov logic networks [richardson and domingos, 2006] or probabilistic soft logic [bach et al., 2017]. more recently, nce has been at the core of several neuro-symbolic reasoning approaches [garciez et al., 2012] like deep logic models [marra et al., 2019] or relational neural machines [marra et al., 2020]. we use nce to derive some tractable formulations of the combinatorial optimization problem.
+
+numerical instability is a major issue in end-to-end training as implicit differentiation at the optimal point leads to zero jacobian when optimizing linear functions. [wilder et al., 2019] introduce end-to-end training of a combinatorial problem by constructing a simpler optimization problem in the continuous relaxation space adding a quadratic regularizer term to the objective. as the continuous relaxation is an outer approximation of the feasible region in mixed integer problems, [ferber et al., 2020] strengthen the formulation by adding cuts. [mandi and guns, 2020] propose to differentiate the homogeneous self-dual formulation, instead of the kkt condition and show its effectiveness.
+
+the smart predict and optimize (spo) framework introduced by [elmachtoub and grigas, 2021] uses a convex surrogate loss based subgradient which could overcome the numerical instability issue for linear problems. [mandi et al., 2020] investigate scaling up the technique for large-scale combinatorial problems using continuous relaxations and warm-starting of the solvers. recent work by [pogančić et al., 2020] is similar to the spo framework but it uses a different subgradient considering "implicit interpolation" of the argmin operator. both of these approaches are capable of computing the gradient for any blackbox implementation of a combinatorial optimization with linear objective. [elmachtoub et al., 2020] extends the spo framework for decision trees.
+
+in all the discussed approaches, scalability is a major challenge due to the need to repeatedly solve the (possibly relaxed) optimisation problems. in contrast, our contrastive losses, coupled with a solution caching mechanism, do away with repeatedly solving the optimization problem during training and can be applied to other solver agnostic predict-and-optimize methods, too.
+
+# 3 problem setting
+
+in our setting we consider a combinatorial optimization problem in the form
+
+$$
+v ^ {*} (c) = \underset {v \in v} {\operatorname {a r g m i n}} f (v, c) \tag {1}
+$$
+
+where  $v$  is a set of feasible solutions and  $f: v \times \mathcal{c} \to \mathbb{r}$  is a real valued function. the objective function  $f$  is parametric in  $c$ , the values we will try to estimate. we denote by  $v^{*}(c)$  an optimal solution of (1). despite the fact that  $v$  can be any set, for the rest of the article we will consider the particular case where  $v$  is a discrete set, specified implicitly
+
+algorithm 1 gradient-descent over combinatorial problem  
+input:  $a,b$  ; training data  $\mathrm{d}\equiv \{(x_i,c_i)\}_{i = 1}^n$    
+hyperparams:  $\alpha$  - learning rate, epochs.   
+1: initialize  $\omega$    
+2: for each epochs do   
+3: for each instances do   
+4:  $\tilde{c}\gets t(\hat{c})$  with  $\hat{c} = m(\omega ,x)$    
+5: obtain  $v$  by calling a solver for eq. (1) with  $\tilde{c}$    
+6:  $\omega \leftarrow \omega -\alpha \frac{\partial\mathcal{l}^{v}}{\partial\tilde{c}}\frac{\partial\tilde{c}}{\partial\omega}\#$  backpropagate (sub)gradient   
+7: end for   
+8: end for
+
+through a set of constraints. this type of sets arise naturally in combinatorial optimization problems, including mixed integer programming (mip) and constraint programming (cp) problems, many of which are known to be np-complete.
+
+the value of  $c$  is unknown but we assume having access to correlated features  $x$  and a historic dataset  $d = \{(x_i, c_i)\}_{i=1}^n$ . one straightforward method to learn  $c$  is to find a model  $m(\omega, x)$  with model parameters  $\omega$  that predicts a value  $\hat{c}$ . this model can be learned by fitting the data  $d$  to minimizing some loss function, as in classical supervised learning approaches.
+
+in a predict-and-optimize setting, the challenge is to learn model parameters  $\omega$ , such that, when it is used to provide estimates  $\hat{c}$ , these predictions lead to an optimal solution of the combinatorial problem with respect to the real values of  $c$ . in order to measure how good a model is, we compute the regret of the combinatorial optimisation, that is, the difference between the true value of: 1) the optimal solution  $v^{*}(c)$  for the true parameter values; and 2) the optimal solution for the estimated parameter values  $v^{*}(\hat{c})$ . formally,  $\mathrm{regret}(\hat{c}, c) = f(v^{*}(\hat{c}), c) - f(v^{*}(c), c)$ . in case of minimisation problems, regret is always positive and it is 0 in case optimizing over the estimated values leads either to the true optimal solution or to an equivalent one.
+
+the goal of prediction-and-optimisation is to learn the model parameters  $\omega$  to minimize the regret of the resulting predictions, i.e.  $\mathrm{argmin}_{\omega}\mathbb{e}$  [regret  $(m(\omega ,x),c)]$  . when using backpropagation as a learning mechanism, regret cannot be directly used as a loss function because it is noncontinuous and involves differentiating over the argmin in  $v^{*}(c)$  . hence, the general challenge of predict-and-optimize is to identify a differentiable and efficient-to-compute loss function  $\mathcal{l}^{\boldsymbol{v}^*}$  that takes into account the structure of  $f$  and  $v^{*}(\cdot)$  more generally.
+
+learning over a set of  $n$  training instances can be formulated within the empirical risk minimisation framework as
+
+$$
+\begin{array}{l} \operatorname * {a r g m i n} _ {\omega} \mathbb {e} \left[ \mathcal {l} ^ {v ^ {*}} (m (\omega , x), c) \right] \\ \approx \underset {\omega} {\operatorname {a r g m i n}} \frac {1}{n} \sum_ {i = 1} ^ {n} \mathcal {l} ^ {v ^ {*}} \left(m \left(\omega , x _ {i}\right), c _ {i}\right) \tag {2} \\ \end{array}
+$$
+
+# 3.1 gradient-descent decision-focused learning
+
+algorithm 1 depicts a standard gradient descent learning procedure for predict-and-optimize approaches. for each epoch
+
+and instance, it computes the predictions, optionally transforms them on line 4, calls a solver to compute  $v^{*}(\tilde{c})$ , and updates the trainable weights  $\omega$  via standard backpropagation for an appropriately defined gradient  $\partial \mathcal{l}^v / \partial c$ .
+
+to overcome both the non-continuous nature of the optimisation problem  $v^{*}(c)$  and the computation time required, a number of works replace the original task  $v^{*}$  by a continuous relaxation  $g^{*}$  and solve and implicitly differentiate over  $\mathcal{l}^{g^*}$ , considering a quadratic [wilder et al., 2019] or log-barrier [mandi and guns, 2020] task-loss. in these cases,  $t(\hat{c}) = \hat{c}$ .
+
+other approaches are solver-agnostic and do the implicit differentiation by defining a subgradient for  $\partial \mathcal{l}^v / \partial c$ . in case of spo+ loss [elmachtoub and grigas, 2021], the subgradient is  $v^{*}(c) - v^{*}(2\hat{c} - c)$ , involving  $t(\hat{c}) = (2\hat{c} - c)$ . in case of blackbox differentiation [pogančić et al., 2020], the solver is called twice on line 5 of alg 1 and the subgradient is an interpolation of  $\mathcal{l}^v$  around  $\hat{c}$ , where the interpolation is between  $v^{*}(\hat{c})$  and its perturbation  $v^{*}(\hat{c} + \lambda c)$ .
+
+in all those cases, in order to find the (sub)gradient, the optimization problem  $v^{*}(c)$  must be solved repeatedly for each instance. in the next section, we present an alternative class of contrastive loss functions that has, to the best of our knowledge, not been used before for predict-and-optimize problems. these loss functions can be differentiated in closed-form and do not require solving a combinatorial problem  $v^{*}(c)$  for every instance.
+
+# 4 a contrastive loss for predict-and-optimize
+
+probabilistic models define a parametric probability distributions over the feasible assignments, and maximum likelihood estimation can be used to find the distribution parameters making the observed data most probable under the model [kindermann, 1980]. in particular, the family of exponential distributions emerges ubiquitously in machine learning, as it is the required form of the optimal solution of any maximum entropy problem [berger et al., 1996].
+
+we now propose an exponential distribution that fits the optimisation problem of eq. (1). let  $v \in v$  be the space of feasible output assignments  $v$  for one example  $x$ . then, we define the following exponential distribution over  $v$ :
+
+$$
+p (v | m (\omega , x)) = \frac {1}{z} \exp (- f (v, m (\omega , x))) \tag {3}
+$$
+
+the partition function  $z$  normalizes the distribution over the assignment space  $v$ :
+
+$$
+z = \sum_ {v ^ {\prime} \in v} \exp \left(- f (v ^ {\prime}, m (\omega , x))\right).
+$$
+
+by construction, if  $v^{*}(m(\omega ,x))$  is the minimizer of eq. 1 for an instance  $x$ , it will maximize eq. (3) and vice versa. we can use this to fix the solution to  $v = v^{*}(c)$  with  $c$  being the true costs, and learn the network weights  $\omega$  that maximize the likelihood  $p(v^{*}(c)|m(\omega ,x))$ . this corresponds to learning an  $\omega$  that makes the intended true solution  $v^{*}(c)$  be the best scoring solution of eq. 3 and hence of  $v^{*}(m(\omega ,x))$ , which is the goal of prediction-and-optimisation. in the following,
+
+these definitions will be implicitly extended over all training instance  $(x_{i},c_{i})$
+
+a main challenge of working with this distribution is that computing the partition function  $z$  requires iterating over all possible solutions  $v$ , which is intractable for most combinatorial optimization problems.
+
+# 4.1 noise-contrastive estimation
+
+learning over this distribution without a direct evaluation of  $z$  can be achieved by using noise contrastive estimation (nce) [mikolov et al., 2013]. the key idea there is to work with a small set of negative samples. to apply nce in this work, we will use as negative samples the solutions that are different from the target solution  $v^{\star}$ , that is any subset  $s \subset (v \setminus v^{\star})$  of feasible solutions.
+
+such an nce approach avoids a direct evaluation of  $z$  and instead maximizes the separation of the probability of the optimal solution  $v_{i}^{\star} = v^{*}(c_{i})$  for  $x_{i}$  from the probability of a sample of the non-optimal ones (the 'noise' part). it is expressed as a maximization of the product of ratios between the optimal solution  $v_{i}^{\star}$  and the negative samples  $s$ :
+
+$$
+\begin{array}{l} \underset {\omega} {\operatorname {a r g m a x}} \log \prod_ {i} \prod_ {v ^ {s} \in s} \frac {p \left(v _ {i} ^ {\star} \mid m \left(\omega , x _ {i}\right)\right)}{p \left(v ^ {s} \mid m \left(\omega , x _ {i}\right)\right)} = \tag {4} \\ = \operatorname {a r g m a x} _ {\omega} \sum_ {i} \sum_ {v ^ {s} \in s} \left(- f \left(v _ {i} ^ {\star}, m (\omega , x _ {i})\right) - \log (z) \right. \\ \left. + f \left(v ^ {s}, m \left(\omega , x _ {i}\right)\right) + \log (z)\right) \\ = \operatorname * {a r g m a x} _ {\omega} \sum_ {i} \sum_ {v ^ {s} \in s} \big (f (v ^ {s}, m (\omega , x _ {i})) - f (v _ {i} ^ {\star}, m (\omega , x _ {i})) \big). \\ \end{array}
+$$
+
+by changing the sign to perform loss minimization, this leads to the following nce-based loss function:
+
+$$
+\mathcal {l} _ {\mathrm {n c e}} = \sum_ {i} \sum_ {v ^ {s} \in s} \left(f \left(v _ {i} ^ {\star}, m (\omega , x _ {i})\right) - f \left(v ^ {s}, m (\omega , x _ {i})\right)\right) \tag {5}
+$$
+
+which can be plugged directly into algorithm 1. during differentiation, both  $v_{i}^{\star}$  and  $v^{s}$  will be treated as constants- the first since it effectively never changes, the second since it will be computed in the forward pass on line 5 in alg. 1. as a side effect, automatic differentiation of eq. 5 will yield a subgradient rather than a true gradient, as is common in integrated predict-and-optimize settings. in section 5, we will discuss how to create the sample  $s$ .
+
+# 4.2 map estimation
+
+self-contrastive estimation [goodfellow, 2015] is a special case of nce where the samples are drawn from the model. a simple but very efficient self-contrastive algorithm takes a single sample, which is the maximum a posteriori (map) assignment, i.e. the most probable solution for each example according to the current model  $m(\omega, \cdot)$ . therefore, the map assignment approximation trains the weights  $\omega$  as:
+
+$$
+\operatorname * {a r g m a x} _ {\omega} \sum_ {i} \left[ - f \left(v _ {i} ^ {\star}, m (\omega , x _ {i})\right) + f \left(\hat {v} _ {i} ^ {\star}, m (\omega , x _ {i})\right) \right]
+$$
+
+with  $\hat{v}_i^\star = \mathrm{argmin}_{v' \in s} [f(v', m(\omega, x_i))]$  being the map solution for the current model. with a sign change to switch optimization direction, this translates into the following loss variant:
+
+$$
+\mathcal {l} _ {\mathrm {m a p}} = \sum_ {i} \left[ f \left(v _ {i} ^ {\star}, m (\omega , x _ {i})\right) - f \left(\hat {v} _ {i} ^ {\star}, m (\omega , x _ {i})\right) \right] \tag {6}
+$$
+
+# 4.3 better handling of linear cost functions
+
+the losses can be minimized by either matching the true optimal solution (the intended behavior), or by making  $f(v_{i}^{\star}, m(\omega, x_{i}))$  and  $f(\hat{v}_{i}^{\star}, m(\omega, x_{i}))$  identical by other means. for example, with a linear cost function  $f(v, c) = c^{t} v$ , eq. 5 translates to:
+
+$$
+\mathcal {l} _ {\mathrm {n c e}} = \sum_ {i} \sum_ {v ^ {s} \in s} m \left(\omega , x _ {i}\right) ^ {t} \left(v _ {i} ^ {\star} - v ^ {s}\right) \tag {7}
+$$
+
+which can be minimized by predicting null costs, i.e.  $m(\omega ,x_i) = 0$ . to address this issue, we introduce a variant of eq. 5, where we replace the  $\hat{c}_i$  term in the loss with  $(\hat{c}_i - c_i)$ . the modification amounts to adding a constant (so that all optimal solutions are preserved), and can be viewed as a regularization term that keeps  $\hat{c}$  close to  $c$ . thus we get:
+
+$$
+\mathcal {l} _ {\mathrm {n c e}} ^ {(\hat {c} - c)} = \sum_ {i} \sum_ {v ^ {s} \in s} \left(\left(m \left(\omega , x _ {i}\right) - c _ {i}\right) ^ {t} \left(v _ {i} ^ {\star} - v ^ {s}\right)\right) \tag {8}
+$$
+
+where  $\hat{c}$  (in the loss name) is a shorthand for  $m(\omega, x_i)$ . note that we do not perturb the predictions prior to computing  $\hat{v}_i^{\star}$ , but only in the loss function.
+
+the loss is still guaranteed non-negative, since  $v_{i}^{\star}$  is by definition the best possible solution with the cost vector  $c_{i}$ . eq. 7 can no longer be minimized with a null cost vector; instead, the loss can only be minimized by having the predicted costs  $\hat{c}_{i}$  match the true costs  $c_{i}$  or, and implied by that, having the solution with the estimated parameters  $\hat{v}_{i}^{\star}$  match the true optimal solution  $v_{i}^{\star}$ . the same approach applied to the map version leads to:
+
+$$
+\mathcal {l} _ {\mathrm {m a p}} ^ {(\hat {c} - c)} = \sum_ {i} (m (\omega , x _ {i}) - c _ {i}) ^ {t} \left(v _ {i} ^ {\star} - \hat {v} _ {i} ^ {\star}\right) \tag {9}
+$$
+
+# 5 negative samples and inner-approximations
+
+# 5.1 negative sample selection
+
+the main question now is how to select the 'noise', i.e. the negative samples  $s$ . the only requirement is that any example in  $s$  is a feasible solution, i.e.  $s \subseteq v$ . instead of computing multiple feasible solutions in each iteration, which would be more costly, we instead propose the pragmatic approach of storing each solution found when calling the solver on line 5 of alg. 1 in a solution cache. as training proceeds, the solution cache will grow each time a new solution is found, and we can use this solution cache as negative samples  $s$ .
+
+while pragmatic, we can also interpret this solution cache  $s$  from a combinatorial optimisation perspective: if  $s$  would contain all possibly optimal solutions (for linear cost functions), it would represent the convex hull of the entire feasible space  $v$ . when containing only a subset of points, that is, a
+
+algorithm 2 gradient-descent with inner approximation  
+input:  $a,b$  ; training data  $\mathrm{d}\equiv \{(x_i,c_i)\}_{i = 1}^n$    
+hyperparams:  $\alpha$  learning rate, epochs,  $p_{solve}$    
+1: initialize  $\omega$    
+2: initialize  $s = \{v^{*}(c_{i})|(x_{i},c_{i})\in d\}$    
+3: for each epochs do   
+4: for each instances do   
+5:  $\tilde{c}\gets t(\hat{c})$  with  $\hat{c} = m(\omega ,x)$    
+6: if random()  $<  p_{solve}$  then   
+7: obtain  $v$  by calling a solver for eq. (1) with  $\tilde{c}$    
+8:  $s\gets s\cup \{v\}$    
+9: else   
+10:  $v = \mathrm{argmin}_{v'\in s}(f(v',\tilde{c})) / /$  simple argmin   
+11: end if   
+12:  $\omega \leftarrow \omega -\alpha \frac{\partial\mathcal{l}^v}{\partial\tilde{c}}\frac{\partial\tilde{c}}{\partial\omega}\#$  backpropagate (sub)gradient   
+13: end for   
+14: end for
+
+subset of the convex hull, it can be seen as an inner approximation of  $v$ . this in contrast to continuous relaxation that relax the integrality constraints, which are commonly used in prediction-and-optimisation today, that lead to an outer approximation. the inner approximation has the advantage of having more information about the structure of  $v$ . this is depicted in figure 1 where a solution cache  $s$  is represented by blue points, and the set  $v$  of feasible points is the union of black and blue points. the continuous relaxation of this set depends on the formulation, that is, the precise set of inequalities used to represent  $v$ , for example, the green part, which clearly is an outer approximation of the convex-hull of  $v$ . the convex-hull of the solution cache is represented as  $conv(s)$  and it is completely included in  $conv(v)$  in contrast to the outer approximation.
+
+# 5.2 gradient-descent with inner approximation
+
+the idea that caching the computed solutions results in an inner approximation, is not limited to noise-contrastive estimation. as  $s$  becomes larger we can expect the inner approximation to become tighter, and hence we can solve the inner approximation instead of the computationally expensive full problem. because the inner approximation is a reasonably sized list of solutions, solving it simply corresponds to a linear-time argmin over this list!
+
+alg. 2 shows the generic algorithm. in comparison to alg. 1 the main difference is that on line 2 we initialise the solution pool, for example with all true optimal solutions; these must be computed for most loss functions anyway. on
+
+![](images/49a13bfed6f8beeb09db9149695be600c8aad2596490b71b54ef3534ab89b249.jpg)  
+figure 1: representation of a solution cache (blue) and the continuous relaxation (green) of  $v$ .
+
+<table><tr><td></td><td>knapsack 60</td><td>knapsack 120</td><td>knapsack 180</td></tr><tr><td>\( \mathcal{l}_{\text{nce}}\hat{c} \)</td><td>912(21)</td><td>760(12)</td><td>2475(45)</td></tr><tr><td>\( \mathcal{l}_{\text{nce}}(\hat{c}-c) \)</td><td>1024(66)</td><td>770(15)</td><td>2474 (40)</td></tr><tr><td>\( \mathcal{l}_{\text{map}}\hat{c} \)</td><td>1277(555)</td><td>912(9)</td><td>491(8)</td></tr><tr><td>\( \mathcal{l}_{\text{map}}(\hat{c}-c) \)</td><td>764 (2)</td><td>562(1)</td><td>327(1)</td></tr><tr><td>two-stage</td><td>989 (14)</td><td>1090 (27)</td><td>433 (12)</td></tr></table>
+
+table 1: comparison among contrastive loss variants on knapsacks (average and standard deviation of regret on test data)  
+
+<table><tr><td></td><td>energy 1</td><td>energy 2</td><td>energy 3</td></tr><tr><td>\( \mathcal{l}_{\text{nce}}\hat{c} \)</td><td>45847(780)</td><td>27633(214)</td><td>18789(194)</td></tr><tr><td>\( \mathcal{l}_{\text{nce}}(\hat{c}-c) \)</td><td>45834(1657)</td><td>28994(659)</td><td>18768(406)</td></tr><tr><td>\( \mathcal{l}_{\text{map}}\hat{c} \)</td><td>104496(18109)</td><td>50897(20958)</td><td>32180(8382)</td></tr><tr><td>\( \mathcal{l}_{\text{map}}(\hat{c}-c) \)</td><td>41236(66)</td><td>27734(267)</td><td>17507(42)</td></tr><tr><td>two-stage</td><td>43384(376)</td><td>31798(781)</td><td>23423(893)</td></tr></table>
+
+line 6 we now first sample a random number between 0 and 1, and if it is below  $p_{solve}$ , which represents the probability of calling the solver, then the expensive solver is called and the solution is added to the cache if not yet present, otherwise an argmin of the cache is done.
+
+note how the probability of solving  $p_{solve}$  has an efficiency-accuracy trade-off: more solving is computationally more expensive but leads to better approximations of v. the approach of alg. 1 corresponds to  $p_{solve} = 1$ .
+
+this inner-approximation caching approach can be used for any decision-focused learning method that calls an external solver, such as spo+ method in [mandi et al., 2020] and its variants [elmachtoub et al., 2020], blackbox solver differentiation of [pogancic et al., 2020] and our two contrastive losses  $\mathcal{l}_{\mathrm{map}}$  and  $\mathcal{l}_{\mathrm{nce}}$ .
+
+# 6 empirical evaluation
+
+in this section we answer the following research questions:
+
+q1 what is the performance of each task loss function in terms of expected regret?  
+q2 how does the growth of the solution caching impact on the solution quality and efficiency of the learning task?  
+q3 how do other solver-agnostic methods benefit from the solution caching scheme?  
+q4 how does the methodology outlined above perform in comparison with the state-of-the-art algorithms for
+
+table 2: comparison among contrastive loss variants on energy scheduling (average and standard deviation of regret on test data)  
+
+<table><tr><td></td><td>matching 10</td><td>matching 25</td><td>matching 50</td></tr><tr><td>\( \mathcal{l}_{\text{nce}}\hat{c} \)</td><td>3702 (64)</td><td>3696 (76)</td><td>3382 (49)</td></tr><tr><td>\( \mathcal{l}_{\text{nce}}(\hat{c}-c) \)</td><td>3618 (81)</td><td>3674 (48)</td><td>3376 (73)</td></tr><tr><td>\( \mathcal{l}_{\text{map}}\hat{c} \)</td><td>3708 (88)</td><td>3700 (23)</td><td>3444 (74)</td></tr><tr><td>\( \mathcal{l}_{\text{map}}(\hat{c}-c) \)</td><td>3732 (85)</td><td>3712 (86)</td><td>3402 (66)</td></tr><tr><td>two-stage</td><td>3700 (42)</td><td>3712 (59)</td><td>3440 (36)</td></tr></table>
+
+table 3: comparison among contrastive loss variants on diverse bipartite matching (average and standard deviation of regret on test data)
+
+decision-focused learning?
+
+to do so, we evaluate our methodology on three np hard problems, the knapsack problem, a job scheduling problem and a maximum diverse bipartite matching problem.
+
+# 6.1 experimental settings
+
+knapsack problem. the objective of this problem is to select a maximal value subset from a set of items subject to a capacity constraint. we generate our dataset from [ifrim et al., 2012], which contains historical energy price data at 30-minute intervals from 2011-2013. each half-hour slot has features such as calendar attributes; day-ahead estimates of weather characteristics; semo day-ahead forecasted energy-load, wind-energy production and prices. each knapsack instance consists of 48 half-our slots, which basically translates to one calendar day. the knapsack weights are synthetically generated where a weight  $\in \{3,5,7\}$  is randomly assigned to each of the 48 slots and the price is multiplied accordingly before adding gaussian noise  $\xi \sim \mathbb{n}(0,25)$  to maintain high correlation between the prices and the weights as strongly correlated instances are difficult to solve [pisinger, 2005]. we study three instances of this knapsack problem with capacities of 60, 120 and 180.
+
+energy-cost aware scheduling. in our next experiment, we consider a more complex combinatorial optimization problem. this combinatorial problem is taken from csplib [gent and walsh, 1999], a library of constraint optimization problems. in energy-cost aware scheduling [simonis et al., 1999], a given number of tasks, each having its own duration, power usage, resource requirement, earliest possible start and latest-possible end, must be scheduled on a certain number of machines respecting the resource capacities of the machines. a task cannot be stopped or migrated once started on a machine. the cost of energy price varies throughout the day and the goal is to find a scheduling which would minimize the total energy consumption cost. we use the same energy price data for this experiment. we study three instances named energy-1, energy-2 and energy-3.
+
+diverse bipartite matching. we adopt this experiment from [ferber et al., 2020]. the matching instances are constructed from the cora citation network [sen et al., 2008].
+
+![](images/4756a6e246dbad9c0278ee0d0f9abb5a140348be054c3dfa987f251dc8bc8205.jpg)  
+(a) nce
+
+![](images/b8d8b4f7ffd66b14ec8988f5b2c93d80015ee3859dc5a37e74333bd23d410dc2.jpg)  
+(b) spo+
+
+![](images/501c2fab7d7c3aed2d1967f65f1aecb8afb5a48993c75a1dce4cd4a52de35073.jpg)  
+(c) blackbox
+
+![](images/8bcc7d79eb4a0b4fb8826683b151153d3df93193e7afbaa440eef1005bc6e9b6.jpg)  
+figure 2: comparison of learning curves with/without the inner approximation with  $p_{solve} = 5\%$  for energy-3.  
+(a) knapsack-120  
+figure 3: regret versus total training time for the different methods
+
+![](images/4ccff7191bb4e342cdb753770d9258fc99b152dc1221f9db46c918417a02ea19.jpg)  
+(b) energy-3
+
+![](images/f69aaf2a97b9f428813f58aded7b11b0e5c002402db5023c6a08585ca8263303.jpg)  
+(c) matching-25
+
+the graph is partitioned into 27 sets of disjoint nodes. diversity constraints are added to ensure there are some edges between papers of the same field as well as edges between papers of different fields. the prediction task is to predict which edges are present using the node features. the optimization task is to find a maximum matching in the predicted graph. contrary to the previous ones, here the learning task is the challenging one whereas the optimisation task is relatively simpler. we study three instances with varying degree of diversity constraints, matching-10, matching-25 and -50.
+
+# 6.2 results
+
+for all the experiments, the dataset is split on training (70%), validation (10%) and test (20%) data. the validation sets are used for selecting the best hyperparameters. the final model is run on the test data 10 times and we report the average and standard deviation (in bracket) of the 10 runs. all methods are implemented with pytorch 1.3.1 [paszke et al., 2019] and gurobi 9.0.1 [gurobi optimization, 2021].
+
+# q1
+
+in section 4, we introduced  $\mathcal{l}_{\mathrm{nce}}$ ,  $\mathcal{l}_{\mathrm{map}}$ ,  $\mathcal{l}_{\mathrm{nce}}^{(\hat{c} - c)}$  and  $\mathcal{l}_{\mathrm{map}}^{(\hat{c} - c)}$ . in table 1, 2 and 3, we compare the test regret of these 4 contrastive losses. the test regret of a two-stage approach, where model training is done with no regards to the optimization task, is provided as baseline.
+
+we can see in table 1 and table2 for the knapsack and the scheduling problem,  $\mathcal{l}_{\mathrm{map}}(\hat{c} - c)$  performs the best among all the loss variants. interestingly, with  $\mathcal{l}_{\mathrm{nce}}$ , there is no significant advantage of the linear objective loss function ( $\hat{c} - c$ ); whereas in case of  $\mathcal{l}_{\mathrm{map}}$ , we observe significant gain by using the linear objective loss function. on the other hand,
+
+in table 3, for the matching problem  $\mathcal{l}_{\mathrm{nce}}$  performs slightly better than  $\mathcal{l}_{\mathrm{map}}$ .
+
+# q2
+
+in the previous experiment, the initial discrete solutions on the training data as well as all solutions obtained during training are cached to form the inner approximation of the feasible region. but, as explained in section 5, finding the optimal  $v^{*}(\hat{c})$  and adding it to the solution cache for all  $\hat{c}$  during training is computationally expensive. instead, now we empirically experiment with  $p_{solve} = 5\%$ , i.e. where new solutions are computed only  $5\%$  of the time.
+
+in figure 2a, we plot regret against training time for energy-3 (we observe similar results as shown in the appendix). there is a significant reduction in computational times as we switch to  $5\%$  sampling strategy. moreover, this does have not deleterious impact on the test regret. we conclude that adding new solutions to the solution cache by sampling seem to be an effective strategy to have good quality solutions without a high computational burden.
+
+# q3
+
+to investigate the validity of inner-approximation caching approach, we implement spo-caching and blackbox-caching, where we perform differentiation of  $\mathrm{spo + }$  loss and blackbox solver differentiation respectively, with  $p_{solve}$  being  $5\%$ . we again plot regret against training time in figure 2b and figure 2c for  $\mathrm{spo + }$  and blackbox respectively. these figures show caching drastically reduces training times without any significant impact on regret both for  $\mathrm{spo + }$  and blackbox differentiation.
+
+finally we investigate what we gain by implementing  $\mathcal{l}_{\mathrm{nce}}$ ,  $\mathcal{l}_{\mathrm{nce}}^{(\hat{c} - c)}$ ,  $\mathcal{l}_{\mathrm{map}}^{(\hat{c} - c)}$  and spo-caching and blackbox-caching with  $p_{solve}$  being  $5\%$ . we compare them against some of the state-of-the-art approaches- spo+ [elmachtoub and grigas, 2021; mandi et al., 2020], blackbox [pogančić et al., 2020], qptl [wilder et al., 2019] and interior [mandi and guns, 2020]. our goal is not to beat them in terms of regret; rather our motivation is to reach similar regret in a time-efficient manner.  
+in figure 3a, figure 3b and 3c, we plot test regret against per epoch training time for knapsack-120, energy-3 and matching-25. in knapsack-120, blackbox and interior performs best in terms of regret.  $\mathcal{l}_{\mathrm{map}}^{(\hat{c} - c)}$ , spo-caching and blackbox-caching attain low regret comparable to these with a significant gain in training time. for energy-3 the regret of spo-caching and blackbox-caching are comparable to the state of the art, whereas  $\mathcal{l}_{\mathrm{map}}^{(\hat{c} - c)}$ , in this specific case, results in lowest regret at very low training time. in matching-25, qptl is the best albeit the slowest and spo+ and blackbox perform marginally better than a two-stage approach. in this instance, caching methods are not good enough; but the four contrastive methods perform better than spo+ and blackbox. these methods can be viewed as trade-off between lower regret of qptl and faster runtime of two-stage.
+
+# 7 concluding remarks
+
+we presented a methodology for decision-focused learning based on two main contributions: i. a new family of loss functions inspired by noise contrastive estimation; and ii. a solution cache representing an inner approximation of the feasible region. we adapted the solution caching concept to other state-of-the-art methods, namely blackbox [pogancic et al., 2020] and spo+ [elmachtoub and grigas, 2021], for decision-focused learning improving their efficiency. these two concepts allow to reduce solution times drastically while reaching similar quality solutions.
+
+# acknowledgments
+
+this research received partial funding from the flemish government (ai research program), the fwo flanders projects g0g3220n and data- driven logistics (fwo-s007318n) and the h2020 project ai4eu, g.a. 825619 as well as from the european research council (erc h2020, grant agreement no. 101002802, chat-opt)
+
+# references
+
+[bach et al., 2017] stephen h bach, matthias broecheler, bert huang, and lise getoor. hinge-loss markov random fields and probabilistic soft logic. the journal of machine learning research, 18(1):3846-3912, 2017.  
+[berger et al., 1996] adam berger, stephen a della pietra, and vincent j della pietra. a maximum entropy approach to natural language processing. computational linguistics, 22(1):39-71, 1996.
+
+[demirovic et al., 2019a] emir demirovic, peter j. stuckey, james bailey, jeffrey chan, chris leckie, kotagiri ramamohanarao, and tias guns. an investigation into prediction + optimisation for the knapsack problem. in louis-martin rousseau and kostas stergiou, editors, integration of constraint programming, artificial intelligence, and operations research, pages 241-257, cham, 2019. springer international publishing.  
+[demirovic et al., 2019b] emir demirovic, peter j stuckey, james bailey, jeffrey chan, christopher leckie, kotagiri ramamohanarao, and tias guns. predict+ optimise with ranking objectives: exhaustively learning linear functions. in ijcai, pages 1078-1085, 2019.  
+[elmachtoub and grigas, 2021] adam n elmachtoub and paul grigas. smart "predict, then optimize". management science, 2021.  
+[elmachtoub et al., 2020] adam elmachtoub, jason cheuk nam liang, and ryan mcnellis. decision trees for decision-making under the predict-then-optimize framework. in international conference on machine learning, pages 2858–2867. pmlr, 2020.  
+[feber et al., 2020] aaron ferber, bryan wilder, bistra dilkina, and milind tambe. mipaal: mixed integer program as a layer. in aaai, pages 1504-1511, 2020.  
+[garcez et al., 2012] artur s d'avila garcez, krysia b broda, and dov m gabbay. neural-symbolic learning systems: foundations and applications. springer science & business media, 2012.  
+[gent and walsh, 1999] ian p gent and toby walsh. csplib: a benchmark library for constraints. in international conference on principles and practice of constraint programming, pages 480-481. springer, 1999.  
+[goodfellow, 2015] ian j goodfellow. on distinguishability criteria for estimating generative models. in proceedings of iclr, 2015.  
+[gurobi optimization, 2021] llc gurobi optimization. http://www.gurobi.com, 2021. accessed: 2021-01-20.  
+[gutmann and hyvarinen, 2010] michael gutmann and aapo hyvarinen. noise-contrastive estimation: a new estimation principle for unnormalized statistical models. in proceedings of the thirteenth international conference on artificial intelligence and statistics, pages 297-304, 2010.  
+[ifrim et al., 2012] georgiana ifrim, barry o'sullivan, and helmut simonis. properties of energy-price forecasts for scheduling. in international conference on principles and practice of constraint programming, pages 957-972. springer, 2012.  
+[kindermann, 1980] ross kindermann. markov random fields and their applications. american mathematical society, 1980.
+
+[kingma and ba, 2015] diederik p. kingma and jimmy ba. adam: a method for stochastic optimization. corr, abs/1412.6980, 2015.  
+[mandi and guns, 2020] jayanta mandi and tias guns. interior point solving for lp-based prediction+optimisation. in h. larochelle, m. ranzato, r. hadsell, m. f. balcan, and h. lin, editors, advances in neural information processing systems, volume 33, pages 7272-7282. curran associates, inc., 2020.  
+[mandi et al., 2020] jayanta mandi, peter j stuckey, tias guns, et al. smart predict-and-optimize for hard combinatorial optimization problems. in proceedings of the aaai conference on artificial intelligence, volume 34, pages 1603–1610, 2020.  
+[marra et al., 2019] giuseppe marra, francesco giannini, michelangelo diligenti, and marco gori. integrating learning and reasoning with deep logic models. in joint european conference on machine learning and knowledge discovery in databases (ecml), pages 517-532. springer, 2019.  
+[marra et al., 2020] giuseppe marra, francesco giannini, michelangelo diligenti, marco maggini, and marco gori. relational neural machines. in european conference on artificial intelligence (ecai), 2020.  
+[mikolov et al., 2013] tomas mikolov, ilya sutskever, kai chen, greg s corrado, and jeff dean. distributed representations of words and phrases and their compositionality. advances in neural information processing systems, 26:3111-3119, 2013.  
+[paszke et al., 2019] adam paszke, sam gross, francisco massa, adam lerer, james bradbury, gregory chanan, trevor killeen, zeming lin, natalia gimelshein, luca antiga, et al. pytorch: an imperative style, high-performance deep learning library. in advances in neural information processing systems, pages 8024-8035, 2019.  
+[pisinger, 2005] david pisinger. where are the hard knapsack problems? computers & operations research, 32(9):2271-2284, 2005.  
+[pogancić et al., 2020] marin vlastelica pogancić, anselm paulus, vit musil, georg martius, and michal rolinek. differentiation of blackbox combinatorial solvers. in *iclr* 2020: eighth international conference on learning representations, 2020.  
+[richardson and domingos, 2006] matthew richardson and pedro domingos. markov logic networks. machine learning, 62(1-2):107-136, 2006.  
+[sen et al., 2008] prithviraj sen, galileo namata, mustafa bilgic, lise getoor, brian galligher, and tina eliassi-rad. collective classification in network data. ai magazine, 29(3):93, sep. 2008.  
+[simonis et al., 1999] helmut simonis, barry o'sullivan, deepak mehta, barry hurley, and milan de cauwer. csplib problem 059: energy-cost aware scheduling. http://www.csplib.org/problems/prob059, 1999.
+
+[wilder et al., 2019] bryan wilder, bistra dilkina, and milind tambe. melding the data-decisions pipeline: decision-focused learning for combinatorial optimization. in proceedings of the aaai conference on artificial intelligence, volume 33, pages 1658-1665, 2019.
+
+# a predictive models
+
+for knapsack and scheduling experiments, we train a simple linear regressor implemented as a single layer network in pytorch, trained to minimize mean square error. for matching experiments, we consider a 2-layers perceptron with an hidden layer of 200 units and relu activation function. as it is used in a binary classification problem, we apply a sigmoid function on its output. the neural network is trained to minimize cross entropy.
+
+all predictive model are trained with adam [kingma and ba, 2015].
+
+# b detailed result
+
+# c problem specification
+
+# c.1 knapsack problem
+
+in this problem we have to predict electricity-price  $c_{t}$  of  $t(= 48)$  half-hour slots of the next day. each slot  $t$ , is associated with a known weight  $w_{t}$ , which can be interpreted as the agency fee of that slot. the problem of maximizing the total revenue is stated as the following milp:
+
+$$
+\begin{array}{l} \max _ {x} \sum_ {t \in t} c _ {t} x _ {t} \\ \text {s u b j e c t} \sum_ {t \in t} w _ {t} x _ {t} \leq b \\ x _ {t} \in \{0, 1 \} \qquad \qquad t \in t \\ \end{array}
+$$
+
+where  $x_{t}$  is a binary variable which takes the value 1 only if slot  $t$  is purchased. constraint limits the number of slots to buy under a fixed budget  $b$ . the objective is to make maximum revenue by selling the electricity to the grid at price  $c_{t}$  in the slots already purchased.
+
+# c.2 energy-cost aware scheduling
+
+in this problem  $j$  is the set of tasks to be scheduled on  $m$  number of machines maintaining resource requirement of  $r$  resources. the tasks must be scheduled over  $t(= 48)$  set of equal length time periods. each task  $j$  is specified by its duration  $d_j$ , earliest start time  $e_j$ , latest end time  $l_j$ , power usage  $p_j$ .  $u_{jr}$  is the resource usage of task  $j$  for resource  $r$  and  $c_{mr}$  is the capacity of machine  $m$  for resource  $r$ . let  $x_{jmt}$  be a binary variable which is 1 only if task  $j$  starts at time  $t$  on machine  $m$ . if  $c_t$  is the (predicted) energy price at timeslot  $t$ , the objective is to minimize the following formulation of total energy cost. then the problem can be formulated as the
+
+following milp:
+
+$$
+\min  _ {x _ {j m t}} \sum_ {j \in j} \sum_ {m \in m} \sum_ {t \in t} x _ {j m t} \left(\sum_ {t \leq t ^ {\prime} <   t + d _ {j}} p _ {j} c _ {t ^ {\prime}}\right)
+$$
+
+$$
+\begin{array}{l} \text {s u b j e c t} \sum_ {m \in m} \sum_ {t \in t} x _ {j m t} = 1, \forall_ {j \in j} \\ x _ {j m t} = 0 \forall_ {j \in j} \forall_ {m \in m} \forall_ {t <   e _ {j}} \\ x _ {j m t} = 0 \forall_ {j \in j} \forall_ {m \in m} \forall_ {t + d _ {j} > l _ {j}} \\ \sum_ {j \in j} \sum_ {t - d _ {j} <   t ^ {\prime} \leq t} x _ {j m t ^ {\prime}} u _ {j r} \leq c _ {m r}, \forall_ {m \in m} \forall_ {r \in r} \forall_ {t \in t} \\ \end{array}
+$$
+
+the first constraint ensures each task is scheduled only once. the next constraints ensure the task scheduling abides by earliest start time and latest end time constraints. the final constraint is to respect the resource requirement of the machines.
+
+# c.3 diverse bipartite matching
+
+following [ferber et al., 2020], in this problem 100 nodes representing scientific publications are split into two sets of 50 nodes  $n_{1}$  and  $n_{2}$ . a (predicted) reward matrix  $c$  indicates the likelihood that a link between each pair of nodes from  $n_{1}$  to  $n_{2}$  exists. finally, a indicator  $m_{i,j}$  is 0 if article  $i$  and  $j$  share the same subject field, and 0 otherwise  $\forall i \in n_{1}, j \in n_{2}$ . let  $p \in [0,1]$  be the rate of pair sharing their field in a solution and  $q \in [0,1]$  the rate of unrelated pairs, the goal is to match as much nodes in  $n_{1}$  with at most one node in  $n_{2}$  by selecting edges which maximizes the sum of rewards under similarity and diversity constraints. formally:
+
+$$
+\begin{array}{l l l} \max _ {x} & \sum_ {i, j} c _ {i, j} x _ {i, j} \\ \text {s u b j e c t t o} & \sum_ {j} x _ {i, j} \leq 1 & \forall i \in n _ {1} \\ & \sum_ {i} x _ {i, j} \leq 1 & \forall j \in n _ {2} \\ & \sum_ {i, j} m _ {i, j} x _ {i, j} \geq p \sum_ {i, j} x _ {i, j} \\ & \sum_ {i, j} (1 - m _ {i, j}) x _ {i, j} \geq q \sum_ {i, j} x _ {i, j} \\ & x _ {i, j} \in \{0, 1 \} & \forall i \in n _ {1}, j \in n _ {2} \end{array}
+$$
+
+in our experiments, we considered three variation of this problem with  $p = q = 10\%$ ,  $25\%$  and  $5\%$ , respectively named matching-10, matching-25 and matching-50.
+
+# d hyperparameter details
+
+<table><tr><td></td><td></td><td>two-stage</td><td>spo</td><td>blackbox</td><td>qptl</td><td>interior</td><td>spo-caching (5%)</td><td>blackbox-caching (5%)</td></tr><tr><td rowspan="2">knapsack-60</td><td>regret</td><td>989 (14)</td><td>734 (10)</td><td>659 (15)</td><td>668 (4)</td><td>700 (54)</td><td>730 (42)</td><td>682 (37)</td></tr><tr><td>mse</td><td>34101(115)</td><td>10^6 (105)</td><td>1.5 × 10^6 (18)</td><td>10^6 (533)</td><td>1.5 × 10^6 (232)</td><td>10^6 (8×10^3)</td><td>1.5 × 10^6 (44)</td></tr><tr><td rowspan="2">knapsack-120</td><td>regret</td><td>1090 (27)</td><td>578 (1)</td><td>528 (10)</td><td>545 (1)</td><td>565 (40)</td><td>558 (7)</td><td>565 (40)</td></tr><tr><td>mse</td><td>34107(79)</td><td>10^6 (50)</td><td>1.5 × 10^6 (40)</td><td>1.5 × 10^6 (37)</td><td>1.5 × 10^6 (280)</td><td>10^6 (10^3)</td><td>1.5 × 10^6 (36)</td></tr><tr><td rowspan="2">knapsack-180</td><td>regret</td><td>433 (12)</td><td>316 (1)</td><td>314 (13)</td><td>1461 (13)</td><td>370 (22)</td><td>354 (14)</td><td>316 (22)</td></tr><tr><td>mse</td><td>34145(80)</td><td>0.5 × 10^6 (33)</td><td>1.5 × 10^6 (16)</td><td>1.5 × 10^6 (44)</td><td>1.5 × 10^6 (260)</td><td>10^6 (10^3)</td><td>1.5 × 10^6 (64)</td></tr></table>
+
+table 4: test regret of the state of the art for the knapsack problem  
+
+<table><tr><td></td><td>spo</td><td>spo-caching (5%)</td><td>blackbox</td><td>blackbox-caching (5%)</td></tr><tr><td>knapsack-60</td><td>2</td><td>0.5</td><td>4.5</td><td>0.5</td></tr><tr><td>knapsack-120</td><td>2</td><td>0.5</td><td>4</td><td>0.5</td></tr><tr><td>knapsack-180</td><td>2</td><td>0.5</td><td>4</td><td>0.5</td></tr></table>
+
+table 5: per epoch runtime (sec.) of the caching implementation for the knapsack problem  
+
+<table><tr><td rowspan="2" colspan="2"></td><td colspan="3">\( \mathcal{l}_{\text{nce}} \)</td><td colspan="3">\( \mathcal{l}_{\text{map}} \)</td></tr><tr><td>\( \hat{c} \)</td><td>\( (\hat{c}-c) \)</td><td>\( (2\hat{c}-c) \)</td><td>\( \hat{c} \)</td><td>\( (\hat{c}-c) \)</td><td>\( (2\hat{c}-c) \)</td></tr><tr><td rowspan="2">knapsack-60</td><td>regret</td><td>912 (21)</td><td>1024 (66)</td><td>908 (15)</td><td>1277 (555)</td><td>764 (2)</td><td>809 (2)</td></tr><tr><td>mse</td><td>\( 10^6 (2\times 10^3) \)</td><td>\( 1.5\times 10^6 (425) \)</td><td>\( 10^6 (10^3) \)</td><td>\( 1.5\times 10^6 (2) \)</td><td>\( 10^6 (395) \)</td><td>\( 10^6 (287) \)</td></tr><tr><td rowspan="2">knapsack-120</td><td>regret</td><td>760 (12)</td><td>770 (15)</td><td>763 (10)</td><td>912 (9)</td><td>562 (1)</td><td>591 (2)</td></tr><tr><td>mse</td><td>\( 1.5\times 10^6 (3) \)</td><td>\( 1.5\times 10^6 (3) \)</td><td>\( 1.5\times 10^6 (2) \)</td><td>\( 1.5\times 10^6 (1) \)</td><td>\( 10^6 (292) \)</td><td>\( 10^6 (264) \)</td></tr><tr><td rowspan="2">knapsack-180</td><td>regret</td><td>2475 (45)</td><td>2474 (40)</td><td>2478 (630)</td><td>491 (8)</td><td>327 (1)</td><td>331 (5)</td></tr><tr><td>mse</td><td>\( 10^6 (47) \)</td><td>\( 10^6 (62) \)</td><td>\( 10^6 (24) \)</td><td>\( 1.5\times 10^6 (1) \)</td><td>40500 (200)</td><td>52000 (158)</td></tr></table>
+
+table 6: test regret of the variants of the knapsack problem  
+
+<table><tr><td></td><td></td><td>two-stage</td><td>spo-relax</td><td>blackbox</td><td>qptl</td><td>interior</td><td>spo-caching (5%)</td><td>blackbox-caching (5%)</td></tr><tr><td rowspan="2">energy-1</td><td>regret</td><td>43384 (376)</td><td>40935 (115)</td><td>38800 (79)</td><td>40615 (799)</td><td>40200 (225)</td><td>40820 (76)</td><td>41635 (781)</td></tr><tr><td>mse</td><td>769 (3)</td><td>9648 (148)</td><td>5432 (2)</td><td>5161 (1)</td><td>2334 (66)</td><td>14464 (434)</td><td>5612 (42))</td></tr><tr><td rowspan="2">energy-2</td><td>regret</td><td>31978 (781)</td><td>27470 (42)</td><td>27405 (144)</td><td>37639 (194)</td><td>29407 (1855)</td><td>27591 (77)</td><td>27776 (856)</td></tr><tr><td>mse</td><td>768 (3)</td><td>5582 (248)</td><td>5525 (2)</td><td>5436 (1)</td><td>3651 (47)</td><td>10654 (664)</td><td>5571 (31)</td></tr><tr><td rowspan="2">energy-3</td><td>regret</td><td>23423 (893)</td><td>18647 (234)</td><td>18187 (587)</td><td>21677 (857)</td><td>18509 (1121)</td><td>18803 (39)</td><td>18881 (1481)</td></tr><tr><td>mse</td><td>770 (3)</td><td>3237 (37)</td><td>5485 (5)</td><td>5208 (4)</td><td>3742 (67)</td><td>5008 (229)</td><td>5455 (32)</td></tr></table>
+
+table 7: test regret of the state of the art of the energy scheduling problem
+
+![](images/b90a8f83177fbdbcc562583dc85e65cb991a4886ba571a17b531f27b494d6958.jpg)  
+(a) knapsack-60
+
+![](images/f4eed901041af89c7aa74ebfbf5ef5b6453e2190a0a2fbc467abdf2fde02ec6c.jpg)  
+(b) knapsack-120
+
+![](images/429d33cbdf094274a6854dca48cd3dc86b059c4214bc4c0bd4f676b881da828b.jpg)  
+(c) knapsack-180
+
+![](images/2dc7b209bbb31ec8379c4a2446a55555858a11edbb0221f33a0098d81104b520.jpg)  
+(d) knapsack-60
+
+![](images/f1252f15e7eb42aac411fcf87b3be899b32db6fa719c3c400cd81c0380a53ae7.jpg)  
+(e) knapsack-120
+
+![](images/302559f4e3af5dc19a59c22412585b220ae20199eec3110dc8ea7ad540de4003.jpg)  
+(f) knapsack-180  
+figure 4: learning curve for knapsack problem  $\mathcal{l}_{map}(\hat{c} - c)$
+
+<table><tr><td></td><td>spo</td><td>spo-caching (5%)</td><td>blackbox</td><td>blackbox-caching (5%)</td></tr><tr><td>energy-1</td><td>6.5</td><td>2</td><td>14</td><td>1</td></tr><tr><td>energy-2</td><td>12</td><td>2</td><td>26.5</td><td>0.5</td></tr><tr><td>energy-3</td><td>21</td><td>3.5</td><td>42.5</td><td>1.5</td></tr></table>
+
+table 8: per epoch runtime (sec.) of the caching implementation for the energy scheduling problem
+
+![](images/00e02dd23f288486144774c44e922b0ca37a973d8dc1d6e6d836e658ff9b9f17.jpg)
+
+![](images/d4c4d3d02ce384e447b29924a0f304df826dac42da13a1b91ebee408291a8131.jpg)  
+(a) energy-1  
+figure 5: learning curve for energy scheduling problem  $\mathcal{l}_{map}(\hat{c} - c)$
+
+![](images/9e9c1e9cc480c38ddedf68d7b1cd13c8a7884d5e6a8304aaea8ed069b5941a4b.jpg)
+
+![](images/b1c3ea268e3ff8d121ceaf79f44e8aaffce5ba6abada1f75d1b1c59f6637fa69.jpg)  
+(b) energy-2
+
+![](images/9b51e1897a95c67d21fafec29dd0e48eab156d45efb143a35dda7dce79a995a5.jpg)
+
+![](images/18adc74afba25b63c935c260153d31dd250ecd9920b33026193684b4563639cd.jpg)  
+(c) energy-3
+
+<table><tr><td rowspan="2"></td><td></td><td colspan="2">\(\mathcal{l}_{\text{nce}}\)</td><td rowspan="2">\((2\hat{c}-c)\)</td><td rowspan="2">\(\hat{c}\)</td><td rowspan="2">\((\hat{c}-c)\)</td><td rowspan="2">\((2\hat{c}-c)\)</td></tr><tr><td></td><td>\(\hat{c}\)</td><td>\((\hat{c}-c)\)</td></tr><tr><td rowspan="2">energy-1</td><td>regret</td><td>45847(780)</td><td>45834(1657)</td><td>51504(339)</td><td>104496 (18109)</td><td>41236 (66)</td><td>40762 (85)</td></tr><tr><td>mse</td><td>5477(5)</td><td>5475(4)</td><td>5352(268)</td><td>19070(291)</td><td>12958(1753)</td><td>15133(1164)</td></tr><tr><td rowspan="2">energy-2</td><td>regret</td><td>27633(214)</td><td>28994(659)</td><td>29339(681)</td><td>50897(20958)</td><td>27734 (267)</td><td>27728(346)</td></tr><tr><td>mse</td><td>5578(55)</td><td>17146(2620)</td><td>17864(3613)</td><td>6190(14)</td><td>10528(945)</td><td>11580(858)</td></tr><tr><td rowspan="2">energy-3</td><td>regret</td><td>18789(194)</td><td>18768(406)</td><td>18665(630)</td><td>32180(8382)</td><td>17507(42)</td><td>17504(156)</td></tr><tr><td>mse</td><td>14528(578)</td><td>14814(742)</td><td>13691(1572)</td><td>5876(36)</td><td>33593(4992)</td><td>49130(13108)</td></tr></table>
+
+table 9: test regret of the variants of the energy scheduling problem  
+
+<table><tr><td colspan="2"></td><td>two-stage</td><td>spo</td><td>blackbox</td><td>qptl</td><td>interior</td><td>spo-caching (5%)</td><td>blackbox-caching (5%)</td></tr><tr><td rowspan="2">matching-10</td><td>regret</td><td>3700 (42)</td><td>3746 (54)</td><td>3642 (73)</td><td>3422 (80)</td><td>3788 (58)</td><td>3664 (140)</td><td>3704 (74)</td></tr><tr><td>auc</td><td>0.497 (0.001)</td><td>0.492 (0.010)</td><td>0.483 (0.003)</td><td>0.586 (0.019)</td><td>0.495 (0.015)</td><td>0.480 (0.001)</td><td>0.495 (0.005)</td></tr><tr><td rowspan="2">matching-25</td><td>regret</td><td>3712 (59)</td><td>3786 (85)</td><td>3710 (65)</td><td>3482 (71)</td><td>3652 (87)</td><td>3696 (85)</td><td>3760 (57)</td></tr><tr><td>auc</td><td>0.495 (0.001)</td><td>0.494 (0.014)</td><td>0.503 (0.006)</td><td>0.569 (0.016)</td><td>0.501 (0.003)</td><td>0.498 (0.004)</td><td>0.498 (0.013)</td></tr><tr><td rowspan="2">matching-50</td><td>regret</td><td>3440 (36)</td><td>3458 (61)</td><td>3314 (76)</td><td>3242 (75)</td><td>3524 (117)</td><td>3416 (70)</td><td>3440 (28)</td></tr><tr><td>auc</td><td>0.494 (0.003)</td><td>0.510 (0.012)</td><td>0.525 (0.004)</td><td>0.564 (0.011)</td><td>0.485 (0.002)</td><td>0.507 (0.003)</td><td>0.490 (0.008)</td></tr></table>
+
+table 10: test regret of the state of the art for the diverse bipartite matching problem  
+
+<table><tr><td rowspan="2" colspan="2"></td><td colspan="3">\( \mathcal{l}_{\text{nce}} \)</td><td colspan="3">\( \mathcal{l}_{\text{map}} \)</td></tr><tr><td>\( \hat{c} \)</td><td>\( (\hat{c}-c) \)</td><td>\( (2\hat{c}-c) \)</td><td>\( \hat{c} \)</td><td>\( (\hat{c}-c) \)</td><td>\( (2\hat{c}-c) \)</td></tr><tr><td rowspan="2">matching-10</td><td>regret</td><td>3702 (64)</td><td>3618 (81)</td><td>3710 (45)</td><td>3708 (88)</td><td>3732 (85)</td><td>3692 (63)</td></tr><tr><td>auc</td><td>0.486 (0.003)</td><td>0.487 (0.004)</td><td>0.488 (0.007)</td><td>0.495 (0.002)</td><td>0.493 (0.004)</td><td>0.492 (0.002)</td></tr><tr><td rowspan="2">matching-25</td><td>regret</td><td>3696 (76)</td><td>3674 (48)</td><td>3736 (74)</td><td>3700 (23)</td><td>3712 (86)</td><td>3760 (60)</td></tr><tr><td>mse</td><td>0.496 (0.004)</td><td>0.495 (0.002)</td><td>0.496 (0.006)</td><td>0.494 (0.002)</td><td>0.490 (0.005)</td><td>0.494 (0.004)</td></tr><tr><td rowspan="2">matching-50</td><td>regret</td><td>3382 (49)</td><td>3376 (73)</td><td>3396 (57)</td><td>3444 (74)</td><td>3402 (66)</td><td>3380 (86)</td></tr><tr><td>auc</td><td>0.513 (0.004)</td><td>0.517 (0.005)</td><td>0.512 (0.003)</td><td>0.499 (0.002)</td><td>0.509 (0.01)</td><td>0.506 (0.007)</td></tr></table>
+
+table 11: test regret of the variants of the diverse bipartite matching problem
+
+<table><tr><td></td><td></td><td>knapsack-60</td><td>knapsack-120</td><td>knapsack-180</td></tr><tr><td rowspan="2">two-stage</td><td>learning rate</td><td>0.1</td><td>0.1</td><td>0.1</td></tr><tr><td>epochs</td><td>20</td><td>20</td><td>20</td></tr><tr><td rowspan="2">spo</td><td>learning rate</td><td>0.7</td><td>0.7</td><td>0.7</td></tr><tr><td>epochs</td><td>4</td><td>20</td><td>20</td></tr><tr><td rowspan="3">blackbox</td><td>learning rate</td><td>0.01</td><td>0.01</td><td>0.01</td></tr><tr><td>displace parameter</td><td>10-5</td><td>10-5</td><td>10-5</td></tr><tr><td>lambda</td><td>32</td><td>32</td><td>32</td></tr><tr><td rowspan="3">qptl</td><td>learning rate</td><td>0.1</td><td>0.01</td><td>0.01</td></tr><tr><td>quadratic regularizer parameter</td><td>10-5</td><td>10-5</td><td>10-5</td></tr><tr><td>epochs</td><td>24</td><td>24</td><td>24</td></tr><tr><td rowspan="4">interior</td><td>learning rate</td><td>0.1</td><td>0.1</td><td>0.1</td></tr><tr><td>λcut-off</td><td>10-3</td><td>10-4</td><td>10-3</td></tr><tr><td>damping factor</td><td>0.1</td><td>0.1</td><td>10-3</td></tr><tr><td>epochs</td><td>5</td><td>25</td><td>20</td></tr><tr><td rowspan="2">spo-caching 5%</td><td>learning rate</td><td>0.7</td><td>0.7</td><td>0.7</td></tr><tr><td>epochs</td><td>8</td><td>8</td><td>8</td></tr><tr><td rowspan="3">blackbox-caching (5%)</td><td>learning rate</td><td>0.01</td><td>0.01</td><td>0.01</td></tr><tr><td>displace parameter</td><td>10-5</td><td>10-5</td><td>10-5</td></tr><tr><td>lambda</td><td>32</td><td>32</td><td>32</td></tr><tr><td rowspan="2">lnce (hat)</td><td>learning rate</td><td>0.1</td><td>0.001</td><td>0.01</td></tr><tr><td>epochs</td><td>20</td><td>20</td><td>20</td></tr><tr><td rowspan="2">lnce (hat-c)</td><td>learning rate</td><td>0.01</td><td>0.001</td><td>0.01</td></tr><tr><td>epochs</td><td>20</td><td>20</td><td>20</td></tr><tr><td rowspan="2">lnce (2hat-c)</td><td>learning rate</td><td>0.1</td><td>0.001</td><td>0.01</td></tr><tr><td>epochs</td><td>20</td><td>20</td><td>20</td></tr><tr><td rowspan="2">lmap (hat)</td><td>learning rate</td><td>0.01</td><td>0.001</td><td>0.001</td></tr><tr><td>epochs</td><td>20</td><td>20</td><td>20</td></tr><tr><td rowspan="2">lmap (hat-c)</td><td>learning rate</td><td>0.7</td><td>0.7</td><td>0.7</td></tr><tr><td>epochs</td><td>20</td><td>20</td><td>20</td></tr><tr><td rowspan="2">lmap (2hat-c)</td><td>learning rate</td><td>0.7</td><td>0.7</td><td>0.7</td></tr><tr><td>epochs</td><td>20</td><td>20</td><td>20</td></tr></table>
+
+table 12: choice of hyperparameters (knapsack problem)
+
+<table><tr><td></td><td></td><td>energy-1</td><td>energy-2</td><td>energy-3</td></tr><tr><td rowspan="2">two-stage</td><td>learning rate</td><td>0.1</td><td>0.1</td><td>0.1</td></tr><tr><td>epochs</td><td>20</td><td>20</td><td>20</td></tr><tr><td rowspan="2">spo</td><td>learning rate</td><td>0.1</td><td>0.1</td><td>0.1</td></tr><tr><td>epochs</td><td>16</td><td>16</td><td>16</td></tr><tr><td rowspan="3">blackbox</td><td>learning rate</td><td>10-3</td><td>10-3</td><td>10-3</td></tr><tr><td>displace parameter</td><td>10-3</td><td>10-3</td><td>10-3</td></tr><tr><td>lambda</td><td>30</td><td>30</td><td>30</td></tr><tr><td rowspan="3">qptl</td><td>learning rate</td><td>0.1</td><td>10-3</td><td>10-2</td></tr><tr><td>quadratic regularizer parameter</td><td>10-6</td><td>0.1</td><td>10-6</td></tr><tr><td>epochs</td><td>5</td><td>5</td><td>5</td></tr><tr><td rowspan="4">interior</td><td>learning rate</td><td>0.7</td><td>0.7</td><td>0.7</td></tr><tr><td>λcut-off</td><td>0.1</td><td>0.1</td><td>0.1</td></tr><tr><td>damping factor</td><td>10-6</td><td>10-6</td><td>10-6</td></tr><tr><td>epochs</td><td>15</td><td>4</td><td>4</td></tr><tr><td rowspan="2">spo-caching (5%)</td><td>learning rate</td><td>0.1</td><td>0.1</td><td>0.1</td></tr><tr><td>epochs</td><td>20</td><td>20</td><td>20</td></tr><tr><td rowspan="3">blackbox-caching (5%)</td><td>learning rate</td><td>0.01</td><td>0.01</td><td>0.01</td></tr><tr><td>displace parameter</td><td>10-3</td><td>10-3</td><td>10-3</td></tr><tr><td>lambda</td><td>30</td><td>30</td><td>30</td></tr><tr><td rowspan="2">lnce (hat)</td><td>learning rate</td><td>10-3</td><td>0.01</td><td>0.1</td></tr><tr><td>epochs</td><td>24</td><td>24</td><td>24</td></tr><tr><td rowspan="2">lnce (hat-c)</td><td>learning rate</td><td>10-3</td><td>0.1</td><td>0.1</td></tr><tr><td>epochs</td><td>24</td><td>24</td><td>24</td></tr><tr><td rowspan="2">lnce (2hat-c)</td><td>learning rate</td><td>10-3</td><td>0.1</td><td>0.1</td></tr><tr><td>epochs</td><td>24</td><td>24</td><td>24</td></tr><tr><td rowspan="2">lmap (hat)</td><td>learning rate</td><td>0.1</td><td>0.01</td><td>0.01</td></tr><tr><td>epochs</td><td>24</td><td>24</td><td>24</td></tr><tr><td rowspan="2">lmap (hat-c)</td><td>learning rate</td><td>0.1</td><td>0.1</td><td>0.7</td></tr><tr><td>epochs</td><td>24</td><td>24</td><td>24</td></tr><tr><td rowspan="2">lmap (2hat-c)</td><td>learning rate</td><td>0.1</td><td>0.1</td><td>0.7</td></tr><tr><td>epochs</td><td>24</td><td>24</td><td>24</td></tr></table>
+
+table 13: choice of hyperparameters (energy scheduling problem)
+
+<table><tr><td></td><td></td><td>matching-10</td><td>matching-25</td><td>matching-50</td></tr><tr><td rowspan="2">two-stage</td><td>learning rate</td><td>\(10^{-3}\)</td><td>\(10^{-3}\)</td><td>\(10^{-3}\)</td></tr><tr><td>epochs</td><td>2</td><td>5</td><td>2</td></tr><tr><td rowspan="2">spo</td><td>learning rate</td><td>\(10^{-3}\)</td><td>\(10^{-3}\)</td><td>\(5 \times 10^{-3}\)</td></tr><tr><td>epochs</td><td>5</td><td>3</td><td>4</td></tr><tr><td rowspan="4">blackbox</td><td>learning rate</td><td>\(5 \times 10^{-3}\)</td><td>\(5 \times 10^{-3}\)</td><td>\(10^{-2}\)</td></tr><tr><td>displace parameter</td><td>0.1</td><td>\(10^{-5}\)</td><td>0.1</td></tr><tr><td>lambda</td><td>3</td><td>5</td><td>4</td></tr><tr><td>epochs</td><td>10-2</td><td>10-2</td><td>\(10^{-3}\)</td></tr><tr><td rowspan="3">qptl</td><td>learning rate</td><td>0.1</td><td>\(10^{-2}\)</td><td>\(10^{-4}\)</td></tr><tr><td>quadratic regularizer parameter</td><td>4</td><td>8</td><td>7</td></tr><tr><td>epochs</td><td>10-3</td><td>\(10^{-3}\)</td><td>0.1</td></tr><tr><td rowspan="3">interior</td><td>learning rate</td><td>\(10^{-6}\)</td><td>0.1</td><td>\(10^{-6}\)</td></tr><tr><td>damping factor</td><td>\(5 \times 10^{-2}\)</td><td>\(5 \times 10^{-2}\)</td><td>\(5 \times 10^{-2}\)</td></tr><tr><td>epochs</td><td>3</td><td>7</td><td>1</td></tr><tr><td rowspan="2">spo-caching(5%)</td><td>learning rate</td><td>\(10^{-3}\)</td><td>\(10^{-3}\)</td><td>\(5 \times 10^{-3}\)</td></tr><tr><td>epochs</td><td>3</td><td>4</td><td>6</td></tr><tr><td rowspan="3">blackbox-caching(5%)</td><td>learning rate</td><td>\(10^{-3}\)</td><td>\(10^{-3}\)</td><td>\(5 \times 10^{-3}\)</td></tr><tr><td>displace parameter</td><td>20</td><td>20</td><td>10</td></tr><tr><td>lambda</td><td>4</td><td>4</td><td>2</td></tr><tr><td rowspan="2">\(\mathcal{l}_{\text{nce}}(\hat{c})\)</td><td>learning rate</td><td>\(10^{-3}\)</td><td>\(10^{-3}\)</td><td>\(10^{-3}\)</td></tr><tr><td>epochs</td><td>4</td><td>4</td><td>3</td></tr><tr><td rowspan="2">\(\mathcal{l}_{\text{nce}}(\hat{c}-c)\)</td><td>learning rate</td><td>\(10^{-3}\)</td><td>\(10^{-3}\)</td><td>\(10^{-3}\)</td></tr><tr><td>epochs</td><td>3</td><td>3</td><td>3</td></tr><tr><td rowspan="2">\(\mathcal{l}_{\text{nce}}(2\hat{c}-c)\)</td><td>learning rate</td><td>\(10^{-3}\)</td><td>\(10^{-3}\)</td><td>\(10^{-3}\)</td></tr><tr><td>epochs</td><td>2</td><td>2</td><td>4</td></tr><tr><td rowspan="2">\(\mathcal{l}_{\text{map}}(\hat{c})\)</td><td>learning rate</td><td>\(5 \times 10^{-3}\)</td><td>\(5 \times 10^{-3}\)</td><td>\(5 \times 10^{-3}1\)</td></tr><tr><td>epochs</td><td>5</td><td>5</td><td>5</td></tr><tr><td rowspan="2">\(\mathcal{l}_{\text{map}}(\hat{c}-c)\)</td><td>learning rate</td><td>\(5 \times 10^{-3}\)</td><td>\(5 \times 10^{-3}\)</td><td>\(5 \times 10^{-3}\)</td></tr><tr><td>epochs</td><td>2</td><td>5</td><td>4</td></tr><tr><td rowspan="2">\(\mathcal{l}_{\text{map}}(2\hat{c}-c)\)</td><td>learning rate</td><td>\(5 \times 10^{-3}\)</td><td>\(5 \times 10^{-3}\)</td><td>\(5 \times 10^{-3}\)</td></tr><tr><td>epochs</td><td>4</td><td>2</td><td>4</td></tr></table>
+
+table 14: choice of hyperparameters (diverse bipartite matching problem)

@@ -1,0 +1,580 @@
+# neurocard: one cardinality estimator for all tables
+
+zongheng yang
+
+uc berkeley
+
+zongheng@berkeley.edu
+
+amog kamsetty*
+
+uc berkeley
+
+amogkamsetty@berkeley.edu
+
+sifei luan*
+
+uc berkeley
+
+lsf@berkeley.edu
+
+eric liang
+
+uc berkeley
+
+ericliang@berkeley.edu
+
+yan duan
+
+xi chen
+
+covariant
+
+{rocky,peter}@covariant.ai
+
+ion stoica
+
+uc berkeley
+
+istoica@berkeley.edu
+
+# abstract
+
+query optimizers rely on accurate cardinality estimates to produce good execution plans. despite decades of research, existing cardinality estimators are inaccurate for complex queries, due to making lossy modeling assumptions and not capturing inter-table correlations. in this work, we show that it is possible to learn the correlations across all tables in a database without any independence assumptions. we present neurocard, a join cardinality estimator that builds a single neural density estimator over an entire database. leveraging join sampling and modern deep autoregressive models, neurocard makes no inter-table or inter-column independence assumptions in its probabilistic modeling. neurocard achieves orders of magnitude higher accuracy than the best prior methods (a new state-of-the-art result of  $8.5 \times$  maximum error on job-light), scales to dozens of tables, while being compact in space (several mbs) and efficient to construct or update (seconds to minutes).
+
+# pvldb reference format:
+
+zongheng yang, amog kamsetty, sifei luan, eric liang, yan duan, xi chen, and ion stoica. neurocard: one cardinality estimator for all tables. pvldb, 14(1): 61 - 73, 2021.
+
+doi:10.14778/3421424.3421432
+
+# pvldb artifact availability:
+
+the source code, data, and/or other artifacts have been made available at https://github.com/neurocard.
+
+# 1 introduction
+
+query optimizers translate queries into executable plans with the best estimated performance. they are critical not only for relational databases, but also for modern analytics engines, such as spark [1] and presto [36]. among various techniques, cardinality estimation often plays a larger role than the cost model or the plan search space in producing high-quality query plans [19]. unfortunately, cardinality estimation is a notoriously difficult problem, where the accuracy may drop exponentially as the query complexity (e.g., the number of joins) increases [21].
+
+![](images/b3ef13a99e295852126c92b05ffb12627269045fe3ec805ae57207350f01be48.jpg)  
+figure 1: neurocard uses a single probabilistic model, which learns all possible correlations among all tables in a database, to estimate join queries on any subset of tables.
+
+at a high level, there are two approaches to cardinality estimation: query-driven and data-driven. query-driven estimators typically rely on supervised learning to learn a function mapping (featurized) queries to predicted cardinalities. they implicitly assume queries from a production workload are "similar" to training queries—namely, training and test sets of queries are drawn from the same underlying distribution. this assumption can be violated when, for example, users issue unexpected types of queries.
+
+in contrast, data-driven estimators approximate the data distribution of a table—a function mapping each tuple to its probability of occurrence in the table—instead of training on “representative” queries. a simple method to approximate the data distribution is a histogram. in theory, once we estimate the distribution of each table in a schema, we can estimate the output cardinality of any query. while this approach is more general, it suffers from two drawbacks: (1) lossy modeling assumptions (e.g., assume the tables' distributions are independent), and (2) low precision (e.g., a limited number of histogram bins). fortunately, recent advances in machine learning have alleviated both drawbacks. unlike previous density estimators, deep autoregressive (ar) models [4, 6, 32, 33, 42] can learn complex high-dimensional data distributions without independence assumptions, achieving state-of-the-art results in both precision and expressiveness. this has resulted in new data-driven cardinality estimators based on deep ar models [48].
+
+however, despite their promise, deep autoregressive model-based cardinality estimators are limited to handling single tables. there are three challenges that make this approach ineffective for joins:
+
+- high training cost: to learn the distribution of a join, any data-driven estimator needs to see actual tuples from the join result. unfortunately, for all but the smallest scale, it is expensive, and sometimes infeasible, to precompute the join.  
+- lack of generality: the ar approach builds a probabilistic model for each join, e.g.,  $t = t_{1} \bowtie t_{2} \bowtie t_{3}$ , that it estimates.
+
+however, the model for  $t$  cannot be directly used to estimate a join on a subset of  $t$ , e.g.,  $t_{2} \bowtie \sigma(t_{3})$ . of course, one could train a model for every possible join. this can be prohibitive, as the number of possible joins is exponential in the number of tables.  
+- large model size: the complexity of the learned ar model grows with the cardinality of the dataset. as joins tend to involve columns with high cardinalities, an ar model built on a join may incur a prohibitively large size.
+
+in this work, we propose neurocard, a learning-based join cardinality estimator that directly learns from data to overcome these challenges. neurocard's distinctive feature is the ability to capture the correlations across multiple joins in a single deep ar model, without any independence assumptions (figure 1). once trained, this model can handle all queries issuable to the schema, regardless of what subset of tables is involved. we address the above challenges using the following key ingredients.
+
+to reduce training cost, neurocard samples from a join, instead of computing the join fully (§4). the key property of such a sample is to capture the join's distribution: if a key is more frequent in the join result, it should be more frequent in the sample as well. to meet this requirement, we precompute the correct sampling weights for each key. while the worst-case cost of computing the join is exponential in the number of tables, computing the sampling weights is done in time linear with the data size by dynamic programming.
+
+to achieve generality, neurocard needs to train a single model to answer queries on any subset of tables (§6). the basic idea behind our solution is to train the ar model on samples from the full outer join of all tables. the full join contains the values from all the base tables, so it has sufficient information to answer a query touching any subset of tables. at inference time, if a table in the schema is not present in a join query, we need to account for any potential fanout effect. consider an ar model trained on samples from the full join  $t = t_{1} \succcurlyeq t_{2}$ , and a query  $\sigma(t_{1})$  whose cardinality we want to estimate. if the join key of  $t_{2}$  is the foreign key of  $t_{1}$ , then a tuple of  $t_{1}$  may appear multiple times in  $t$ . neurocard learns the probabilities of these "duplicated" tuples and additional bookkeeping information, which enables us to account for fanouts.
+
+finally, to scale to large-cardinality columns while avoiding prohibitively large models, neurocard employs lossless column factorization (§5). an ar model stores one embedding vector per distinct value, so it could quickly blow up in size for columns with large numbers of distinct values, e.g., 100,000s or more. with factorization, a column is decomposed into several subcolumns, each taking a chunk of bits from the binary representation of the original column values. for instance, a 32-bit id column id can be decomposed into  $(\mathrm{id}_0,\dots ,\mathrm{id}_3)$  with the first subcolumn corresponding to the first 8 bits, and so on. we then train the autoregressive model on these lower-cardinality subcolumns instead of the full columns.
+
+by combining these ingredients, neurocard achieves state-of-the-art estimation accuracy, including in the challenging tail quantiles. on the popular job-light benchmark, a schema that contains 6 tables and basic filters, neurocard achieves a maximum q-error of  $8.5 \times$  using 4 mb. this corresponds to a  $4.6 \times$  improvement over the previous state of the art. we created a more difficult benchmark, job-light-ranges, with a larger variety of content columns and range filters. on this benchmark, neurocard achieves up to  $15 - 34 \times$
+
+![](images/f8d123e006a839969614739ea10748c9f354156b8411611cb87f9ea99f227ea9.jpg)  
+figure 2: overview of neurocard. the join sampler (§4) provides correct training data (sampled tuples from join) by using unbiased join counts. sampled tuples are streamed to an autoregressive model for maximum likelihood training (§3). inference algorithms (§6) use the learned distribution to estimate query cardinalities.
+
+higher accuracy than previous solutions, including deepdb [12], mscn [15], and ibjs [20]. lastly, to test neurocard's ability to handle a more complex join schema, we created job-m which has 16 tables and multi-key joins. neurocard scales well to this benchmark, offering  $10 \times$  higher accuracy than conventional approaches while maintaining a low model size (27 mb, covering 16 tables).
+
+in summary, this paper makes the following contributions:
+
+- we design and implement neurocard, the first learned data-driven cardinality estimator that learns across joins in a schema without any independence assumptions. all in-schema correlations among the tables are captured by a single autoregressive model, which can estimate any query on any subset of tables.  
+- neurocard learns the correct distribution of a join without actually computing that join. instead, the model is trained on uniform and independent samples of the join of all tables in a schema.  
+- we propose lossless column factorization (§5), a technique that significantly reduces the size of the autoregressive model, making its use practical for high-cardinality columns.  
+- compared to the best prior methods, neurocard significantly improves the state-of-the-art accuracy on the job-light benchmark. we further propose two new benchmarks, job-light-ranges and job-m, and show that both are much more challenging and thus better gauges of estimator quality (§7).
+
+to invite further research, neurocard and the benchmarks used in this paper are open source at https://github.com/neurocard.
+
+# 2 overview of neurocard
+
+consider a set of tables,  $t_{1}, \ldots, t_{n}$ . we define their join schema as the graph of join relationships, where vertices are tables, and each edge connects two joinable tables. a query is a subgraph of the overall schema. if a query joins a table multiple times, our framework duplicates that table in the schema. we assume the schema and queries submitted to the estimator are acyclic (\$4.2 discusses relaxations), so they can be viewed as trees.
+
+next, we present an overview of neurocard as a sequence of goals and solutions to achieve these goals.
+
+# 2.1 goals and solutions
+
+goal: a single estimator. our goal is building a single cardinality estimator for the entire join schema. for example, assuming the schema has three tables, the estimator should handle joins on any subset of tables, e.g.,  $\sigma(t_2)$ ,  $t_1 \bowtie t_3$ , or  $t_1 \bowtie t_2 \bowtie \sigma(t_3)$ .
+
+having a single estimator has two key benefits: simplicity and accuracy. having multiple estimators—each covering a specific join template (a table subset)—does not scale for a large number of tables, as the number of possible join templates increases exponentially. in addition, it is easier for a dbms to operationalize a single estimator rather than many estimators. most importantly, having multiple estimators can hurt accuracy. this is because estimating the cardinality of a query on a table subset not covered by any single estimator, but by multiple estimators, requires some form of independence assumption to combine these estimators. if the independence assumption does not hold, the accuracy will suffer.
+
+solution: we build a single cardinality estimator that learns the distribution of the full outer join of all tables in the schema (henceforth, full join). for example, for a three-table schema, we learn  $p(t_1 \succ t_2 \succ t_3)$ . note that using the inner join instead of the full join would not work. indeed, the inner join  $t_1 \succ t_2 \succ t_3$  is the intersection of the three tables. if a query uses only  $t_1$  or  $t_1 \succ t_3$ , their tuples may not be fully contained in this intersection, and thus the estimator would have insufficient information to answer these queries.
+
+goal: efficient sampling of the full join. a data-driven estimator learns a distribution by reading representative tuples from that distribution. to learn the distribution of the full join, a straightforward approach is to compute it and then uniformly draw random samples from the result. unfortunately, even on a small 6-table schema (the job-light workload), the full join contains two trillion  $(2 \cdot 10^{12})$  tuples, making it infeasible to compute in practice.
+
+solution: we perform uniform sampling over the full join without materializing it. specifically, we ensure that any tuple in the full join  $j$  (a multiset) is sampled with same probability,  $1 / |j|$ . to achieve this, we leverage a state-of-the-art join sampling algorithm [50] (§4). we first precompute join count tables that map each table's join keys to their correct sampling weights with respect to the full join. then, we sample the keys using these counts as weights. given a sampled key, we construct the full tuple by looking up the remaining columns via indexes from all tables, and then concatenating them. this way, we only need to materialize the join counts as opposed to the full join. using dynamic programming, computing the join counts takes time linear in the size of the database, and is quite fast in practice (e.g., 13 seconds for 6 tables in job-light, and 4 minutes for 16 tables in job-m).
+
+goal: support any subset of tables. although the full outer join contains all information of the tables, we need to take care when a query involves just a subset of the tables. consider:
+
+$$
+\begin{array}{l} t _ {1}. \mathrm {i d}: [ 1, 2 ] \quad t _ {2}. \mathrm {i d}: [ 1, 1 ] \longrightarrow t _ {1} \rtimes <   t _ {2}: \left[ (1, 1), (1, 1), (2, \emptyset) \right] \\ \text {q u e r y :} \quad \sigma_ {\mathrm {i d} = 1} (t _ {1}) \\ \end{array}
+$$
+
+the correct selectivity is  $\frac{1}{2}$  (1 row). however, in the full join distribution,  $p(t_{1}. \mathrm{id} = 1) = \frac{2}{3}$  (2 rows). this is because we have not accounted for the fanout produced by the missing table,  $t_{2}$ .
+
+solution: handle schema subsetting: if a query does not include a table, we downscale the estimate by the fanout introduced by that table. in essence, since the learned probability space is the full join, we must downscale appropriately when a query touches a subset and expects the returned selectivity to refer to that subset.
+
+goal: accurate density estimation. the final ingredient to achieve our goal is an accurate and compact density estimator.
+
+solution: we leverage deep autoregressive (ar) models to implement our density estimator. this family of neural density estimators have been successfully employed on high-dimensional data types such as image [33], audio [42], and text [32]. recently, naru [48] has leveraged deep ar models to achieve state-of-the-art accuracy results on estimating the cardinalities of single-table queries, while learning the correlations among all columns without independence assumptions. we apply naru to learn the distribution of the full join, and optimize its construction and inference for our setting.
+
+# 2.2 putting it all together
+
+figure 2 shows the high-level architecture of neurocard.
+
+building the estimator consists of two stages. first, we prepare the join sampler by building or loading existing single-table indexes on join keys and computing the join count tables for the specified join schema (§4). second, we train the deep ar model by repeatedly requesting batches of sampled tuples from the sampler, usually 2k tuples at a time. the sampler fulfills this request in the background, potentially using multiple sampling threads.
+
+once the estimator is built, it is ready to compute the cardinality estimates for given queries. for each query, we use probabilistic inference algorithms (§6) to compute the cardinality estimate by (1) performing monte carlo integration on the learned ar model, and (2) handling schema subsetsetting. a single estimator can handle queries joining any subset of tables, with arbitrary range selections.
+
+# 3 constructing neurocard
+
+in this section, we present the background of the techniques used to implement neurocard.
+
+# 3.1 probabilistic modeling of tables
+
+consider a table  $t$  with column domains  $\{a_1, \dots, a_n\}$ . this table induces a discrete joint data distribution, defined as the probability of occurrence of each tuple  $(f(\cdot)$  denotes number of occurrences):
+
+$$
+p \left(a _ {1}, \dots , a _ {n}\right) = f \left(a _ {1}, \dots , a _ {n}\right) / | t |.
+$$
+
+the  $n$ -dimensional data distribution (the joint)  $p(\cdot)$  allows us to compute a query's cardinality as follows. define a query  $q$  as  $\sigma: a_1 \times \dots \times a_n \to \{0, 1\}$ . then, the selectivity—the fraction of records that satisfy the query—can be computed as a probability:  $p(q) = \sum_{a_1 \in a_1} \dots \sum_{a_n \in a_n} \sigma(a_1, \ldots, a_n) \cdot p(a_1, \ldots, a_n)$ . the cardinality is obtained by multiplying it with the row count:  $|q| = p(q) \cdot |t|$ .
+
+data-driven cardinality estimators can be grouped along two axes: (1) joint factorization, and (2) the density estimator used.
+
+joint factorization, or the modeling assumption, determines how precisely data distribution  $p$  is factored. any modeling assumption risks losing information about correlations across columns, which ultimately leads to a loss in accuracy. for example, the widely used id histogram technique assumes the columns are independent. as a result, it factors  $p$  into a set 1d marginals,  $p \approx \prod_{i=1}^{n} p(a_i)$ , which can lead to large inaccuracies when the columns' values are strongly correlated. similarly, other data-driven cardinality estimators such as graphical models [3, 7, 8, 40, 41] either assume conditional independence or partial independence among columns. one exception is the autoregressive (product-rule) factorization,
+
+$$
+p = \prod_ {i = 1} ^ {n} p \left(a _ {i} \mid a _ {<   i}\right), \tag {1}
+$$
+
+which precisely expresses the overall joint distribution as the product of the  $n$  conditional distributions.
+
+the density estimator determines how precisely the aforementioned factors are actually approximated. the most accurate "estimator" would be recording these factors exactly in a hash table. unfortunately, this leads to enormous construction and inference costs (e.g., in the case of  $p(a_{n}|a_{1:n - 1})$ ). at the other end, the 1d histogram has low costs, but this comes at the expense of low precision, as it makes no distinction between the values falling in the same bin. over the years, a plethora of solutions have been proposed, including kernel density estimators and bayesian networks. recently, deep autoregressive (ar) models [4, 32, 33] have emerged as the density estimator of choice. deep ar models compute  $\{p(a_i|a_{< i})\}$  without explicitly materializing them by learning the  $n$  conditional distributions in compact neural networks. deep ar models achieve state-of-the-art precision, and, for the first time, provide a tractable solution for implementing the autoregressive factorization.
+
+# 3.2 naru: deep autoregressive models as cardinality estimators
+
+neurocard builds on naru, a state-of-the-art cardinality estimator that fully captures the correlations among all columns of a single table using a deep ar model. next, we present an overview of naru and discuss how neurocard leverages it.
+
+**construction.** given table  $t$ , an ar model  $\theta$  takes a tuple  $\pmb{x} \in t$  as input, and predicts conditional probability distributions,  $\{p_{\theta}(x_i | \pmb{x}_{<i})\}$ , each of which is an 1d distribution over the  $i$ -th column (conditioned on all prior column values of  $\pmb{x}$ ). the likelihood of the input tuple is then predicted as  $p_{\theta}(\pmb{x}) = \prod_{i=1}^{n} p_{\theta}(x_i = \pmb{x}_i | \pmb{x}_{<i})$ . any deep ar architecture can instantiate this framework, e.g., resmade [4] or transformer [43]. training aims to approximate the data distribution  $p$  using  $p_{\theta}$ , by minimizing the kl divergence [26],  $d_{kl}(p | p_{\theta})$ . this is achieved by maximum likelihood estimation (mle) and gradient ascent to maximize the predicted (log-)likelihood of data:
+
+$$
+\text {s a m p l e} \quad x \sim p \tag {2}
+$$
+
+take gradient steps to maximize  $\log p_{\theta}(\pmb {x})$  (3)
+
+in our setting, we define  $t$  as the full outer join of all tables within a schema. consequently, the deep ar model learns the correlations across all tables. next, we need to sample tuples with probabilities prescribed by  $p$ . otherwise,  $p_{\theta}$  would approximate an incorrect,
+
+![](images/acdf5bc41b9d3ed4ab78cff6b9f4203d7cc76cdae03350a4ab2424be6ed82a78.jpg)  
+figure 3: default architecture of the autoregressive model.
+
+biased distribution. to achieve this, we use a sampler that emits simple random samples from the full join  $t$  (§4).
+
+estimating query cardinalities. once constructed, the naru estimator estimates the cardinality of a given query. a query is represented as a hyper-rectangle: each column  $x_{i}$  with domain  $a_{i}$  is constrained to take on values in a valid region  $r_{i} \subseteq a_{i}$ :
+
+$$
+\text {q u e r y :} \quad \wedge \left\{x _ {i} \in r _ {i} \right\} \tag {4}
+$$
+
+next, naru estimates the probability of the query (an event) using a monte carlo integration algorithm, progressive sampling:
+
+$$
+\text {p r o g r e s s i v e s a m p l i n g} \left(\left\{x _ {i} \in r _ {i} \right\}\right): \quad p _ {\theta} \left(\wedge \left\{x _ {i} \in r _ {i} \right\}\right) \cdot | t | \tag {5}
+$$
+
+it works by drawing imaginary, in-region tuples from the model's learned distributions. specifically, it draws the first dimension of the sample as  $x_{1} \sim p_{\theta}(x_{1}|x_{1} \in r_{1})$ , the second dimension of the sample as  $x_{2} \sim p_{\theta}(x_{2}|x_{2} \in r_{2}; x_{1})$ , and so on. the likelihoods of the samples are importance-weighted. this procedure also efficiently supports omitted columns, i.e., wildcards of the form  $x_{i} \in *$ .
+
+neurocard's inference invokes progressive sampling to estimate cardinalities, but extends it in two ways. first, we apply the column factorization optimization (§5), which potentially changes a  $x_{i + i}$ 's valid region,  $r_{i + 1}$ , based on the value drawn from  $x_{i}$ . second, we add support for schema subsetsetting (§6), by downscaling selectivity  $p_{\theta}(\wedge \{x_i \in r_i\})$  by the corresponding fanout.
+
+# 3.3 join problem formulation
+
+a join schema induces the full outer join of all tables in the schema,  $t = t_{1} \triangleright \dots \triangleright t_{n}$ . our goal is to build a fully autoregressive probabilistic model on the full join consisting of all tables' columns:
+
+$$
+\text {m o d e l :} \quad p _ {\theta} (t) \equiv p _ {\theta} \left(t _ {1}. \operatorname {c o l} _ {1}, t _ {1}. \operatorname {c o l} _ {2}, \dots , t _ {n}. \operatorname {c o l} _ {k}\right) \tag {6}
+$$
+
+we can then use the probabilistic model to estimate the cardinalities of join queries on any subset of tables in the schema.
+
+supported joins. neurocard supports acyclic join schemas and queries containing multi-way, multi-key equi-joins (§4.2 discusses how to relax the acyclic requirement). the schema should capture the most common joins. for joins not captured in the schema, their cardinalities can be estimated by first obtaining single-table estimates using neurocard, then combining the estimates using classical heuristics [21]. this allows uncommon cases to be handled under the same framework, albeit at the cost of lower accuracy.
+
+supported filters. neurocard supports equality and range filters on discrete or numerical columns. these include arithmetic comparison operators  $(<, >, \leq, \geq, =)$  and in. more complex filters can also be expressed using the valid region encoding, mentioned in the previous section. arbitrary forms of and/or can be handled via the inclusion-exclusion principle.
+
+# 3.4 model architecture
+
+neurocard uses a standard ar architecture, resmade [4], which is also employed by naru; see figure 3. input tuples are represented as discrete, dictionary-encoded ids,  $(x_{1},\ldots ,x_{n})$ , and embedded by per-column embedding matrices. the concatenated embedded vector is fed to a series of residual blocks, each consisting of two masked linear layers (they are masked to ensure the autoregressive property). the output layer produces logits  $\{\log p_{\theta}(x_i|x_{< i})\}$  by dotting the last layer's output with the embedding matrices. next, we compute a cross-entropy loss on the logits and perform backpropagation. we turn on naru's wildcard skipping optimization, which randomly masks inputs to train special marginalization tokens that aid infer-time estimation (i.e., using these tokens to skip sampling any wildcards in a query).
+
+masked multi-layer perceptrons such as resmade strike a good balance between efficiency and accuracy. neurocard can use any advanced ar architectures, if desired. in §7, we also instantiate neurocard with an advanced architecture (the transformer [43]).
+
+# 4 sampling from joins
+
+a key challenge in neurocard is computing an unbiased sample of the full join (§2.1) to ensure that the learned distribution faithfully approximates the full join distribution. namely, every tuple in the full join  $j$  (a multiset) must be sampled equally likely with probability  $1 / |j|$ . the samples should also be i.i.d., as required by equation 2. neurocard meets these requirements by using a sampler that produces simple random samples with replacement.
+
+# 4.1 algorithm
+
+a tuple in the full join contains join key columns and content columns. our sampler exploits this decomposition. the first step of the sampler is to precompute join count tables, which are per-table statistics that reflect the occurrence counts of the join keys in the full join. the sampler then samples the join keys, table-by-table, with occurrence probabilities proportional to their join counts. lastly, it selects content columns from the base tables by looking up the drawn join keys. this completes a batch of sample, which is sent to the model for training, and the procedure repeats on demand.
+
+computing join counts. zhao et al. [50] provide an efficient algorithmic framework of join sampling that produces simple random samples from general multi-key joins. neurocard implements the exact weight algorithm from zhao et al., adapted to full outer joins.
+
+we illustrate the algorithm on a join schema (a tree) consisting of tables  $t_{1}, \ldots, t_{n}$ . for exposition, assume they only involve join keys (content columns are gathered later). let  $t_{1}$  be the root table. the join count of a tuple  $t \in t_{i}$  is the total number of tuples in the full outer join of all of  $t_{i}$ 's descendants that joins with  $t$ . it is recursively defined as:
+
+$$
+w _ {i} (t) = \prod_ {t _ {j} \in \text {c h i l d r e n} \left(t _ {i}\right)} \sum_ {t ^ {\prime} \in t \prec t _ {j}} w _ {j} \left(t ^ {\prime}\right) \quad \forall i, \forall t \in t _ {i} \tag {7}
+$$
+
+where  $t \rtimes t_j$  denotes all tuples in  $t_j$  that join with  $t$ . for a leaf table with no descendants,  $w_i(\cdot)$  is defined as 1. at the root table  $t_1$ ,  $w_1(t)$  represents the count of all  $t \in t_1$  in the entire full outer join. the join counts of each table are computed by aggregating over the join counts of all of its child tables, and can thus be computed
+
+recursively in a bottom-up fashion. using dynamic programming, the time complexity is linear in the number of tuples in all tables,  $o(|t_1| + \dots + |t_n|)$ .
+
+sampling. once the join counts are computed, the sampler produces a sample by traversing the join tree in a top-down fashion. it starts by drawing a sample  $t_1$  from the root table  $t_1$  using weights  $\{w_1(t):t\in t_1\}$  (i.e., with probabilities  $\{w_{1}(t) / \sum_{t^{\prime}\in t_{1}}w_{1}(t^{\prime})\}$ ). it then samples through all descendants of  $t_1$  in the breadth-first order. at a child table, say  $t_2$ , it samples  $t_2$  from  $t_1\rtimes t_2$  (all tuples in  $t_2$  that join with  $t_1$ ) using weights  $\{w_{2}(t):t\in t_{1}\rtimes t_{2}\}$ . the procedure continues recursively until all tables are visited, and thus produces a sample  $(t_{1},\dots ,t_{n})$ , each  $t_i$  being a tuple of join keys from the respective table.
+
+example. consider the schema in figure 4a. figure 4b shows the computed join counts. the leaf table  $c$  has a count of 1 for every tuple. in  $b$ , since  $(2, c)$  can join with two tuples in  $c$ , its join count is  $2 = 1 + 1$ . similar propagation happens for  $a.x = 2$  which gets a count of  $3 = 1 + 2$ . physically, we store the join counts indexed by join keys (e.g., for  $c$ , only one mapping  $c \rightarrow 1$  is kept). for sampling, suppose  $a.x = 2$  is first sampled. it has two matches in  $b$  with weights 1 and 2, so the second match,  $(2, c)$ , has an inclusion probability of  $2/3$ .
+
+null handling. to support full outer joins, we handle null keys as follows. we add a virtual  $\varnothing$  tuple (which denotes null) to each table  $t_{i}$ , and make it join with all normal  $t\in t_j$  that have no matches in  $t_{i}$ , where  $t_{j}\in \mathrm{children}(t_{i})$ . similarly, any normal  $t\in \mathrm{parent}(t_i)$  that has no match in  $t_{i}$  joins with  $t_{i}$ 's  $\varnothing$ . all-null is invalid. propagation proceeds as before; figure 4b shows examples.
+
+constructing complete sample tuples. in the prior example, suppose  $\langle 2; 2, c; c \rangle$  is drawn. we gather the content columns of  $a$  by looking up  $a.x = 2$  and similarly for  $(b.x, b.y) = (2, c)^2$  and  $c.y = c$ . on multiple matches, we pick a row uniformly at random. their concatenation represents a sampled tuple from the full join.
+
+computing the size of the full join (normalizing constant). recall from §3.2 that the row count  $|j|$  (the normalizing constant in probabilistic terms) is required to convert selectivities into cardinalities. with join counts it can be computed exactly:  $|j| = \sum_{t \in t_1} w_1(t)$ .
+
+parallel sampling. finally, the sampling procedure is embarrassingly parallel: after the join count tables  $\{w_{i}(\cdot)\}$  are produced, parallel threads can be launched to read the join counts and produce samples. computation of the join count tables is also parallelizable, although it is an one-time effort. sampling correctness is preserved even in the presence of parallelism due to the i.i.d. property.
+
+# 4.2 comparison with other samplers
+
+our key requirements of uniform and i.i.d. samples from the full join render many related sampling algorithms unsuitable. if either property is not satisfied, the sampling distribution would be biased and thus compromise the quality of the learned ar model. as examples, index-based join sampling (ibjs) [20] is neither uniform nor independent; wander join [22] produces independent but non-uniform samples. both approaches do produce unbiased
+
+![](images/c67d54b398ef5cd3977b2a9c836b19df4ec79af3ffb0d9e56ee8733819bc11af.jpg)  
+(a) schema and base tables
+
+![](images/371d7f09a59e2d21d886696f5878f0e8c5bf2c6b8d073c175fb9685f3dfec02b.jpg)  
+(b) join counts
+
+(c) full outer join, with virtual columns in blue  
+(d) schema resetting  
+![](images/10ea8735240f5929749d611545b17ba24478a5c0f0e7725cd9d71c5aa3edc13b.jpg)  
+-- in full join,  $|\mathbf{a}.\mathbf{x} = 2| = 3$ .  
+-- q1. true answer is 2.  
+select count  $(\star)$  
+from a join b on x  
+join c on y  
+where  $a.x = 2$  
+-- q2. true answer is 1.  
+select count( \*)  
+from a where  $\mathrm{a}.\mathrm{x} = 2$
+
+![](images/82a7e01ac650578d0212a487f0daecd75f60fd587600b2eb627ae2f9c8bb3dfb.jpg)  
+figure 4: end-to-end example. (a) a join schema of three tables and their join key columns. content columns are omitted. (b) join counts (blue) enable uniform sampling of the full outer join and are computed in linear time by dynamic programming. here, edges connect join partners. (c) learning target: the full outer join of the schema, with virtual columns in blue. we show the fanouts  $\mathcal{f}$ , the number of times a join key value appears in the corresponding base table, for keys  $b.x$  and  $c.y$ . the fanouts for  $a.x$  and  $b.y$  are all 1 and omitted. each indicator  $\mathbb{1}_t$  denotes whether a tuple has a match in table  $t$ . (d) examples of schema subsetsetting, i.e., queries that touch a subset of the full join ( $\s 6$ ).  
+figure 5: lossless column factorization (§5).
+
+estimators for counts or other aggregate statistics, but are not designed to return uniform join samples. reservoir sampling, a well-known technique, draws samples without replacement (thus, non-independent) and requires a full scan over the full join, which is not scalable. lastly, the exact weight algorithm neurocard implements is among the most efficient in zhao et al. [50]. they provide additional extensions to support general, potentially cyclic joins (e.g., a cycle can be broken), which neurocard can leverage to broaden our formulation (§3.3).
+
+# 5 lossless column factorization
+
+a key challenge of using an autoregressive model for high-cardinality data is that the size of the model parameters can scale linearly with the numbers of distinct values in the columns. in the model architecture we use (§3.4), each column (any data type; categorical or numerical) is first dictionary-encoded into integer token ids. then a per-column embedding layer is applied on these token ids. the size of the trainable embedding matrix (essentially, a hash table) for each column  $c$  scales linearly with  $|c|$ , i.e., the number of distinct values in the domain. even a moderately sized column with up to  $10^6$  distinct values, therefore, easily takes up 128 mb of space, assuming 32-dimensional embeddings are used.
+
+to handle high-cardinality columns efficiently, we propose an optimization that we call lossless column factorization. this optimization is inspired by the popular use of "subword units" [35] in modern natural language processing, and also shares characteristics with "bit slicing" in the indexing literature [28]. different from subword units, column factorization does not use a statistical algorithm such as byte pair encoding to determine what subwords to use (a potential optimization). different from bit slicing, we slice a value into groups of bits and convert them back into base-10 integers.
+
+figure 5 illustrates the idea on a simple example. suppose a column (any datatype) has a domain size of  $|c| = 10^6$ . naively supporting this column would require allocating  $|c| \cdot h$  floats as
+
+its embedding matrix, where  $h$  is the embedding dimension. instead, neurocard factorizes each value on-the-fly during training: we convert an original-space value into its binary representation, then slice off every  $n$  bits, the factorization bits hyperparameter. each sliced off portion becomes a subcolumn, now in base-10 integer representation. these subcolumns are now treated as regular columns to learn over by the autoregressive model. crucially, a much smaller embedding matrix is now needed for each subcolumn containing at most  $2^{n} \cdot h$  floats. in this example, we can reduce 128 mb to 250 kb—a more than  $500 \times$  space reduction.
+
+model size vs. statistical efficiency. choosing the factorization bits  $n$  enables a tradeoff between model size vs. statistical efficiency. by decreasing  $n$ , we have more subcolumns, each with a smaller domain, but learning across more variables becomes harder. in theory, by using autoregressive modeling no information is lost in this translation, so the precision of the learned distributions is not affected. in practice, we observed that lower factorization bits, i.e., slicing into more subcolumns, generally underperform higher ones that use more space, but not by a significant margin (§7.5). we thus set the factorization bits  $n$  based on a space usage budget.
+
+lossless = factorization + autoregressive modeling. with factorization, a column is factorized into multiple subcolumns, which are then fed into a downstream density estimator. however, if a density estimator with independence assumptions, e.g., 1d histograms, is used, then this whole process is lossy. by modeling  $p(\mathrm{subcol}_1, \mathrm{subcol}_2) \approx p(\mathrm{subcol}_1)p(\mathrm{subcol}_2)$ , histograms would fail to capture any potential correlation between the two subcolumns. in other words, other estimators could read in subcolumn values and potentially reduce space usage, but their inherent quality and assumptions determine how much information is learned about the subcolumns, and about their correlations with other columns. by using autoregressive modeling, neurocard forces the ar model to explicitly capture such correlation, namely (ignoring other columns):
+
+$$
+p (\text {c o l}) \equiv p (\text {s u b c o l} _ {1}, \text {s u b c o l} _ {2}) = p (\text {s u b c o l} _ {1}) p (\text {s u b c o l} _ {2} | \text {s u b c o l} _ {1}),
+$$
+
+which has no inherent loss of information. hence, we call the unique combination of factorization and autoregressive modeling lossless.
+
+filters on subcolumns. during probabilistic inference, a filter on an original column needs to be translated into equivalent filters on subcolumns. recall from §3.2 that the probabilistic inference procedure draws samples that lie inside the queried region. we
+
+modify that procedure to handle subcolumns by respecting each filter's semantics. going back to our example, consider the filter  $\mathrm{col} < 1,000,000$ . the filter for the high-bits  $\mathrm{subcol}_1$  is relaxed to  $\leq 976$  (note the less-equal). the inference procedure would draw a  $\mathrm{subcol}_1$  value in this range, based on which the low-bits filter is relaxed appropriately. if the drawn  $\mathrm{subcol}_1$  is 976, then the filter on  $\mathrm{subcol}_2$  is set to “< 576”; otherwise, the high-bits already satisfy the original filter so a wildcard is placed on the low-bits subcolumn. this is reminiscent of processing range predicates on bit-sliced indexes [28]; neurocard applies these processing logic in the new context of probabilistic inference for autoregressive models.
+
+# 6 querying neurocard
+
+once built, the autoregressive model summarizes the entire full outer join. the challenge with querying this probabilistic model for a selectivity estimate is that the query may restrict the space it touches to a subset of the full join—a phenomenon we term schema subsetsetting. since the selectivity estimate returned by the model assumes the probability space to be the full outer join, rather than the query-specific restricted space, the estimate should be downscaled appropriately during probabilistic inference.
+
+neurocard's inference algorithms combine two building blocks. first, naru [48] introduced progressive sampling, a monte carlo algorithm that integrates over an autoregressive model to produce selectivity estimates. we invoke this routine (i.e., equation 5) on the trained autoregressive model with changes outlined in this section. second, hilprecht et al. [12] have proposed inference algorithms to query a sum-product network trained on a full outer join. we state their algorithms below and discuss how to adapt these algorithms into our framework, thereby generalizing them to a new type of probabilistic model.
+
+basic case: no table omitted. the simplest case of schema sub-setting is an inner join query on all tables. consider the example data in figure 4a and an inner join query q1 in figure 4d. the query,  $\sigma_{a.x = 2}(a\bowtie_xb\bowtie_yc)$ , restricts the probability space from the full join to the inner join. naively querying the model for  $|a.x = 2|$  would return a cardinality of  $|j|\cdot (3 / 5) = 3$  rows, as 3 out of 5 rows in the full join  $j$  (figure 4c) satisfy the filter. however, the correct row count for this query is 2 (two rows in the inner join; both pass the filter). left/right outer joins can also exhibit this behavior.
+
+to correct for this, hilprecht et al. propose a simple solution by adding an indicator column per table into the full join. a binary column  $\mathbb{1}_t$  is added for each table  $t$ , with value 1 if a tuple (in the full join) has a non-trivial join partner with table  $t$ , and 0 otherwise.
+
+neurocard adopts this solution as follows. first, during training, the sampler is tasked with appending these virtual indicator columns on-the-fly to sampled tuples. recall that each sampled tuple is formed by querying base-table indexes with sampled join keys. if a table  $t$  contains a join key, we set that sampled tuple's  $\mathbb{1}_t$  to 1, and 0 otherwise (see figure 4c). the autoregressive model treats these indicator columns as regular columns to be learned.
+
+second, during inference, neurocard adds equality constraints on the indicator columns, based on what tables are present in the query. the progressive sampling routine (equation 5) not only gets the usual filter conditions,  $\{x_{i}\in r_{i}\}$ , but also  $\{\mathbb{1}_t = 1\}$  for any
+
+table  $t$  that appears in the inner-join query graph<sup>3</sup>. in summary, for the no-omission case, the routine now estimates the probability:
+
+$$
+p \left(\left\{x _ {i} \in r _ {i} \right\} \wedge \left\{\mathbb {1} _ {t} = 1: \text {f o r a l l t a b l e} t \right\}\right) \tag {8}
+$$
+
+example. coming back to the example query q1,  $\sigma_{a.x = 2}(a\rtimes_x b\rtimes_y c)$ , we compute the selectivity under the full join as  $p(a.x = 2\land \mathbb{1}_a = \mathbb{1}_b = \mathbb{1}_c = 1)$ . reading from figure 4c, this probability is  $2 / 5$ , so the cardinality is correctly computed as  $5\cdot (2 / 5) = 2$  rows.
+
+omitting tables and fanout scaling. the less straightforward case is if a query omits, i.e., does not join, certain tables. consider q2 in figure 4d:  $\sigma_{a.x = 2}(a)$ . when restricting the scope to table  $a$ , the row count of  $a.x = 2$  is 1, different from  $|j|\cdot p(a.x = 2\wedge \mathbb{1}_a = 1) = 3$  rows. the fundamental reason this happens is because the operation of a full join has fanned out tuples from base tables. to correctly downscale, hilprecht et al. propose recording a per-join fanout column. we adapt this solution in neurocard<sup>4</sup>.
+
+specifically, for each join key column  $t.k$ , we insert into the full join a virtual fanout column,  $\mathcal{f}_{t.k}$ , defined as the number of times each value appears in  $t.k$ . for example, 2 appears twice in  $b.x$ , so its fanout is  $\mathcal{f}_{b.x}(2) = 2$ ; see figures 4a and 4c. again, we task the join sampler with adding these fanout values on-the-fly to each batch of sampled tuples. the inclusion of fanouts is piggybacked onto the index lookup path (querying the size of each lookup result list), which adds negligible overheads.
+
+on the inference side, hilprecht et al. showed that the correct cardinality with omitted tables can be computed via fanout scaling:
+
+cardinality(query  $q) = |j|\cdot p(\{x_i\in r_i\}$  subsetted to query q
+
+$$
+= | j | \cdot \underset {x \sim j} {\mathbb {e}} \left[ \frac {\mathbb {1} _ {\{x _ {i} \in r _ {i} \}} \cdot \prod_ {t \in q} \mathbb {1} _ {t}}{\prod_ {r \notin q} \mathcal {f} _ {r , \text {k e y}}} \right]. \tag {9}
+$$
+
+in essence, the numerator handles the basic case above, while the denominator counts the total number of times omitted tables  $\{r\notin q\}$  have fanned out each tuple in query  $q$ . it loops through each omitted table  $r$ , finds its unique join key  $r.\mathrm{key}$  that connects to  $q$  in the schema (discussed in detail below), and looks up the associated fanout value  $\mathcal{f}_{r.\mathrm{key}}$ . we incorporate this scaling as follows. since the fanout columns are learned by the model, we modify progressive sampling to draw a concrete value for each relevant  $\mathcal{f}_{r.\mathrm{key}}$  per progressive sample, compute the product of these fanouts, and divide the progressive sample's estimated likelihood by this product.
+
+example. coming back to  $\mathbb{q}2$ ,  $\sigma_{a.x = 2}(a)$ , the constraints are  $\{a.x = 2, \mathbb{1}_a = 1\}$ . reading from figure 4c, three rows satisfy the constraints and the relevant downscaling keys are  $b.x$  and  $c.y$ . thus the expectation expands as:  $\frac{1}{5} \cdot \left( \frac{1}{2 \cdot 1} + \frac{1}{2 \cdot 2} + \frac{1}{2 \cdot 2} \right) = \frac{1}{5}$ . multiplying with  $|j| = 5$  arrives at the correct cardinality of 1 row.
+
+handling fanout scaling for multi-key joins. our formulation of fanout scaling supports multi-key joins, e.g., both  $x$  and  $y$  keys in the example schema  $a.x = b.x \land b.y = c.y$  (figure 4a). the challenge of fanout scaling in this case is determining the set of omitted keys to downscale. let  $v$  be the set of all tables. let  $q$  be
+
+![](images/aae3a2b42cbaa0bc40960fd38d2692e539fb9bd745e5251ccf8603caeea5f329.jpg)  
+figure 6: distribution of query selectivity (§7.1).
+
+the set of tables joined in a query, and the complement  $o = v \setminus q$  the omitted tables. pick any table  $t \in q$ . there exists a unique path from each omitted  $t_o \in o$  to  $t$ , because the join schema graph is a tree (acyclic, connected). the join key attached to the edge incident to  $t_o$  on this path is the unique join key for table  $t_o$  to downscale. hence, the fanout downscaling factor in equation 9 is well-defined.
+
+going back to example q2 where only  $a$  is queried, when considering the omitted table  $b$  which has two join keys  $(b.x, b.y)$ , we see that  $b.x$  is the unique fanout key since it lies on the path  $a \longleftrightarrow b$ .
+
+summary of schema subsetting. to recap, neurocard's probabilistic inference leverages the progressive sampling algorithm from naru and the idea of additional columns from hilprecht et al. that we term virtual columns. our join sampler is modified to logically insert into the full join two types of virtual columns, the indicators and the fanouts. both are treated as regular columns to be learned over by the density model, and both are used during progressive sampling to handle various cases of schema subsetting.
+
+ordering virtual columns in the autoregressive factorization. the autoregressive model requires some fixed ordering of columns in its factorization (§3.2). naru has shown that different orderings may have different performance in the tail error but not in the lower error quantiles. we adopt the same practice as naru in using an arbitrary ordering for the content columns. for the virtual columns introduced above, we place them after all the content columns, with indicators before fanouts. the intuition here is to ensure that (1) the conditional distributions involving content columns do not get confused by the presence of virtual columns, and (2) when sampling fanouts, placing them at the end allows for prediction using a maximum amount of prior information.
+
+in our early benchmarks this choice performed better than if virtual columns were placed early in the ordering. we also experimented with multi-order training [6] in the autoregressive model, but did not see noticeably better performance. thus, we opt for a simple treatment and leave such optimizations to future work.
+
+# 7 evaluation
+
+we evaluate neurocard on accuracy and efficiency and compare it with state-of-the-art cardinality estimators. the key takeaways are:
+
+- neurocard outperforms the best prior methods by  $4 - 34 \times$  in accuracy (§7.3). on the popular job-light benchmark, neurocard achieves a maximum error of  $8.5 \times$  using 4 mb.  
+- neurocard scales well to more complex queries (§7.3). on the two new benchmarks job-light-ranges (more difficult range filters) and job-m (more tables in schema), neurocard achieves orders of magnitude higher accuracy than prior approaches.
+
+table 1: workloads used in evaluation. tables: number of base tables. rows, cols, dom.: row count, column count, and maximum column domain size of the full outer join of each schema. feature characterizes each workload's queries. rows in full join:  $2 \cdot 10^{12}; 2 \cdot 10^{12}; 10^{13}$ .  
+
+<table><tr><td>workload</td><td>tables</td><td>rows</td><td>cols</td><td>dom.</td><td>feature</td></tr><tr><td>job-light</td><td>6</td><td>2·1012</td><td>8</td><td>235k</td><td>single-key joins</td></tr><tr><td>job-light-ranges</td><td>6</td><td>2·1012</td><td>13</td><td>134k</td><td>+complex filters</td></tr><tr><td>job-m</td><td>16</td><td>1013</td><td>16</td><td>2.7m</td><td>+multi-key joins</td></tr></table>
+
+- neurocard is efficient to construct and query (§7.4). a few million tuples, learned in less than 5 minutes, suffice for it to reach best-in-class accuracy.  
+- we study the relative importance of each component of neurocard (§7.5). out of all factors, learning the correlations across all tables and performing unbiased join sampling prove the most impactful.
+
+# 7.1 experimental setup
+
+workloads (table 1). we adopt the real-world imdb dataset and schema to test cardinality estimation accuracy. prior work [19, 21] reported that correlations abound in this dataset and established it to be a good testbed for cardinality estimators. we test the following query workloads on imdb:
+
+- job-light: a 70-query benchmark used by many recent cardinality estimator proposals [12, 15, 38]. the schema contains 6 tables, title (primary), cast_info, movie_companies, movie_info, movie_keyword, movie_info_idx and is a typical star schema—every non-primary table only joins with title on title.id. the full outer join contains  $2 \cdot 10^{12}$  tuples. each query joins between 2 to 5 tables, with only equality filters except for range filters on titleproduction_year.  
+- job-light-ranges: we synthesized this second benchmark containing 1000 queries derived from job-light by enriching filter variety. we generate the 1000 queries uniformly distributed to each join graph of job-light (18 in total), as follows. for each join graph, using our sampler we draw a tuple from the inner join result. we use the non-null column values of this tuple as filter literals, and randomly place 3-6 comparison operators associated with these literals, based on whether each column can support range (draw one of  $\{\leq, \geq, =\}$ ) or equality filters (=). overall, this generator (1) follows the data distribution and guarantees non-empty results, and (2) includes more filters, in variety and in quantity, than job-light. an example 3-table query is: mc  $\bowtie$ $\sigma_{\text {info_type_id }=99}(\text { mi_idx }) \bowtie$ $\sigma_{\text {episode\_nr} \leq 4 \wedge \text { phonetic_code } \geq n612^{\prime}}(t)$ , where t.id is joined with other tables' movie_id.  
+- job-m: this last benchmark contains 16 tables in imdb and involves multiple join keys. for instance, the table movie_companies is joined not only with title on movie_id, but also with company_name on company_id, and with company_type on company_type_id, etc. we adapt the 113 job queries [19] by allowing each table to appear at most once per query and removing logical disjunctions (e.g., a.x=1 ∨ b.y=1). each query joins 2-11 tables. we use job-m to test neurocard's scalability as its full join is  $5 \times$  larger and has more dimensions than the above (see table 1).
+
+the benchmarks are available at https://github.com/neurocard.
+
+metric. we report the usual q-error distribution of each workload, where the q-error of a query is the multiplicative factor an estimated cardinality deviates from the query's true cardinality:  $\mathrm{q - error}(\mathrm{query})\coloneqq \max \left(\frac{\mathrm{card}_{\mathrm{actual}}}{\mathrm{card}_{\mathrm{estimate}}},\frac{\mathrm{card}_{\mathrm{estimate}}}{\mathrm{card}_{\mathrm{actual}}}\right)$ . both actual and estimated cardinalities are lower bounded by 1, so the minimum attainable q-error is  $1\times$ . as reported in prior work [48], reducing high-quantile errors is much more challenging than mean or median; thus, we report the quantiles  $p100,p99,p95$ , and the median. for timing experiments, we report latency/throughput using an aws ec2 vm with a nvidia v100 gpu and 32 vcpus.
+
+benchmark characteristics. figure 6 plots the distributions of selectivities of these workloads, where we calculate each query's selectivity as  $\mathrm{card}_{\mathrm{actual}} / \mathrm{card}_{\mathrm{inner}}$  (denominator is the row count of the query join graph—an inner join—without filters). the selectivity spectrums of our two benchmarks (job-light-ranges and job-m) are much wider than job-light due to higher filter variety. the median selectivity is more than  $100\times$  lower, while at the low tail the minimum selectivities are  $1000\times$  lower.
+
+# 7.2 compared approaches
+
+we compare against several prevalent families of estimators. in each family, we aim to choose a state-of-the-art representative. related work (§8) includes a more complete discussion on all families and their representative methods.
+
+supervised query-driven estimators. we use mscn [15] as a recent representative from this family. it takes in a featurized query, runs the query filters on pre-materialized samples of the base tables, then use these bitmaps as additional network inputs, and predicts a final cardinality. for job-light, we used the training queries and sample bitmaps provided in the authors' source code [16]. for job-light-ranges, due to new columns, we generated 10k new training queries—generating and executing them to obtain true cardinality labels took 3.2 hours—and used a bitmap size of 2k to match the size of other estimators in this benchmark. for job-light, we also cite the best numbers obtained by sun and li [38], termed  $e2e$ , which is a deep supervised net with more effective building blocks (e.g., pooling, lstm) than mscn.
+
+unsupervised data-driven estimators. we use deepdb [12] as a recent technique in this family. it uses a non-neural sum-product network [29] as the density estimator for each table subset chosen by correlation tests. conditional independence is assumed across subsets. in contrast, neurocard uses a neural autoregressive model to build a single learned estimator over all tables in a schema. we use two recommended configurations from deepdb: a base version that learns up to 2-table joins, and a larger version that additionally builds 3-table models. these correspond to their storage-optimized and the standard setups, respectively.
+
+we found that the deepdb source code [13] did not support range queries on categorical string columns out-of-the-box. since job-light-ranges contains such queries, we perform data and query rewriting for this baseline, by dictionary-encoding the string values into integers. reported results are with this optimization enabled.
+
+join sampling. we implement the index-based join sampling method (ibjs) [20], using 10,000 as the maximum sample size. a
+
+table 2: job-light, estimation errors. lowest errors are bolded.  
+
+<table><tr><td>estimator</td><td>size</td><td>median</td><td>95th</td><td>99th</td><td>max</td></tr><tr><td>postgres</td><td>70 kb</td><td>7.97</td><td>797</td><td>3 · 103</td><td>103</td></tr><tr><td>ibjs</td><td>-</td><td>1.48</td><td>103</td><td>103</td><td>104</td></tr><tr><td>mscn</td><td>2.7 mb</td><td>3.01</td><td>136</td><td>1 · 103</td><td>103</td></tr><tr><td>e2e (quoting [38])</td><td>n/a</td><td>3.51</td><td>139</td><td>244</td><td>272</td></tr><tr><td>deepdb</td><td>3.7 mb</td><td>1.32</td><td>4.90</td><td>33.7</td><td>72.0</td></tr><tr><td>deepdb-large</td><td>32 mb</td><td>1.19</td><td>4.66</td><td>35.0</td><td>39.5</td></tr><tr><td>neurocard</td><td>3.8 mb</td><td>1.57</td><td>5.91</td><td>8.48</td><td>8.51</td></tr></table>
+
+query's cardinality is estimated by taking a sample from the query's join graph and executing per-table filters on-the-fly.
+
+real dbms. we use postgres v12, which performs cardinality estimation using 1d histograms and heuristics to combine them.
+
+other baselines. the methods chosen above have been compared to other estimators in prior studies. naru [48] has shown that estimators based on classical density modeling (kde; bayesian networks; the maxdiff n-dimensional histogram) or random sampling significantly lag behind deep autoregressive models. deepdb [12] also shows that it significantly outperforms wavelets [2]. we therefore do not compare to these methods.
+
+neurocard. we implement neurocard on top of the naru source code [27]. we use resmade by default. for complex benchmarks we also use the transformer (§3.4), which is suffixed with -large.
+
+# 7.3 estimation accuracy
+
+7.3.1 job-light. table 2 reports each estimator's accuracy on the 70 job-light queries. overall, neurocard exhibits high accuracy across the spectrum. it sets a new state-of-the-art maximum error at  $8.5 \times$  using  $3.8\mathrm{mb}$  of parameters. this represents an  $>8 \times$  improvement over the best prior method when controlling for size.
+
+we now discuss a few observations. not surprisingly, postgres has the most inaccurate median—indicating a systematic mismatch between the approximated distribution and data—due to its use of coarse-grained density models (histograms) and heuristics. ibjs fares better at the median, but falls off sharply at tail, because samples of a practical size have a small chance to hit low-density queries in a large joint space. both mscn and e2e are deep supervised regressors which show marked improvements over prior methods. however, their median and 95th errors are quite similar and have sizable gaps from the two data-driven estimators.
+
+neurocard vs. deepdb shows interesting trends. neurocard is up to  $4 - 8\times$  better at tail (99th, max), and deepdb is slightly better at lower quantiles. neurocard is more robust at tail due to (1) a markedly better density model (neural autoregressive vs. non-neural sum-product networks that use inter-column independence assumptions), and (2) learning all possible correlations among the columns of all 6 tables, whereas deepdb assumes (conditional) independence across several table subsets. deepdb-large, being  $8.4\times$  bigger and trained on  $7.7\times$  more (54m) tuples, still trails neurocard at tail by more than  $4\times$ . neurocard slightly trails at the lower quantiles ("easy" queries with high true density) likely due to the mode-covering behavior of kl-divergence minimization [9].
+
+table 3: job-light-ranges, estimation errors. lowest errors bolded.  
+
+<table><tr><td>estimator</td><td>size</td><td>median</td><td>95th</td><td>99th</td><td>max</td></tr><tr><td>postgres</td><td>70 kb</td><td>13.8</td><td>2 · 103</td><td>2 · 104</td><td>5 · 106</td></tr><tr><td>ibjs</td><td>-</td><td>10.1</td><td>4 · 104</td><td>106</td><td>108</td></tr><tr><td>mscn</td><td>4.5 mb</td><td>4.53</td><td>397</td><td>6 · 103</td><td>2 · 104</td></tr><tr><td>deepdb</td><td>4.4 mb</td><td>3.40</td><td>537</td><td>8 · 103</td><td>2 · 105</td></tr><tr><td>deepdb-large</td><td>21 mb</td><td>2.00</td><td>91.7</td><td>2 · 103</td><td>4 · 104</td></tr><tr><td>neurocard</td><td>4.1 mb</td><td>1.87</td><td>57.1</td><td>375</td><td>8169</td></tr><tr><td>neurocard-large</td><td>21 mb</td><td>1.40</td><td>35.1</td><td>232</td><td>1029</td></tr></table>
+
+table 4: job-m, estimation errors. lowest errors are bolded.  
+
+<table><tr><td>estimator</td><td>size</td><td>median</td><td>95th</td><td>99th</td><td>max</td></tr><tr><td>postgres</td><td>120 kb</td><td>174</td><td>\( 1 \cdot 10^4 \)</td><td>\( 8 \cdot 10^4 \)</td><td>\( 1 \cdot 10^5 \)</td></tr><tr><td>ibjs</td><td>-</td><td>61.1</td><td>\( 3 \cdot 10^5 \)</td><td>\( 4 \cdot 10^6 \)</td><td>\( 4 \cdot 10^6 \)</td></tr><tr><td>neurocard</td><td>27.3 mb</td><td>2.84</td><td>404</td><td>1327</td><td>\( 2 \cdot 10^4 \)</td></tr><tr><td>neurocard-large</td><td>409 mb</td><td>1.96</td><td>26.4</td><td>304</td><td>874</td></tr></table>
+
+7.3.2 job-light-ranges. this 1000-query benchmark adds equality/range filters on more content columns, using the same join templates as job-light (which has range filters on one column only). results are shown in table 3.
+
+neurocard achieves the best accuracy across all error quantiles, and improves on the best prior methods by up to  $15 - 34\times$ . it is also the only estimator with  $< 2\times$  median and 3-digit  $99\%$  -tile errors. overall, all estimators produce less accurate cardinalities, though the drops are of varying degrees. compared with mscn, neurocard improves by  $2\times$  at median,  $7\times$  at 95th,  $15\times$  at 99th, and  $2\times$  at max. compared with deepdb, neurocard improves the four quantiles by  $2\times$ ,  $9\times$ ,  $21\times$ , and  $23\times$ , respectively. comparing the enlarged versions of the two estimators (simplified with -large), the accuracy gains become  $1.4\times$ ,  $2.6\times$ ,  $9.6\times$  and  $34\times$ , respectively.
+
+neurocard's improvements over baselines significantly widen in this benchmark, due to prior approaches failing to capture the more complex inter-column correlations being tested.
+
+7.3.3 job-m. this final benchmark tests neurocard's ability to scale to a much larger and more complex join schema. different from the job-light schema, job-m contains 16 tables, with each query joining 2-11 tables on multiple join keys (in addition to movie_id only in job-light). for baselines, we only include postgres and ibjs, because mscn's query encoding does not support the complex filters in this benchmark and deepdb ran out of memory on this 16-table dataset due to high-cardinality categorical columns.
+
+results in table 4 show that neurocard's accuracy remains high on this complex schema. postgres produces large errors, and ibjs also struggles, due to many intermediate samples becoming empty as the number of joins grows. neurocard overcomes this challenge and offers more than  $10 \times$  better accuracy across the board. in terms of space efficiency, since the model needs to be trained on the full outer join of 16 tables and the maximum domain size exceeds 2 million, a vanilla neurocard would require  $900\mathrm{mb}$  in model size. with column factorization (§5), the model size is reduced to  $27\mathrm{mb}$  less than  $1\%$  of the total size of all tables. we also present a large model neurocard-large to demonstrate scalability.
+
+![](images/97972d7522574851e77a017ce040a9dd71b2172bb3b390fa6e557dc64fa171ee.jpg)  
+(a) accuracy vs. tuples trained
+
+![](images/b9f91a31494d35b411440e53bdb8d687e9e7d6300ca545e15955e9189f247480.jpg)  
+(b) training throughput
+
+![](images/edc3ea23e7b86457409b2fb9956d71c034f4ec81f3e575990f42daea1f199aef.jpg)  
+(c) training comparison
+
+![](images/f096cfe3c3fabae19a6b67b915588c74b64e2d7a8e9a69d09a286414e37b1183.jpg)  
+(d) inference comparison  
+figure 7: statistical and physical efficiency of neurocard.
+
+# 7.4 efficiency
+
+having established that neurocard achieves the best accuracy, we now study the statistical and physical efficiency of neurocard.
+
+how many tuples are required for good accuracy? figure 7a plots accuracy (p99 on job-light and job-light-ranges) vs. number of tuples trained. about 2-3m tuples are sufficient for neurocard to achieve best-in-class accuracy (compare with tables 2 and 3). using more samples helps, but eventually yields diminishing returns. reaching high accuracy using a total of  $\sim 10^{7}$  samples out of a population of  $10^{12}$  data points (i.e., only  $0.001\%$  of the data)—many queries would inevitably touch unseen data points—shows that neurocard generalizes well and is statistically efficient.
+
+how does sampling affect training throughput? figure 7b plots the training throughput, in tuples per second, vs. the number of sampling threads used to provide training data. four threads suffice to saturate the gpu used for training. at lower thread counts, the device spends more time waiting for training data than doing computation. with a peak throughput of  $\sim 40\mathrm{k}$  tuples/second, neurocard can finish training on 3m tuples in about 1.25 minutes.
+
+wall-clock training time comparison. figure 7c compares the wall-clock time used for training the mscn, deepdb, and neurocard configurations reported in tables 2 and 3. mscn requires a separate phase of executing training queries to collect true cardinalities, which takes much longer (3.2 hours for 10k queries) than just the training time shown here. deepdb runs on parallel cpus and is quite efficient. neurocard starts training/on-the-fly sampling after calculating the join count tables, which takes 13 seconds for both datasets. its construction is efficient due to parallel sampling and accelerated gpu computation.
+
+wall-clock inference time comparison. lastly, figure 7d plots the latency cdf of the learning approaches for 1000 job-light-ranges queries. as before, we use the base configurations reported in the accuracy tables. mscn and neurocard run on gpu while deepdb runs on cpu; all three approaches are implemented in python. mscn is fastest because its lightweight network has fewer
+
+table 5: ablation studies: varying primary components of neurocard. unlisted values are identical to the base configuration. we show the impact of the sampler (a), column factorization bits (b), autoregressive model size (c), inter-table correlations learned (d), and whether to use an autoregressive model at all (e) on the  $50\%$  and  $95\%$  -tile errors of job-light-ranges.  
+
+<table><tr><td></td><td>sampler</td><td>fact. 
+bits</td><td>df; demb</td><td>correlations 
+learned</td><td>p50</td><td>p95</td></tr><tr><td>base 
+(4.1 mb)</td><td>unbiased</td><td>14</td><td>128; 16</td><td>all tables in one 
+ar</td><td>1.9</td><td>57.1</td></tr><tr><td>(a)</td><td>biased</td><td></td><td></td><td></td><td>33</td><td>3270</td></tr><tr><td>(b)</td><td></td><td>10 
+(2.2 mb)</td><td></td><td></td><td>2.2</td><td>173</td></tr><tr><td></td><td></td><td>12 
+(2.6 mb)</td><td></td><td></td><td>2.0</td><td>168</td></tr><tr><td></td><td></td><td>none 
+(12 mb)</td><td></td><td></td><td>1.6</td><td>62.7</td></tr><tr><td>(c)</td><td></td><td></td><td>128; 64 
+(23 mb)</td><td></td><td>1.5</td><td>44.0</td></tr><tr><td></td><td></td><td></td><td>1024; 16 
+(31 mb)</td><td></td><td>1.7</td><td>64.0</td></tr><tr><td>(d)</td><td></td><td></td><td></td><td>one ar per table</td><td>40</td><td>9 · 10^4</td></tr><tr><td>(e)</td><td colspan="4">no model; uniform join samples only</td><td>4.0</td><td>2 · 10^5</td></tr></table>
+
+calculations involved. deepdb's latencies span a wide spectrum, from  $\sim 1$  ms for queries with low complexity (numbers of joins and filters involved) to  $\sim 100$  ms for queries with the highest complexity. neurocard's latencies are more predictable, with  $17\mathrm{ms}$  at median and  $12\mathrm{ms}$  at minimum: this is due to the higher number of floating point operations involved in the neural autoregressive model. all approaches can be sped up by engineering efforts (e.g., if run in a native language). for neurocard, model compression or weight quantization can also reduce the computational cost.
+
+# 7.5 dissecting neurocard
+
+to gain insights, we now evaluate the relative importance of primary components of neurocard, by varying them and measuring the change in estimation accuracy on job-light-ranges. we use the smaller neurocard in table 3 as the base configuration, and ablate each component in isolation. table 5 presents the results.
+
+in (a), using ibjs adapted for full joins<sup>5</sup> as a biased sampler significantly decreases the learned estimator's accuracy. the large increase in the median error implies a systematic distribution mismatch. overall, this design choice is the second most important.
+
+rows in group (b) vary the column factorization granularity. using smaller bits results in more subcolumns and yields a small drop in accuracy. disabling factorization uses the most space and appears to perform the best.
+
+group (c) varies the size of the autoregressive model, by changing the dimension of the feedforward linear layers  $(d_{\mathrm{ff}})$  or the embeddings  $(d_{\mathrm{emb}})$ . an enlarged embedding proves markedly more useful than enlarged linear layers, likely because each token's captured semantics becomes more finetuned during optimization.
+
+![](images/507882defcb6290eebf824504c887d67731c521d9df156af8a45906f7cbf34dd.jpg)  
+figure 8: updating neurocard, fast and slow. job-light. errors (p95, p50) of each strategy are averaged from 10 runs. postgres is also run as comparison, whose statistics are updated  $(1\sim 2$  sec.) on each ingest.
+
+in group (d) we vary the correlation learned by neurocard. while all configurations above learn the distribution of all tables in a single model—capturing all possible correlations among them—here we build one model (same architecture as base) per table. queries that join across tables are estimated by combining individual models' estimates via independence. without modeling intertable correlations, this variant yields the lowest accuracy.
+
+finally, group (e) ablates away the ar model altogether. we test uniform join samples as a standalone estimator: it uses our sampler (\$4) to draw  $10^{4}$  simple random samples (actual tuples in the database) from each query's join graph. while the median error is reasonable, it is  $10^{4} \times$  less accurate than an autoregressive model at tail as many queries have no sample hits. the ar model is more statistically efficient than sampling, because it provides access to conditional probability distributions—these conditional contributions enable an efficient probabilistic inference procedure, i.e., progressive sampling, which cannot be used otherwise.
+
+tuning guide. groups (b) and (c) show that neurocard is not overly sensitive to hyperparameters. for new datasets, we recommend starting with the base configuration and increasing sizing as much as possible up to a size budget. the recommended precedence is: factorization bits;  $d_{\mathrm{emb}}$ ;  $d_{\mathrm{ff}}$  and the number of layers. the number of training tuples can be set by early-stopping or a time budget; §7.4's results suggest starting with a few to 10+ million.
+
+# 7.6 update strategies
+
+neurocard handles new data by either retraining, or taking additional gradient steps, i.e., incremental training. to test both strategies, we simulate the practice of time-ordered partition appends: table title is range-partitioned on a year column into 5 partitions. each partition defines a distinct snapshot of the entire database and the full join, so running the same set of queries at different partition count yields 5 sets of true cardinalities. we compare three update strategies, all of which are trained fully for 7m tuples after the first ingest: (1) stale, trained once on the first snapshot and never updated, (2) fast update, incrementally updated after each new ingest on  $1\%$  of original samples (70k), and (3) retrain, using  $100\%$  of original samples (7m) after each ingest. we also show the latency required to perform additional gradient steps.
+
+results are shown in figure 8. without update, the stale neurocard significantly degrades in accuracy, which is expected as each partition adds a significant amount of new information. a fast updated neurocard recovers most of the accuracy, incurring a
+
+minimal overhead. even fully retraining only requires a few minutes and yields the highest accuracy. both the statistical efficiency (number of tuples needed vs. accuracy) and the physical efficiency of neurocard contribute to these highly practical update strategies.
+
+# 8 related work
+
+unsupervised data-driven cardinality estimators. this family approximates the data distribution and dates back to system r's use of 1d histograms [34]. the quality of the density model used has seen steady improvements throughout the years:
+
+classical methods. multidimensional histograms [10, 25, 30, 31] are more precise than 1d histograms by capturing inter-column correlations. starting from early 2000s, graphical models were proposed for either single-table or join cardinality estimation [3, 8, 40]. these density models tradeoff precision for efficiency by assuming conditional or partial independence, and require expensive structure learning (finding the best model structure given a dataset).
+
+sum-product networks. spns, a tree-structured density estimator, were proposed about 10 years ago [29]. each leaf is a coarse histogram of a slice of an attribute, and each intermediate layer uses either  $\times$  and  $+$  to combine children information. due to their heuristics (e.g., inter-slice independence), spns have limited expressiveness: there exists simple distributions that cannot be efficiently captured by spns of any depth [24]. deepdb [12] is a recent cardinality estimator that uses spns. neurocard is similar to deepdb in the following aspects. (s1) both works use the formulation of learning the full outer join of multiple tables. (s2) our "schema subsetting" capability builds on their querying algorithms.
+
+neurocard differs from deepdb in the following. (d1) modern density model: neurocard's choice of a deep autoregressive model is a universal function approximator hence fundamentally more expressive. unlike spns, no independence assumption is made in the modeling. (d2) correlations learned: neurocard argues for capturing as much correlation as possible across tables, and proposes learning the full outer join of all tables of a schema. deepdb, due to limited expressiveness, learns multiple spns, each on a table subset ( $\sim 1-3$  tables) chosen by correlation tests. conditional independence is assumed across table subsets. (d3) correct sampling: neurocard identifies the key requirement of sampling from the data distribution of joins in an unbiased fashion. in contrast, deepdb obtains join tuples either from full computation or ibjs which samples from a biased distribution. due to these differences, neurocard outperforms deepdb by up to  $34 \times$  in accuracy ( $\s 7$ ).
+
+deep autoregressive models. a breakthrough in density estimation, deep ar models are the current state-of-the-art density models from the ml community [4, 6, 32, 43]. they tractably learn complex, high-dimensional distributions in a neural net, capturing all possible correlations among attributes. distinctively, ar models provide access to all conditional distributions among input attributes. naru [48] is a single-table cardinality estimator that uses a deep ar model. by accessing conditional distributions, naru proposes efficient algorithms to integrate over an ar model, thereby producing selectivity estimates. neurocard builds on single-table naru and overcomes the unique challenges (§2) to support joins.
+
+supervised query-driven cardinality estimators. leveraging past or collected queries to improve estimates dates back to leo [37]. interest in this approach has seen a resurgence partly due to an abundance of query logs [44] or better function approximators (neural networks) [15, 38] that map featurized queries to predicted cardinalities. hybrid methods that leverage query feedback to improve density modeling have also been explored, e.g., kde [11, 14] and mixture of uniforms [49]. supervised estimators can easily leverage query feedback, handle complex predicates (e.g., udfs), and are usually more lightweight [5]. neurocard has demonstrated superior estimation accuracy to representatives in this family, while being fundamentally more robust since it is not affected by out-of-distribution queries. complex predicates can also be handled by executing on tuples sampled from neurocard's learned distribution.
+
+join sampling. extensive research has studied join sampling, a fundamental problem in databases. neurocard leverages a state-of-the-art join sampler to obtain training tuples representative of a join. neurocard adopts the linear-time exact weight algorithm from zhao et al. [50], which is among the top-performing samplers they study. this algorithm provides uniform and independent samples, just as neurocard requires. neurocard may further leverage their extensions to support cyclic join schemas. while ibjs [20] and wander join [22] provide unbiased estimators for counts and aggregates, they do not provide uniform samples of a join and thus are unsuitable for collecting training data. lastly, we show that it is advantageous to layer a modern density model on join samples.
+
+learned database components. a great deal of work has recently applied either classical ml or modern deep learning to various database components, e.g., indexing [17], data layout [47], and query optimization [18, 23, 39]. neurocard can be seen as a versatile core that can benefit any query engine, learned or not learned. being able to model inter-table and inter-column correlations without any independence assumptions, neurocard's use may go beyond query optimization to other tasks that require an understanding of tables and attributes (e.g., data imputation [45] or indexing [46]).
+
+# 9 conclusion
+
+neurocard is built on a simple idea: learn the correlations across all tables in a database without making any independence assumptions. neurocard applies established techniques from join sampling and deep self-supervised learning to cardinality estimation, a fundamental problem in query optimization. it learns from data—just like classical data-driven estimators—but captures all possible intertable correlations in a probabilistic model:  $p_{\theta}$  (all tables). to our knowledge, neurocard is the first cardinality estimator to achieve assumption-free probabilistic modeling of more than a dozen tables. neurocard achieves state-of-the-art accuracy for join cardinality estimation  $(4 - 34 \times$  better than prior methods) using a single schema model that is both compact and efficient to learn.
+
+# acknowledgments
+
+we thank joe hellerstein for fruitful discussions and guidance, and michael whittaker, richard liaw, and chenggang wu for their insightful comments on this paper.
+
+# references
+
+[1] michael armburst, reynold s. xin, cheng lian, yin huai, davies liu, joseph k. bradley, xiangrui meng, tomer kaftan, michael j. franklin, ali ghodsi, and matei zaharia. 2015. spark sql: relational data processing in spark. in proceedings of the 2015 acm sigmod international conference on management of data (melbourne, victoria, australia) (sigmod '15). acm, new york, ny, usa, 1383-1394.  
+[2] kaushik chakrabarti, minos garofalakis, rajeev rastogi, and kyuseok shim. 2001. approximate query processing using wavelets. the vldb journal 10, 2-3 (2001), 199-223.  
+[3] amol deshpande, minos garofalakis, and rajeev rastogi. 2001. independence is good: dependency-based histogram synopses for high-dimensional data. acm sigmod record 30, 2 (2001), 199-210.  
+[4] conor durkan and charlie nash. 2019. autoregressive energy machines. in proceedings of the 36th international conference on machine learning (proceedings of machine learning research), kamalika chaudhuri and rusaln salakhutdinov (eds.), vol. 97. pmlr, long beach, california, usa, 1735-1744.  
+[5] anshuman dutt, chi wang, azade nazi, srikanth kandula, vivek narasayya, and surajit chaudhuri. 2019. selectivity estimation for range predicates using lightweight models. proceedings of the vldb endowment 12, 9 (2019), 1044-1057.  
+[6] mathieu germain, karol gregor, iain murray, and hugo larochelle. 2015. made: masked autoencoder for distribution estimation. in international conference on machine learning, 881-889.  
+[7] lise getoor, nir friedman, daphne koller, and benjamin taskar. 2001. learning probabilistic models of relational structure. in icml, vol. 1. 170-177.  
+[8] lise getoor, benjamin taskar, and daphne koller. 2001. selectivity estimation using probabilistic models. in acm sigmod record, vol. 30. acm, 461-472.  
+[9] ian goodfellow, yoshua bengio, and aaron courville. 2016. deep learning. mit press.  
+[10] dimitrios gunopoulos, george kollios, vassilis j tsotras, and carlotta domeni. 2005. selectivity estimators for multidimensional range queries over real attributes. the vldb journal 14, 2 (2005), 137-154.  
+[11] max heimel, martin kiefer, and volker markl. 2015. self-tuning, gpu-accelerated kernel density models for multidimensional selectivity estimation. in proceedings of the 2015 acm sigmod international conference on management of data (sigmod '15). acm, new york, ny, usa, 1477-1492.  
+[12] benjamin hilprecht, andreas schmidt, moritz kulessa, alejandro molina, kristian kersting, and carsten binnig. 2020. deepdb: learn from data, not from queries! proceedings of the vldb endowment 13, 7 (2020), 992-1005.  
+[13] hilprecht et al. 2020. github repository, deepdb-public. github.com/ datamanagementlab/deepdb-public. [online; accessed april, 2020].  
+[14] martin kiefer, max heimel, sebastian breß, and volker markl. 2017. estimating join selectivities using bandwidth-optimized kernel density models. proceedings of the vldb endowment 10, 13 (2017), 2085–2096.  
+[15] andreas kipf, thomas kipf, bernhard radke, viktor leis, peter a. boncz, and alfons kemper. 2019. learned cardinalities: estimating correlated joins with deep learning. in cidr 2019, 9th biennial conference on innovative data systems research, asilomar, ca, usa, january 13-16, 2019, online proceedings.  
+[16] kipf et al. 2019. github repository, learnedcardinalities. github.com/andreaskipf/learnedcardinalities. [online; accessed april, 2020].  
+[17] tim kraska, alex beutel, ed h chi, jeffrey dean, and neoklis polyzotis. 2018. the case for learned index structures. in proceedings of the 2018 international conference on management of data. acm, 489-504.  
+[18] sanjay krishnan, zongheng yang, ken goldberg, joseph hellerstein, and ion stoica. 2018. learning to optimize join queries with deep reinforcement learning. arxiv preprint arxiv:1808.03196 (2018).  
+[19] viktor leis, andrey gubichev, atanas mirchev, peter boncz, alfons kemper, and thomas neumann. 2015. how good are query optimizers, really? proceedings of the vldb endowment 9, 3 (2015), 204-215.  
+[20] viktor leis, bernhard radke, andrey gubichev, alfons kemper, and thomas neumann. 2017. cardinality estimation done right: index-based join sampling.. in cidr.  
+[21] viktor leis, bernhard radke, andrey gubichev, atanas mirchev, peter boncz, alfons kemper, and thomas neumann. 2018. query optimization through the looking glass, and what we found running the join order benchmark. the vldb journal (2018), 1-26.  
+[22] feifei li, bin wu, ke yi, and zhuoyue zhao. 2016. wander join: online aggregation via random walks. in proceedings of the 2016 international conference on management of data. 615-629.  
+[23] ryan marcus, parimarjan negi, hongi mao, chi zhang, mohammad alizadeh, tim kraska, olga papaemmanouil, and nesime tatbul. 2019. neo: a learned query optimizer. pvldb 12, 11 (2019), 1705-1718.  
+[24] james martens and venkatesh medabalimi. 2014. on the expressive efficiency of sum product networks. arxiv preprint arxiv:1411.7717 (2014).  
+[25] m muralikrishna and david j dewitt. 1988. equi-depth multidimensional histograms. in acm sigmod record, vol. 17. acm, 28-36.  
+[26] kevin p murphy. 2012. machine learning: a probabilistic perspective. mit press.
+
+[27] neural relation understanding (naru). 2020. github repository, naru. github. com/naru-project/naru. [online; accessed april, 2020].  
+[28] patrick o'neil and dallan quass. 1997. improved query performance with variant indexes. in proceedings of the 1997 acm sigmod international conference on management of data. 38-49.  
+[29] hoifung poon and pedro domingos. 2011. sum-product networks: a new deep architecture. in 2011 ieee international conference on computer vision workshops (iccv workshops). ieee, 689-690.  
+[30] viswanath poosala, peter j. haas, yannis e. ioannidis, and eugene j. shekita. 1996. improved histograms for selectivity estimation of range predicates. in proceedings of the 1996 acm sigmod international conference on management of data (montreal, quebec, canada) (sigmod '96). acm, new york, ny, usa, 294-305.  
+[31] viswanath poosala and yannis e ioannidis. 1997. selectivity estimation without the attribute value independence assumption. in vldb, vol. 97. 486-495.  
+[32] alec radford, jeffrey wu, rewon child, david luan, dario amodei, and ilya sutskever. 2019. language models are unsupervised multitask learners. url https://openai.com/blog/better-language-models (2019).  
+[33] tim salimans, andrej karpathy, xi chen, and diederik p. kingma. 2017. pixelcnn++. improving the pixelcnn with discretized logistic mixture likelihood and other modifications. in 5th international conference on learning representations, iclr 2017, toulouse, france, april 24-26, 2017, conference track proceedings.  
+[34] p griffiths selinger, morton m astrahan, donald d chamberlin, raymond a lorie, and thomas g price. 1979. access path selection in a relational database management system. in proceedings of the 1979 acm sigmod international conference on management of data. acm, 23-34.  
+[35] rico sennrich, barry haddow, and alexandra birch. 2016. neural machine translation of rare words with subword units. in proceedings of the 54th annual meeting of the association for computational linguistics (volume 1: long papers). association for computational linguistics, berlin, germany, 1715-1725.  
+[36] r. sethi, m. traverso, d. sundstrom, d. phillips, w. xie, y. sun, n. yegitbasi, h. jin, e. hwang, n. shingte, and c. berner. 2019. presto: sql on everything. in 2019 ieee 35th international conference on data engineering (icde), 1802-1813.  
+[37] michael stilliger, guy m lohman, volker markl, and mokhtar kandil. 2001. leo-db2's learning optimizer. in vldb, vol. 1, 19–28.  
+[38] ji sun and guoliang li. 2019. an end-to-end learning-based cost estimator. proceedings of the vldb endowment 13, 3 (2019), 307-319.  
+[39] immanuel trummer, junxiong wang, deepak maram, samuel moseley, saehan jo, and joseph antonakakis. 2019. skinnerdb: regret-bounded query evaluation via reinforcement learning. in proceedings of the 2019 international conference on management of data (sigmod '19). acm, new york, ny, usa, 1153-1170.  
+[40] kostas tzoumas, amol deshpande, and christian s jensen. 2011. lightweight graphical models for selectivity estimation without independence assumptions. proceedings of the vldb endowment 4, 11 (2011), 852-863.  
+[41] kostas tzoumas, amol deshpande, and christian s jensen. 2013. efficiently adapting graphical models for selectivity estimation. the vldb journal 22, 1 (2013), 3-27.  
+[42] aaron van den oord, sander dieleman, heiga zen, karen simonyan, oriol vinyals, alex graves, nal kalchbrenner, andrew senior, and koray kavukcuoglu. 2016. wavenet: a generative model for raw audio. arxiv preprint arxiv:1609.03499 (2016).  
+[43] ashish vaswani, noam shazeer, niki parmar, jakob uszkoreit, lion jones, aidan n gomez, lukasz kaiser, and illia polosukhin. 2017. attention is all you need. in advances in neural information processing systems. 5998-6008.  
+[44] chenggang wu, alekh jindal, saeed amizadeh, hiren patel, wangchao le, shi qiao, and sriram rao. 2018. towards a learning optimizer for shared clouds. proceedings of the vldb endowment 12, 3 (2018), 210-222.  
+[45] richard wu, aoqian zhang, ihab ilyas, and theodoros rekatsinas. 2020. attention-based learning for missing data imputation in holoclean. proceedings of machine learning and systems (2020), 307-325.  
+[46] yingjun wu, jia yu, yuanyuan tian, richard sidle, and ronald barber. 2019. designing succinct secondary indexing mechanism by exploiting column correlations. in proceedings of the 2019 international conference on management of data. 1223-1240.  
+[47] zongheng yang, badrish chandramouli, chi wang, johannes gehrke, yinan li, umar farooq minhas, per-ake larson, donald kossmann, and rajeev acharya. 2020. qd-tree: learning data layouts for big data analytics. in proceedings of the 2020 international conference on management of data (sigmod '20).  
+[48] zongheng yang, eric liang, amog kamsetty, chenggang wu, yan duan, xi chen, pieter abbeel, joseph m hellerstein, sanjay krishnan, and ion stoica. 2019. deep unsupervised cardinality estimation. proceedings of the vldb endowment 13, 3 (2019), 279-292.  
+[49] barzan mozafari yongjoo park, shucheng zhong. 2020. quicksel: quick selectivity learning with mixture models. sigmod (2020).  
+[50] zhuoyue zhao, robert christensen, feifei li, xiao hu, and ke yi. 2018. random sampling over joins revisited. in proceedings of the 2018 international conference on management of data. 1525-1539.

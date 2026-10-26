@@ -1,0 +1,655 @@
+# slimsell: a vectorizable graph representation for breadth-first search
+
+maciej besta $^{1\dagger}$ , florian marending $^{1\dagger}$ , edgar solomonik $^{2}$ , torsten hoeffer $^{1}$
+
+$^{1}$ department of computer science, eth zurich
+
+$^{2}$ department of computer science, university of illinois at urbana-champaign
+
+both authors contributed equally to this work.
+
+abstract—vectorization and gpus will profoundly change graph processing. traditional graph algorithms tuned for 32- or 64-bit based memory accesses will be inefficient on architectures with 512-bit wide (or larger) instruction units that are already present in the intel knights landing (knl) manycore cpu. anticipating this shift, we propose slimsell: a vectorizable graph representation to accelerate breadth-first search (bfs) based on sparse-matrix dense-vector (spmv) products. slimsell extends and combines the state-of-the-art simd-friendly sell- $c$ - $\sigma$  matrix storage format with tropical, real, boolean, and sel-max semiring operations. the resulting design reduces the necessary storage (by up to  $50\%$ ) and thus pressure on the memory subsystem. we augment slimsell with the slimwork and slimchunk schemes that reduce the amount of work and improve load balance, further accelerating bfs. we evaluate all the schemes on intel haswell multicore cpus, the state-of-the-art intel xeon phi knl manycore cpus, and nvidia tesla gpus. our experiments indicate which semiring offers highest speedups for bfs and illustrate that slimsell accelerates a tuned graph500 bfs code by up to  $33\%$ . this work shows that vectorization can secure high-performance in bfs based on spmv products; the proposed principles and designs can be extended to other graph algorithms.
+
+this is an extended version of a paper published at ieee ipdps'17 under the same title
+
+# i. introduction
+
+upcoming cpus armed with wide vector instruction units as well as gpus with even wider warps of cores will transform the way graph algorithms are reasoned about, developed, and executed. graph schemes are traditionally optimized for architectures based on 32- or 64-bit instructions. this is not only due to the prevalence of such systems but also because graph processing is most often based on irregular fine-grained memory accesses [25], [8]. with the trend to develop machines deploying large vector instruction or simd units, we must rethink the design of graph algorithms to use the available hardware effectively.
+
+one such important algorithm is breadth-first search (bfs) [12] that is used in many scientific domains such as machine learning, data mining, and computational sciences. moreover, it has applications in various graph-related problems, including bipartiteness testing and the ford-fulkerson method. thus, despite the wealth of existing optimizations for bfs, the growing amounts and sizes of graph datasets require even faster bfs schemes.
+
+it is well-known that bfs can be viewed in either the traditional combinatorial or the algebraic abstraction. traditional bfs is based on primitives such as queues. algebraic bfs is a series of matrix-vector (mv) products over various semirings [19]; the products consist of a sparse matrix and a dense vector (spmv) or a sparse matrix and a sparse vector (spmspv). bfs based on spmv (bfs-spmv) uses no explicit locking [33] or atomics [34] and has a succinct description as well as good locality [19], [37]. yet, it needs more work than traditional bfs and bfs based on spmspv [39].
+
+there exist some bfs schemes for gpus [31], [28], [11], [39], [14], [18]. however, they usually underutilize the available simd and vectorization parallelism as they focus on work-optimal traditional bfs or bfs based on spmspv that use fine-grained irregular memory accesses. moreover, they are often tuned to a given architecture and thus not portable. in this work, we illustrate that even if bfs-spmv is not work-optimal, one can use vectorization to outweigh potential performance penalties and secure high-performance. for this, we first show how to combine the sell-  $c - \sigma$  [20] sparse matrix storage format with the algebraic bfs based on tropical, real, boolean, and selmax semirings. intuitively, sell-  $c - \sigma$  decomposes a matrix into chunks stored in such a way that each chunk can be processed without additional overheads by the whole simd execution unit. we conduct a work/storage complexity and
+
+![](images/870fd04de17c860858d4c61eb36ebd9e98e92a01cd9b86690e7dde70d61eb943.jpg)  
+figure 1: time to compute each bfs iteration for a kronecker power-law graph on an intel xeon phi knights landing manycore cpu.
+
+performance analysis and discover which semiring is the most advantageous for bfs-spmv based on sell-  $c$ - $\sigma$  for a large selection of parameters. to the best of our knowledge, this is the first theoretical work complexity analysis as well as performance study on the benefits and downsides of each considered semiring.
+
+the advantage of sell-  $c - \sigma$  is that it enables portable performance for spmv products on cpus and gpus. still, sell-  $c - \sigma$  was not originally built for graph processing where it does not perform well. to alleviate this, we propose slimsell: a vectorizable graph representation that needs up to  $50\%$  less storage than sell-  $c - \sigma$ , lowering the pressure on the memory subsystem when traversing undirected graphs. intuitively, we do not explicitly store non-zero entries of the adjacency matrix but instead derive them implicitly from column indices. we then augment slimsell with the slimwork and the slimchunk schemes to reduce the amount of work and load imbalance, and thus accelerate bfs even further. here, two key ideas are to: skip chunks of computations if they correspond to final output values (e.g., vertex distances) that would not change, and divide large chunks among multiple compute units; an example illustration of slimsell advantages is in figure 1. we then analyze the work and storage complexity of bfs based on slimsell and derive bounds for general graphs as well as for graph models that follow uniform (erdős-rényi) and power-law vertex degree distributions. our evaluation on multi- and manycore cpus and gpus shows that the resulting bfs-spmv outperforms traditional bfs by up to  $33\%$ . finally, this is one of the first works to report bfs results on the state-of-the-art intel knights landing (knl) xeon phi manycore.
+
+we provide the following contributions:
+
+- we combine the state-of-the-art sell- $c$ - $\sigma$  matrix storage format with algebraic bfs based on tropical, boolean, real, and sel-max semirings. we conduct work/storage complexity and performance analysis and show which semiring secures the highest performance.  
+- we introduce slimsell, a vectorizable graph representation that improves the storage complexity of sell- $c$ - $\sigma$  and accelerates bfs based on spmv products.  
+- we propose slimwork and slimchunk, two schemes that reduce the amount of work and improve load balancing in bfs based on slimsell.  
+- we evaluate slimsell and show performance improvements of  $33\%$  over the optimized graph500 bfs code and storage reductions of  $50\%$  over sell- $c$ - $\sigma$ . our work covers multi- and manycore cpus as well as gpus, with the total of seven different systems; we provide one of the first bfs results on the intel knl manycore.
+
+# ii. background
+
+we start with presenting the utilized concepts.
+
+<table><tr><td>graph
+struct</td><td>g
+n, m
+ρ, d</td><td>a graph g = (v, e); v and e are sets of vertices and edges.
+numbers of vertices and edges in g; |v| = n, |e| = m.
+average degree and the diameter of g, respectively.</td></tr><tr><td>algebraic
+notation</td><td>⊗, ⊙
+a, a&#x27;
+xk, fki
+d, p
+dp(d)</td><td>matrix-vector (mv); element-wise vector-vector (vv) product.
+g&#x27;s adjacency matrix and the transformed a used in § iii-a1.
+the result of a ⊗ fki; the frontier of vertices in iteration k.
+distances (to the root) and parents (in th bfs traversal tree).
+a transformation that derives vertex parents p from d.</td></tr><tr><td>various</td><td>t, w
+c, nc
+σ</td><td>the number of threads; work complexity of a given scheme.
+chunk height; the number of chunks in slimsell or sell-c-σ.
+sorting scope in slimsell and sell-c-σ (σ ∈ [1, n]).</td></tr></table>
+
+table i: the most important symbols used in the paper.
+
+# a. notation
+
+for convenience, table i lists the most important symbols.
+
+1) graph structure: we describe a graph  $g$  as a tuple  $(v, e)$ ;  $v$  is a set of vertices and  $e \subseteq v \times v$  is a set of edges between vertices;  $|v| = n$  and  $|e| = m$ .  $\mathbf{a}$  is the adjacency matrix of  $g$ .  $g$ 's diameter is denoted as  $d$ .  
+2) linear algebra: bold symbols refer to vectors and matrices while standard font indicates a vector/matrix element. the matrix-vector (mv) multiplications are denoted with  $\otimes$ . the element-wise vector-vector (hadamard) product is referred to with  $\odot$ . the lower index is used to indicate the iteration number (e.g.,  $\mathbf{x}_k$  is  $\mathbf{x}$  in iteration  $k$ ) while the upper index refers to a vector element (e.g.,  $x_k^s$  is the  $s$ th element of  $\mathbf{x}_k$ ); we also use square brackets when referring to vector elements in the source code when they are implemented with arrays ( $x_k^s \equiv x_k[s]$ ). the logical negation of a vector  $\mathbf{x}$  is an element-wise operation  $\overline{\mathbf{x}}$  where  $\overline{x}^s = 0$  if  $x^s \in \mathbb{r} \setminus \{0\}$ , and  $\overline{x}^s = 1$  if  $x^s = 0$  (e.g.,  $(0,7,0)^t = (1,0,1)^t$ ).
+
+```c
+1 // notes: v is a vector of length c of int: v ≡ int[c].  
+2 // the names of the used intel functions can be found in listing 2.  
+3  
+4 v load(v* addr); // load and return c elements from addr.  
+5 void store(v* addr, v data); // store data at address addr.  
+6 v[t1,t2,...,t3]; // create a vector of c elements.  
+7  
+8 // compare a and b elementwise using operand op; return a vector  
+9 // with binary outcome of each comparison (0/1 if  
+10 // different/same); op can be eq (equality), neq (non-equality).  
+11 v cmp(v a, v b, op op);  
+12  
+13 // interleave elements of a and b based on mask elements;  
+14 // ∀i ∈ [0,c]: out[i] = mask[i] ? b[i] : a[i]  
+15 v blend(v a, v b, v mask);  
+16  
+17 // return t elementwise result of the function fun applied to  
+18 // a and b. fun can be: min (minimum), max (maximum), add (sum),  
+19 // mul (product), and (logical and), or (logical or).  
+20 v fun(v a, v b);
+```
+
+listing 1: used vectorization functions: syntax and semantics.
+
+# b. vectorization: concepts and considered architectures
+
+modern x86 cpus feature single instruction, multiple data (simd) execution units (also called vector instruction units) [24]. one unit has several lanes that proceed synchronously in parallel and execute a specified scalar instruction on a data vector; each lane processes a vector element of a specified size. in modern cpus with avx (advanced vector extensions), registers that hold the vectors
+
+![](images/3ac954568d3076aad471d9259894f24512c9b368cf23efe1df09854549f7f22c.jpg)  
+figure 2: csr and sell-  $c - \sigma$  constructed from an adjacency matrix. we only show val arrays that illustrate the differences between representations.
+
+![](images/de5e1d94062416d4fc34212f8bf7a53fba830471b4b9bdac57167438a49f4633.jpg)  
+listing 2: the syntax/semantics of the utilized vector functions on intel x86
+
+![](images/e6a4126ba4cb164d1d84a23dc79defaa8f9963ff7e4b25f884eb242b9b8772fc.jpg)
+
+are 256-bit wide, enabling 8 single-precision (or 4 double-precision) floating point operations per instruction. consequently, the simd width is respectively 8 and 4. next, manycores such as xeon phi knl use wider simd units; knl comes with 512-bit wide units. finally, gpus employ simt where cuda cores roughly correspond to simd lanes. they are scheduled in warps; one warp usually counts 32 cores, which constitutes the gpu "simd width". we present the used vectorization functions in listing 1. for a widespread analysis of slimsell, we evaluate all three types of architectures: intel cpus (represent classic latency-oriented x86 multicores), intel xeon phi knl (stands for state-of-the-art manycores), and nvidia gpus (represent modern throughput-oriented simt gpus).
+
+```c
+1 /* notes: t is an arbitrary type supported by the  
+2 * avx instruction set extension. c is determined  
+3 * by the size of one instance of t: an avx register  
+4 * can hold  $c = 256 / (8*$  sizeof(t)) elements of type t.  
+5 *  
+6 * 'vec' describes a vector of  $c$  elements of type t and is  
+7 * stored in a 256-bit avx register.  
+8 *  
+9 * following the simplified syntax we provide the real  
+10 * instruction names as specified by the avx instruction set  
+11 * extension. for this we assume t to be 32-bit floating  
+12 * point. for different types the names vary. */  
+13  
+14 /* load c elements at address addr into a vector. */  
+15 vec load(t * addr);  
+16 __m256 __mm256_load_ps(float const * addr)  
+17  
+18 /* store the c elements contained in data  
+19 * at address addr. */  
+20 void store(t * addr, vec data);  
+21 void __mm256_store_ps(float * addr, __m256 data);  
+22  
+23 /* create a vector of length c from c individual elements */  
+24 vec set(t tc, ..., t t1);  
+25 __m256 __mm256_set_ps(float t_8, float t_7, ..., float t_1);  
+26  
+27 /* create a vector of c repeated instances of t */  
+28 vec set1(t t);  
+29 __m256 __mm256_set1_ps(float a);  
+30  
+31 /* compare vectors a and b elementwise based on comparison  
+32 * operand op and return a vector containing binary  
+33 * information on the outcome of each comparison. */  
+34 vec cmpvec a, vec b, op op);  
+35 __m256 __mm256_cmp_ps(_m256 a, __m256 b, const int op);  
+36  
+37 /* interleave elements of vectors a and b  
+38 * based on corresponding element
+```
+
+```txt
+39  $\ast$  of mask:  $\forall i\in [0,c]$  :out[i]  $=$  mask[i] ? b[i] : a[i] \*/   
+40 vec blend( vec a, vec b, vec mask);   
+41 __m256 __m256 blend ps(_m256 a, __m256 b, const int mask);   
+42   
+43  $\ast$  convert vector a of integer type to floating point type \*/   
+44 vec cvti2fvec a);   
+45 __m256 __m256_cvtepi32_ps(_m256i a);   
+46   
+47  $\ast$  return a vector containing the elementwise minimum of the   
+48 \* vectors a and b. \*/   
+49 vec min vec a, vec b);   
+50 __m256 __m256_min_ps(_m256 a, __m256 b);   
+51   
+52  $\ast$  return a vector containing the elementwise maximum of the   
+53 \* vectors a and b. \*/   
+54 vec max vec a, vec b);   
+55 __m256 __m256_max_ps(_m256 a, __m256 b);   
+56   
+57  $\ast$  return a vector containing the elementwise addition of the   
+58 \* vectors a and b. \*/   
+59 vec add vec a, vec b);   
+60 __m256 __m256_add_ps(_m256 a, __m256 b);   
+61   
+62  $\ast$  return a vector containing the elementwise multiplication of   
+63 \* the vectors a and b. \*/   
+64 vec mul vec a, vec b);   
+65 __m256 __m256_mul_ps(_m256 a, __m256 b);   
+66   
+67  $\ast$  return a vector containing the elementwise logical and of   
+68 \* the vectors a and b. \*/   
+69 vec and vec a, vec b);   
+70 __m256 __m256_and_ps(_m256 a, __m256 b);   
+71   
+72  $\ast$  return a vector containing the elementwise logical or of the   
+73 \* vectors a and b. \*/   
+74 vec or vec a, vec b);   
+75 __m256 __m256_or_ps(_m256 a, __m256 b);
+```
+
+# c. algorithms: bfs in various abstractions
+
+the goal of bfs is to visit each vertex in  $g$ . first, it visits the neighbors of a specified root vertex  $r$ , then all the unvisited neighbors of  $r$ 's neighbors, and so on. vertices that are processed in a current step constitute the bfs frontier. bfs outputs either the distance (in hops) from each vertex to  $r$ , or the parent of each vertex in the bfs traversal tree. distances are stored in a vector  $\mathbf{d} \in \mathbb{r}^n$  ( $d^v$  is the distance from vertex  $v$  to  $r$ ) and parents in  $\mathbf{p} \in \mathbb{r}^n$  ( $p^v$  is the parent of vertex  $v$ ).  $\mathbf{d}$  can be transformed into  $\mathbf{p}$  using  $o(m + n)$  work and  $o(1)$  depth. to achieve this, for each vertex  $v$ ,
+
+the neighbor  $w$  of  $v$  with the distance  $d^w = d^v - 1$  must be found; we refer to it as the dp transformation  $(\mathbf{p} = dp(\mathbf{d}))$ .
+
+1) traditional bfs: here, a frontier is implemented with a queue  $q$ . at every iteration, vertices are removed in parallel from  $q$  and all their unvisited neighbours are appended to  $q$ ; this process is repeated until  $q$  is empty.  
+2) algebraic bfs: bfs can also be implemented with the mv product over a selected semiring. for example, for the real semiring,  $\mathbf{x}_0\in \mathbb{r}^n$  is a starting vector with  $x_0^r = 1$  and 0 elsewhere. then, for iteration  $k\geq 1$ ,  $\mathbf{x}_k = \mathbf{a}\otimes \mathbf{f}_{k - 1}$  (we assume that  $\mathbf{a}$  is pre-transposed in accordance with common practice [9]);  $\mathbf{f}_{k - 1}$  is the frontier in iteration  $k - 1$ ; note that  $\mathbf{f}_0 = \mathbf{x}_0$ . as we show in § iii-a, for some semirings  $\mathbf{f}_k = \mathbf{x}_k$ , while for others one must derive  $\mathbf{f}_k$  from  $\mathbf{x}_k$ .  $\mathbf{x}$  and  $\mathbf{f}$  can be represented either as sparse or dense vectors that respectively result in sparse-sparse and sparse-dense  $\mathbf{a}\otimes \mathbf{f}$  products; the latter entail more work but offer more potential for vectorization that we use in slimsell.
+
+# d. data structures: csr, sell-c-  $\sigma$  , and adjacency list
+
+finally, we discuss data structures relevant for our work.
+
+1) compressed sparse row (csr): in the well-known csr format (see figure 2), a matrix is represented with three arrays: val, col, and row. val contains all a's non-zeros (that correspond to  $g$ 's edges) in the row major order. col contains the column index for each corresponding value in val and thus has the same size  $(o(m))$ . finally, row contains starting indices in val (and col) of the beginning of each row in a (size  $o(n)$ ). csr is widely adopted for its simplicity and low memory footprint for sparse matrices. yet, it hinders high-performance vectorization. consider the csr-based textbook mv product in listing 3 where we unroll the inner loop. such unrolling ensures consecutive data accesses necessary to effectively use vectorization (consecutive val entries are exposed). yet, due to the reduction (line 8) and the cleanup of the loop remainder (line 10), the unrolling becomes inefficient for sparse matrices [20].
+
+```javascript
+1 /* the code computes  $\mathbf{x}_{k + 1} = \mathbf{a}\otimes \mathbf{x}_k$  using csr. */   
+2 for(int i  $= \emptyset$  ;i  $<  n$  .i++) {   
+3 int t_0  $=$  t_1  $=$  t_2  $=$  t_3  $=$  0;   
+4 for(int j  $=$  row[i];j  $<$  row[i+1];j  $+ = 4$  ）{   
+5 t_0  $+ =$  val[j+0]*xk[col[j+0]];t_1  $+ =$  val[j+1]*xk[col[j+1]];   
+6 t_2  $+ =$  val[j+2]*xk[col[j+2]];t_3  $+ =$  val[j+3]*xk[col[j+3]];   
+7 }   
+8  $x_{k + 1}[i] = t_{-}0 + t_{-}1 + t_{-}2 + t_{-}3;$  //reduction.   
+9 // clean up the loop remainder:   
+10 for(j=j-4;j<jrow[i+1];j++)  $\{x_{k + 1}[i] + = v a l[j]*x_{k}[c o l[j]]\} \}$
+```
+
+listing 3: (§ ii-d1) mv product with csr and 4-way loop unrolling. data alignment is assumed for clarity.
+
+```txt
+1 /* the code computes  $\mathbf{x}_{k + 1} = \mathbf{a}\otimes \mathbf{x}_k$  using sell-  $c - \sigma$  .\*/   
+2 for(int i  $= 0$  ;i  $<  n / c$  ++i）{   
+3 for(int j  $= 0$  ;j  $<  cl[i] + + j)$  {   
+4  $x_{k + 1}[i*c + \theta ]$  +=val[cs[i]  $+j\star c + \theta ]$  \*  $x_{k}[col[cs[i] + j\star c + \theta ]]$    
+5  $x_{k + 1}[i*c + 1]$  +=val[cs[i]  $+j\star c + 1]$  \*  $x_{k}[col[cs[i] + j\star c + 1]]$    
+6  $x_{k + 1}[i*c + 2]$  +=val[cs[i]  $+j\star c + 2]$  \*  $x_{k}[col[cs[i] + j\star c + 2]]$    
+7  $x_{k + 1}[i\star c + 3]$  +=val[cs[i]  $+j\star c + 3]$  \*  $x_{k}[col[cs[i] + j\star c + 3]]$  }
+```
+
+listing 4: (§ ii-d2) the mv product kernel with sell-  $c - \sigma$  ( $c$  is 4).
+
+2) sell-c-σ format: to overcome the issues in csr, kreutzer et al. proposed a sparse matrix format called sell-c-σ that exposes data parallelism portably across architectures with different simd widths [20]. intuitively, the key move from csr is to "turn by  $90^{\circ}$ " the layout of val and col in memory so that consecutive simd lanes/cores can process in parallel consecutive rows of a. we illustrate sell-c-σ in figure 2 and listing 4. it has four arrays: val, col, cs, and cl. like in csr, val and col host non-zeros in a and the related column indices. the difference is that they consist of contiguous chunks; each chunk contains c matrix rows. chunk elements are stored in the column major order; chunks are consecutive in memory. the cs and cl arrays provide starting offsets and lengths of each chunk. rows are zero-padded up to the longest row in a chunk. similar-sized rows are stored together by sorting them by the length, reducing the amount of required padding. finally,  $\sigma \in [1,n]$  controls the sorting scope; a larger  $\sigma$  entails more sorting. in this work, we show how to adapt sell-c-σ to bfs and to improve its design for more performance.  
+3) adjacency list (al): finally, al is the well-known graph representation that uses  $2m + n$  memory cells to store an undirected and unweighted graph; it consists of an array with ids of neighbors of each vertex (size  $2m$ ) and an offset array with the beginning of the neighbor data of each vertex (size  $n$ ). al is used together with traditional bfs. we show that slimsell has comparable or smaller size than al and secures more performance for various types of graphs.
+
+# iii. accelerating bfs based on spmv
+
+we now proceed to describe how to amortize and outweigh the inherent additional work in bfs-spmv using vectorization and simd parallelism. the first key idea is to combine sell-  $c - \sigma$  with semirings to portably accelerate bfs-spmv (§ iii-a). the second core idea is to develop slimsell, a vectorizable graph representation that builds upon sell-  $c - \sigma$  by making it more storage-efficient (§ iii-b). finally, we propose slimwork (§ iii-c) and slimchunk (§ iii-d), two schemes that reduce the work amount and improve load balancing in bfs-spmv based on slimsell.
+
+# a. combining sell-c-  $\sigma$  with semirings
+
+we now provide the first systematic comparison of semirings for bfs-spmv, and combine them with sell-c-σ; see listing 5 for a bfs iteration (frontier expansion) with the considered semirings. a reader who is not interested in the following theoretical details can proceed directly to § iii-b. a semiring is defined as a tuple  $s = (x, op_1, op_2, el_1, el_2)$  where  $x$  is a set equipped with two binary operations  $op_1, op_2$  such that  $(x, op_1)$  is a commutative monoid with identity element  $el_1$  and  $(x, op_2)$  is a monoid with identity element  $el_2$ . we denote matrix-vector multiplication and hadamard products on semiring  $s$  as  $\otimes_s$  and  $\odot_s$ .
+
+1) the tropical semiring  $t = (\mathbb{r} \cup \{\infty\}, \min, +, \infty, 0)$ : to use bfs with this semiring, one must first transform  $\mathbf{a}$  to  $\mathbf{a}'$  where each off-diagonal zero entry is  $\infty$ . next, one sets  $x_0^r = 0$  and  $x_0^s = \infty$ , for  $s \neq r$  (the initial distance to  $r$  and any other vertex is respectively 0 and  $\infty$ ). then,  $\mathbf{x}_k = \mathbf{f}_k = \mathbf{a}' \otimes_t \mathbf{f}_{k-1}$ . this bfs computes distances after the final iteration:  $\mathbf{d} = \mathbf{x}_d$  ( $d$  is the diameter) with predecessors  $\mathbf{p} = dp(\mathbf{d})$  (see § ii-c for a description of  $dp$ ).
+
+// val, col, cs, cl are data structures in sell-c-σ (see § ii-d2);  
+for(int i = 0; i < nc; i++) { // iterate over every chunk.  
+int index = cs[i]; // get offset to chunk i.  
+v x = load(&fk-1[i*c]); // load chunk i from frontier  $f_{k-1}$ .  
+for(int j = 0; j < cl[i]; j++) { // iterate over each column.  
+v vals = load(&val[index]); // load a' values.  
+// create the rhs vector consisting of c  $f_{k-1}$  entries.  
+v rhs = [fk-1[col[index+3]],fk-1[col[index+2]],fk-1[col[index+1]],fk-1[col[index+0]]];  
+// compute  $x_{k}$  (versions differ based on the used semiring):  
+#ifdef use_tropical_semiring  
+x = min(add(rhs, vals), x);  
+tropical semiring  
+#elif defined useboolean_semiring  
+x = or(and(rhs, vals), x);  
+boolean semiring  
+#elif defined use_selmax_semiring  
+x = max(mul(rhs, vals), x);  
+sel-max semiring  
+#endif  
+index += c;  
+}  
+// now, derive  $f_{k}$  (versions differ based on the used semiring):  
+#ifdef use_tropical_semiring  
+store(&fk[i*c], x); // just a store.  
+tropical semiring  
+#elif defined useboolean_semiring  
+// first, derive  $f_{k}$  using filtering.  
+v g = load(&gk-1[i*c]); // load the filter  $g_{k-1}$ .  
+x = cmp(and(x, g), [0,0,...0], neq); store(&x[k[i*c], x);  
+// second, update distances d; depth is the iteration number.  
+v x_mask = x; x = mul(x, [depth,..., depth]);  
+x = blend(load(&d[i*c]), x, x_mask); store(&d[i*c], x);  
+// third, update the filtering term.  
+g = and(not(x_mask), g); store(&g[k[i*c], g);  
+#elif defined use_selmax_semiring:  
+// update parents.  
+v pars = load(&p_k-1[i*c]); // load the required part of  $\mathbf{p}_{k-1}$   
+v pnz = cmp(pars, [0,0,...0], neq);  
+pars = blend([0,0,...,0], pars, pnz); store(&p_k[i*c], pars);  
+// set new  $x_{k}$  vector.  
+v tmpnz = cmp(x, [0,0,...,0], neq);  
+x = blend(x, &v[i*c], tmpnz); store(&x[k[i*c], x);  
+#endif
+
+listing 5: one iteration (frontier expansion) of bfs-spmv;  $c$  is 4. we omit the real semiring as it is very similar to the boolean one.
+
+2) the real semiring  $r = (\mathbb{r}, +, \cdot, 0, 1)$ : here,  $x_0^r = f_0^r = 1$  and any other element of  $\mathbf{x}_0$  and  $\mathbf{f}_0$  equals 0 (i.e., only  $r$  is in the initial frontier). then,  $\mathbf{x}_k = \mathbf{a} \otimes_r \overline{\mathbf{f}_{k-1}}$  and  $\mathbf{f}_k = \mathbf{x}_k \odot_r \mathbf{g}_k$  where  $\mathbf{g}_k$  is the filtering term:  $\mathbf{g}_k = \sum_{l=0}^{k-1} \overline{\mathbf{f}_l}$ . finally,  $\mathbf{d} = \sum_{l=1}^d l \mathbf{f}_l$  and  $\mathbf{p} = dp(\mathbf{d})$ . this semiring results in code snippets similar to the following boolean semiring and we omit it due to space constraints.  
+3) the boolean semiring  $b = (\{0,1\} ,|, \& , 0,1)$ : similarly to the real semiring,  $x_0^r = f_0^r = 1$  and  $x_0^s = f_0^s = 0$ ,  $s \neq r$ . next,  $\mathbf{x}_k = \mathbf{a} \otimes_b \mathbf{f}_{k-1}$ , and  $\mathbf{f}_k = \mathbf{x}_k - \mathbf{g}_k$ ;  $\mathbf{g}_k = \bigcup_{l=0}^{k-1} \mathbf{f}_l$ ,  $k \geq 2$ . then,  $\mathbf{d} = \bigcup_{l=1}^d l \mathbf{f}_l$  and  $\mathbf{p} = dp(\mathbf{d})$ . 4) the sel-max (s) semiring  $(\mathbb{r}, \max, \cdot, -\infty, 1)$ : all the above bfs variants require the  $dp$  transformation to derive
+
+p. we now present a semiring that facilitates computing parents. in this semiring  $\mathbf{x}_0^r = r$  and  $\mathbf{x}_0^s = 0, s \neq r$ . the frontier is given by  $\mathbf{f}_0^r = 1$  and  $\mathbf{f}_0^s = 0, s \neq r$ . here, we also use an additional vector  $\mathbf{p}_0 = \mathbf{x}_0$ . then, in each iteration, we first calculate  $\mathbf{x}_k = \mathbf{a} \otimes \mathbf{x}_{k-1}$  and derive the current frontier  $\mathbf{f}_k = \overline{\mathbf{x}_k} - \mathbf{g}_k$  where  $\mathbf{g}_k = \sum_{l=0}^{k-1} \mathbf{f}_l$  ( $\overline{\mathbf{x}}$  is a double logical negation to transform each non-zero in  $\mathbf{x}$  into 1). we next obtain  $\mathbf{p}_k = \mathbf{p}_{k-1} + \overline{\mathbf{p}_{k-1}} \odot \mathbf{x}_k$ . moreover,  $\mathbf{x}_k$  must be updated in such a way that each non-zero element becomes equal to its index:  $\mathbf{x}_k = \overline{\mathbf{x}_k} \odot (1, 2, \dots, n)^t$ . after the last iteration, we have  $\mathbf{p} = \mathbf{p}_d$ . finally,  $\mathbf{d} = \bigcup_{l=1}^{d} l \mathbf{f}_l$ .
+
+work complexity we compare work complexity  $w$  of bfs-spmv based on sell-  $c - \sigma$  with other schemes in table ii. full sorting that takes  $o(n\log n)$  is assumed  $(\sigma = n)$ . still, we exclude this term as it is a one-time investment and it does not change the asymptotic complexity. given vertices sorted in increasing order by degree, we let  $\rho_{i}$  denote the degree of the  $i$ th vertex and  $\hat{\rho}$  denote the maximum vertex degree. our results focus on the tropical semiring, results for other semirings follow similarly. we derive a general bound for  $w$  based only on  $c$  and the maximum degree  $\hat{\rho}$  for any graph. we then apply this bound to obtain expected storage bounds for erdős-rényi and power-law graph models.
+
+bfs algorithm  $w$  traditional bfs (textbook [12])  $o(n + m)$  traditional bfs (bag-based [21])  $o(n + m)$  traditional bfs (direction-inversion [18])  $o(dn + dm)$  bfs-spmv (textbook [12])  $o(dn^2)$  bfs-spmv [14]  $o(dn + dm)$  bfs (spmspv with merge sort [39])  $o(n + m\log m)$  bfs (spmspv with radix sort [39])  $o(n + xm)$  bfs (spmspv with no sort [39])  $o(n + m)$  this work (graphs with max degree  $\hat{\rho}$ )  $o(dn + dm + dc\hat{\rho})$  this work (erdős-rényi graphs) see equation (1) this work (power-law graphs) see equation (2)
+
+table ii: comparison of  $w$ ;  $x$  is the length of the largest key in binary [39].
+
+the size of all the blocks (except the largest) is in total
+
+$$
+\sum_ {i = 2} ^ {n _ {c}} c \rho_ {i c - 1} \leq \sum_ {i = 1} ^ {n _ {c} - 1} \sum_ {j = 1} ^ {c} \rho_ {(i - 1) c + j} \leq m,
+$$
+
+as the size of each block is smaller than the number of vertices in the previous (larger) block. next, the size of the largest block is  $\widehat{\rho} c$ , so the total storage is bounded by
+
+$$
+\sum_ {i = 1} ^ {n _ {c}} c \rho_ {i c - 1} \leq m + \hat {\rho} c.
+$$
+
+this bound is illustrated in figure 3. asymptotically, this bound is always tight for  $\operatorname{sell}c - \sigma$ , since the minimum storage (a lower bound) is  $\max(m, \hat{\rho}c)$ .
+
+![](images/889c7fd5890d7172f8b7819dbcc3d1953889cbfb003a2559dafba39c83c3d917.jpg)  
+figure 3: justification of the upper bound on work and storage in sell-  $c - \sigma$  (for  $c = 3$ ). overall, the padding can generate at most  $c\hat{\rho}$  extra storage where  $\hat{\rho}$  is the maximum degree.
+
+![](images/2fd3c01897026d9e22fc547a6410138fe20d521b9966abbdd96495c5862cde5b.jpg)
+
+to obtain a bound on  $w$ , we assume all vertices and edges need to be accessed at each of  $d$  steps, which yields
+
+$$
+w = o (d n + d m + d \hat {\rho} c).
+$$
+
+in erdős-rényi graphs, an edge exists with a probability  $p$ . a balls-into-bins argument [32] may be applied to bound the maximum vertex degree, (each bin can be thought of as a vertex in the adjacency matrix and each ball an outgoing edge). when  $np = \omega (\log (n))$ , this analysis implies that the maximum degree of such a graph will be  $\hat{\rho} = o(np)$ . when  $p$  is very small, the same type of argument leads to a bound of  $\hat{\rho} = o(\log (n))$ . therefore, we ascertain
+
+$$
+w = o (d n + d m + d c \log (n)) \tag {1}
+$$
+
+in power-law graphs, the probability that a vertex has degree  $\rho$  is  $f(\rho) = \alpha \rho^{-\beta}$ . to get a high-probability bound on the max degree of a power-law graph  $\widehat{\rho}$ , we consider the probability that a vertex has degree  $\rho \geq \widehat{\rho}$ ,
+
+$$
+p [ \rho > \widehat {\rho} ] = \alpha \sum_ {x = \widehat {\rho} + 1} ^ {n - 1} x ^ {- \beta} \approx \alpha \int_ {\widehat {\rho}} ^ {\infty} x ^ {- \beta} d x = \alpha \frac {\widehat {\rho} ^ {1 - \beta}}{\beta - 1}.
+$$
+
+to ensure that with probability  $1 - 1 / \log (n)$  all vertices have degree less than  $\widehat{\rho}$ , we need
+
+$$
+(1 - p [ \rho > \hat {\rho} ]) ^ {n} \leq 1 - \frac {1}{\log (n)}.
+$$
+
+this allows us to bound the maximum vertex degree with high probability (using bernoulli's inequality),
+
+$$
+\begin{array}{l} p [ \rho > \hat {\rho} ] \geq 1 - \left(1 - \frac {1}{\log (n)}\right) ^ {1 / n} \\ \hat {\rho} \geq \left(\frac {\beta - 1}{\alpha} \left[ 1 - \left(1 - \frac {1}{\log (n)}\right) ^ {1 / n} \right]\right) ^ {\frac {1}{1 - \beta}} \\ \geq \left(\frac {\beta - 1}{\alpha} \frac {1}{n \log (n)}\right) ^ {\frac {1}{1 - \beta}} = o \big ((\alpha n \log (n)) ^ {\frac {1}{\beta - 1}} \big). \\ \end{array}
+$$
+
+given this probabilistic bound on the maximum degree, we obtain a bound on the amount of work for power-law graphs,
+
+$$
+w = o \left(d n + d m + d c (\alpha n \log (n)) ^ {\frac {1}{\beta - 1}}\right). \tag {2}
+$$
+
+the analysis for other semirings differs in that more instructions are required to derive  $\mathbf{f}$  from  $\mathbf{x}$  in each iteration. these instructions take  $o(n)$  of the total additional work to each term from the analysis for the tropical semiring.
+
+# b. reducing storage complexity with slimsell
+
+we now build on sell-  $c - \sigma$  and introduce slimsell: a representation for unweighted graphs that reduces the original sell-  $c - \sigma$  size by a factor of up to  $\frac{m + n}{2m + n}$ , putting less pressure on the memory subsystem. our key notion is that, for undirected graphs, entries in a only indicate presence or absence of edges; this information can be contained in col without any need for val. for this, each entry in col in slimsell contains either a usual column index of the corresponding non-zero entry in a (as in sell-  $c - \sigma$ ) or a special marker (e.g., -1) if the entry is not an edge but is only present due to padding. thus, an entry in col different from the marker indicates an edge and implies a 1 in val. we illustrate slimsell in figure 4 and in listing 6. instead of directly loading val (like in listing 5, line 7), we first load the corresponding column indices from col (listing 6, line 8). then, a vectorized compare instruction provides us with a mask that determines which column indices are -1 and which are non-negative entries corresponding to edges. finally, we derive the contents of val (lines 10-12).
+
+```txt
+1 // vectors used by slimsell:  
+2 v m ones = [-1, ..., -1], ones = [1, ..., 1], infs = [∞, ..., ∞];  
+3  
+4 for(int i = 0; i < n/c; i++) { // iterate over each chunk.  
+5 int index = cs[i]; // get offset to chunk i.  
+6 v tmp = load(&fk-1[i*c]); // load chunk i from frontier  $f_{k-1}$ .  
+7 for(int j = 0; j < cl[i]; j++) { // iterate over each column.  
+8 v cols = load(&col[index]); // load entries from col.  
+9 // compute a mask that indicates which entry in cols is -1.  
+10 v vals = cmp(cols, m ones, eq);  
+11 // derive required entries from val.  
+12 vals = blend(ones, infs, vals);  
+13 // create the rhs vector consisting of four  $f_{k-1}$  entries.  
+14 v rhs = [fk-1[cl[index+3]],fk-1[cl[index+2]],  
+15 f_{k-1}[col[index+1]],f_{k-1}[col[index+0]]];  
+16 tmp = min(add(rhs, vals), tmp); // compute a new frontier.  
+17 index += c;  
+18 }  
+19 store(&fk[i*c], tmp); // set a new frontier.
+```
+
+listing 6: (§ iii-b) an example of using slimsell;  $c$  is 4.
+
+slimsell reduces data transfer by removing loads of val. yet, more computation is required (lines 10-12). we show in § iv-a3 that this does not entail significant overheads and slimsell offers more performance than sell- $c$ - $\sigma$ .
+
+storage complexity slimsell reduces the size of not only sell-  $c - \sigma$  but also csr and al; see table iii for a summary. sell-  $c - \sigma$  and slimsell require respectively  $4m + \frac{2n}{c} + p$  and  $2m + \frac{2n}{c} + p$  words;  $p$  is the number of cells from padding and it depends on a specific graph and its degree distribution. slimsell uses less storage than the corresponding al if:
+
+![](images/1fc5d803e4b05daa1e9c4e48c2e9279776925c8534b54825b6becc5dcbe90652.jpg)  
+figure 4: slimsell: val can be inferred from col.  $c = 4$ ,  $\sigma = 12$ .
+
+$$
+2 m + \frac {2 n}{c} + p <   n + 2 m \leftrightarrow p <   n \left(1 - \frac {2}{c}\right) \tag {3}
+$$
+
+this translates to  $p < \frac{3n}{4}$  for  $c = 8$  (e.g., in xeon cpus),  $p < \frac{7n}{8}$  for  $c = 16$  (e.g., in knls), and  $p < \frac{7n}{8}$  for  $c = 32$  (e.g., in tesla gpus). we show in an empirical analysis that covers various families of graphs (§ iv-e) that the impact of  $p$  is negligible for larger sorting scopes ( $\sigma > \sqrt{n}$ ) and slimsell always uses less space than csr and sell-  $c - \sigma$  and it is comparable or more space-efficient than al. finally, note that the size of val in slimsell and sell-  $c - \sigma$  (=  $2m + p$ ) is equal to the amount of work  $w$  of a single spmv product. thus, bounds (1) and (2) equal storage complexities for erdős-rényi and power-law graph models.
+
+<table><tr><td>representation</td><td>|| sell-c-σ</td><td>| csr</td><td>| al</td><td>| slimsell</td></tr><tr><td>size [cells]</td><td colspan="4">|| 4m + 2n/c + p | 4m + n | 2m + n | 2m + 2n/c + p</td></tr></table>
+
+table iii: (§ iii-b) storage complexity of considered graph representations;  $p$  is the number of padded memory cells.
+
+listing 7: (§ iii-c1) slimwork for various semirings;  $c$  is 4.  
+```c
+1 // frontier expansion: we start like in listing 6.  
+2 for(int i = 0; i < n/c; i++) {  
+3 int skip = 1; // assume we skip the current chunk  
+4 for(int j = 0; j < c; j++) {  
+5 ifdef use_tropical_semiring  
+6 if(fk-1[i*c+j] == ∞) tropical semiring  
+7 skip = 0; // if any distance is still ∞, go on.  
+8 #elif defined useboolean_semiring ||  
+9 defined use_real_semiring  
+10 if(gk-1[i*c+j] != ∞)  
+11 skip = 0; // if any filter is still ≠ 0, go on.  
+12 #elif defined use_selmax_semiring  
+13 if(pk-1[i*c+j] != ∞)  
+14 skip = 0; // if any parent is still ≠ 0, go on.  
+15 #endif  
+16 ifskip // swap the frontiers.  
+17 store(&xk[i*c], load(&xk-1[i*c])); continue;  
+18 /* now, continue with the mv product as in listing 5... */
+```
+
+# c. reducing work amount with slimwork
+
+slimsell improves upon sell-  $c - \sigma$  by reducing it size. we now introduce slimwork (see listing 7), a scheme that reduces the work amount in bfs-spmv. intuitively, we skip chunks of computation if they are associated with the final bfs values (distances or parent ids) that do not change in future iterations. as our performance study shows (§ iv), this scheme significantly accelerates bfs-spmv. we now present how to use slimwork with each semiring.
+
+1) tropical semiring: slimwork for the tropical semiring is illustrated in listing 7 (lines 5-7). consider  $\mathbf{f}_k = \mathbf{a}' \otimes \mathbf{f}_{k-1}$ . in the label-setting bfs,  $f_k^s$  can only differ from  $f_{k-1}^s$  if  $f_{k-1}^s$  is not the final distance. by verifying whether  $f_k^s = f_{k-1}^s$ , we determine if  $f_{k+1}^s$  has to be computed or whether it can simply be carried over from  $\mathbf{f}_k$  (line 18).  
+2) other semirings: real or boolean semirings require a vector for the filtering term  $\mathbf{g}_k = \overline{\sum_{l=0}^{k-1} \mathbf{f}_l}$  (see § iii-a2) to verify if a given chunk of  $\mathbf{f}_k$  must be updated. the computation in a chunk is skipped if all the rows in that chunk satisfy the condition that the corresponding entries of  $\mathbf{g}_k$  are 0. a similar criterion (based on the  $\mathbf{p}_k$  vector) is used for the selpmax semiring; see listing 7.
+
+work complexity slimwork adds  $o(c)$  work per chunk as it must decide whether to omit chunks of computation. however, in return it may reduce  $w$  by  $o(\widehat{\rho}_i c)$  for each skipped chunk  $i$ ;  $\widehat{\rho}_i$  is the maximum degree in chunk  $i$ .
+
+# d. improving load balance with slimchunk
+
+the final slimchunk scheme aims at accelerating bfs-spmv when executing on units with large simd widths. specifically, consider a case with a large sorting scope (e.g.,  $\sigma = \sqrt{n}$ ). the rows are sorted by the degree of the corresponding vertices. thus, some chunks (related to high-degree vertices) may entail much more computation than the chunks related to low-degree vertices, resulting in load imbalance. to alleviate this, we split  $\mathbf{a}$  not only horizontally
+
+into chunks, but we also split the chunks vertically, in two dimensions. this still leads to the contiguous layout in memory but also accelerates bfs-spmv by dividing work more equally between threads, as we show in § iv.
+
+to conclude, slimsell improves the design of bfs-spmv along three dimensions: it reduces the size, lowers the amount of work, and improves the load balancing.
+
+# iv. performance analysis and evaluation
+
+we now illustrate that slimsell secures high performance for bfs-spmv. we also analyze the differences between bfs-spmv based on various semirings and representations.
+
+selection of benchmarks and parameters we consider all four bfs-spmv semiring variants. next, performance and storage improvements from slimsell, slimwork, and slimchunk are evaluated. both strong- and weak-scaling is considered. we also analyze the  $dp$  transformation overheads (dp, no-dp). to evaluate the impact from sorting, we vary  $\sigma \in [1,n]$  (for simplicity  $\sigma$  is a multiple of  $c$ ). we verify the bfs performance in each iteration for a fine-grained analysis. next, static and dynamic openmp scheduling is incorporated (omp-s, omp-d). three classes of graphs are considered: synthetic power-law kronecker [22] and erdős-rényi (er) [15] graphs such that  $n \in \{2^{20}, \dots, 2^{28}\}$  and  $\overline{\rho} \in \{2^1, \dots, 2^{10}\}$ ; we also use real-world graphs (rw); see table iv. we present and discuss in detail a representative subset of results.
+
+<table><tr><td>type</td><td>id</td><td>n</td><td>m</td><td>ρ</td><td>d</td></tr><tr><td>kronecker graphs</td><td>k</td><td>1m-268m</td><td>2m-536m</td><td>2-1014</td><td>19-33</td></tr><tr><td rowspan="3">social networks</td><td>orc</td><td>3.07m</td><td>117m</td><td>39</td><td>9</td></tr><tr><td>pok</td><td>1.63m</td><td>30.6m</td><td>18.75</td><td>11</td></tr><tr><td>epi</td><td>75k</td><td>508k</td><td>6.7</td><td>15</td></tr><tr><td>ground-truth [40] community</td><td>ijn</td><td>3.99m</td><td>34.6m</td><td>8.67</td><td>17</td></tr><tr><td rowspan="4">web graphs</td><td>brk</td><td>685k</td><td>7.60m</td><td>11.09</td><td>514</td></tr><tr><td>gog</td><td>875k</td><td>5.1m</td><td>5.82</td><td>21</td></tr><tr><td>sta</td><td>281k</td><td>2.31m</td><td>8.2</td><td>46</td></tr><tr><td>ndm</td><td>325k</td><td>1.49m</td><td>4.59</td><td>674</td></tr><tr><td>purchase network</td><td>amz</td><td>262k</td><td>1.23m</td><td>4.71</td><td>32</td></tr><tr><td>road network</td><td>rca</td><td>1.96m</td><td>2.76m</td><td>1.4</td><td>849</td></tr></table>
+
+table iv: the analyzed graphs with skewed degree distributions.
+
+comparison targets (performance) we compare bfs-spmv equipped with slimsell to the work-efficient highly-optimized openmp bfs graph500 code [30] (trad-bfs). this baseline applies several optimizations; among others it reduces the amount of fine-grained synchronization by checking if the vertex was visited before executing an atomic. as trad-bfs is work-optimal, it also represents the work-optimal bfs based on spmspv. we execute trad-bfs on both knls and cpus to secure fair comparison and to illustrate one of the points of our work: vectorization- and simd-friendly slimsell enables bfs-spmv to be comparable to work-efficient bfs optimized for cpus.
+
+comparison targets (storage) in the storage analysis, we compare slimsell to csr, al, and sell-  $c - \sigma$
+
+experimental setup and architectures we conduct the analysis on several cpus, gpus, and manycores, with the total of seven evaluated systems:
+
+dora (cpu) one node of the cscs piz dora supercomputer contains two intel xeons e5-2695 v4 @ 2.10 ghz. each cpu has 18 cores, 18x 256 kb l2 and 45 mb l3 cache. each nodes has 64 gb of ram. we use gcc-5.3.
+
+tesla (gpu) we use nvidia tesla k80 gpus from the cscs greina hpc cluster (covering high-performance gpus). any cpu code is compiled using gcc-5.3, the cuda code uses cudatoolkit-6.5.
+
+knl (manycore) we use intel xeon phi knls 7210 (also from greina). each knl has 64 4-way 1.3ghz multi-threaded cores with the total of 32 mb l2 and 66 gb of ram. we use icc 16.0.1.150.
+
+others other systems include a tesla k20x from the cscs piz daint supercomputer, a trivium server with an intel haswell cpu and an nvidia gtx 670 that represent commodity machines, and a xeon e5-1620 @3.50ghz from cscs greina to cover very low-latency systems.
+
+# a. cpu analysis (xeon e5-2695 v4)
+
+we start with the cpu analysis; see figure 5. we fix  $c$  to match architectural constraints. for example, choosing 32-bit integers to represent vertex identifiers on a cpu yields a simd width of 8 due to 256-bit wide avx registers. we use openmp for intra-node parallelization.
+
+1) impact from sorting  $(\sigma)$ : we first investigate the impact of  $\sigma$  for various bfs-spmv scenarios (figures 5a-5c). performance strongly depends on  $\sigma$  as significantly different vertex degrees in one  $c$  entail wasted work due to padding. thus, large  $\sigma$  is preferable. next,  $\sigma < c$  does not reduce padding and work but only reorders rows within a chunk. thus, the performance does not increase while  $\log \sigma \leq 3$ . moreover, in figure 5a, an overhead due to the  $dp$  transformation is visible as  $\sigma$  goes towards  $n$ , except for the sel-max semiring. this is because in static openmp scheduling all threads process similar counts of chunks. then, for a very large  $\sigma$ , the first chunk contains all of the longest rows and consequently the corresponding thread performs the majority of work, causing imbalance. dynamic openmp scheduling adds  $\approx 1 - 2\%$  of relative overhead but alleviates the problem; see figure 5b.
+
+2) differences between semirings: the inner-most loop that processes chunks is the same for each semiring except for the used vector instructions (cf. listing 5, lines 6-21). as figure 5 shows, performance differences are negligible ( $\approx 1 - 2\%$ ), confirming the intuition that bfs is memory-bound. however, semirings also differ in the post-processing that derives  $\mathbf{f}_k$  from  $\mathbf{x}_k$  (lines 22-45). the tropical semiring contains no additional work. contrarily, the real and boolean semirings update the filter  $\mathbf{g}_k$  (six instructions and two
+
+![](images/52a715f37b0823e9c615517dc9ca45431a1d416ce06826340f9e3243ee6aec55.jpg)  
+(a) kronecker, dp, omp-s.
+
+![](images/3e3d1615d9ce9f7c86d01507ca6bdf17dd018ed31c2c4b1302b13d6af3ca30fd.jpg)  
+figure 5: (§ iv-a) cpu analysis (dora). the kronecker graphs have  $n = 2^{23}$ ,  $\bar{\rho} = 16$ ; the er graphs have  $n = 2^{23}$ ,  $p = 2 \cdot 10^{-6}$ ,  $\bar{\rho} \approx 16$ .
+
+![](images/069f150ba247204ac73189d9a1518eabb3b2ac719789e27505b79e44f3940873.jpg)  
+(b) kronecker, no-dp, omp-d.  
+(c) er, dp, omp-d
+
+![](images/1a6c5bdcf71f3b1a767529e2dbfa142936a7015c1d5a5cb277991030fd6f5454.jpg)  
+(d) slimwork.
+
+![](images/f2e62424c520ce71528526c10263bf748f241e256dd5c3c36648cc1b2f46368f.jpg)  
+(a) kronecker, dp.
+
+![](images/3df3e377a53cf31853ffa8456567f17c0c1e83b3bdf6d39353589867fa5f1fd3.jpg)  
+(b) er, dp.
+
+![](images/35b78401f12de63371e765d1e3768ddf9297246c35c96860561cf4d33337ad72.jpg)  
+(c) kronecker,  $\mathsf{dp}$ ,  $\sigma = 2^{10}$ .
+
+![](images/b768c6979f2b9cbdeb6608dc948c9e47eff981999d9ef46a5b5abfc8ed05cc8d.jpg)  
+(d) kronecker, dp.  
+figure 6: (§ iv-b) gpu analysis (tesla k80). the kronecker graphs have  $n = 2^{20}$ ,  $\bar{\rho} = 16$ ; the er graphs have  $n = 2^{18}$ ,  $p = 1.5 \cdot 5 \cdot 10^{-5}$ ,  $\bar{\rho} \approx 16$ .
+
+![](images/1809b3285081ef5cd392757270c7dfd5767a77746d4f0669641c4cae4bdd0f11.jpg)  
+(e) kronecker,  $\mathsf{dp}$ ,  $\sigma = 2^{10}$ .
+
+stores) while the sel-max semiring processes the  $\mathbf{p}$  vector (four instructions and two stores). still, the only major performance difference comes with the dp in sel-max semiring.
+
+3) advantages of slimsell: we next illustrate advantages of slimsell over sell-  $c - \sigma$  (table v). here,  $\sigma$  determines how much bandwidth is wasted on unused loads. larger  $\sigma$  results in lower impact from slimsell as the bandwidth is used more efficiently due to sorting.
+
+<table><tr><td>σ</td><td>boolean</td><td>real</td><td>tropical</td><td>sel-max</td></tr><tr><td>24</td><td>1.17</td><td>1.17</td><td>1.21</td><td>1.18</td></tr><tr><td>218</td><td>1.00</td><td>1.04</td><td>1.04</td><td>1.03</td></tr></table>
+
+table v: speedup of slimsell over sell-  $c-\sigma$  in kronecker graphs  $(n = 2^{24},\overline{\rho} = 16)$ .
+
+4) advantages of slimwork: we present slimwork advantages in figure 5d. we compare bfs-spmv variants with and without slimwork for several  $\sigma$ s (for clarity, we plot only the case with  $\sigma = n$ ). the larger  $\sigma$ , the faster work amount decreases with iterations. this is because larger  $\sigma$ s make it more probable that the majority of the largest chunks (associated with high-degree vertices) are processed in early iterations. next, slimwork skips chunks as soon as all the associated vertices have been visited. thus, as more vertices are visited, the number of chunks left to compute
+
+decreases and the last few iterations entail only little work. contrarily, early iterations gain no speedup; they instead pay a small overhead for checking the skipping criteria. still, the overhead is rapidly outweighed by saving expensive chunk computations. overall, slimwork accelerates the baseline slimsell by a large factor, for example  $\approx 129\%$  for sel-max for a kronecker graph with  $n = 2^{24}$ ,  $\bar{\rho} = 16$ . finally, in “no slimwork” (corresponding to sell- $c$ - $\sigma$  augmented only with the slimsell storage reductions), there is no performance improvement after the first iteration.
+
+5) various graph families: we now discuss erdős-rényi and real-world inputs. the degrees of the former follow the uniform instead of the power law distribution. the impact from large  $\sigma$  is therefore less evident; see figure 5c. the fine-grained analysis of each bfs step illustrates that the decrease in time only starts during the final iterations. next, we consider real-world graphs. some, like amz or rca, have high  $d$  and low  $\bar{\rho}$  (3.4 for amz and 1.4 for rca). this leads to small or no improvement from slimwork, regardless of  $\sigma$ . others behave similarly to kronecker graphs as their  $\bar{\rho}$  is large enough for slimwork to ensure speedups.
+
+# b. gpu analysis (tesla k80)
+
+we present a representative subset of results in figure 6. our insights are similar to those of the cpu analysis. the
+
+![](images/32998f4757d688e0d39a7bd77c4981c6dd70b97bd3d7514b23f9b188eacb22e7.jpg)
+
+![](images/00f5f67059b6a579cbe97405f4366fd6a9e8e601657f390194a88420acac4020.jpg)  
+(a) kronecker graphs (larger sorting scope).  
+(c) kronecker graphs (smaller sorting scope).  
+figure 7: (§ iv-e) size analysis for various  $n$ ,  $\bar{\rho}$ , and  $\sigma$ ; the used kronecker graphs fill the whole memory;  $c$  is 8.
+
+![](images/9516ddbbb2da0bad0e092ab07450cd20f7a1f4720da381667724cc5fed6a051c.jpg)
+
+![](images/7483029613debe04ecf1125c44f287e67629fef214e91459631ddf20a90d0767.jpg)  
+(b) real-world graphs (larger sorting scope).  
+(d) real-world graphs (smaller sorting scope).
+
+![](images/425fa2f239fdb4bcb59ef01025a6b8ecbdde28bf03ce451081ec81040e94843d.jpg)  
+(a)  $n = 2^{20}$  
+figure 8: (§ iv-c, knl analysis) a fine-grained analysis (using the tropical semiring) on kronecker graphs; two numbers for each graph are  $\log n - \overline{\rho}$ .
+
+![](images/ff7cc4ae69a6e488e84b882d2751a3b3ed09d31b10baed1df75b73b1576b083f.jpg)  
+(b)  $n\in \{2^{21},2^{22}\}$
+
+main difference is that wider simd units in gpus secure higher speedups. first, figures 6a and 6b depict the total execution time for varying  $\sigma$  for kronecker and er graphs. similarly to cpus, the performance does not improve up to a certain  $\sigma$  equal to  $c$ . second, sel-max performs better than others as it does not need  $dp$ . moreover, the performance for higher  $\sigma$  is because the sorting of the rows in a leads to large load imbalance (e.g., see figure 6b). then, the per iteration performance follows patterns similar to cpus as illustrated in figure 6c. finally, we show that slimchunk brings expected significant advantages, for example  $\approx 50\%$  in the first two iterations in figure 6e).
+
+# c. manycore analysis (knl)
+
+here, we evaluate slimsell on intel knls; see figure 8. the latency of each iteration grows as expected with the increasing  $\overline{\rho}$  or  $n$ . knl secures a drop in compute time after the first iteration. in gpus, this effect is less visible due to larger simd widths that hinder reducing computation. on cpus, it is only negligibly visible in figure 4d as erdős-rényi graphs are used there. later (§ iv-f) we show that our variant of bfs-spmv based on slimsell outperforms the traditional work-efficient bfs on knls.
+
+# d. preprocessing analysis
+
+we illustrate that the full sorting time required for good storage improvements as well as the actual build time can be amortized away. for a kronecker graph with  $n = 2^{24}$ , sorting takes  $\approx 0.95\mathrm{s}$ , which constitutes  $\approx 21\%$  of a single bfs run. thus, 10 bfs runs are enough to reduce the sorting time to  $< 2\%$  of the total runtime. the build time is analogous to that of sell-  $c - \sigma$  [20]; it lasts longer but can also be amortized with more bfs runs. for example, on a kronecker graph with  $n = 2^{18}$ , 20 bfs runs are enough to reduce the full preprocessing time to  $< 5\%$  of the total runtime. the results for other graphs are similar. in our analyses, we amortize the preprocessing time and report averaged iteration or total execution times.
+
+# e. storage analysis
+
+figure 7 illustrates storage improvements of slimsell for various  $\sigma, n, \bar{\rho}$ , and graph families. slimsell reduces the size of sell-  $c$ - $\sigma$  by  $\approx 50\%$ , a consistent advantage for various  $n$ ,  $\bar{\rho}$ , and  $\sigma$ . notably, for full sorting ( $\sigma = n$ ) and for kronecker
+
+![](images/65d12897e648d6b6376506403669193e2dd499871251be236fb0868dac108ed0.jpg)  
+(a)  $n = 2^{19},\overline{\rho} = 1024$
+
+![](images/a830c50db733be86a80252b145a81e5a6624455288e93d5a6fce87cf8c87fc1e.jpg)  
+(b)  $n = 2^{20},\overline{\rho} = 512$  
+figure 9: (§ iv-c, knl analysis) fine-grained comparison between bfs-trad and bfs-spmv with slimsell and sel-max;  $c$  is 16,  $g$  is kronecker.
+
+![](images/257e2e9ac86164c87b08010fc6c9b3ad3def14dc1337e08b3554e96e81632baa.jpg)  
+(c)  $n = 2^{21},\overline{\rho} = 128$
+
+graphs, slimsell is also more compact than al (by  $\approx 5 - 10\%$ ) which is effectively the smallest graph representation if no compression is used. the same effect sets in for  $\sigma \geq \sqrt{n}$  for rw graphs. note that  $c = 8$  in the above analysis. larger  $c$  brings even more storage reductions.
+
+# f. comparison to the state-of-the-art
+
+we compare bfs-spmv equipped with slimsell to trad-bfs in a fine-grained analysis. figure 10 shows the time to finish each bfs iteration for various  $\overline{\rho} \in \{1, \dots, 512\}$ ; we compare the optimized traditional bfs running on a system where it achieves highest performance (xeon cpu) with bfs-spmv based on slimsell that executes on tesla k80 gpu. the higher  $\overline{\rho}$  (denser  $g$ ), the faster bfs-spmv is. this is supported with the intuition: more edges in  $g$  entail a larger simd potential. finally, figures 1 and 9 show that bfs-spmv based on slimsell outperforms the traditional bfs by up to  $53\%$ ; denser graphs entail larger speedups. as expected, power-law graphs are more simd-friendly during the expansion of the large frontier part. contrarily, erdős-rényi graphs do not have this property. we conclude that slimsell enables bfs-spmv (running on throughput-oriented architectures such as gpus) to match the performance of highly-optimized work-efficient codes (executing on optimized and latency-oriented cpus).
+
+# v. related work
+
+extensive research has been done to address the challenges in parallel graph processing [25]. one category of works includes parallel graph processing engines (e.g., pregel [26] or pbgl [17]) and various improvements for algorithms and implementations such as direction-inversion [18], [36]). the well-known direction-optimization [3] and other work-avoidance schemes are orthogonal to our work and can be implemented on top of slimsell; see figure 1. in general, we do not focus on improving the well-studied queue-based bfs algorithm, but instead apply changes to the graph representation to improve performance.
+
+there are several works on vectorization and gpus for bfs [31], [28], [11], [39], [14], [18]. yet, they use queue-based approaches or sparse matrix-sparse vector products
+
+and thus suffer from the common downsides such as bad data locality, irregular data accesses, and simd or vectorization underutilisation [11]. contrarily, we start from sparse-matrix dense-vector products as a basis for slimsell that come with regular memory accesses and better simd utilization. the slimsell optimization for unweighted graphs is applicable not only to  $\operatorname{sell} - c - \sigma$  but also other sparse matrix formats such as ellpack/ell, sliced ellpack [29], esb [23], acsr [2], and csr. they all address general matrices and thus use the val array with matrix values that can be omitted to reduce data transfer. next, slimsell removes padding and thus storage overheads inherent in ellpack, differs from ellpack/ell and esb as it turns the graph storage layout by 90 degrees in memory along with  $\operatorname{sell} - c - \sigma$  to utilize more of simd compute power, and targets not only gpus (like sliced ellpack or acsr) or only knl (like esb), but can be used for both and for cpus. finally, our work is the first to conduct a systematic analysis on using different semirings for bfs and on work complexity of bfs for miscellaneous graph classes and schemes.
+
+slimchunk is similar to acsr [2] and to csr-vectorl in csr-adaptive [13]. unlike them, we do not adaptively split chunks and instead let the dynamic nature of the partial chunk allocation deal with work imbalance. the advantage of our approach lies in its simplicity: no complex adaptive schemes are required. in addition, slimchunk is by default enabled only for gpus as this is the only architecture that entailed load imbalance. thus, slimsell offers an intuitive and simple design for cpus and xeon phi. another similar scheme is sell-p [1]: it pads the rows with zeros to make the row length of each block a multiple of the number of threads assigned to a row. yet, this is discussed only for gpu-based krylov solvers. furthermore, yang et al. [41] facilitate matrix tiling to enhance temporal locality, a scheme different from slimsell that uses  $\mathrm{sell} - c - \sigma$  to turn the matrix layout by 90 degrees for better simd utilization, reduces work and storage overheads to limit the pressure on the memory subsystem. next, gunrock [38] is a cuda library for graph-processing on gpus. it does not prescribe a high-performance graph representation, but instead provides a
+
+![](images/4cc94423b131f0e5dec3da5eb75fde628aa6446da9d45c5a15491d2042547fbb.jpg)  
+(a)  $\overline{\rho} = 128$
+
+![](images/60248c0efb454acb985dbd4a26902a13b3de5fae7174b820a40d9e40ec5d7823.jpg)  
+(b)  $\overline{\rho} = 256$  
+figure 10: (§ iv-f) fine-grained comparison between bfs-trad (optimized for cpus) and bfs-spmv executing on gpus based on the tropical semiring;  $c$  is 32,  $g$  is kronecker,  $n = 2^{20}$ .
+
+![](images/0db0388288993284f6789492e5e2bddd29b7bd616d58079c4a8dc2b0bc33db1f.jpg)  
+(c)  $\overline{\rho} = 512$
+
+high-level, bulk-synchronous, data-centric abstraction that allows programmers to quickly develop new graph primitives. slimsell could substitute graph representations used by default in gunrock for higher speedups; an idea that we leave for future work. another thread of future work is to port slimsell to massively threaded systems such as sparc64 or adapteva parallel.
+
+some work has been done into the formulation and implementation of bfs based on the algebraic formulation. examples include graphblas [27], combinatorial blas (combblas) [10], and bfs with 2d adjacency data distribution [9]. slimsell, slimwork, and slimchunk can be used to accelerate combblas. finally, our first systematic discussion and theoretical analysis of bfs based on various semirings may be incorporated into the theoretical graphblas framework.
+
+# vi. conclusion
+
+vectorization and throughput-oriented gpus are reshaping graph processing: traditional bfs codes optimized for latency-oriented cpus will be inefficient on systems with wide simd units. we address this trend and propose slimsell: a vectorizable graph representation for bfs based on sparse matrix-dense vector products. slimsell augments the state-of-the-art sell-  $c - \sigma$  matrix storage format along three dimensions: size, work, and load balance. it effectively applies the regular simd parallelism to irregular graph traversals to match or outperform in various scenarios optimized graph500 codes tuned for high-performance cpus.
+
+furthermore, our work provides the first systematic analysis of the formulation, performance, and work/storage complexity of algebraic bfs variants based on different semirings. we derive bounds for uniform and power-law graphs; our theoretical insights combined with performance studies for state-of-the-art architectures such as intel knights landing can be used by architects and developers to improve heuristics and graph representations implemented in processing engines such as combblas [10].
+
+we strongly believe that slimsell can be used to accelerate other graph algorithms, for example schemes for solving betweenness centrality [35]. potential speedups can be
+
+much higher because bfs is a data-driven scheme with different memory access patterns across iterations while many algorithms (e.g., pagerank) have identical communication patterns in each superstep. finally, the principles behind slimsell could be extended to distributed-memory settings [6], [7], [4], [16], [5]. we leave these directions for future work.
+
+acknowledgements: we thank hussein harake, colin mcmurtrie, and the whole cscs team granting access to the greina, piz dora, and daint machines, and for their excellent technical support. we thank moritz kreutzer and the anonymous reviewers for their insightful comments.
+
+# references
+
+[1] h. anzt et al. acceleration of gpu-based krylov solvers via data transfer reduction. int. j. high perform. comput. appl., 29(3):366-383, aug. 2015.  
+[2] a. ashari et al. fast sparse matrix-vector multiplication on gpus for graph applications. in proc. of the acm/ieee supercomputing, sc '14, pages 781-792, 2014.  
+[3] s. beamer et al. direction-optimizing breadth-first search. scientific programming, 21(3-4):137-148, 2013.  
+[4] m. besta and t. hoefler. fault tolerance for remote memory access programming models. in proceedings of the 23rd international symposium on high-performance parallel and distributed computing, pages 37-48, 2014.  
+[5] m. besta and t. hoefler. slim fly: a cost effective low-diameter network topology. in sc'14: proceedings of the international conference for high performance computing, networking, storage and analysis, pages 348-359. ieee, 2014.  
+[6] m. besta and t. hoefler. accelerating irregular computations with hardware transactional memory and active messages. in proceedings of the 24th international symposium on high-performance parallel and distributed computing, pages 161–172, 2015.  
+[7] m. besta and t. hoefler. active access: a mechanism for high-performance distributed data-centric computations. in proceedings of the 29th acm on international conference on supercomputing, pages 155-164, 2015.
+
+[8] m. besta, m. podstawski, l. groner, e. solomonik, and t. hoefler. to push or to pull: on reducing communication and synchronization in graph computations. in proceedings of the 26th international symposium on high-performance parallel and distributed computing, pages 93–104, 2017.  
+[9] a. buluc and k. madduri. parallel breadth-first search on distributed memory systems. in acm/ieee supercomputing, page 65, 2011.  
+[10] a. buluc et al. the combinatorial blas: design, implementation, and applications. intl. j. high perform. comput. appl., 25(4):496-509, nov. 2011.  
+[11] y. cheng et al. understanding the simd efficiency of graph traversal on gpu. in intl. conf. on alg. and arch. for par. proc., pages 42-56, 2014.  
+[12] t. h. cormen et al. introduction to algorithms. mcgraw-hill higher education, 2nd edition, 2001.  
+[13] m. daga and j. l. greathouse. structural agnostic spmv: adapting csr-adaptive for irregular matrices. in intl. conf on high perf. comp. (hipc), pages 64-74. ieee, 2015.  
+[14] y. s. deng et al. taming irregular eda applications on gpus. in proc. of the intl. conf. on comp. aid. des., pages 539-546. acm, 2009.  
+[15] p. erdős and a. rényi. on the evolution of random graphs. selected papers of alfred rényi, 2:482-525, 1976.  
+[16] r. gerstenberger, m. besta, and t. hoefler. enabling highly- scalable remote memory access programming with mpi-3 one sided. in proceedings of the international conference on high performance computing, networking, storage and analysis, pages 1-12, 2013.  
+[17] d. gregor et al. the parallel bgl: a generic library for distributed graph computations. par. obj.-or. sc. comp. (poosc), 2:1-18, 2005.  
+[18] p. harish and p. narayanan. accelerating large graph algorithms on the gpu using cuda. in intl. conf. on high-perf. comp., pages 197–208, 2007.  
+[19] j. kepner and j. gilbert. graph algorithms in the language of linear algebra, volume 22. siam, 2011.  
+[20] m. kreutzer et al. a unified sparse matrix data format for efficient general sparse matrix-vector multiplication on modern processors with wide simd units. siam journal on scientific comp., 36(5):c401-c423, 2014.  
+[21] c. e. leiserson and t. b. schardl. a work-efficient parallel breadth-first search algorithm (or how to cope with the nondeterminism of reducers). in proc. of the acm symp. on par. in alg and arch. (spaa), pages 303-314, 2010.  
+[22] j. leskovec et al. kronecker graphs: an approach to modeling networks. j. of m. learn. res., 11:985-1042, 2010.  
+[23] x. liu et al. efficient sparse matrix-vector multiplication on x86-based many-core processors. in intl. conf. on super. (ics), pages 273-282. acm, 2013.
+
+[24] c. lomont. introduction to intel advanced vector extensions. intel white paper, 2011.  
+[25] a. lumsdaine et al. challenges in parallel graph processing. par. proc. l., 17(01):5-20, 2007.  
+[26] g. malewicz et al. pregel: a system for large-scale graph processing. in proc. of the acm sigmod intl. conf. on manag. of data, pages 135-146, 2010.  
+[27] t. mattson et al. standards for graph algorithm primitives. arxiv preprint arxiv:1408.0393, 2014.  
+[28] d. merrill, m. garland, and a. grimshaw. high-performance and scalable gpu graph traversal. acm trans. on par. comp., 1(2):14, 2015.  
+[29] a. monakov et al. automatically tuning sparse matrix-vector multiplication for gpu architectures. in intl. conf. on high-perf. emb. arch. and comp., pages 111–125. springer, 2010.  
+[30] r. c. murphy et al. introducing the graph 500. cray user's group (cug), 2010.  
+[31] m. paredes, g. riley, and m. luján. breadth first search vectorization on the intel xeon phi. in proc. of acm intl. conf. on comp. fron., pages 1-10, 2016.  
+[32] m. raab et al. “balls into bins”—a simple and tight analysis. in intl. work. on rand. and approx. techniques in cs, pages 159–170. springer, 1998.  
+[33] p. schmid, m. besta, and t. hoefler. high-performance distributed rma locks. in proceedings of the 25th acm international symposium on high-performance parallel and distributed computing, pages 19–30, 2016.  
+[34] h. schweizer, m. besta, and t. hoefler. evaluating the cost of atomic operations on modern architectures. in 2015 international conference on parallel architecture and compilation (pact), pages 445-456. ieee, 2015.  
+[35] e. solomonik, m. besta, f. vella, and t. hoefler. scaling betweenness centrality using communication-efficient sparse matrix multiplication. in proceedings of the international conference for high performance computing, networking, storage and analysis, pages 1-14, 2017.  
+[36] t. suzumura et al. performance characteristics of graph500 on large-scale distributed environment. in ieee intl. symp. on. work. char. (iiswc), pages 149-158, 2011.  
+[37] a. tate, a. kamil, a. dubey, a. größlinger, b. chamberlain, b. goglin, c. edwards, c. j. newburn, d. padua, d. unat, et al. programming abstractions for data locality. 2014.  
+[38] y. wang et al. gunrock: a high-performance graph processing library on the gpu. in acm symp. on prin. and proc. of par. prog. (ppopp), page 11, 2016.  
+[39] c. yang, y. wang, and j. d. owens. fast sparse matrix and sparse vector multiplication algorithm on the gpu. in par. and dist. proc. symp. work. (ipdpsw), ieee intl., pages 841-847. ieee, 2015.
+
+[40] j. yang et al. defining and evaluating network communities based on ground-truth. knowledge and inf. systems, 42(1):181-213, 2015.  
+[41] x. yang et al. fast sparse matrix-vector multiplication on gpus: implications for graph mining. proc. of vldb end., 4(4):231-242, 2011.

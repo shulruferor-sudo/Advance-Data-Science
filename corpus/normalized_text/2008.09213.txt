@@ -1,0 +1,687 @@
+# heterogeneity-aware cluster scheduling policies for deep learning workloads
+
+deepak narayanan†, keshav santhanam†, fiodar kazhamiaka†, amar phanishayee*, matei zaharia†  
+*microsoft research †stanford university
+
+# abstract
+
+specialized accelerators such as gpus, tpus, fpgas, and custom asics have been increasingly deployed to train deep learning models. these accelerators exhibit heterogeneous performance behavior across model architectures. existing schedulers for clusters of accelerators, which are used to arbitrate these expensive training resources across many users, have shown how to optimize for various multi-job, multi-user objectives, like fairness and makespan. unfortunately, existing schedulers largely do not consider performance heterogeneity. in this paper, we propose gavel, a heterogeneity-aware scheduler that systematically generalizes a wide range of existing scheduling policies. gavel expresses these policies as optimization problems, making it easy to optimize for objectives in a heterogeneity-aware way, while also being cognizant of performance optimizations like space sharing. gavel then uses a round-based scheduling mechanism to ensure jobs receive their ideal allocation given the target scheduling policy. gavel's heterogeneity-aware policies allow a heterogeneous cluster to sustain higher input load, and improve end objectives such as average job completion time and makespan by up to  $3.5 \times$  compared to heterogeneity-agnostic policies.
+
+# 1 introduction
+
+as moore's law comes to an end, specialized accelerators such as gpus, tpus, fpgas, and other domain-specific architectures have emerged as an alternative to more general-purpose cpus. these accelerators have been deployed to great effect [27, 37] to train state-of-the-art deep neural network (dnn) models for many domains, including language, images and video [15, 32, 33, 53, 57].
+
+consequently, users today must choose from a wide variety of accelerators to train their dnn models. for example, public cloud users can rent several generations of nvidia gpus and google tpus from cloud providers [1-3]. even organizations with private clusters have accumulated different accelerator types over time [36]; anecdotally, our research group has titan v, titan x, and p100 gpus in its private cluster. resources in these multi-tenant settings are typically arbitrated by a scheduler. gpu cluster schedulers such as themis [42], tiresias [30], allox [39], and gandiva [60] thus need to decide how to allocate diverse resources to many users while implementing complex cluster-wide scheduling policies, optimizing objectives such as fairness or minimum makespan. unfortunately, choosing the most effective accelerator types in this context is difficult for three reasons:
+
+![](images/3b8660a9a06e0b3f604f98c0b52fec582ba94bb0a7289c2e65e4aff0adea0835.jpg)  
+(a) throughput.
+
+![](images/391cc55557a1d4c756afaa96ce25b5421d4518b23910e7e976480fc0c013fd1c.jpg)  
+(b) dollar-normalized.  
+figure 1: throughputs and dollar-normalized throughputs of training for various ml models. dollar-normalized throughputs are computed by dividing the corresponding throughput by the relevant gcp on-demand price, the magnitude of speedup across gpu generations varies significantly across models.
+
+performance heterogeneity. commonly used model architectures show heterogeneous performance behavior across accelerator types due to various architectural differences. for example, figure 1a shows that a resnet-50 model sees a nearly  $10 \times$  speedup from an nvidia v100 gpu compared to a k80 gpu, while an a3c deep reinforcement learning model only sees a  $2 \times$  speedup. however, as shown in figure 1b, the v100 is no longer the optimal choice for all models when we consider the number of samples trained per dollar – for many models, the older p100 gpu is competitive or cheaper on a per-dollar basis. some scheduling policies can also benefit from splitting a job between multiple resource types: for example, minimizing a job's cost subject to a latency slo (e.g., complete a job in 10 hours) might involve using a cheaper accelerator to begin training and then switching to a faster, more expensive device to meet the slo. thus, for even simple single-job settings, the choice of accelerator type is non-trivial and depends on both the job and the policy. this gets more complicated in multi-job settings as granting all jobs their preferred accelerator simultaneously might not be possible. existing schedulers like gandiva, tiresias, and themis do not consider the heterogeneous performance behavior across accelerators.
+
+generality across policies. cluster operators might want to implement different scheduling policies based on their business goals, such as optimizing for time to complete a set of batch jobs (makespan), fairness for ad-hoc jobs, or more sophisticated hierarchical policies that divide resources among high-level entities (e.g., departments) using one policy, and then individual jobs within the entity using another [36]. in data analytics clusters, many job schedulers have support for hierarchical allocation policies [7,8,13,61] already. the two recently proposed gpu schedulers that do consider heterogeneous resources, allox [39] and gandivafair [19], optimize for a single scheduling objective, and tightly couple their scheduling mechanism to that objective (e.g., max-min fairness). thus, they cannot easily support the more sophisticated policies often used in practice.
+
+colocation and placement optimizations. to improve cluster utilization, existing gpu schedulers often deploy optimizations such as space sharing as in gandiva [60], where multiple jobs can use the same accelerator concurrently, and placement sensitivity as in themis and tiresias [30, 42], which involves the careful placement of tasks in a distributed job to ensure good scaling performance. the performance benefits of these optimizations should be considered explicitly while optimizing for global scheduling objectives, since these optimizations are more effective when deployed in a heterogeneity-aware way. we show that this explicit modeling for space sharing can improve objectives by up to  $2.2 \times$  compared to gandiva's ad-hoc approach.
+
+in this paper, we present gavel, a new cluster scheduler designed for dnn training in both on-premise and cloud deployments, that effectively incorporates heterogeneity in both hardware accelerators and workloads to generalize a wide range of existing scheduling policies. for example, gavel can provide heterogeneity-aware versions of fair sharing / least attained service [30], fifo, minimum makespan, minimum cost subject to slos, finish-time fairness [42], shortest job first, and hierarchical policies [13, 61].
+
+gavel's key observation is that many widely used scheduling policies, including hierarchical ones, can be expressed as optimization problems whose objective is a function of the jobs' achieved throughputs. for example, least attained service is equivalent to maximizing the minimum scaled throughput among the jobs, makespan is equivalent to minimizing the maximum duration (computed as the ratio of number of iterations to achieved throughput), and so on. given the optimization problem for a scheduling policy, gavel introduces a general way to transform the problem to make it heterogeneity-, colocation- and placement-aware. in particular, gavel changes the problem to search over a heterogeneous allocation for each job, the fraction of time spent in various resource configurations (e.g.,  $60\%$  of time running alone on a v100 gpu and  $40\%$  of time space-sharing an a100 gpu with another job), and changes the throughput terms in the
+
+objective function to effective throughput, i.e. the average throughput of the job over the mix of resources in its allocation. additional constraints need to be added to ensure that the returned allocation is valid. we show that gavel's transformed optimization problems are efficient to execute even for clusters with hundreds of gpus and jobs, and can support a wide range of policies. many of these problems can be solved using a sequence of one or more linear programs.
+
+gavel's heterogeneity-aware allocations for each job need to be mapped to actual scheduling decisions (placement of jobs on specific resources in the cluster for a specified duration of time). to achieve this, gavel uses a preemptive round-based scheduling mechanism to ensure that jobs receive resources in fractions similar to the computed target allocation. gavel's scheduling mechanism needs to be able to schedule both distributed training jobs, which request multiple accelerators at once, as well as combinations of jobs running concurrently on a given accelerator due to space sharing.
+
+gavel makes these scheduling decisions transparently: it specifies an api between the scheduler and applications that allow jobs written in existing deep learning frameworks like pytorch [50] and tensorflow [14] to be moved between resources with minimal code changes, and uses a mechanism similar to quasar [23] to estimate performance measurements of colocated jobs, which are needed as inputs to gavel's policies, when not available a priori.
+
+by explicitly considering performance heterogeneity, gavel improves various policy objectives (e.g., average job completion time or makespan): on a smaller physical cluster, it improves objectives by up to  $1.4 \times$ , and on a larger simulated cluster, it increases the maximum cluster load, while improving objectives such as average job completion time by  $3.5 \times$ , makespan by  $2.5 \times$ , and cost by  $1.4 \times$ .
+
+to summarize, our main contributions are: 1) a systematic method to convert existing cluster scheduling policies into equivalent policies that consider heterogeneity and colocation; these equivalent optimization problems are practical to execute for current dnn clusters. 2) a round-based scheduling mechanism to ensure that the cluster realizes the allocations returned by these policies. 3) generalizations of many existing policies in our framework that improve overall performance and other policy objectives by up to  $3.5 \times$ .
+
+# 2 background
+
+in this section, we provide a brief overview of dnn training (§2.1), and discuss performance optimizations used in existing schedulers that gavel can help deploy more effectively (§2.2).
+
+# 2.1 deep neural network (dnn) training
+
+dnn training proceeds in iterations. in each iteration, the dnn processes a collection of inputs (called a minibatch) and subsequently updates the model parameters using gradients derived from the input minibatch. each minibatch is typically of similar size, which means model training through
+
+![](images/31f69740cadf96918e5da21000e898f1e6864cb11acb554ad75c9db2545a8885.jpg)  
+figure 2: gavel overview. jobs are written in frameworks like pytorch or tensorflow. gavel's throughput estimator obtains performance measurements for each runnable job on each available accelerator type if necessary; its policy then computes an allocation that optimizes a user-specified objective such as fairness. gavel's scheduling mechanism accepts this computed allocation as an input, and makes per-round placement decisions in proportions that faithfully mimic the computed allocation.
+
+put can be measured by averaging over 100s of iterations. gavel leverages this fact in its throughput estimator. jobs are typically fairly long-running (on the order of hours to days), and can be distributed over many workers [10, 60].
+
+modern dnn schedulers leverage the fact that dnn training is iterative to suspend and resume training at iteration boundaries [30, 60]; this ensures that jobs can be time multiplexed over the existing physical resources. the latest model parameters need to be checkpointed to stable storage when a job is suspended to ensure training progress is not lost.
+
+# 2.2 performance optimizations
+
+prior work has shown that gpus can be severely underutilized in multi-tenant clusters [36]; for example, average gpu utilization (measured as the percentage of gpu streaming multiprocessors active over time) was as low as  $52\%$  on a microsoft cluster. prior work has also shown the placement of tasks for a distributed training job can have significant impact on performance. gavel can more systematically employ these optimizations, as we show in §3.1.
+
+space sharing. smaller models often do not leverage the full computational capacity of modern gpus. in such cases, concurrently executing multiple models on the same gpu using nvidia's multi process service (mps) or cuda streams can help improve utilization [11, 49].
+
+placement sensitivity. dnn models show heterogeneity in their distributed scaling behavior depending on the size of the data that need to be exchanged between workers during training: some models have compact weight representations and can scale well even when workers are not on the same server, while other models scale poorly when workers are spread over many servers. existing schedulers like tiresias use heuristics for placement sensitivity to ensure that model training is run in a consolidated setting when necessary.
+
+# 3 overview of gavel
+
+given a collection of jobs, gavel arbitrates cluster resources (in the form of accelerators of different types) among the resident jobs, while optimizing for the desired cluster objective. this is accomplished in a two-step process: first, a heterogeneity-aware policy computes the fraction of time
+
+different jobs (and combinations) should run on different accelerator types to optimize the desired objective. these policies require as input the performance behavior (in terms of throughputs) for each job on each accelerator type, which can either be provided by the user, or can be measured on the fly by gavel's throughput estimator. then, given the policy's output allocation, gavel's scheduling mechanism grants jobs time on the different resources, and moves jobs between workers as necessary to ensure that the true fraction of time each job spends on different resources closely resembles the optimal allocation returned by the policy. gavel can recompute its policy either when a reset event occurs (job arrives or completes, or a worker in the cluster fails), or at periodic intervals of time. gavel's workflow is shown in figure 2.
+
+# 3.1 heterogeneity-aware policies
+
+gavel expresses scheduling policies as optimization problems for various objectives of interest, such as fairness or makespan, and allocations as matrices that specify the fraction of wall-clock time a job should spend on each accelerator type. a matrix  $x$  can represent allocations on a single accelerator type (homogeneous setting), allocations on multiple accelerator types (heterogeneous setting), as well as allocations with other optimizations deployed. for three jobs and three accelerator types, an example allocation could be:
+
+$$
+x ^ {\text {e x a m p l e}} = \left( \begin{array}{c c c} v 1 0 0 & p 1 0 0 & k 8 0 \\ 0. 6 & 0. 4 & 0. 0 \\ 0. 2 & 0. 6 & 0. 2 \\ 0. 2 & 0. 0 & 0. 8 \end{array} \right) \begin{array}{c} \text {j o b} 0 \\ \text {j o b} 1 \\ \text {j o b} 2 \end{array}
+$$
+
+![](images/346c6623debf7cb8eaa79decea5b35ea4b26d177e047e829f2ea2884b37a4653.jpg)  
+figure 3: the cumulative time each job spends on accelerator types between allocation recomputations for allocation  $x^{\text{example}}$ .
+
+according to this allocation, job 0 should spend  $60\%$  of its time on a v100 gpu, and job 1 should spend  $40\%$ . this is shown visually in figure 3.
+
+gavel finds an optimal value for the matrix  $x$  given a policy expressed as an optimization problem. to construct the optimization problem for a given policy, gavel requires a throughput matrix  $t$  with each job's throughput (in training iterations per second) on different accelerators.  $t_{mj}$  can be set to  $-\infty$  if job  $m$  does not run on accelerator type  $j$  (for example, due to memory constraints).
+
+given  $t$  and  $x$ , we define the effective throughput of a model  $m$  as the time-weighted average throughput across accelerators and jobs. we denote this quantity  $\mathrm{throughput}_t(m,x)$  or simply  $\mathrm{throughput}(m,x)$  (dropping the  $t$ ) for brevity. for allocations  $x$  without space sharing,
+
+$$
+\operatorname {throughput}(m,x) = \sum_{\substack{j\in \\ \text{accelerator types}}}t_{mj}\cdot x_{mj}
+$$
+
+different cluster scheduling policies can be expressed as optimization problems for  $x$  while maximizing or minimizing an appropriate objective function. constraints need to be specified to ensure that  $x$  is a valid allocation. then, a hypothetical policy that maximizes total effective throughput would look like,
+
+$$
+\operatorname {m a x i m i z e} _ {x} \sum_ {m \in \text {j o b s}} \operatorname {t h r o u g h p u t} (m, x)
+$$
+
+we need to add additional constraints to ensure that the cluster is not overprovisioned:
+
+$$
+0 \leq x _ {m j} \leq 1 \quad \forall (m, j) \tag {1}
+$$
+
+$$
+\sum_ {j} x _ {m j} \leq 1 \quad \forall m \tag {2}
+$$
+
+$$
+\sum_ {m} x _ {m j} \cdot \operatorname {s c a l e}  \leq \operatorname {n u m}  \quad \forall j \tag {3}
+$$
+
+these constraints ensure that each job-worker allocation is non-negative and is between 0 and 1, that the total allocation for a job does not exceed 1, and that the allocation does not oversubscribe the workers.
+
+space sharing. gavel's allocation matrices can also incorporate space sharing options. while previous work has used greedy algorithms for space sharing, we found that different pairs of dnn applications in practice have vastly different performance when colocated together, based on the resources they consume (figure 15 in appendix). when using space sharing,  $x$  needs to contain rows for each viable combination of jobs, and  $t$  needs to have throughputs of the job combinations, like:
+
+$$
+t = \left( \begin{array}{c c c} v 1 0 0 & p 1 0 0 & k 8 0 \\ 4. 0 & 2. 0 & 1. 0 \\ 3. 0 & 2. 0 & 1. 0 \\ (2. 0, 1. 5) & 0. 0 & 0. 0 \end{array} \right) \begin{array}{l} \text {j o b}   0 \\ \text {j o b}   1 \\ \text {j o b s}   (0, 1) \end{array}
+$$
+
+![](images/3acc461510cccaa02237220bd455dc7f82c13bde090764dad8a495ed165bce01.jpg)  
+figure 4: priorities are used to move the received allocation towards the intended allocation (in this case,  $x^{\text{example}}$ ). priorities $_n$  is computed as  $f(x, \text{rounds\_received}_n)$  where  $f(.)$  is the element-wise division operator.
+
+we limit entries of  $t$  to combinations of at most 2 jobs; we found empirically that larger combinations rarely increase net throughput. additionally, although the size of  $t$  grows quadratically with the number of jobs even with job combinations of size 2, we found that in practice we only need to consider combinations that actually perform well. we evaluate the scaling behavior of these ss-aware policies in §7.4.
+
+objectives in terms of throughput  $(m,x)$  remain the same; however, throughput  $(m,x)$  now needs to be computed to include the throughputs of co-located jobs, and additional constraints need to be specified to ensure that  $x$  is a valid allocation in this new regime:
+
+$$
+0 \leq x _ {k j} \leq 1 \quad \forall k, j
+$$
+
+$$
+\sum_ {k \in c _ {m}} \sum_ {j} x _ {k j} \leq 1 \quad \forall m
+$$
+
+$$
+\sum_ {k} x _ {k j} \cdot \text {s c a l e}  \leq \text {n u m}  \quad \forall j
+$$
+
+$c_m$  is the set of all job combinations that contain job  $m$ .
+
+placement sensitivity. similarly, gavel's allocation matrices can also be extended to incorporate placement sensitivity. the observed throughput for distributed jobs depends on the location of tasks, as well as the model and accelerator type (slower workers are less likely to be communication-bound, which means consolidation of tasks is less effective). we can make our policies placement-sensitive by considering the performance of distributed jobs in: 1) a consolidated setting, where as many accelerators are on the same server as possible (for example, 8 gpus per server if using 8-gpu servers), and 2) an unconsolidated setting, where accelerators are on independent servers. these are extreme points in the placement space, and are upper and lower bounds on performance. we can model this in our policies by having two different worker types (consolidated and unconsolidated) with corresponding throughput values in  $t$  and allocation values in  $x$ .
+
+# 3.2 round-based scheduling mechanism
+
+after computing the optimal allocation, gavel's next step is to assign jobs (or job combinations, in the case of space sharing) to accelerator types while matching the optimal allocation as closely as possible. that is, to realize the allocation  $x^{\text{example}}$
+
+above, the scheduling mechanism needs to make sure that in the time period where jobs 0, 1, and 2 are the only threeifiable jobs in the cluster, jobs should receive resources according to their computed fractions (e.g., job 0 receives  $60\%$  of v100 time).
+
+to do this, the scheduler computes a priority score for every job and accelerator type combination that is high when a job has received a smaller time fraction than the optimal allocation. scheduling is performed in rounds; in each round, the scheduler runs jobs in decreasing priority order, while ensuring that a given job is not scheduled on multiple workers (or accelerators) in a given round. this is shown in figure 4. priorities are updated as rounds complete. we have found empirically that round durations of 20 minutes or less allow gavel to effectively approximate the ideal allocation. we present an analysis of how the round duration affects scheduling quality and overhead in §7.5.
+
+# 3.3 throughput estimator
+
+to estimate the throughputs of concurrent jobs (e.g., in the case of space sharing), gavel employs a throughput estimator, similar to those found in prior work such as quasar [23]. gavel's throughput estimator maps a new job to a set of preprofiled reference jobs. the throughputs of the closest reference job can then be used as the initial performance estimate for the new job's combinations. for individual jobs, the throughput estimator is not needed, since these can be estimated on the fly as jobs run on different resource types over many rounds.
+
+# 3.4 limitations and non-goals
+
+while gavel exposes a flexible api that supports a variety of policies and objectives, we do not propose new scheduling policies or performance optimizations in this work. instead, gavel's main goal is to determine how best to share resources amongst many different users and jobs in a heterogeneity-aware way, while supporting many existing cluster-wide objectives. gavel accomplishes these goals with a policy framework that easily allows policies to be made heterogeneity-, colocation-, and placement-aware ( $\s 4$ ), a scheduling mechanism that can be reused across policies ( $\s 5$ ), and a narrow scheduler api that allows users to deploy their applications on the shared cluster with minimal code changes ( $\s 6$ ).
+
+# 4 scheduling policies
+
+in this section, we show how various scheduling policies such as max-min fairness (least attained service or las) and multi-level fairness can be expressed as optimization problems in terms of effective throughput. we also describe some properties of the resulting heterogeneity-aware allocations at the end of this section.
+
+# 4.1 max-min fairness as an optimization problem
+
+the classical least attained service (las) policy, used by tiresias [30], implements max-min fairness across active
+
+users in the cluster, by round-robining resources across jobs according to the total number of accelerator hours consumed. this can be modified into a weighted max-min fairness policy with per-user weights  $w_{m}$ .
+
+thus, on a homogeneous cluster, if a job  $m$  with weight  $w_{m}$  receives a fraction  $x_{m}$  (which is a scalar since there is only one resource type), las can be expressed as the following optimization problem:
+
+$$
+\operatorname {m a x i m i z e} _ {x} \min  _ {m} \frac {1}{w _ {m}} x _ {m}
+$$
+
+we need to add an additional constraint to ensure that the cluster is not overprovisioned  $(\sum_{m}x_{m}\leq 1)$
+
+however, this vanilla las policy is not fair in a heterogeneous setting; jobs might see unequal reductions in throughput due to variations in performance across accelerator types. for example, giving one job a k80 and another job a v100 would equalize their number of resources, but could result in very low performance for the job with the k80.
+
+to compute a more fair allocation, we can compute max-min fairness over the weighted normalized effective throughputs, as defined in §3.1. let  $x_{m}^{\mathrm{equal}}$  be the allocation given to job  $m$  assuming it receives equal time share on each worker in the cluster. for example, if the cluster had 1 v100 and 1 k80,  $x_{m}^{\mathrm{equal}} = [0.5, 0.5]$ .  $x_{m}^{\mathrm{equal}}$  scales the effective throughputs to make them comparable across jobs.
+
+$$
+\operatorname {m a x i m i z e} _ {x} \min  _ {m} \frac {1}{w _ {m}} \frac {\text {t h r o u g h p u t} (m , x)}{\text {t h r o u g h p u t} (m , x _ {m} ^ {\text {e q u a l}})}
+$$
+
+as specified in §3.1, additional constraints need to be specified to ensure that allocations are valid.
+
+as an example, consider 3 jobs which benefit differently when moved from a k80 gpu to a v100 gpu:
+
+$$
+v 1 0 0 \quad k 8 0
+$$
+
+$$
+t = \left( \begin{array}{c c} 4. 0 & 1. 0 \\ 3. 0 & 1. 0 \\ 2. 0 & 1. 0 \end{array} \right) \begin{array}{c} \text {j o b} 0 \\ \text {j o b} 1 \\ \text {j o b} 2 \end{array}
+$$
+
+solving the above optimization problem with  $w_{m} = 1$ , and a cluster with 1 v100 and 1 k80 yields the following allocation:
+
+$$
+x ^ {\text {h e t .}} = \left( \begin{array}{c c} 0. 4 5 & 0. 0 \\ 0. 4 5 & 0. 0 9 \\ 0. 0 9 & 0. 9 1 \end{array} \right) \begin{array}{l} v 1 0 0 \\ \text {j o b} 0 \\ \text {j o b} 1 \\ \text {j o b} 2 \end{array}
+$$
+
+jobs receive about  $10\%$  higher throughput compared to an allocation where every user is given  $1/n$  of the time on each accelerator (in this case,  $n = 3$ ), also called an isolated allocation [28].
+
+fairness policy objective functions need to be modified to take into account multi-resource jobs with scale_factor  $m > 1$
+
+<table><tr><td>policy</td><td>description</td></tr><tr><td>makespan</td><td>minimize time taken by batch of jobs.</td></tr><tr><td>las [30]</td><td>max-min fairness by total compute time.</td></tr><tr><td>las w/ weights</td><td>max-min fairness with weights.</td></tr><tr><td>finish time fairness [42]</td><td>maximize minimum job speedup.</td></tr><tr><td>fifo</td><td>first in, first out.</td></tr><tr><td>shortest job first</td><td>minimize time taken by shortest job.</td></tr><tr><td>minimize cost</td><td>minimize total cost in public cloud.</td></tr><tr><td>minimize cost w/ slos</td><td>minimize total cost subject to slos.</td></tr><tr><td>hierarchical [61]</td><td>multi-level policy: fifo, fairness, etc.</td></tr></table>
+
+table 1: policies that can be expressed in gavel.
+
+since these multi-resource jobs occupy a larger share of the cluster per unit time. an easy way to do this is to multiply the scale_factor $_m$  to the max-min objectives from before. concretely, the las objective from before now becomes,
+
+$$
+\operatorname {m a x i m i z e} _ {x} \min  _ {m} \frac {1}{w _ {m}} \frac {\text {t h r o u g h p u t} (m , x)}{\text {t h r o u g h p u t} (m , x _ {m} ^ {\text {e q u a l}})} \cdot \operatorname {s c a l e} _ {\text {f a c t o r} _ {m}}
+$$
+
+# 4.2 other policies as optimization problems
+
+we can express many other common cluster scheduling policies, some proposed by recent papers, using throughput  $(m,x)$ ; we list these policies in table 1. most of these policies can be expressed using a single linear program, with a few exceptions: the makespan policy is formulated as a sequence of linear programs, and the cost policies are formulated as a linear-fractional program [9], which can be reduced to a sequence of linear programs as well. these optimization problems yield corresponding heterogeneity-aware allocations. the optimal allocation can be computed by solving one or more linear programs (lp), which off-the-shelf solvers can solve very quickly even at the scale of a large cluster.
+
+minimize makespan. the minimum makespan policy tries to complete all active jobs as soon as possible. gandiva uses a version of this policy to finish higher-level tasks such as hyperparameter tuning and automl, which involve training a large number of variants of a model. if num_steps $_m$  is the number of iterations remaining to train model  $m$ , then the makespan is the maximum of the durations of all active jobs, where the duration of job  $m$  is the ratio of the number of iterations to throughput $(m,x)$  (which is expressed in iterations / second). overall, this can be framed as,
+
+$$
+\operatorname {m i n i m i z e} _ {x} \max  _ {m} \frac {\operatorname {n u m} }{\operatorname {t h r o u g h p u t} (m , x)}
+$$
+
+minimize finish-time fairness (themis). themis [42] proposes a new metric called finish-time fairness (represented as  $\rho$ ), which is the ratio of the time taken to finish a job using a given allocation and the time taken to finish the job using  $1/n$  of the cluster ( $x^{\text{isolated}}$ ), assuming  $n$  users using the cluster. this can be expressed in terms of throughput  $(m, x)$  as follows
+
+(num_steps  $m$ ,  $t_m$  is the time elapsed since the start of training for model  $m$ , and  $t_m^{\mathrm{isolated}}$  is the hypothetical time elapsed since the start of training if model  $m$  had a dedicated fraction of the cluster to itself),
+
+$$
+\rho_ {t} (m, x) = \frac {t _ {m} + \frac {\text {n u m} }{\text {t h r o u g h p u t} (m , x)}}{t _ {m} ^ {\text {i s o l a t e d}} + \frac {\text {n u m} }{\text {t h r o u g h p u t} (m , x ^ {\text {i s o l a t e d}})}}
+$$
+
+the final optimization problem is then,
+
+$$
+\operatorname {m i n i m i z e} _ {x} \max  _ {m} \rho_ {t} (m, x)
+$$
+
+fifo. the first-in-first-out (fifo) policy schedules jobs in the order they arrive. in a heterogeneous regime, jobs should be placed on the fastest available accelerator type. mathematically, we can write this as maximizing the throughput of job  $m$  relative to its throughput on the fastest type (throughput  $(m, x^{\text{fastest}})$ ). assuming that jobs are enumerated in order of their arrival time ( $m$  arrived before  $m + 1$ ), a fifo allocation can be computed with the following objective:
+
+$$
+\operatorname {m a x i m i z e} _ {x} \sum_ {m} \frac {\text {t h r o u g h p u t} (m , x)}{\text {t h r o u g h p u t} (m , x ^ {\text {f a s t e s t}})} (m - m)
+$$
+
+where  $m$  is the total number of jobs.
+
+shortest job first. the shortest job first policy finds the allocation that minimizes the duration of the shortest job,
+
+$$
+\operatorname {m i n i m i z e} _ {x} \min  _ {m} \frac {\operatorname {n u m} }{\operatorname {t h r o u g h p u t} (m , x)}
+$$
+
+minimizing total cost and cost subject to slos. we can express policies for deployments that use elastic public cloud resources. since cloud vms are charged on a per-time basis, we can express policies that explicitly optimize for total cost, speed, or both.
+
+consider a simple policy that maximizes total throughput,
+
+$$
+\operatorname {m i n i m i z e} _ {x} \sum_ {m} \operatorname {t h r o u g h p u t} (m, x)
+$$
+
+the above policy can be extended to incorporate cost by optimizing the following cost-adjusted objective,
+
+$$
+\operatorname {m a x i m i z e} _ {x} \frac {\sum_ {m} \text {t h r o u g h p u t} (m , x)}{\sum_ {m} \left(\sum_ {j} \cos t _ {j} \cdot x _ {m j}\right)}
+$$
+
+where  $\mathrm{cost}_j$  is the cost of accelerator type  $j$ . the numerator in the above objective is the time-averaged effective throughput, and the denominator is the time-averaged cost. when using space sharing, care must be taken to not double count the cost of instances running job combinations (all jobs in a job combination derive value in terms of some throughput from the instance).
+
+![](images/7bec8b6c4dee6fee4092f774e1987c18b8eb2ccb3d101deb27be8c684bdcebb3.jpg)  
+figure 5: example of a hierarchical policy: weighted fairness across two entities: a product and research team, fairness across jobs within the product team, and fifo within the research team.
+
+jobs can have time slos as well, e.g., certain high-priority jobs might need to complete every 12 hours. we can add additional constraints: given  $\mathrm{slo}_m$  for each model  $m$  (models without slos can have  $\mathrm{slo}_m = \infty$ ),
+
+$$
+\operatorname {t h r o u g h p u t} (m, x) \geq \operatorname {n u m \_ s t e p s} _ {m} / \operatorname {s l o} _ {m}
+$$
+
+# 4.3 hierarchical scheduling policies
+
+modern cluster schedulers do not only deploy "single-level" policies. hierarchical policies are common [7, 13, 61]: a large organization might share a single physical cluster among many sub-organizations (or entities) using a fairness policy. in turn, each entity can share resources among individual jobs according to a distinct per-entity policy, such as per-user fairness or fifo. we give an example in figure 5, where a research and product team share the same physical cluster. the research team runs ad-hoc experiments that can be executed in fifo order, but the product team needs to ensure that all its jobs receive a fair share of the cluster.
+
+gavel can currently support fairness in the upper levels and fairness or fifo in the lower levels, which matches the hierarchical policies supported by the hadoop scheduler [7]. determining how to extend this to other hierarchical policy sets (for example, with finish time fairness) is future work.
+
+gavel solves hierarchical objectives using a procedure called water filling [16], which is used in other max-min fairness problems such as link allocation in networks [51]. at a high level, the water-filling algorithm increases the allocation given to all parties at an equal rate to respect max-min fairness, until a party saturates. the saturated party is then taken out, and the procedure repeated iteratively until all commodities are saturated. we adapt this procedure to our setting, solving a series of optimization problems iteratively: an lp that computes a fair allocation across entities while respecting each entity's internal policy, and an milp (specified in appendix a.1) that identifies bottlenecked jobs, i.e., jobs whose effective throughputs cannot be improved without lowering the effective throughput of other jobs.
+
+we denote each entity  $s$  associated with a weight  $w_{s}$ ; the jobs belonging to this entity receive a total share of the cluster proportional to this weight. we denote  $w_{m}^{\mathrm{job}}$  to be the weight of job  $m$ , set such that  $\sum_{m\in s}w_m^{\mathrm{job}} = w_s$ . jobs are assigned priorities in accordance to the relevant entity's policy; for example, a fairness policy at the entity level would assign each job a weight proportional to its individual weight within
+
+the entity, while for fifo, the first job in the queue would initially receive the entire weight of the entity.
+
+in each iteration, we solve the following modified lp, assuming scale_factor  $m = 1$  for all  $m$  for simplicity:
+
+$$
+\operatorname {m a x i m i z e} _ {x} \min  _ {\{m: w _ {m} ^ {\text {j o b}} > 0 \}} \frac {1}{w _ {m} ^ {\text {j o b}}} \left(\frac {\text {t h r o u g h p u t} (m , x)}{\text {t h r o u g h p u t} (m , x _ {m} ^ {\text {e q u a l}})} - t _ {m}\right)
+$$
+
+$t_m$  is the normalized effective throughput of job  $m$  in the previous iteration ( $t_m \coloneqq 0$  in the first iteration). the above objective can be appropriately modified for larger scale_factor $_m$ . bottlenecked jobs are given priority 0 and no longer considered in future iterations. priorities are redistributed among non-bottlenecked jobs according to the entity's policy at the end of every iteration. for instance, in the example shown in figure 5, if job 4 is bottlenecked then its weight is reassigned to job 5 in accordance to the fifo policy, while if job 2 is bottlenecked, its weight is distributed equally between jobs 1 and 3 in accordance with the entity's fairness policy. the lp then solves the max-min problem on the resources remaining while ensuring each job's throughput does not drop compared to the previous iteration's allocation  $x^{\mathrm{prev}}$ , expressed as the constraint throughput  $(m,x) \geq \mathrm{throughput}(m,x^{\mathrm{prev}})$  for all  $m$ .
+
+iterations continue until all jobs are bottlenecked. to make this procedure more concrete, consider an example with 4 identical jobs: job 1 with a weight of 3.0, and jobs 2-4 with a weight of 1.0; and 4 identical gpus. in the first iteration, job 1 is assigned resources such that its throughput is 1.0, and jobs 2, 3, and 4 are assigned resources such that their throughput is 0.33 to respect weights. job 1 is a bottleneck; the throughput of the remaining jobs can still be increased. in the next iteration, jobs 2-4 are given full-gpu allocations.
+
+the final allocation satisfies both inter-entity and intra-entity policies. we note that the above water-filling procedure can also be used for single-level fairness policies such as the one described in §4.1 to improve the throughput of non-bottlenecked jobs.
+
+# 4.4 properties of gavel's policies
+
+existing scheduling schemes have been analyzed in terms of properties like sharing incentive, pareto efficiency, and strategy proofness [28]. we formalize gavel's heterogeneity-aware policies in the context of these properties as well.
+
+homogeneous clusters. for homogeneous clusters, gavel's heterogeneity-aware policies are equivalent to the baseline policies (throughput  $(m,x) = x_{m}\cdot t_{m})$ , since the heterogeneity-aware optimization problems reduce to the original optimization problems with one accelerator type.
+
+sharing incentive. for heterogeneous clusters, the policy's objective metric (maximize least job share in las, completion time of first job in fifo, or makespan) is at least as well off as it would be under a policy that naively splits all resources equally among all runnable jobs. this is because the
+
+allocation corresponding to giving each user  $1 / n$  of each resource is a feasible solution to gavel's optimization problem, so gavel's solution will be at least as good. all gavel policies have sharing incentive [28], which encourages users to use the shared cluster rather than a static private share.
+
+colocation. solutions with colocation are always at least as good as without colocation.
+
+pareto efficiency. allocations of max-min fairness policies with water filling are pareto efficient: that is, the allocation for a particular job cannot be increased without decreasing the allocation for another job.
+
+note that some of gavel's policies may not satisfy other desirable properties. for example, sun et al. [55] showed that no fair-sharing policy can simultaneously satisfy pareto efficiency, sharing incentive and strategy proofness in a setting with interchangeable resources. we leave consideration of strategy-proof policies to future work.
+
+# 5 scheduling mechanism
+
+gavel's scheduling mechanism schedules training iterations of runnable jobs on the available workers (with possibly different accelerators), such that for each schedulable job (or combination), the fraction of wall-clock time it spends on each device class is approximately equal to the computed optimal allocation  $x^{\mathrm{opt}}$  between allocation recomputation events. this is challenging for two main reasons: 1) jobs can run on multiple accelerators. moreover, since distributed training can be communication intensive [21,48], jobs should be placed on accelerators "close" to each other (for example, on accelerators on the same server, or on accelerators in servers in the same rack). 2) combinations of up to two jobs can run on a set of accelerators in order to improve resource utilization (space sharing). each distinct job can have  $\leq 1$  job combination running in a given round to prevent work duplication.
+
+gavel makes its scheduling decisions in rounds. that is, the scheduler tries to place work on all available workers for a specific duration (this time period is configurable; we use 6 minutes in our experiments). we call the work handed to each worker in a given round a micro-task. without rounds, jobs that request many accelerators can suffer from starvation. for example, consider a cluster with 8 total accelerators and 4 available. the scheduler can handle a 8-accelerator job waiting for resources in one of two ways: a) wait for 8 accelerators to become available; 4 accelerators will be unused until the full quota of 8 accelerators becomes available, b) keep the 8-accelerator job in the queue, and give 4 accelerators to another job that requests a fewer number of resources. however, this situation can repeat itself, leading to starvation [61]. scheduling is thus performed in rounds to limit resource under-utilization that can arise from starvation mitigation, simplify scheduling logic, and still ensure that jobs that request a large number of workers do not experience prolonged starvation.
+
+![](images/c5dd1a99973b9255fc713a1bc333d03877cdad025314f10888e06e02db965cf8.jpg)  
+figure 6: round-based scheduling mechanism in action to achieve an allocation  $x^{\mathrm{het. + ss}}$ . space sharing is shown with vertically split boxes. each round is denoted by a box. numbers in boxes represent job ids.
+
+since the number of active, schedulable jobs might far exceed the total number of workers, gavel first determines the job combinations that should run in the upcoming round. to do this, gavel maintains the time  $t_{mj}$  spent by a job (or combination)  $m$  on accelerator type  $j$ , which is updated as jobs run on different accelerator types every round. given  $t_{mj}$ , gavel's scheduler can then compute the fraction of total wall-clock time spent by each job (or combination)  $m$  on each accelerator type  $j$  as  $f_{mj} = t_{mj} / (\sum_{m'} t_{m'j})$ . the matrix of priorities is then just the element-wise division of  $x^{\mathrm{opt}}$  by  $f$ .
+
+algorithm. in every round, we want to move  $f_{mj}$  closer to  $x_{mj}^{\mathrm{opt}}$ . this can be achieved by giving high-priority jobs time on accelerator type  $j$ .
+
+this problem can be solved exactly if jobs only request single accelerators and if space sharing is not deployed, by finding the num_workers  $j$  jobs with highest priority (for example, using a heap). however, jobs submitted to gavel can be distributed, and space sharing can be used to improve resource utilization. solving this problem exactly with these added requirements makes the problem similar to a multiple-choice knapsack problem [54], which is np-hard.
+
+to overcome these challenges, we observe that it is acceptable to make greedy sub-optimal decisions occasionally, since we can recover from these sub-optimal decisions in subsequent rounds. we study the impact of this design choice in §7.5. a job not run in a particular round will have increased priority in subsequent rounds until it receives accelerator time, while a job combination that runs in a particular round will have decreased priority. this ensures that job combinations cannot suffer from starvation if they have a non-zero optimal allocation (priority  $>0$ ).
+
+gavel uses a greedy algorithm to pick the highest-priority job combinations that fit in the provided resource budget. the algorithm maintains a set of eligible job combinations (eligible_job_combinations) that can be scheduled in the upcoming scheduling round. the scheduling mechanism then tries to add job combinations with highest priority into a job_combinations_to_schedule set. once a job combination is added to this set, all conflicting job combinations are removed from the set of eligible combinations to ensure that a given job is not run more than once in a given scheduling round. job combinations that cannot fit in the current
+
+algorithm 1 algorithm for gavel's scheduling mechanism  
+1: function schedule_jobs  
+2: active_combinations  $\leftarrow$  all active job combinations  
+3: num_workers_remaining  $\leftarrow$  number of total workers  
+4: while num_workers_remaining > 0 do  
+5:  $j \gets$  job combination with highest priority  
+6: remove  $j$  from active_combinations  
+7: if j scale_factor > num_workers_remaining then  
+8: continue  
+9: for all  $j'$  that conflict (share a job  $k$ ) with  $j$  do  
+10: remove  $j'$  from active_combinations  
+11: num_workers_remaining  $- = j.$  scale_factor
+
+round due to space limitations (required number of accelerators scale_factor unavailable) are also removed from the set of eligible combinations. this algorithm is detailed in algorithm 1. gavel's scheduling mechanism is decoupled from its policies, ensuring that the same scheduling mechanism can be used for many different policies. figure 6 shows gavel's scheduling mechanism in action.
+
+once gavel has decided what jobs (and combinations) should run in a given round on different accelerator types, gavel must decide how to place these jobs. gavel's scheduler places jobs in decreasing order of the number of requested workers, and tries to give jobs accelerators on the same physical server to minimize fragmentation.
+
+# 6 implementation
+
+we implemented a prototype of gavel and an accompanying simulator in approximately 8000 lines of python code. we used cvxpy [25] to implement gavel's heterogeneity-aware policies, and grpc [5] for the communication of control messages between the scheduler and workers.
+
+interface between scheduler and applications. gavel currently supports user applications written in pytorch [50]; support for tensorflow [14] is left for future work. the scheduler and user applications then interact through a narrow api. gavel ships with a python library that users can import into their code. this library provides an implementation for a gaveliterator, a wrapper around existing framework-provided data iterators. the gaveliterator ensures that each task in a distributed job runs for the same number of iterations, and synchronizes the conclusion of rounds between the scheduler and workers. gaveliterator is instantiated with load_checkpoint and save_checkpoint function pointers, which can be called to load all necessary parameters and metadata from a checkpoint at the start of a round, and to create a checkpoint at the end of a round. both the load_checkpoint and save_checkpoint methods need to be implemented by the user, but only need to call appropriate framework methods (about 10 loc in our implementation). gaveliterator contacts the scheduler near the end of a round to see if the same job will run in the next round on the same worker. we call
+
+![](images/1b8dcd4b6d216dee5f3329ebdb94cbfff2baf389c7af1df4d59c4b2eb90d5a9c.jpg)  
+figure 7: gavel's throughput estimator. profiling is combined with matrix completion to obtain a fingerprint for every new job. the fingerprint is then used to find the closest reference job.
+
+<table><tr><td>model</td><td>task</td><td>dataset / application</td><td>batch size(s)</td></tr><tr><td>resnet-50 [6,33]</td><td>image classification</td><td>imagenet [24]</td><td>16,32,64,128</td></tr><tr><td>resnet-18 [33,41]</td><td>image classification</td><td>cifar-10 [38]</td><td>16,32,64,128,256</td></tr><tr><td>a3c [29,46]</td><td>deep rl</td><td>pong</td><td>4</td></tr><tr><td>lstm [12]</td><td>language modeling</td><td>wikitext-2 [44]</td><td>5,10,20,40,80</td></tr><tr><td>transformer [35,57]</td><td>language translation</td><td>multi30k [26](de-en)</td><td>16,32,64,128,256</td></tr><tr><td>cyclegan [40,62]</td><td>image-to-image translation</td><td>monet2photo [62]</td><td>1</td></tr><tr><td>recoder [47](autoencoder)</td><td>recommendation</td><td>ml-20m [31]</td><td>512,1024,2048,4096,8192</td></tr></table>
+
+table 2: models used in evaluation.
+
+this a lease renewal. if the lease is not renewed, the iterator calls the save_checkpoint method at the end of the round, and returns execution back to the scheduler. the scheduler can then launch another job on the worker.
+
+throughput estimation. gavel uses a similar technique to quasar [23] to estimate colocated throughputs when space sharing if they are not available a priori, mixing profiling with matrix completion. matrix completion enables sparse low rank matrices to be reconstructed with low error [18, 45]. with matrix completion, gavel is able to extrapolate measurements obtained through direct profiling on separate workers dedicated to profiling, and determine the job's most similar pre-profiled reference job. the throughput estimator can then use the reference job's throughput measurements as an initial throughput estimate. gavel's throughput estimator is diagrammed in figure 7.
+
+# 7 evaluation
+
+in this section, we seek to answer the following questions:
+
+- do gavel's heterogeneity-aware policies improve objective metrics in a physical cluster (§7.2) and in simulations of larger clusters (§7.3)?  
+- how does gavel's scheduling overhead scale with the number of active jobs? (§7.4)  
+- how well does gavel's scheduling mechanism realize gavel's heterogeneity-aware allocations? (§7.5)
+
+<table><tr><td>trace</td><td>system</td><td>objective</td><td>physical</td><td>simulation</td></tr><tr><td>continuous</td><td>gavel</td><td>average jct</td><td>3.6 hrs</td><td>3.4 hrs</td></tr><tr><td>continuous</td><td>baseline las</td><td>average jct</td><td>5.0 hrs</td><td>5.2 hrs</td></tr><tr><td>static</td><td>gavel</td><td>makespan</td><td>17.7 hrs</td><td>17.9 hrs</td></tr><tr><td>static</td><td>gandiva</td><td>makespan</td><td>21.3 hrs</td><td>21.9 hrs</td></tr></table>
+
+table 3: comparison of end objective between physical experiment and simulation for two different traces. for the continuous trace, we measure the average jct of 25 jobs in a steady-state cluster. for the static trace, we measure the total time needed to complete 100 jobs submitted at the start of the run. the heterogeneity-aware policies improve target objectives by up to  $1.4 \times$ , and results on the physical cluster are in agreement with results on simulated cluster ( $< 5\%$ ).
+
+![](images/e9296741384e75384cde567b31008cbd5c28c0108a1a9296e0926839dd2f9bc0.jpg)  
+(a) average job completion time vs. cluster load.
+
+![](images/4ee4e60bd1b7d192856ce4b77bea7592ba196194fe40c77e752c9f561a802161.jpg)  
+(b) cdf of job completion times.  
+figure 8: comparison of heterogeneity-agnostic least attained service (las) policy to a heterogeneity-aware las policy, on the simulated cluster and continuous-single trace.
+
+- is gavel able to accurately estimate the throughputs of co-located jobs when using space sharing? (§7.6)
+
+# 7.1 experiment setup
+
+we run experiments on both a physical and simulated cluster.
+
+clusters. we run physical cluster experiments on a 48-gpu cluster with 8 v100s, 16 p100s, and 24 k80s. simulated cluster experiments are run on a 108-gpu cluster with 36 v100s, 36 p100s, and 36 k80s.
+
+traces. we run physical and simulated experiments on two types of traces: one where all jobs are available at the start of the trace and jobs are not subsequently added ("static"), and another where jobs are continuously added to the cluster ("continuous").
+
+for the continuous trace, job arrival times are generated
+
+according to a poisson arrival process initialized with an interarrival rate  $\lambda$ . for the simulated experiments, we vary  $\lambda$  to show the extra load each gavel policy is able to sustain in steady state. we run 3 seeds for every  $\lambda$ , and show standard deviations. for the physical cluster experiments, we use a single  $\lambda$  that keeps the cluster well-utilized in steady state.
+
+traces are populated with a list of 26 job configurations, including cnn-based image classification models, rnn-based language models, and others, based on performance measurements on real hardware. table 2 presents the full list of models and configurations. we sample durations from an exponential distribution between  $10^{1.5}$  minutes and  $10^{4}$  minutes to match the process gandiva used in its evaluation [60]. for the simulated experiments, we show results in two regimes: one where all jobs use a single worker ("continuous-single"), and another where roughly  $70\%$  of jobs request a single worker, another  $25\%$  request between 2 and 4 workers, and the remaining  $5\%$  request 8 workers, as observed in published traces from microsoft [10] ("continuous-multiple").
+
+metrics. for fairness and fifo policies, our target metric is average job completion time of steady-state jobs, which is the same metric used by related work [30, 43]. we also show finish time fairness (ftf) for policies that explicitly optimize for ftf. for makespan policies, our target metric is the time needed to complete a batch of jobs, and only the static trace is used. for cost-related policies, the metric is cost (in dollars), and the percentage of jobs that violate slos.
+
+round durations. for the results presented in §7.2, we use a round duration of 20 minutes, and for all other results we use a round duration of 6 minutes (we explain the choice of 6 minutes in §7.5). we use a larger duration in the physical cluster experiments to mitigate scheduler overhead; however, previous work has shown that it is feasible to hide this overhead [4, 20, 42, 60]. we also found that using 6 minute rounds in simulation for the §7.2 experiments did not significantly alter the results.
+
+# 7.2 end-to-end results on physical cluster
+
+for our physical cluster experiments, we run a heterogeneity-aware and a heterogeneity-agnostic fairness policy on an appropriately-sized continuous trace, and a heterogeneity-aware makespan policy against a baseline that uses gandiva's ad-hoc space sharing on an appropriately-sized static trace. results are shown in table 3. gavel's heterogeneity-aware policies help improve objectives by up to  $1.4 \times$ .
+
+we also compare the real performance to simulations and observe that for both policies, the difference between metrics in simulation and on the physical cluster is small  $(< 5\%)$ , indicating that our simulator has high fidelity.
+
+# 7.3 end-to-end results in simulation
+
+we use a larger simulated cluster to evaluate the efficacy of gavel's heterogeneity-aware policies across a range of objectives, and compare with heterogeneity-agnostic versions
+
+![](images/f73a857b3a22a8d94ff245fcb9f45df225cca3a4e87fc7b5ecb32723024aa810.jpg)  
+(a) average job completion time vs. cluster load.
+
+![](images/bcd396f9ee0485c56a5ce54c0364789c42947c2634cc595e51f550c6458db2dc.jpg)  
+(b) cdf of job completion times.
+
+from previous work. as appropriate, we compare to other baselines like allox. we include additional supporting figures in the appendix (§a.2).
+
+least attained service (las). figures 8 and 9 compare the vanilla las policy with its heterogeneity-aware variants. we compare with two other baselines: a modified las policy that uses gandiva's ad-hoc space sharing, and an allox policy that explicitly optimizes average job completion time (but only for single-worker jobs). we make three observations.
+
+first, the heterogeneity-aware policies support higher load on the same cluster, and also reduce average jct by up to  $3.5 \times$  for the single-worker trace, and by up to  $2.2 \times$  for the multi-worker trace. second, the heterogeneity-aware las version supports higher load than allox, since allox can give short jobs preferential treatment in the interest of optimizing average jct, leading to long jobs experiencing starvation (long tail in long jobs cdf). at moderate load, allox represents a best-case scenario since it explicitly optimizes for average jct on a heterogeneous cluster. gavel is able to essentially match allox on average jct, while also being able to support other objectives. third, gandiva-style packing, which randomly explores job combinations until a combination that improves performance is found, is ineffective compared to the principled packing used by gavel's heterogeneity-aware policies ( $2.2 \times$  better average jct for both traces).
+
+![](images/9032bb4d27a1d965584a88e9c2146377a3f4c82b16e5856e7da551156c107455.jpg)  
+(a) average job completion time vs. cluster load.
+
+![](images/24927bd3ee6bbf682c4a009e9156d320db389eb7a2670104299ff00949face2c.jpg)  
+figure 9: comparison of heterogeneity-agnostic least attained service (las) policy to a heterogeneity-aware las policy, on the simulated cluster and continuous-multiple trace. each input job rate is run with 3 seeds; shaded regions around lines show the standard deviati/n.  
+(b) cdf of perf-job ftf.  
+figure 10: comparison of heterogeneity-agnostic finish time fairness (ftf) policy to a heterogeneity-aware ftf policy, on the simulated cluster and continuous-multiple trace.
+
+finish time fairness (ftf). we compare the heterogeneity-aware version of finish time fairness (ftf) to its heterogeneity-agnostic counterpart in figure 10. the heterogeneity-aware policy reduces average jcts by  $3 \times$  and improves average ftf by  $2.8 \times$ .
+
+makespan. gavel's heterogeneity-aware makespan policy reduces makespan by  $2.5 \times$  compared to a fifo baseline, and by  $1.4 \times$  compared to a baseline that uses gandiva's ad-hoc space sharing. makespan is reduced by a further  $8\%$  when the number of jobs in the trace is high when using space sharing.
+
+fifo. the heterogeneity-aware versions of fifo allow the cluster to support higher load (in terms of average input job rate). at high load, the heterogeneity-aware version without space sharing reduces average jct by up to  $2.7 \times$ , and the heterogeneity-aware version with space sharing reduces average jct by up to  $3.8 \times$ . space sharing is less effective for distributed jobs: it reduces average jct by  $1.1 \times$  for the trace with distributed jobs, and by  $1.4 \times$  for the single-gpu trace.
+
+las with priorities. we also run an experiment with the las policies where  $20\%$  of jobs have higher priority. at high load, gavel reduces the average jct of high-priority jobs by  $1.5 \times$  and the average jct of low-priority jobs by  $2.7 \times$ .
+
+cost. we simulate each of the cost policies on a 500-job workload comprised of resnet-50 and a3c jobs. as we observe in figure 1b, the resnet-50 job has the best cost-normalized throughput on the v100 while the a3c job has the best cost-normalized throughput on the k80. each job's
+
+![](images/50926068ce24694953b33a8240e8e3be9965e2085c047b18ca295be4c5a6d429.jpg)  
+(a) fraction of total throughput for each job with time.
+
+![](images/3d4101b87ffff0cbfc5507b3d12fb7419d7bba04b33188d74be24348981cc2aa.jpg)  
+(b) total throughput vs. time.
+
+duration is chosen from  $\{0.5,1,2,4,8\}$  days, and each job's slo is chosen from  $\{1.2\times ,2\times ,10\times \}$  its duration.
+
+the policy that minimizes cost reduces the total cost compared to the policy that maximizes throughput by a factor of roughly  $1.4 \times$ . however, approximately  $35 \%$  of jobs violate their slo as this policy prioritizes cheaper but slower gpus; in particular, the a3c jobs are scheduled on k80 gpus which results in violations for tight slos. in comparison, the policy that includes slos as well eliminates all violations for a small increase in cost (a cost reduction of  $1.23 \times$  compared to the baseline policy), by ensuring that a3c jobs with tight slos are run on instances with v100 gpus.
+
+multi-level hierarchical policies. figure 11 shows the behavior of a multi-level fairness policy as new jobs belonging to multiple entities are added to the cluster. resources are granted to jobs in a way that respects both the higher-level and lower-level policies: in figure 11a, fairness is enforced both within and across entities (as can be seen by the widths of the colored bands, which represents cross-entity fairness, and the widths of bands within a color, which represents fairness across jobs within an entity), and allocations are adjusted as new jobs come in. the figure 21 in the appendix shows a similar timeline diagram for a fairness+fifo policy.
+
+the multi-level fairness policy can also be implemented in a heterogeneity-agnostic manner by statically partitioning resources across users while respecting per-entity and per-user weights. while this results in a fair allocation as well, we observe that total effective throughput is about  $17\%$  lower
+
+![](images/8cd72dc52915c4b438eb0243c496e4b4f6f6bd143cbb92e69ea3798023ab020c.jpg)  
+(a) las.
+
+![](images/4cba432767ee2c2eca028dc330d93284cc815d280e44edb9d2453de848bfbebd.jpg)  
+(b) hierarchical.
+
+![](images/b7111ac795987ac2d88eb932bef7c25928a30d57ea3f485ced311eee16129d65.jpg)  
+figure 11: behavior of a multi-level fairness policy with time as jobs are added to a small cluster with 3 v100 gpus, 3 p100 gpus, and 3 k80 gpus. each line represents a separate job, and jobs are added every 4 timesteps. the first 6 jobs belong to entity 0 (weight of entity,  $w_0 = 1$ ), the next 6 jobs belong to entity 1 ( $w_1 = 2$ ), and the last 6 jobs belong to entity 2 ( $w_2 = 3$ ).  
+(a) effect of round length.  
+figure 13: (a) effect of round length on average jct for the heterogeneity-aware las policy. (b) comparison of scheduling mechanism to an ideal baseline that allocates resources to jobs exactly according to the computed allocation for the same policy.
+
+![](images/0eaffb333bacc35c82ea314c6157ca2dca0c6ee0f60e8c00d92993d4155835cb.jpg)  
+figure 12: scaling of las and hierarchical policies with the number of active jobs on a heterogeneous cluster with an equal number of v100, p100, and k80 gpus. the size of the cluster is increased as the number of active jobs is increased.  
+(b) mechanism vs. ideal.
+
+compared to the heterogeneity-aware policy (figure 11b).
+
+# 7.4 scalability of gavel
+
+figure 12 shows the scaling behavior of the heterogeneity-aware las and multi-level fairness policies with and without space sharing. we observe that even with 2048 active jobs, the hierarchical policy without space sharing can be run in  $< 10$  minutes. with space sharing, the policy can be run with 512 jobs in  $< 10$  minutes. the single-level las policy is much cheaper to compute in comparison. we note that allocations do not need to be recomputed every scheduling round – however, the longer the policy takes to run, the longer it takes for a new job to be granted resources on the cluster. having said that, we believe latencies of  $< 30$  minutes are acceptable for large clusters (and preferable to a non-preemptive scheduler where jobs might experience large queuing delays).
+
+# 7.5 efficacy of scheduling mechanism
+
+figure 13a shows the effect of the round length on average jct for the heterogeneity-aware las policy with a single-gpu trace. we observed similar behavior on traces with multi-gpu jobs, as well as other policies. a smaller round length gives gavel's scheduling mechanism more rounds to course correct, allowing the true allocation and computed optimal allocation to more closely match. we found that the time needed to load and save checkpoints for our target models is  $<$
+
+![](images/ab10a9823a589ae4324a9e7e28aae08062d321b8f2b4cff0690dd080a8fea5a9.jpg)  
+figure 14: comparison of ss-aware las policy with estimated throughputs, compared to the ss-aware with oracle throughputs and las without space sharing on a heterogeneous 12-gpu cluster.
+
+5 seconds, which means that a round length of 6 minutes gives a good theoretical tradeoff between fidelity with the optimal allocation and preemption overhead. in practice, hiding this preemption overhead is achievable with careful engineering.
+
+we compare this to an ideal baseline that allocates resources to jobs exactly according to their computed allocation. as shown in figure 13b, gavel's scheduling mechanism with a round duration of 6 minutes behaves almost identically to this ideal baseline with a single-gpu trace (behavior with a multi-gpu trace is similar).
+
+# 7.6 impact of throughput estimation
+
+figure 14 shows the effect of gavel's throughput estimator on average jct when using the space sharing-aware las policy compared to the las policy without space sharing, and the las policy with space sharing and oracle throughputs. the throughput estimator is able to determine missing throughputs in an online fashion accurately enough to observe a very small decrease in average jct at high load (orange and blue lines).
+
+# 8 related work
+
+existing dnn training schedulers. several recent papers have proposed schedulers targeting dnn training workloads.
+
+gandiva [60] uses time and space sharing to reduce queuing delay and improve resource utilization, but does not specify an explicit scheduling policy. it uses a profiling-based methodology to determine whether to co-locate jobs on an accelerator. however, it does not incorporate model performance data (isolated or co-located performance) into its scheduling policy, resorting to random exploration of job combinations until a combination that improves performance is found, and does not support configurable objectives.
+
+tiresias [30] and themis [42] use different objectives to achieve multi-job fairness. however, both do not incorporate jobs' affinities for different accelerator types in their scheduling objectives, and have scheduling mechanisms strongly coupled with the target policy, making it hard to support other more sophisticated policies like multi-level fairness.
+
+allox [39] and gandivafair [19] are recent dnn schedulers that do consider worker and model heterogeneity. however, both only work for single policies (average job completion time for allox, max-min fairness for gandivafair). moreover, gandivafair uses a second-price auction mechanism to im
+
+prove the performance of a heterogeneity-agnostic max-min fairness scheme, but does not provide guarantees as to the optimality of the final allocation. on the other hand, gavel formalizes each policy as an optimization problem, and can provide a guarantee that the returned solution is "optimal". gavel is also able to support more sophisticated policies such as multi-level fairness.
+
+traditional cluster schedulers. traditional schedulers such as mesos [34], borg [59], tetrisched [56], and yarn [58] support workloads with fixed heterogeneous resource requests, but do not reason about the diverse performance characteristics of jobs across accelerators. mesos and yarn do not reason about interchangeable resource types that can run the same computation: for example, mesos's drf multi-resource sharing policy [28] decides how to give jobs allocations of distinct resource types, such as ram and cpus, but assumes that each job has declared which resources it needs to use and in what ratio (unlike our case, where accelerators display heterogeneous performance behavior).
+
+the multi-interchangeable resource allocation (mira) problem [55] also introduces the notion of effective throughput similar to gavel, but does not demonstrate how this can be used to specify policies as optimization problems, does not consider performance optimizations like space sharing and placement sensitivity, and does not discuss how computed allocations can be realized on physical resources.
+
+omega [52], apollo [17], and hydra [22] are schedulers that take into account the fact that the target workload shows heterogeneity in the number and duration of constituent tasks. however, tasks largely take the same time on different cpus, and heterogeneity in memory capacities only impacts the number and size of tasks that can be placed on a server. in our work, the compute devices themselves are interchangeable with sometimes large performance differences, and policies decide the time fractions of resources each job should receive while optimizing for various end objectives.
+
+dynamic performance estimation. as detailed in §6, gavel uses the approach proposed by quasar [23] to estimate co-located job performance online. in particular, gavel uses a mix of profiling and matrix completion to compute a "fingerprint" against a set of reference models profiled offline. in this work, we show that the techniques used by quasar can be successfully applied to this new setting.
+
+# 9 conclusion
+
+in this paper, we proposed gavel, a heterogeneity-aware cluster scheduler that is able to optimize for many high-level metrics like fairness, makespan, and cost. gavel demonstrates how existing policies can be expressed as optimization problems, and extends these policies to be heterogeneity-aware. gavel then uses a decoupled round-based scheduling mechanism to ensure that the computed optimal allocation is realized. gavel's heterogeneity-aware policies improve end objec
+
+tives both on a physical and simulated cluster. it can support a higher maximum cluster load, while improving objectives such as average job completion time by  $3.5 \times$ , makespan by  $2.5 \times$ , and cost by  $1.4 \times$ .
+
+# references
+
+[1] aws accelerator offerings. https://aws.amazon.com/ec2/instance-types/, 2020.  
+[2] cloud gpus on gcp. https://cloud.google.com/gpu, 2020.  
+[3] cloud tpus on gcp. https://cloud.google.com/tpu, 2020.  
+[4] elasticdl. https://github.com/ sql-machine-learning/elasticsearchd, 2020.  
+[5] grpc. https://grpc.io, 2020.  
+[6] imagenet training in pytorch. https://github.com/pytorch/examples/tree/master/imagenet, 2020.  
+[7] implementing core scheduler functionality in resource manager (v1) for hadoop. https://issues.apache.org/jira/browse/hadoop-3445, 2020.  
+[8] job scheduling in spark. https://spark.apache.org/docs/latest/job-scheduling.html#scheduling-within-an-application, 2020.  
+[9] linear-fractional optimization. http://www.seas.ucla.edu/~vandenbe/ee236a/lectures/lfp.pdf, 2020.  
+[10] microsoft philly trace. https://github.com/msr-fiddle/philly-traces, 2020.  
+[11] nvidia multi-process service. https://docs.nvidia.com/deploy/pdf/cuda_multi_process_service_overview.pdf, 2020.  
+[12] word-level language modeling rnn. https://github.com/pytorch/examples/tree/master/word_language_model, 2020.  
+[13] yarn - the capacity scheduler. https://blog.cloudera.com/yarn-capacity-scheduler/, 2020.  
+[14] m. abadi, p. barham, j. chen, z. chen, a. davis, j. dean, m. devin, s. ghemawat, g. irving, m. isard, et al. tensorflow: a system for large-scale machine learning. in 12th usenix symposium on operating systems design and implementation (osdi 16), pages 265-283, 2016.  
+[15] d. amodei, s. ananthanarayanan, r. anubhai, j. bai, e. battenberg, c. case, j. casper, b. catanzaro, q. cheng, g. chen, et al. deep speech 2: end-to-end
+
+speech recognition in english and mandarin. in international conference on machine learning, pages 173-182, 2016.  
+[16] d. p. bertsekas and r. g. gallager. data networks. 1987.  
+[17] e. boutin, j. ekanayake, w. lin, b. shi, j. zhou, z. qian, m. wu, and l. zhou. apollo: scalable and coordinated scheduling for cloud-scale computing. in 11th usenix symposium on operating systems design and implementation (osdi 14), pages 285-300, 2014.  
+[18] e. j. candes and y. plan. matrix completion with noise. proceedings of the ieee, 98(6):925-936, 2010.  
+[19] s. chaudhary, r. ramjee, m. sivathanu, n. kwatra, and s. viswanatha. balancing efficiency and fairness in heterogeneous gpu clusters for deep learning. in proceedings of the fifteenth european conference on computer systems, pages 1-16, 2020.  
+[20] w. chen, j. rao, and x. zhou. preemptive, low latency datacenter scheduling via lightweight virtualization. in usenix annual technical conference, usenix atc 2017, pages 251-263, 2017.  
+[21] c. coleman, d. kang, d. narayanan, l. nardi, t. zhao, j. zhang, p. bailis, k. olokotun, c. ré, and m. zaharia. analysis of dawnbench, a time-to-accuracy machine learning performance benchmark. acm sigops operating systems review, 53(1):14-25, 2019.  
+[22] c. curino, s. krishnan, k. karanasos, s. rao, g. m. fumarola, b. huang, k. chaliparambil, a. suresh, y. chen, s. heddaya, et al. hydra: a federated resource manager for data-center scale analytics. in 16th usenix symposium on networked systems design and implementation (nsdi 19), pages 177–192, 2019.  
+[23] c. delimitrou and c. kozyrakis. quasar: resource-efficient and qos-aware cluster management. in acm sigarch computer architecture news, volume 42, pages 127-144, 2014.  
+[24] j. deng, w. dong, r. socher, l.-j. li, k. li, and l. fei-fei. imagenet: a large-scale hierarchical image database. in proceedings of the ieee conference on computer vision and pattern recognition, pages 248–255, 2009.  
+[25] s. diamond and s. boyd. cvxpy: a python-embedded modeling language for convex optimization. the journal of machine learning research, 17(1):2909-2913, 2016.
+
+[26] d. elliott, s. frank, k. sima'an, and l. specia. multi30k: multilingual english-german image descriptions. in proceedings of the 5th workshop on vision and language, pages 70-74. association for computational linguistics, 2016.  
+[27] j. fowers, k. ovtcharov, m. papamichael, t. massengill, m. liu, d. lo, s. alkalay, m. haselman, l. adams, m. ghandi, et al. a configurable cloud-scale dnn processor for real-time ai. in 2018 acm/ieee 45th annual international symposium on computer architecture (isca), pages 1-14, 2018.  
+[28] a. ghodsi, m. zaharia, b. hindman, a. konwinski, s. shenker, and i. stoica. dominant resource fairness: fair allocation of multiple resource types. in 8th usenix symposium on networked systems design and implementation (nsdi 11), pages 24-24, 2011.  
+[29] d. griffiths. rl a3c pytorch. https://github.com/dgriff777/rl_a3cpytorch, 2020.  
+[30] j. gu, m. chowdhury, k. g. shin, y. zhu, m. jeon, j. qian, h. liu, and c. guo. tiresias: a gpu cluster manager for distributed deep learning. in 16th usenix symposium on networked systems design and implementation (nsdi 19), pages 485-500, 2019.  
+[31] f. m. harper and j. a. konstan. the movielens datasets: history and context. acm transactions on interactive intelligent systems (tiis), 5(4):19, 2016.  
+[32] k. he, g. gkioxari, p. dollár, and r. girshick. mask r-cnn. in proceedings of the ieee international conference on computer vision, pages 2961-2969, 2017.  
+[33] k. he, x. zhang, s. ren, and j. sun. deep residual learning for image recognition. in proceedings of the ieee conference on computer vision and pattern recognition, pages 770-778, 2016.  
+[34] b. hindman, a. konwinski, m. zaharia, a. ghodsi, a. d. joseph, r. h. katz, s. shenker, and i. stoica. mesos: a platform for fine-grained resource sharing in the data center. in 8th usenix symposium on networked systems design and implementation (nsdi 11), pages 22–22, 2011.  
+[35] y.-h. huang. attention is all you need: a pytorch implementation. https://github.com/jadore801120/attention-is-all-you-need-pytorch, 2018.  
+[36] m. jeon, s. venkataraman, a. phanishayee, j. qian, w. xiao, and f. yang. analysis of large-scale multi-tenant gpu clusters for dnn training workloads. in usenix annual technical conference, usenix atc 2019, pages 947-960, 2019.
+
+[37] n. p. jouppi, c. young, n. patil, d. patterson, g. agrawal, r. bajwa, s. bates, s. bhatia, n. boden, a. borchers, et al. in-datacenter performance analysis of a tensor processing unit. in 2017 acm/ieee 44th annual international symposium on computer architecture (isca), pages 1–12, 2017.  
+[38] a. krizhevsky, v. nair, and g. hinton. the cifar-10 dataset. online: http://www.cs.toronto.edu/kriz/cifar.html, 55, 2014.  
+[39] t. n. le, x. sun, m. chowdhury, and z. liu. allox: compute allocation in hybrid clusters. in proceedings of the fifteenth european conference on computer systems, pages 1-16, 2020.  
+[40] e. linder-noren. pytorch-gan. https://github.com/eriklindernoren/pytorch-gan#cyclegan, 2020.  
+[41] k. liu. train cifar-10 with pytorch. https://github.com/kuangliu/pytorch-cifar, 2020.  
+[42] k. mahajan, a. balasubramanian, a. singhvi, s. venkataraman, a. akella, a. phanishayee, and s. chawla. themis: fair and efficient gpu cluster scheduling. in 17th usenix symposium on networked systems design and implementation (nsdi 20), pages 289-304, 2020.  
+[43] h. mao, m. schwarzkopf, s. b. venkatakrishnan, z. meng, and m. alizadeh. learning scheduling algorithms for data processing clusters. in proceedings of the acm special interest group on data communication, pages 270-288. 2019.  
+[44] s. merity, c. xiong, j. bradbury, and r. socher. pointer sentinel mixture models. in 5th international conference on learning representations, iclr 2017, toulon, france, april 24-26, 2017, conference track proceedings, 2017.  
+[45] a. mnih and r. r. salakhutdinov. probabilistic matrix factorization. in advances in neural information processing systems, pages 1257-1264, 2008.  
+[46] v. mnih, a. p. badia, m. mirza, a. graves, t. lillicrap, t. harley, d. silver, and k. kavukcuoglu. asynchronous methods for deep reinforcement learning. in international conference on machine learning, pages 1928-1937, 2016.  
+[47] a. moussawi. towards large scale training of autoencoders for collaborative filtering. in proceedings of late-breaking results track part of the twelfth acm conference on recommender systems, recsys'18, vancouver, bc, canada, 2018.
+
+[48] d. narayanan, a. harlap, a. phanishayee, v. seshadri, n. r. devanur, g. r. ganger, p. b. gibbons, and m. zaharia. pipedream: generalized pipeline parallelism for dnn training. in proceedings of the 27th acm symposium on operating systems principles, pages 1-15, 2019.  
+[49] d. narayanan, k. santhanam, a. phanishayee, and m. zaharia. accelerating deep learning workloads through efficient multi-model execution. in neurips workshop on systems for machine learning (december 2018), 2018.  
+[50] a. paszke, s. gross, f. massa, a. lerer, j. bradbury, g. chanan, t. killeen, z. lin, n. gimelshein, l. antiga, et al. pytorch: an imperative style, high-performance deep learning library. in advances in neural information processing systems, pages 8024–8035, 2019.  
+[51] b. radunovic and j.-y. le boudec. a unified framework for max-min and min-max fairness with applications. ieee/acm transactions on networking, 15(5):1073-1083, 2007.  
+[52] m. schwarzkopf, a. konwinski, m. abd-el-malek, and j. wilkes. omega: flexible, scalable schedulers for large compute clusters. in proceedings of the 8th acm european conference on computer systems, pages 351–364, 2013.  
+[53] m. j. shafiee, b. chywl, f. li, and a. wong. fast yolo: a fast you only look once system for real-time embedded object detection in video. arxiv preprint arxiv:1709.05943, 2017.  
+[54] p. sinha and a. a. zoltners. the multiple-choice knapsack problem. operations research, 27(3):503-515, 1979.  
+[55] x. sun, t. n. le, m. chowdhury, and z. liu. fair allocation of heterogeneous and interchangeable resources. acm sigmetrics performance evaluation review, 46(2):21-23, 2019.  
+[56] a. tumanov, t. zhu, j. w. park, m. a. kozuch, m. harchol-balter, and g. r. ganger. tetrisched: global rescheduling with adaptive plan-ahead in dynamic heterogeneous clusters. in proceedings of the eleventh european conference on computer systems, page 35. acm, 2016.  
+[57] a. vaswani, n. shazeer, n. parmar, j. uszkoreit, l. jones, a. n. gomez, l. kaiser, and i. polosukhin. attention is all you need. in advances in neural information processing systems, pages 5998-6008, 2017.
+
+[58] v. k. vavilapalli, a. c. murthy, c. douglas, s. agarwal, m. konar, r. evans, t. graves, j. lowe, h. shah, s. seth, et al. apache hadoop yarn: yet another resource negotiator. in proceedings of the 4th annual symposium on cloud computing, page 5. acm, 2013.  
+[59] a. verma, l. pedrosa, m. korupolu, d. oppenheimer, e. tune, and j. wilkes. large-scale cluster management at google with borg. in proceedings of the tenth european conference on computer systems, page 18, 2015.  
+[60] w. xiao, r. bhardwaj, r. ramjee, m. sivathanu, n. kwatra, z. han, p. patel, x. peng, h. zhao, q. zhang, et al. gandiva: introspective cluster scheduling for deep learning. in 13th usenix symposium on operating systems design and implementation (osdi 18), pages 595-610, 2018.  
+[61] m. zaharia, d. borthakur, j. sen sarma, k. elmeleegy, s. shenker, and i. stoica. delay scheduling: a simple technique for achieving locality and fairness in cluster scheduling. in proceedings of the 5th european conference on computer systems, pages 265-278. acm, 2010.  
+[62] j.-y. zhu, t. park, p. isola, and a. a. efros. unpaired image-to-image translation using cycle-consistent adversarial networks. in proceedings of the ieee international conference on computer vision, pages 2223–2232, 2017.
+
+# a appendix
+
+in this section, we describe how more complicated optimization problem formulations can be solved in practice, and present additional results.
+
+# a.1 policies requiring multi-step solutions
+
+minimize makespan. the makespan policy tries to allocate resources to jobs in such a way that all active jobs are completed as soon as possible. to compute an allocation for this policy, we can binary search for the smallest makespan  $m$  that satisfies the following constraints,
+
+$$
+\operatorname {n u m} _ {\text {s t e p s} _ {m}} \leq \operatorname {t h r o u g h p u t} (m, x) \cdot m \quad \forall m
+$$
+
+$$
+0 \leq x _ {m j} \leq 1 \quad \forall (m, j)
+$$
+
+$$
+\sum_ {j} x _ {m j} \leq 1 \quad \forall m
+$$
+
+$$
+\sum_ {m} x _ {m j} \leq 1 \quad \forall j
+$$
+
+identifying bottleneck jobs in fairness policy. solving a max-min fairness policy, such as las or hierarchical fairness, results in an allocation that satisfies fairness metrics but may underutilize resources in scenarios where the bottlenecked job's throughput is matched by other jobs without using all available resources. identifying bottleneck jobs after an iteration of a fairness policy computation can be done by solving a mixed-integer linear program. the binary integer variable  $z_{m}$  is set to 1 when job  $m$ 's scaled effective throughput can be improved without causing any other job's scaled effective throughput to drop below the minimum computed in the previous iteration of the policy's lp. we identify all jobs which are stuck as  $\{m : z_{m} = 0\}$  by computing an allocation that maximizes the sum of all  $z_{m}$ :
+
+$$
+\operatorname {maximize}_{x}\sum_{\{m:p_{m} > 0\}}z_{m}
+$$
+
+subject to:
+
+$$
+z _ {m} = \left\{ \begin{array}{l l} 1 & \text {i f t h r o u g h p u t} (m, x) > \text {t h r o u g h p u t} (m, x ^ {\text {p r e v}}) \\ 0 & \text {o t h e r w i s e} \end{array} \right.
+$$
+
+the conditional constraint on  $z_{m}$  can be expressed as two linear inequalities:
+
+$$
+\operatorname {t h r o u g h p u t} (m, x ^ {\text {p r e v}}) <   \operatorname {t h r o u g h p u t} (m, x) + y \left(1 - z _ {m}\right)
+$$
+
+$$
+\operatorname {t h r o u g h p u t} (m, x ^ {\text {p r e v}}) \geq \operatorname {t h r o u g h p u t} (m, x) - y z _ {m}
+$$
+
+![](images/64afe9deb6e2e60c7fefb015307fd3da15528093bfa66e19a8d6b6598eb4c6a8.jpg)  
+figure 15: performance of several dnn models when run concurrently on a single p100 gpu. the cell at row  $i$  and column  $j$  reports the normalized throughput (iterations/second) achieved by colocated models  $i$  and  $j$ . throughputs are normalized with respect to the throughput achieved by each model when run in isolation. black squares show jobs that cannot co-locate due to memory constraints.
+
+where  $y$  is a sufficiently large number such that it is not an active constraint, such as the max throughput of the job.
+
+# a.2 additional results
+
+figure 15 shows the performance of colocated dnn models on a single nvidia p100 gpu, presented as a heat map.
+
+figures 16, 17, 18, 19, and 20 show a comparison of vanilla, heterogeneity-agnostic policies with their heterogeneity-aware counterparts on single-worker and multi-worker traces. we see across the board that gavel's heterogeneity-aware policies allow the cluster to support higher load (in terms of average job input rate), and also reduce end objectives.
+
+figure 21 shows the behavior of a multi-level fairness policy that combines a higher-level fairness policy with a low-level fifo policy. the widths of the colored bands are in the ratios of the weights of each entity; within an entity, the effective throughputs of jobs are ordered in a way that respects the arrival order of jobs within that entity. all jobs within low-weight entities do not receive resources under high load.
+
+![](images/65690618737c8906e24a1ecf703662624c08f1f6c311cff82bb8a6632601f2a4.jpg)  
+(a) average job completion time vs. cluster load.
+
+![](images/715452e01fbdf89641bf63bd4bcfa65fba5fcbad17c512c46f4d8ec5435a4e67.jpg)  
+(b) cdf of job completion times.
+
+![](images/d49e6e6b7a317ae50ff9183e83e015ee373e623e548e92c8d2e9bf5a9e9243d3.jpg)  
+(a) average job completion time vs. cluster load.
+
+![](images/243d91c3a54333b12239512a1f13bcfd1be40629ba216eb6e5afddd914bef497.jpg)  
+(b) cdf of job completion times.  
+figure 17: comparison of heterogeneity-agnostic finish time fairness (ftf) policy to a heterogeneity-aware ftf policy, on the simulated cluster and continuous-single trace.
+
+![](images/6c756692d37c7be7773df23837a65528ccce9f9e07527418bdea4aac248bc96b.jpg)  
+(a) average job completion time vs. cluster load.
+
+![](images/9ad649974b7bcf69bcbc4f967ee2941d1ed24406d7bdf9ff0077c4bc9f9fe750.jpg)  
+figure 16: comparison of heterogeneity-agnostic fifo policy to a heterogeneity-aware fifo policy, on the simulated cluster and continuous-single trace.  
+(b) cdf of job completion times.
+
+![](images/3d650361ad6cafa29548b7e0811bc13256011fcb271c963ca97e824b1eef25e3.jpg)  
+figure 18: comparison of heterogeneity-agnostic fifo policy to a heterogeneity-aware fifo policy, on the simulated cluster and continuous-multiple trace.
+
+![](images/d594f13acc66df043df000b862560f7cab6b54e9309b97a52bba61cdbfafcad9.jpg)  
+figure 19: comparison of heterogeneity-agnostic makespan policy to a heterogeneity-aware makespan policy, as well as fifo and gandiva baselines on the simulated cluster and the static-multiple trace.  
+figure 20: comparison of heterogeneity-agnostic las policy to a heterogeneity-aware las policy, on the simulated cluster, continuous-multiple trace, with  $20\%$  of jobs with high priority.
+
+![](images/70fabe9e527926c17d7cb256ab70a463eb331fed9470ea8a1726bdae37ffe25f.jpg)  
+figure 21: timeline showing behavior of a hierarchical policy (fairness as top-level policy, fifo as bottom-level policy) with time. a job is added every 4 timesteps. the first 6 jobs belong to entity 0, the next 6 jobs belong to entity 1, and the last 6 jobs belong to entity 2. entity 0 has a weight of 1, entity 1 has a weight of 2, and entity 2 has a weight of 3. real throughputs are used, and jobs are sampled from those shown in table 2.

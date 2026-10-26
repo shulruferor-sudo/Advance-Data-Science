@@ -1,0 +1,863 @@
+# pint: probabilistic in-band network telemetry
+
+ran ben basat
+
+harvard university
+
+ran@seas.harvard.edu
+
+gianni antichi
+
+queen mary university of london
+
+g.antichi@qmul.ac.uk
+
+sivaramakrishnan ramanathan
+
+university of southern california
+
+satyaman@usc.edu
+
+minlan yu
+
+harvard university
+
+minlanyu@seas.harvard.edu
+
+yuliang li
+
+harvard university
+
+yuliangli@g.harvard.edu
+
+michael mitzenmacher
+
+harvard university
+
+michael@mecs.harvard.edu
+
+# abstract
+
+commodity network devices support adding in-band telemetry measurements into data packets, enabling a wide range of applications, including network troubleshooting, congestion control, and path tracing. however, including such information on packets adds significant overhead that impacts both flow completion times and application-level performance.
+
+we introduce pint, an in-band telemetry framework that bounds the amount of information added to each packet. pint encodes the requested data on multiple packets, allowing per-packet overhead limits that can be as low as one bit. we analyze pint and prove performance bounds, including cases when multiple queries are running simultaneously. pint is implemented in p4 and can be deployed on network devices. using real topologies and traffic characteristics, we show that pint concurrently enables applications such as congestion control, path tracing, and computing tail latencies, using only sixteen bits per packet, with performance comparable to the state of the art
+
+# 1 introduction
+
+network telemetry is the basis for a variety of network management applications such as network health monitoring [72], debugging [28], fault localization [6], resource accounting and planning [56], attack detection [27, 65], congestion control [46], load balancing [2, 41, 42], fast reroute [47], and path tracing [36]. a significant recent advance is provided by the in-band network telemetry (int) [75]. int allows switches to add information to each packet, such as switch id, link utilization, or queue status, as it passes by. such telemetry information is then collected at the network egress point upon the reception of the packet.
+
+int is readily available in programmable switches and network interface cards (nics) [8, 14, 58, 85], enabling an unprecedented level of visibility into the data plane behavior and making this technology attractive for real-world deployments [16, 46]. a key drawback of int is the overhead on packets. since each switch adds information to the packet, the packet byte overhead grows linearly with the path length. moreover, the more telemetry data needed per-switch, the higher the overhead is: on a generic data center topology with 5 hops, requesting two values per switch requires 48 bytes of overhead, or  $4.8\%$  of a 1000 bytes packet ( $\s 2$ ). when more bits used to store telemetry data, fewer bits can be used to carry the packet payload and stay within the maximum transmission unit (mtu). as a result, applications may have to split a message, e.g., an rpc call, onto multiple packets, making it harder to support the run-to-completion model that high-performance transport and nics need [7]. indeed, the overhead of int can impact application performance, potentially
+
+leading in some cases to a  $25\%$  increase and  $20\%$  degradation of flow completion time and goodput, respectively ( $\s 2$ ). furthermore, it increases processing latency at switches and might impose additional challenges for collecting and processing the data ( $\s 2$ ).
+
+we would like the benefits of in-band network telemetry, but at smaller overhead cost; in particular, we wish to minimize the per-packet bit overhead. we design probabilistic in-band network telemetry (pint), a probabilistic variation of int, that provides similar visibility as int while bounding the per-packet overhead according to limits set by the user. pint allows the overhead budget to be as low as one bit, and leverages approximation techniques to meet it. we argue that often an approximation of the telemetry data suffices for the consuming application. for example, telemetry-based congestion control schemes like hpcc [46] can be tuned to work with approximate telemetry, as we demonstrate in this paper. in some use cases, a single bit per packet suffices.
+
+with pint, a query is associated with a maximum overhead allowed on each packet. the requested information is probabilistically encoded onto several different packets so that a collection of a flow's packets provides the relevant data. in a nutshell, while with int a query triggers every switch along the path to embed their own information, pint spreads out the information over multiple packets to minimize the per-packet overhead. the insight behind this approach is that, for most applications, it is not required to know all of the per-packet-per-hop information that int collects. existing techniques incur high overheads due to requiring perfect telemetry information. for applications where some imperfection would be sufficient, these techniques may incur unnecessary overheads. pint is designed for precisely such applications. for example, it is possible to check a flow's path conformance [30, 56, 72], by inferring its path from a collection of its packets. alternatively, congestion control or load balancing algorithms that rely on latency measurements gathered by int, e.g., hpcc [46], clove [41] can work if packets convey information about the path's bottleneck, and do not require information about all hops.
+
+we present the pint framework (§3) and show that it can run several concurrent queries while bounding the per-packet bit overhead. to that end, pint uses each packet for a query subset with cumulative overhead within the user-specified budget. we introduce the techniques we used to build this solution (§4) alongside its implementation on commercial programmable switches supporting p4 (§5). finally, we evaluate (§6) our approach with three different use cases. the first traces a flow's path, the second uses data plane telemetry for congestion control, and the third estimates the experienced median/tail latency. using real topologies and traffic characteristics, we show that pint enables all of them concurrently,
+
+<table><tr><td>metadata value</td><td>description</td></tr><tr><td>switch id</td><td>id associated with the switch</td></tr><tr><td>ingress port id</td><td>packet input port</td></tr><tr><td>ingress timestamp</td><td>time when packet is received</td></tr><tr><td>egress port id</td><td>packet output port</td></tr><tr><td>hop latency</td><td>time spent within the device</td></tr><tr><td>egress port tx utilization</td><td>current utilization of output port</td></tr><tr><td>queue occupancy</td><td>the observed queue build up</td></tr><tr><td>queue congestion status</td><td>percentage of queue being used</td></tr></table>
+
+table 1: example metadata values.
+
+with only sixteen bits per packet and while providing comparable performance to the state of the art.
+
+in summary, the main contributions of this paper are:
+
+- we present pint, a novel in-band network telemetry approach that provides fine-grained visibility while bounding the per-packet bit overhead to a user-defined value.  
+- we analyze pint and rigorously prove performance bounds.  
+- we evaluate pint in on path tracing, congestion control, and latency estimation, over multiple network topologies.  
+- we open source our code [1].
+
+# 2 int and its packet overhead
+
+int is a framework designed to allow the collection and reporting of network data plane status at switches, without requiring any control plane intervention. in its architectural model, designated int traffic sources, (e.g., the end-host networking stack, hypervisors, nics, or ingress switches), add an int metadata header to packets. the header encodes telemetry instructions that are followed by network devices on the packet's path. these instructions tell an int-capable device what information to add to packets as they transit the network. table 1 summarizes the supported metadata values. finally, int traffic sinks, e.g., egress switches or receiver hosts, retrieve the collected results before delivering the original packet to the application. the int architectural model is intentionally generic, and hence can enable a number of high level applications, such as (1) network troubleshooting and verification, i.e., microburst detection [36], packet history [30], path tracing [36], path latency computation [34]; (2) rate-based congestion control, i.e., rcp [22], xcp [40], timely [53]; (3) advanced routing, i.e., utilization-aware load balancing [2, 42].
+
+int imposes a non-significant overhead on packets though. the metadata header is defined as an 8b vector specifying the telemetry requests. each value is encoded with a 4b number, as defined by the protocol [75]. as int encodes per-hop information, the overall overhead grows linearly with both the number of metadata values and the number of hops. for a generic data center topology with 5 hops, the minimum space required on packet would be 28 bytes (only one metadata value per int device), which is  $2.8\%$  of a 1000 byte packet (e.g., rdma has a 1000b mtu). some applications, such as alibaba's high precision congestion control [46] (hpcc), require three different int telemetry values for each hop. specifically, for hpcc, int collects timestamp, egress port tx utilization, and queue occupancy, alongside some additional data that is not defined by the int protocol. this would account
+
+![](images/d0e6d489155e2461e5a4451a7932aa2511ee170a753687a8b28e60bede6a43cb.jpg)  
+figure 1: normalized average flow completion time varying the network load and increasing the per-packet overhead.
+
+![](images/aacc0ce4a21234f4d1749040b776580e6f4f6f8ca8f5e5177b73b18fb3792ca0.jpg)  
+figure 2: normalized average goodput of long flows (>10mb) varying the network load and increasing per-packet overhead.
+
+for around  $6.8\%$  overhead using a standard int on a 5-hop path. $^{1}$  this overhead poses several problems:
+
+1. high packet overheads degrade application performance. the significant per-packet overheads from int affect both flow completion time and application-level throughput, i.e., goodput. we ran an ns3 [76] experiment to demonstrate this. we created a 5-hop fat-tree data center topology with 64 hosts connected through 10gbps links. each host generates traffic to randomly chosen destinations with a flow size distribution that follows a web search workload [3]. we employed the standard ecmp routing with tcp reno. we ran our experiments with a range of packet overheads from 28b to 108b. the selected overheads correspond to a 5-hop topology, with one to five different int values collected at each hop. figure 1 shows the effect of increasing overheads on the average flow completion time (fct) for  $30\%$  (average) and  $70\%$  (high) network utilization. figure 2, instead, focuses on the goodput for only the long flows, i.e., with flow size  $>10$  mbytes. both graphs are normalized to the case where no overhead is introduced on packets.
+
+in the presence of 48 bytes overhead, which corresponds to  $3.2\%$  of a 1500b packet (e.g., ethernet has a 1500b mtu), the average fct increases by  $10\%$ , while the goodput for long flows degrades by  $10\%$  if network utilization is approximately  $70\%$ . further increasing the overhead to 108b ( $7.2\%$  of a 1500b packet) leads to a  $25\%$  increase and  $20\%$  degradation of flow completion time and goodput, respectively. this means that even a small amount of bandwidth headroom can provide a dramatic reduction in latency [4]. the long flows' average goodput is approximately proportional to the residual capacity of the network. that means, at a high network utilization, the residual capacity is low, so the extra bytes in the header cause larger goodput degradation than the byte overhead itself [4]. as in our example, the theoretical goodput degradation should be around  $1 - \frac{100\%-70\%\ast1.072}{100\%-70\%\ast1.032} \approx 10.1\%$  when increasing the header overhead from 48b to 108b at around  $70\%$  network utilization. this closely matches the experiment result, and is much larger than the extra byte overhead ( $4\%$ ).
+
+although some data center networks employ jumbo frames to mitigate the problem $^2$ , it is worth noting that (1) not every network can employ jumbo frames, especially the large number of enterprise and isp networks; (2) some protocols might not entirely support
+
+<table><tr><td>application</td><td>description</td><td>measurement primitives</td></tr><tr><td colspan="3">per-packet aggregation</td></tr><tr><td>congestion control [22, 29, 40, 46]</td><td>congestion control with in-network support</td><td>timestamp, port utilization, queue occupancy</td></tr><tr><td>congestion analysis [17, 38, 57]</td><td>diagnosis of short-lived congestion events</td><td>queue occupancy</td></tr><tr><td>network tomography [26]</td><td>determine network state, i.e., queues status</td><td>switchid, queue occupancy</td></tr><tr><td>power management [31]</td><td>determine under-utilized network elements</td><td>switchid, port utilization</td></tr><tr><td>real-time anomaly detection [66, 86]</td><td>detect sudden changes in network status</td><td>timestamp, port utilization, queue occupancy</td></tr><tr><td colspan="3">static per-flow aggregation</td></tr><tr><td>path tracing [36, 56, 65, 72]</td><td>detect the path taken by a flow or a subset</td><td>switchid</td></tr><tr><td>routing misconfiguration [45, 69, 72]</td><td>identify unwanted path taken by a given flow</td><td>switchid</td></tr><tr><td>path conformance [45, 69, 73]</td><td>checks for policy violations.</td><td>switchid</td></tr><tr><td colspan="3">dynamic per-flow aggregation</td></tr><tr><td>utilization-aware routing [2, 41, 42]</td><td>load balance traffic based on network status.</td><td>switchid, port utilization</td></tr><tr><td>load imbalance [45, 65, 73]</td><td>determine links processing more traffic.</td><td>switchid, port utilization</td></tr><tr><td>network troubleshooting [36, 57, 73]</td><td>determine flows experiencing high latency.</td><td>switchid, timestamp</td></tr></table>
+
+table 2: use cases enabled by pint, organized per aggregation mode.
+
+jumbo frames; for example, rdma over converged ethernet nics provides an mtu of only 1kb [54].
+
+2. switch processing time. in addition to consuming bandwidth, the int overhead also affects packet processing time at switches. every time a packet arrives at and departs from a switch, the bits carried over the wire need to be converted from serial to parallel and vice versa, using the 64b/66b (or 66b/64b) encoding as defined by the ieee standard 802.3 [33]. for this reason, any additional bit added into a packet affects its processing time, delaying it at both input and output interfaces of every hop. for example, adding 48 bytes of int data on a packet (int header alongside two telemetry information) would cause a latency increase with respect to the original packet of almost 76ns and 6ns for 10g and 100g interfaces, respectively<sup>3</sup>. on a state-of-the-art switch with 10g interfaces, this can represent an approximately  $3\%$  increase in processing latency [60]. on larger topologies and when more telemetry data is needed, the overhead on the packet can cause an increase of latency in the order of microseconds, which can hurt the application performance [61].
+
+3. collection overheads. telemetry systems such as int generate large amounts of traffic that may overload the network. additionally, int produces reports of varying size (depending on the number of hops), while state-of-the-art end-host stack processing systems for telemetry data, such as confluo [43], rely on fixed-byte size headers on packets to optimize the computation overheads.
+
+# 3 the pint framework
+
+we now discuss the supported functionalities of our system, formalizing the model it works in.
+
+telemetry values. in our work, we refer to the telemetry information as values. specifically, whenever a packet  $p_j$  reaches a switch  $s$ , we assume that the switch observes a value  $v(p_j, s)$ . the value can be a function of the switch (e.g., port or switch id), switch state (e.g., timestamp, latency, or queue occupancy), or any other quantity computable in the data plane. in particular, our definition supports the information types that int [75] can collect.
+
+# 3.1 aggregation operations
+
+we design pint with the understanding that collecting all (per-packet per-switch) values pose an excessive and unnecessary overhead. instead, pint supports several aggregation operations that allow efficient encoding of the aggregated data onto packets. for example, congestion control algorithms that rely on the bottleneck link experienced by packets (e.g., [46]) can use a per-packet aggregation. alternatively, applications that require discovering the flow's path (e.g., path conformance) can use per-flow aggregation.
+
+- per-packet aggregation summarizes the data across the different values in the packet's path, according to an aggregation function (e.g., max/min/sum/product). for example, if the packet  $p_j$  traverses the switches  $s_1, s_2, \ldots, s_k$  and we perform a max-aggregation, the target quantity is  $\max \{v(p_j, s_i)\}_{i=1}^k$ .  
+- static per-flow aggregation targets summarizing values that may differ between flows or switches, but are fixed for a (flow, switch) pair. denoting the packets of flow  $x$  by  $p_1, \ldots, p_z$ , the static property means that for any switch  $s$  on  $x$ 's path we have  $v(p_1, s) = \ldots = v(p_z, s)$ ; for convenience, we denote  $v(x, s) \triangleq v(p_1, s)$ . if the path taken by  $x$  is  $s_1, \ldots, s_k$ , the goal of this aggregation is then to compute all values on the path, i.e.,  $v(x, s_1), v(x, s_2), \ldots, v(x, s_k)$ . as an example, if  $v(x, s_i)$  is the id of the switch  $s_i$ , then the aggregation corresponds to inferring the flow's path.  
+- dynamic per-flow aggregation summarizes, for each switch on a flow's path, the stream of values observed by its packets. denote by  $p_1, \ldots, p_z$  the packets of  $x$  and by  $s_1, \ldots, s_k$  its path, and let sequence of values measured by  $s_i$  on  $x$ 's packets be denoted as  $s_{x,i} = \langle v(p_1, s_i), v(p_2, s_i), \ldots, v(p_z, s_i) \rangle$ . the goal is to compute a function of  $s_{i,x}$  according to an aggregation function (e.g., median or number of values that equal a particular value  $v$ ). for example, if  $v(p_j, s_i)$  is the latency of the packet  $p_j$  on the switch  $s_i$ , using the median as an aggregation function equals computing the median latency of flow  $x$  on  $s_i$ .
+
+# 3.2 use cases
+
+pint can be used for a wide variety of use cases (see table 2). in this paper, we will mainly discuss three of them, chosen in such a way that we can demonstrate all the different pint aggregations in action.
+
+per-packet aggregation: congestion control. state of the art congestion control solutions often use int to collect utilization and queue occupancy statistics [46]. pint shows that we can get similar or better performance while minimizing the overheads associated with collecting the statistics.
+
+static per-flow aggregation: path tracing. discovering the path taken by a flow is essential for various applications like path conformance [45, 69, 73]. in pint, we leverage multiple packets from the same flow to infer its path. for simplicity, we assume that each flow follows a single path.
+
+dynamic per-flow aggregation: network troubleshooting. for diagnosing network issues, it is useful to measure the latency quantiles from each hop [17, 34, 36, 57]. tail quantiles are reported as the most effective way to summarize the delay in an isp [19]. for example, we can detect network events in real-time by noticing a change in the hop latency [9]. to that end, we leverage pint to collect the median and tail latency statistics of (switch, flow) pairs.
+
+# 3.3 query language
+
+each query in pint is defined as a tuple  $\langle \text{val\_t}, \text{agg\_t}, \text{bit-budget}, \text{optional}: \text{space-budget}, \text{flow definition, frequency} \rangle$  that specifies which values are used (e.g., switch ids or latency), the aggregation type as in section 3.1, and the query bit-budget (e.g., 8 bits per packet). the user may also specify a space-budget that determines how much per-flow storage is allowed, the flow-definition (e.g., 5-tuple, source ip, etc.) in the case of per-flow queries, and the query frequency (that determines which fraction of the packets should be allocated for the query).
+
+pint works with static bit-budgets to maximize its effectiveness while remaining transparent to the sender and receiver of a packet. intuitively, when working with int/pint one needs to ensure that a packet's size will not exceed the mtu even after the telemetry information is added. for example, for a 1500b network mtu, if the telemetry overhead may add to  $x$  bytes, then the sender would be restricted to sending packets smaller than  $1500 - x$ . thus, by fixing the budget, we allow the network flows to operate without being aware of the telemetry queries and path length.
+
+# 3.4 query engine
+
+pint allows the operator to specify multiple queries that should run concurrently and a global bit-budget. for example, if the global bit-budget is 16 bits, we can run two 8-bit-budget queries on the same packet. in pint, we add to packets a digest - a short bitstring whose length equals the global bit budget. this digest may compose of multiple query digests as in the above example.
+
+each query instantiates an encoding module, a recording module, and an inference module. the encoding runs on the switches and modifies the packet's digest. when a packet reaches a pint sink (the last hop on its path), the sink extracts (removes) the digest and sends the data packet to its destination. this way, pint remains transparent to both the sender and receiver. the extracted digest is intercepted by the recording module, which processes and
+
+![](images/423eae43f0a4eabb40624386e2033bb47f50709e7a7908f29c1d9a8d6193ccb6.jpg)  
+figure 3: pint's architecture: the query engine decides on an execution plan that determines the probability of running each query set on packets and notifies the switches. the first hop, pint source, adds a digest whose size is determined by the user. every switch along the path may modify the digest but does not add bits. the last hop, pint sink, removes the collected telemetry information and sends it to the recording module. on demand, the inference module is invoked to analyze the recorded data.
+
+stores the digests. we emphasize that the per-flow data stored by the recording module sits in an offline storage and no per-flow state is stored on the switches. another advantage of pint is that, compared with int, we send fewer bytes from the sink to be analyzed and thereby reduce the network overhead. the inference module runs on a commodity server that uses the stored data to answer queries. fig. 3 illustrates pint's architecture.
+
+importantly, all switches must agree on which query set to run on a given packet, according to the distribution chosen by the query engine. we achieve coordination using a global hash function, as described in section 4.1. unlike int, we do not add a telemetry header; in this way we minimize the bit overhead.<sup>4</sup> instead, the pint query engine compiles the queries to decide on the execution plan (which is a probability distribution on a query set, see fig. 3) and notifies the switches.
+
+# 3.5 challenges
+
+we now discuss several challenges we face when designing algorithms for pint.
+
+bit constraints. in some applications, the size of values may be prohibitively large to a point where writing a single value on each packet poses an unacceptable overhead.
+
+switch coordination. the switches must agree on which query set to use for each packet. while the switches can communicate by exchanging bits that are added to packets, this increases the bit-overhead of pint and should be avoided.
+
+switch constraints. the hardware switches have constraints, including limited operations per packet, limited support for arithmetic operations (e.g., multiplication is not supported), inability to keep per-flow state, etc. see [12] for a discussion of the constraints. for pint, these constraints mean that we must store minimal amount of state on switches and use simple encoding schemes that adhere to the programmability restrictions.
+
+# 4 aggregation techniques
+
+in this section, we present the techniques used by pint to overcome the above challenges. we show how global hash functions allow efficient coordination between different switches and between switches and the inference module. we also show how distributed encoding schemes help reduce the number of packets needed to collect the telemetry information. finally, we adopt compression techniques to reduce the number of bits required to represent numeric values (e.g., latency).
+
+our techniques reduce the bit-overhead on packets using probabilistic techniques. as a result, some of our algorithms (e.g., latency quantile estimation) are approximate, while others (e.g., path tracing) require multiple packets from the same flow to decode. intuitively, oftentimes one mostly cares about tracing large (e.g., malicious) flows and does not require discovering the path of very short ones. similarly, for network diagnostics it is ok to get approximated latency measurements as we usually care about large latencies or significant latency changes. we summarize which techniques apply for each of the use cases in table 3.
+
+<table><tr><td>use case</td><td>global hashes</td><td>distributed coding</td><td>value approximation</td></tr><tr><td>congestion control</td><td>x</td><td>x</td><td>✓</td></tr><tr><td>path tracing</td><td>✓</td><td>✓</td><td>x</td></tr><tr><td>latency quantiles</td><td>✓</td><td>x</td><td>✓</td></tr></table>
+
+table 3: a summary of which techniques are used for each use case.
+
+# 4.1 implicit coordination via global hash functions
+
+in pint, we extensively use global hash functions to determine probabilistic outcomes at the switches. as we show, this solves the switch coordination challenge, and also enables implicit coordination between switches and the inference module - a feature that allows us to develop efficient algorithms.
+
+coordination among switches. we use a global (i.e., that is known to all switches) hash function to determine which query set the current packet addresses. for example, suppose that we have three queries, each running with probability  $1/3$ , and denote the query-selection hash, mapping packet ids to the real interval[5]  $[0, 1]$ , by  $\mathfrak{q}$ . then if  $\mathfrak{q}(p_j) < 1/3$ , all switches would run the first query, if  $\mathfrak{q}(p_j) \in [1/3, 2/3]$  the second query, and otherwise the third. since all switches compute the same  $\mathfrak{q}(p_j)$ , they agree on the executed query without communication. this approach requires the ability to derive unique packet identifiers to which the hashes are applied (e.g., ipid, ip flags, ip offset, tcp sequence and ack numbers, etc.). for a discussion on how to obtain identifiers, see [21].
+
+coordination between switches and inference module. the inference module must know which switches modified an incoming packet's digest, but we don't want to spend bits on encoding switch ids in the packet. instead, we apply a global hash function  $g$  on a (packet id, hop number)<sup>6</sup> pair to choose whether to act on a packet.
+
+this enables the pint recording module to compute  $g$ 's outcome for all hops on a packet's path and deduct where it was modified. this coordination plays a critical role in our per-flow algorithms as described below.
+
+example #1: dynamic per-flow aggregation. in this aggregation, we wish to collect statistics from values that vary across packets, e.g., the median latency of a (flow, switch) pair. we formulate the general problem as follows: fix some flow  $x$ . let  $p_1, \ldots, p_z$  denote the packets of  $x$  and  $s_1, \ldots, s_k$  denote its path. for each switch  $s_i$ , we need to collect enough information about the sequence  $s_{i,x} = \langle v(p_1, s_i), v(p_2, s_i), \ldots, v(p_z, s_i) \rangle$  while meeting the query's bit-budget. for simplicity of presentation, we assume that packets can store a single value.<sup>7</sup>
+
+pint's encoding module runs a distributed sampling process. the goal is to have each packet carry the value of a uniformly chosen hop on the path. that is, each packet  $p_j$  should carry each value from  $\{v(p_j, s_1), \ldots, v(p_j, s_k)\}$  with probability  $1 / k$ . this way, with probability  $1 - e^{-\omega(z / k)}$ , each hop will get  $z / k \cdot (1 \pm o(1))$  samples, i.e., almost an equal number.
+
+to get a uniform sample, we use a combination of global hashing and the reservoir sampling algorithm [82]. specifically, when the  $i$ 'th hop on the path (denoted  $s_i$ ) sees a packet  $p_j$ , it overwrites its digest with  $v(p_j, s_i)$  if  $g(p_j, i) \leq r_i$ . therefore, the packet will end up carrying the value  $v(p_j, s_i)$  only if (i)  $g(p_j, i) \leq r_i$ , and (ii)  $\forall j \in \{i + 1, \dots, k\} : g(p_j, j) > r_j$ . to get uniform sampling, we follow the reservoir sampling algorithm and set  $r_i \triangleq 1 / i$ . indeed, for each hop (i) and (ii) are simultaneously satisfied with probability  $1 / k$ . intuitively, while later hops have a lower chance of overriding the digest, they are also less likely to be replaced by the remaining switches along the path.
+
+intuitively, we can then use existing algorithms for constructing statistics from subsampled streams. that is, for each switch  $s_i$ , the collected data is a uniformly subsampled stream of  $s_{i,x}$ . one can then apply different aggregation functions. for instance, we can estimate quantiles and find frequently occurring values. as an example, we can estimate the median and tail latency of the (flow, switch) pair by finding the relevant quantile of the subsampled stream.
+
+on the negative side, aggregation functions like the number of distinct values or the value-frequency distribution entropy are poorly approximable from subsampled streams [49].
+
+pint aims to minimize the decoding time and amount of per-flow storage. to that end, our recording module does not need to store all the incoming digests. instead, we can use a sketching algorithm that suits the target aggregation (e.g., a quantile sketch [39]). that is, for each switch  $s_i$  through which flow  $x$  is routed, we apply a sketching algorithm to the sampled substream of  $s_{i,x}$ . if given a per-flow space budget (see §3.3) we split it between the  $k$  sketches evenly. this allows us to record a smaller amount of per-flow information and process queries faster. further, we can use a sliding-window sketch (e.g., [5, 11, 13]) to reflect only the most recent measurements. finally, the inference module uses the sketch to provide estimates on the required flows.
+
+![](images/24f5142f7972a04c2d653de9032f260a8730f4610667454d3da26ba802492521.jpg)  
+figure 4: multiple encoders send a distributed message.
+
+the accuracy of pint for dynamic aggregation depends on the aggregation function, the number of packets  $(z)$ , the length of the path  $(k)$ , and the per-flow space stored by the recording module (which sits off-switch in remote storage). we state results for two typical aggregation functions. the analysis is deferred to appendix a.1.
+
+theorem 1. fix an error target  $\varepsilon \in (0,1)$  and a target quantile  $\phi \in (0,1)$  (e.g.,  $\phi = 0.5$  is the median). after seeing  $o(k\varepsilon^{-2})$  packets from a flow  $x$ , using  $o(k\varepsilon^{-1})$  space, pint produces a  $(\phi \pm \varepsilon)$ -quantile of  $s_{x,i}$  for each hop  $i$ .
+
+theorem 2. fix an error target  $\varepsilon \in (0,1)$  and a target threshold  $\theta \in (0,1)$ . after seeing  $o(k\varepsilon^{-2})$  packets from a flow  $x$ , using  $o(k\varepsilon^{-1})$  space, pint produces all values that appear in at least a  $\theta$ -fraction of  $s_{x,i}$ , and no value that appears less than a  $(\theta - \varepsilon)$ -fraction, for each hop  $i$ .
+
+# 4.2 distributed coding schemes
+
+when the values are static for a given flow (i.e., do not change between packets), we can improve upon the dynamic aggregation approach using distributed encoding. intuitively, in such a scenario, we can spread each value  $v(x, s_i)$  over multiple packets. the challenge is that the information collected by pint is not known to any single entity but is rather distributed between switches. this makes it challenging to use existing encoding schemes as we wish to avoid adding extra overhead for communication between switches. further, we need a simple encoding scheme to adhere to the switch limitations, and we desire one that allows efficient decoding.
+
+traditional coding schemes assume that a single encoder owns all the data that needs encoding. however, in pint, the data we wish to collect can be distributed among the network switches. that is, the message we need to transfer is partitioned between the different switches along the flow's path.
+
+we present an encoding scheme that is fully distributed without any communication between encoders. specifically, we define our scheme as follows: a sequence of  $k$  encoders hold a  $k$ -block message  $m_1, \ldots, m_k$  such that encoder  $e_i$  has  $m_i$  for all  $i \in \{1, \ldots, k\}$ . the setting is illustrated in fig. 4. each packet carries a digest which has a number of bits that equals the block size and has a unique identifier which distinguishes it from other packets. additionally, each encoder is aware of its hop number (e.g., by computing it from the ttl field in the packet header). the packet starts with a digest of  $\overline{0}$  (a zero bitstring) and passes through  $e_1, \ldots, e_k$ . each encoder can modify the packet's digest before passing it to the next encoder. after the packet visits  $e_k$ , it is passed to the receiver, which tries to decode the message. we assume that the encoders are stateless to model the switches' inability to keep a per-flow state in networks.
+
+our main result is a distributed encoding scheme that needs  $k \cdot \log \log^* k \cdot (1 + o(1))$  packets for decoding the message with near-linear decoding time. we note that network coding [32] can also be
+
+![](images/3067e253672aaeafb06488382972b848ec70b4e1112f2ccf7d73fc26e57fcf97.jpg)  
+(a) algorithm progress
+
+![](images/e97a77132e7f607f88b1dc1b93b6f2c28c7dd219449b4f31d90d95888075d761.jpg)  
+(b) probability of decoding  
+figure 5: the xor scheme (with prob.  $1 / d$ ) decodes fewer hops at first but is able to infer the entire path using a similar number of packets to baseline. by interleaving both schemes (hybrid), we get a better result as the first hops are mainly decoded by baseline packets and the last hops by xor packets that have xor probability  $\log \log d / \log d$  and are more likely to hit the missing hops. plotted for  $d = k = 25$  hops.
+
+adapted to this setting. however, we have found it rather inefficient, as we explain later on.
+
+baseline encoding scheme. a simple and intuitive idea for a distributed encoding scheme is to carry a uniformly sampled block on each packet. that is, the encoders can run the reservoir sampling algorithm using a global hash function to determine whether to write their block onto the packet. similarly to our dynamic aggregation algorithm, the receiver can determine the hop number of the sampling switch, by evaluating the hash function, and report the message.
+
+the number of packets needed for decoding the message using this scheme follows the coupon collector process (e.g., see [24]), where each block is a coupon and each packet carries a random sample. it is well-known that for  $k$  coupons, we would need  $k \ln k(1 + o(1))$  samples on average to collect them all. for example, for  $k = 25$ , coupon collector has a median (i.e., probability of  $50\%$  to decode) of 89 packets and a 99'th percentile of 189 packets, as shown in fig. 5.
+
+the problem with the baseline scheme is that while the first blocks are encoded swiftly, later ones require a higher number of packets. the reason is that after seeing most blocks, every consecutive packet is unlikely to carry a new block. this is because the encoders are unaware of which blocks were collected and the probability of carrying a new block is proportional to number of missing blocks. as a result, the baseline scheme has a long "tail", meaning that completing the decoding requires many packets.
+
+distributed xor encoding. an alternative to the baseline scheme is to use bitwise-xor while encoding. we avoid assuming that the encoders know  $k$ , but assume that they know a typical length  $d$ , such that  $d = \theta(k)$ . such an assumption is justified in most cases; for example, in data center topologies we often know a tight bound on the number of hops [72]. alternatively, the median hop count in the internet is estimated to be 12 [80], while only a few paths have more than 30 hops [15, 77]. the xor encoding scheme has a parameter  $p$ , and each encoder on the path bitwise-xors its message onto the packet's digest with probability  $p = 1 / d$ , according to the global hash function. that is, the  $i$ 'th encoder changes the digest if  $g(p_j, i) < p$ . we note that this probability is uniform and that the decision of whether to xor is independent for each encoder, allowing a distributed implementation without communication between the encoders.
+
+when a packet reaches the receiver, the digest is a bitwise-xor of multiple blocks  $m_{i_1} \oplus \ldots \oplus m_{i_k}$ , where  $k$  is a binomial random variable  $k \sim \text{bin}(k, p)$ . the receiver computes  $g(p_j, 1), \ldots, g(p_j, k)$  to determine the values  $i_1, \ldots, i_k$ . if this set contains exactly one unknown message block, we can discover it by bitwise-xoring the other blocks. for example, if we have learned the values of  $m_1, m_3, m_4, m_6$  and the current digest is  $p_j \cdot \mathrm{dig} = m_1 \oplus m_5 \oplus m_6$ , we can derive  $m_5$  since  $m_5 = p_j \cdot \mathrm{dig} \oplus m_1 \oplus m_6$ .
+
+on its own, the xor encoding does not asymptotically improve over the baseline. its performance is optimized when  $p = 1 / d = \theta(1 / k)$ , where it requires  $o(k \log k)$  packets to decode, i.e., within a constant factor from the baseline's performance. interestingly, we show that the combination of the two approaches gives better results. interleaving the encoding schemes. intuitively, the xor and baseline schemes behave differently. in the baseline, the chance of learning the value of a message block with each additional packet decreases as we receive more blocks. in contrast, to recover data from an xor packet, we need to know all xor-ed blocks but one. when  $p$  is much larger than  $1 / k$ , many packet digests are modified by multiple encoders, which means that the probability to learn a message block value increases as we decode more blocks.
+
+as an example for how the interleaved scheme helps, consider the case of  $k = 2$  encoders. the baseline scheme requires three packets to decode the message in expectation; the first packet always carries an unknown block, but each additional packet carries the missing block with probability only  $1/2$ . in contrast, suppose each packet chooses the baseline scheme and the xor scheme each with probability  $1/2$ , using  $p = 1$ . for the interleaved scheme to complete, we need either two baseline packets that carry different blocks or one xor packet and one baseline packet. a simple calculation shows that this requires just  $8/3$  packets in expectation.
+
+for combining the schemes, we first choose whether to run the baseline with probability  $\tau$ , or the xor otherwise. once again, switches make the decision based on a global hash function applied to the packet identifier to achieve implicit agreement on the packet type. intuitively, the baseline scheme should reduce the number of undecoded blocks from  $k$  to  $k'$ , and the xor will decode the rest. to minimize the number of packets, we can set  $\tau = 3/4$  and the xor probability<sup>8</sup> to log  $\log d / \log d$  to reduce the required number of packets to  $o(k \log \log k / \log \log \log k)$ . in such setting, the baseline decodes most hops, leaving  $k' \approx k / \log k$  for the xor layer. for example, when  $k = 25$ , we get a median of 41 packets and a 99'th percentile of 68 packets to decode the message. that is, not only does it improve the average case, the interleaving has sharper tail bounds. this improvement is illustrated in fig. 5.
+
+multi-layer encoding. so far, we used a single probability for xor-ing each packet, which was chosen inversely proportional to  $k'$  (the number of hops that were not decoded by the baseline scheme). this way, we maximized the probability that a packet is xor-ed by exactly one of these  $k'$  blocks, and we xor any block from the  $k - k'$  that are known already to remove them from the decoding. however, when most of the  $k'$  blocks left for xor are decoded, it also "slows down" and requires more packets for decoding each additional block. therefore, we propose to use multiple xor layers that vary in their sampling probabilities. we call the baseline
+
+scheme layer 0, and the xor layers  $1,\ldots ,\mathcal{l}$ . each xor layer  $\ell \in \{1,\dots ,\mathcal{l}\}$  starts with  $k_{\ell}$  undecoded blocks, xors with probability  $p_\ell$ , and ends when  $k_{\ell +1}$  blocks are undecoded.
+
+our analysis, given in appendix a.2, shows that by optimizing the algorithm parameters  $\tau, \mathcal{l}, \{k_{\ell}\}_{\ell=1}^{\mathcal{l}}$  and  $\{p_{\ell}\}_{\ell=1}^{\mathcal{l}}$ , we obtain the following result. the value of  $\mathcal{l}$  is a function of  $d$ , and we have that  $\mathcal{l} = 1$  if  $d \leq \lfloor e^{e} \rfloor = 15$  and  $\mathcal{l} = 2$  if  $16 \leq d \leq e^{e^{e}}$ ; i.e., in practice we need only one or two xor layers.
+
+theorem 3. after seeing  $k \log \log^* k(1 + o(1))$  packets, the multi-layer scheme can decode the message.
+
+we note that the  $o(1)$  term hides an  $o(k)$  packets additive term, where the constant depends on how well  $d$  approximates  $k$ . namely, when  $d = k$ , our analysis indicates that  $k(\log \log^* k + 2 + o(1))$  packets are enough. finally, we note that if  $d$  is not representative of  $k$  at all, we still get that  $k\ln k(1 + o(1))$  packets are enough, the same as in the baseline scheme (up to lower order terms). the reason is that our choice of  $\tau$  is close to 1, i.e., only a small fraction of the packets are used in the xor layers.
+
+comparison with linear network coding. several algorithms can be adapted to work in the distributed encoding setting. for example, linear network coding (lnc) [32] allows one to decode a message in a near-optimal number of packets by taking random linear combinations over the message blocks. that is, on every packet, each block is xor-ed into its digest with probability  $1/2$ . using global hash functions to select which blocks to xor, one can determine the blocks that were xor-ed onto each digest. lnc requires just  $\approx k + \log_2 k$  packets to decode the message. however, in some cases, lnc may be suboptimal and pint can use alternative solutions. first, the lnc decoding algorithm requires matrix inversion which generally takes  $o(k^3)$  time in practice (although theoretically faster algorithms are possible). if the number of blocks is large, we may opt for approaches with faster decoding. second, lnc does not seem to work when using hashing to reduce the overhead. as a result, in such a setting, lnc could use fragmentation, but may require a larger number of packets than the xor-based scheme using hashing.
+
+example #2: static per-flow aggregation. we now discuss how to adapt our distributed encoding scheme for pint's static aggregation. specifically, we present solutions that allow us to reduce the overhead on packets to meet the bit-budget in case a single value cannot be written on a packet. for example, for determining a flow's path, the values may be 32-bit switch ids, while the bit-budget can be smaller (even a single bit per packet). we also present an implementation variant that allows to decode the collection of packets in near-linear time. this improves the quadratic time required for computing  $\{g(p_j,i)\}$  for all packets  $p_j$  and hops  $i$ .
+
+reducing the bit-overhead using fragmentation. consider a scenario where each value has  $\mathfrak{q}$  bits while we are allowed to have smaller b-bits digests on packets. in such a case, we can break each value into  $f \triangleq \lceil \mathfrak{q} / \mathfrak{b} \rceil$  fragments where each has  $\leq \mathfrak{b}$  bits. using an additional global hash function, each packet  $p_j$  is associated with a fragment number in  $\{1, \dots, f\}$ . we can then apply our distributed encoding scheme separately on each fragment number. while fragmentation reduces the bit overhead, it also increases the number of packets required for the aggregation, and the decode complexity, as if there were  $k \cdot f$  hops.
+
+reducing the bit-overhead using hashing. the increase in the required number of packets and decoding time when using fragmentation may be prohibitive in some applications. we now propose an alternative that allows decoding with fewer packets, if the value-set is restricted. suppose that we know in advance a small set of possible block values  $\mathcal{v}$ , such that any  $m_{i}$  is in  $\mathcal{v}$ . for example, when determining a flow's path,  $\mathcal{v}$  can be the set of switch ids in the network. intuitively, the gain comes from the fact that the keys may be longer than  $\log_2|\mathcal{v}|$  bits (e.g., switch ids are often 32-bit long, while networks have much fewer than  $2^{32}$  switches). instead of fragmenting the values to meet the q-bits query bit budget, we leverage hashing. specifically, we use another global hash function  $h$  that maps (value, packet id) pairs into q-bit bitstrings. when encoder  $e_i$  sees a packet  $p_j$ , if it needs to act it uses  $h(m_i,p_j)$  to modify the digest. in the baseline scheme  $e_i$  will write  $h(m_i,p_j)$  on  $p_j$ , and in the xor scheme it will xor  $h(m_i,p_j)$  onto its current digest. as before, the recording module checks the hop numbers that modified the packet. the difference is in how the inference module works – for each hop number  $i$ , we wish to find a single value  $v \in \mathcal{v}$  that agrees with all the baseline packets from hop  $i$ . for example, if  $p_1$  and  $p_2$  were baseline packets from hop  $i$ ,  $m_i$  must be a value such that  $h(m_i,p_1) = p_1.\mathrm{dig}$  and  $h(m_i,p_2) = p_2.\mathrm{dig}$ . if there is more than one such value, the inference for the hop is not complete and we require additional packets to determine it. once a value of a block  $m_i$  is determined, from any digest  $p_j$  that was xor-ed by the  $i$ 'th encoder, we xor  $h(m_i,p_j)$  from  $p_j.\mathrm{dig}$ . this way, the number of unknown blocks whose hashes xor-ed  $p_j$  decreases by one. if only one block remains, we can treat it similarly to a baseline packet and use it to reduce the number of potential values for that block. another advantage of the hashing technique is that it does not assume anything about the width of the values (e.g., switch ids), as long as each is distinct.
+
+reducing the decoding complexity. our description of the encoding and decoding process thus far requires processing is superquadratic  $(\omega(k^2))$  in  $k$ . that is because we need  $\approx k \log \log^* k$  packets to decode the message, and we spend  $o(k)$  time per packet in computing the  $g$  function to determine which encoders modified its digest. we now present a variant that reduces the processing time to nearly linear in  $k$ . intuitively, since the probability of changing a packet is  $\omega(1/k)$ , the number of random bits needed to determine which encoders modify it is  $o(k \log k)$ . previously, each encoder used the global function  $g$  to get  $o(\log k)$  pseudo-random bits and decide whether to change the packet. instead, we can use  $g$  to create  $o(\log 1/p) = o(\log k)$  pseudo-random  $k$ -bit vectors. intuitively, each bit in the bitwise-and of these vectors will be set with probability  $p$  (as defined by the relevant xor layer). the  $i$ 'th encoder will modify the packet if the  $i$ 'th bit is set in the bitwise-and of the vectors<sup>9</sup>. at the recording module, we can compute the set of encoders that modify a packet in time  $o(\log k)$  by drawing the random bits and using their bitwise-and. once we obtain the bitwise-and vector we can extract a list of set bits in time  $o(\# \text{set bits})$  using bitwise operations. since the average number of set bits is  $o(1)$ , the overall per-packet complexity remains  $o(\log k)$  and the total decoding time becomes  $o(k \log k \log \log^* k)$ . we note that this improvement assumes that  $k$
+
+fits in  $o(1)$  machine words (e.g.,  $k \leq 256$ ) and that encoders can do  $o(\log k)$  operations per packet.
+
+improving performance via multiple instantiations. the number of packets  $pint$  needs to decode the message depends on the query's bit-budget. however, increasing the number of bits in the hash may not be the best way to reduce the required number of packets. instead, we can use multiple independent repetitions of the algorithm. for example, given an 8-bit query budget, we can use two independent 4-bit hashes.
+
+# 4.3 approximating numeric values
+
+encoding an exact numeric value on packet may require too many bits, imposing an undesirable overhead. for example, the 32-bit latency measurements that int collects may exceed the bit-budget. we now discuss to compress the value, at the cost of introducing an error.
+
+multiplicative approximation. one approach to reducing the number of bits required to encode a value is to write on the packet's digest  $\mathfrak{a}(p_j,s) \triangleq \left[\log_{(1 + \varepsilon)^2} v(p_j,s)\right]$  instead of  $v(p_j,s)$ . here, the  $[\cdot]$  operator rounds the quantity to the closest integer. at the inference module, we can derive a  $(1 + \varepsilon)$ -approximation of the original value by computing  $(1 + \varepsilon)^{2\cdot \mathfrak{a}(p_j,s)}$ . for example, if we want to compress a 32-bit value into 16 bits, we can set  $\varepsilon = 0.0025$ .
+
+additive approximation. if distinguishing small values is not as crucial as bounding the maximal error, we obtain better results by encoding the value with additive error instead of multiplicative error. for a given error target  $\delta$  (thereby reducing the overhead by  $\left\lfloor \log_2\delta \right\rfloor$  bits), the encoding module writes  $\mathfrak{a}(p_j,s)\triangleq \left[\frac{v(p_j,s)}{2\delta}\right]$ , and the inference module computes  $(2\delta)\cdot \mathfrak{a}(p_j,s)$ .
+
+randomized counting. for some aggregation functions, the aggregation result may require more bits than encoding a single value. for example, in a per-packet aggregation over a  $k$ -hop path with  $q$ -bit values, the sum may require  $q + \log k$  bits to write explicitly while the product may take  $q \cdot k$  bits. this problem is especially evident if  $q$  is small (e.g., a single bit specifying whether the latency is high). instead, we can take a randomized approach to increase the value written on a packet probabilistically. for example, we can estimate the number of high-latency hops or the end-to-end latency to within a  $(1 + \varepsilon)$ -multiplicative factor using  $o(\log \varepsilon^{-1} + \log \log (2^q \cdot k \cdot \varepsilon^2))$  bits [55].
+
+example #3: per-packet aggregation. here, we wish to summarize the data across the different values in the packet's path. for example, hpcc [46] collects per-switch information carried by int data, and adjusts the rate at the end host according to the highest link utilization along the path. to support hpcc with pint, we have two key insights: (1) we just need to keep the highest utilization (i.e., the bottleneck) in the packet header, instead of every hop; (2) we can use the multiplicative approximation to further reduce the number of bits for storing the utilization. intuitively, pint improves hpcc as it reduces the overheads added to packets, as explained in section 2.
+
+in each switch, we calculate the utilization as in hpcc, with slight tuning to be supported by switches (discussed later). the multiplication is calculated using log and exp based on lookup tables [67]. the result is encoded using multiplicative approximation. to further eliminate systematic error, we write  $\mathfrak{a}(p_j,s)\triangleq \left[\log_{(1 + \varepsilon)^2}v(p_j,s)\right]_r$ ,
+
+![](images/0d7347f3eec81c6a8f642ba135fa5b491a59575f021924bf6823582a425c6abb.jpg)  
+(a) web search workload (large flows)
+
+![](images/14b43c02715cc7a52f2ba1f4cd3ef39c3e2b2a942e042181cf18a766d8ce9c02.jpg)  
+(b) web search workload
+
+![](images/85975c3b6f3e05def1006ea7f6a4e65151ed151cc659b3c8a55451ad4e4cfe63.jpg)  
+(c) hadoop workload
+
+![](images/f22f5254a8db7bedb6bde8056934791244c1c396c92edd931d991276f750d345.jpg)  
+figure 7: comparison of the 95th-percentile slowdown of the standard int-based hpcc and the pint-based hpcc. pint improves the performance for the long flows due to its reduced overheads. in (b) and (c), the network load is  $50\%$  and the x-axis scale is chosen such that there are  $10\%$  of the flows between consecutive tick marks.  
+figure 6: layout illustration for two path tracing hashes, alongside a latency query, and a congestion control query.
+
+the  $[ \cdot ]_r$  randomly performs floor or ceiling, with a probability distribution that gives an expected value equals to  $\log_{(1 + \varepsilon)^2}v(p_j,s)$ . this way, some packets will overestimate the utilization while others underestimate it, thus resulting in the correct value on average. in practice, we just need 8 bits to support  $\varepsilon = 0.025$ .
+
+tuning hpcc calculation for switch computation. we maintain the exponential weighted moving average (ewma) of link utilization  $u$  of each link in the switch.  $u$  is updated on every packet with:  $u = \frac{t - \tau}{t} \cdot u + \frac{\tau}{t} \cdot u$ , where  $u = \frac{qlen}{b \cdot t} + \frac{byte}{b \cdot \tau}$  is the new sample for updating  $u$ . here,  $t$  is the base rtt and  $b$  is the link bandwidth (both are constants). intuitively, the weight of the ewma,  $\frac{\tau}{t}$ , corresponds to each new packet's time occupation  $\tau$ . the calculation of  $u$  also corresponds to each new packet: byte is the packet's size, and qlen is the queue length when the packet is dequeued<sup>10</sup>.
+
+to calculate the multiplications, we first do the following transformation:  $u = \frac{t - \tau}{t} \cdot u + \frac{qlen \cdot \tau}{b \cdot t^2} + \frac{byte}{b \cdot t}$ . then we calculate the multiplications using logarithm and exponentiation as detailed in appendix b.
+
+# 5 implementation
+
+pint is implemented using the p4 language and can be deployed on commodity programmable switches. we explain how each of our use cases is executed.
+
+for running the path tracing application (static per-flow aggregation), we require four pipeline stages. the first chooses a layer, another computes  $g$ , the third hashes the switch id to meet the
+
+query's bit budget, and the last writes the digest. if we use more than one hash for the query, both can be executed in parallel as they are independent.
+
+computing the median/tail latency (dynamic per-flow aggregation) also requires four pipeline stages: one for computing the latency, one for compressing it to meet the bit budget; one to compute  $g$ ; and one to overwrite the value if needed.
+
+our adaptation of the hpcc congestion control algorithm requires six pipeline stages to compute the link utilization, followed by a stage for approximating the value and another to write the digest. for completeness, we elaborate on how to implement in the data plane the different arithmetic operations needed by hpcc in appendix c. we further note that running it may require that the switch would need to perform the update of  $u$  in a single stage. in other cases, we propose to store the last  $n$  values of  $u$  on separate stages and update them in a round-robin manner, for some integer  $n$ . this would mean that our algorithm would need to recirculate every  $n$ 'th packet as the switch's pipeline is one-directional.
+
+since the switches have a limited number of pipeline stages, we parallelize the processing of queries as they are independent of each other. we illustrate this parallelism for a combination of the three use cases of pint. we start by executing all queries simultaneously, writing their results on the packet vector. since hpcc requires more stages than the other use cases, we concurrently compute which query subset to run according to the distribution selected by the query engine (see §3.4). we can then write the digests of all the selected queries without increasing the number of stages compared with running hpcc alone. the switch layout for such a combination is illustrated in fig. 6.
+
+# 6 evaluation
+
+we evaluate on the three use cases discussed on §3.2.
+
+# 6.1 congestion control
+
+we evaluate how pint affects the performance of hpcc [46] using the same simulation setting as in [46]. our goal is not to propose a new congestion control scheme, but rather to present a low-overhead approach for collecting the information that hpcc utilizes. we use ns3 [76] and a fattree topology with 16 core switches, 20 agg switches, 20 tors, and 320 servers (16 in each rack). each server has a single 100gbps nic connected to a single tor. the capacity of
+
+![](images/8880ef1cb5fb273444f6fa97b02cb92b480b1120aac997d825466262981173d8.jpg)  
+(a) web search workload
+
+![](images/1c0dee5cf2f2f8a252f6d71967ba2e53c5220cfbfa442fccead2d871414ea04d.jpg)  
+(b) hadoop workload
+
+each link between core and agg switches, as well as agg switches and tors, are all 400gbps. all links have a  $1\mu s$  propagation delay, which gives a  $12\mu s$  maximum base rtt. the switch buffer size is 32mb. the traffic is generated following the flow size distribution in web search from microsoft [3] and hadoop from facebook [62]. each server generates new flows according to a poisson process, destined to random servers. the average flow arrival time is set so that the total network load is  $50\%$  (not including the header bytes). we use the recommended setting for hpcc:  $w_{ai} = 80$  bytes, maxstage  $= 0$ ,  $\eta = 95\%$ , and  $t = 13\mu s$ .
+
+the results, depicted in fig. 7(b) and fig. 7(c), show that pint has similar performance (in terms of slowdown) to hpcc, despite using just 8 bits per packet. here, slowdown refers to the ratio between the completion time of the flow in the presence of other flows and alone. specifically, pint has better performance on long flows while slightly worse performance on short ones. the better performance on long flows is due to pint's bandwidth saving. fig. 7(a) shows the relative goodput improvement, averaged over all flows over 10mb, of using pint at different network load. at higher load, the byte saving of pint brings more significant improvement. for example, at  $70\%$  load, using pint improves the goodput by  $71\%$ . this trend aligns with our observation in §2.
+
+to evaluate how the congestion control algorithm would perform alongside other queries, we experiment in a setting where only a  $p = 1, 1/16, 1/256$  fraction of the packets carry the query's digest. as shown in fig. 8(a) and fig. 8(b), the performance only slightly degrades for  $p = 1/16$ . this is expected, because the bandwidth-delay product (bdp) is 150 packets, so there are still 9.4 ( $\approx 150/16$ ) packets per rtt carrying feedback. thus the rate is adjusted on average once per 1/9.4 rtt (as compared to 1/150 rtt with per-packet feedback), which is still very frequent. with  $p = 1/256$ , the performance of short flows degrades significantly, because it takes longer than an rtt to get feedback. the implication is that congestion caused by long flows is resolved slowly, so the queue lasts longer, resulting in higher latency for short flows. the very long flows (e.g.,  $> 5\mathrm{mb}$ ) also have worse performance. the reason is that they are long enough to collide with many shorter flows, so when the competing shorter flows finish, the long flows have to converge back to the full line rate. with  $p = 1/256$ , it takes much longer time to converge than with smaller  $p$ .
+
+![](images/e50d15cf725cc4a16bc21db2e411d8f424f1eee60f2648780c4489f9b1488c45.jpg)  
+figure 8: the 95th-percentile slowdown of running pint-based hpcc (at  $50\%$  network load) on  $p$ -fraction of the packets. on both workloads, the performance of running it on  $1/16$  of the packets produces similar results to running it on all.  
+figure 9: pint error on estimating latency quantiles with a sketch  $(\mathrm{pint}_s)$  and without. in the first row, the sketch has 100 digests; in the second, the sample has 500 packets.
+
+in principle, the lower feedback frequency  $p$  only affects the convergence speed as discussed above, but not the stability and fairness. stability is guaranteed by no overreaction, and hpcc's design of reference window (constant over an rtt) provides this regardless of  $p$ . fairness is guaranteed by additive-increase-multiplicative-decrease (aimd), which is preserved regardless of  $p$ .
+
+# 6.2 latency measurements
+
+using the same topology and workloads as in our congestion control experiments, we evaluate pint's performance on estimating latency quantiles. we consider pint in four scenarios, using  $b = 4$  and  $b = 8$  bit-budgets, with sketches (denoted  $pint_s$ ), and without. in our experiment, we have used the, state of the art, kll sketch [39]. the results, appearing in fig. 9, show that when getting enough packets, the error of the aggregation becomes stable and converges to the error arising from compressing the values. as shown, by compressing the incoming samples using a sketch (e.g., that keeps 100 identifiers regardless of the number of samples), pint accuracy degrades only a little even for small 100b sketches. we conclude that such sketches offer an attractive space to accuracy tradeoff.
+
+# 6.3 path tracing
+
+we conduct these experiments on mininet [52] using two large-diameter (denoted  $d$ ) isp topologies (kentucky datalink and us carrier) from topology zoo [44] and a  $(k = 8)$  fat tree topology. the kentucky datalink topology consisted of 753 switches with a diameter of 59 and the us carrier topology consisted of 157 switches with a diameter of 36. for each topology and every path, we estimate the average and  $99^{\prime}$ th percentile number of packets needed for decoding over 10k runs. we consider three variants of pint- using 1-bit, 4-bit, and two independent 8-bit hash functions (denoted by  $2 \times (b = 8)$ ). we compare pint to two state-of-the-art ip traceback solutions ppm [65] and ams2 [70] with  $m = 5$  and  $m = 6$ . when configured with  $m = 6$ , ams2 requires more packets to infer the path but also has a lower chance of false positives (multiple possible paths) compared with  $m = 5$ . we implement an improved version of both algorithms using reservoir sampling, as proposed in [63]. pint is configured with  $d = 10$  on the isp topologies and  $d = 5$  (as this is the diameter) on the fat tree topology. in both cases, this means a single xor layer in addition to a baseline layer.
+
+![](images/af1efa159433f4424d3fa32eadad2da29d49db27eae9aaaf0275c174b035ae96.jpg)  
+(a) kentucky datalink  $(d = 59)$
+
+![](images/1b72c85ec1b73f78101a3b0931061822df04a235b0b98cfa69405e094a0fbc01.jpg)  
+(b) us carrier  $(d = 36)$
+
+![](images/1721f1cf459f69526d09b7cf079a9b6046b756a7f1ea1a6518fa27e6b8f68554.jpg)
+
+![](images/931c585aced10a72a4200148c82af3c50443959d3b7065622ed9e9810f5f9cd9.jpg)  
+(c) fat tree  $(d = 5)$
+
+![](images/ce9262bd191b47c14e802b4c436cc8de7feccff21966ecb528c3282625fbe492.jpg)  
+(d) kentucky datalink  $(d = 59)$
+
+![](images/e969de8f89a3a8c1cccaf3a9142c91bbb60b5e95170b838d2542aade0980d229.jpg)  
+(e) us carrier  $(d = 36)$
+
+![](images/b50292e150918b7b1dbac583cf73b90fc8c47dd09f4381614ee0cdb8174bf3f0.jpg)  
+(f) fat tree  $(d = 5)$  
+figure 10: comparison of the number of packets required (lower is better) for path decoding of different algorithms, including pint with varying bit-budget.
+
+the results (fig. 10) show that pint significantly outperforms previous works, even with a bit-budget of a single bit (ppm and ams both have an overhead of 16 bits per packet). as shown, the required number of packets for pint grows near-linearly with the path length, validating our theoretical analysis. for the kentucky datalink topology ( $d = 59$ ), pint with  $2 \times (b = 8)$  on average uses 25-36 times fewer packets when compared to competing approaches. even when using pint with  $b = 1$ , pint needs 7-10 times fewer packets than competing approaches. for the largest number of hops we evaluated (59, in the kentucky datalink topology), pint requires only 42 packets on average and 94 for the 99'th percentile, while alternative approaches need at least 1-1.5k on average and 3.3-5k for 99'th percentile, respectively.
+
+# 6.4 combined experiment
+
+we test the performance of pint when running all three use cases concurrently. based on the previous experiments, we tune pint to run each query using a bit budget of 8 bits and a global budget of 16 bits. our goal is to compare how pint performs in such setting, compared with running each application alone using 16 bits per packet (i.e., with an effective budget of  $3 \times 16$  bits). that is, each packet can carry digests of two of the three concurrent queries. as we observe that the congestion control application has good
+
+performance when running in  $p = 1/16$  of the packets, and the path tracing requires more packets than the latency estimation, we choose the following configuration. we run the path algorithm on all packets, alongside the latency algorithm in  $15/16$  of the packets, and alongside hpcc in  $1/16$  of the packets. as fig. 11 shows, the performance of pint is close to a baseline of running each query separately. for estimating median latency, the relative error increases by only  $0.7\%$  from the baseline to the combined case. in case of hpcc, we that observe short flows become  $6.6\%$  slower while the
+
+![](images/30f9d8a4cdf440a3f18ce397ecc05e3f0ff6ce35135140091e61a0538cf3f22c.jpg)  
+figure 11: the performance of each query in a concurrent execution (fattree topology + hadoop workload) compared to running it alone.
+
+![](images/fa68fe53e52f7b17c4e612142552d45245953ad1c12b9508921bf6b82da63d6d.jpg)
+
+![](images/1f589509c4db1af5b39845670ea8f077a4a3c58efc7da44bdf43df7aff327a26.jpg)
+
+performance of long flows does not degrade. as for path tracing, the number of packets increases by  $0.5\%$  compared with using two 8 bit hashes as in fig. 10. we conclude that, with a tailored execution plan, our system can support these multiple concurrent telemetry queries using an overhead of just two bytes per packet.
+
+# 7 limitations
+
+in this section, we discuss the limitations associated with our probabilistic approach. the main aspect to take into consideration is the required per-packet bit-budget and the network diameter. the bigger overhead allowed and the smaller the network, the more resilient pint will be in providing results in different scenarios.
+
+tracing short flows. pint leverages multiple packets from the same flow to infer its path. in our evaluation (§6), we show that our solution needs significantly fewer packets when compared to competing approaches. however, in data center networks, small flows can consist of just a single packet [3]. in this case, pint is not effective and a different solution, such as int, would provide the required information.
+
+data plane complexity. today's programmable switches have a limited number of pipeline stages. although we show that it is possible to parallelize the processing of independent queries (\$5), thus saving resources, the pint requirements might restrict the amount of additional use cases to be implemented in the data plane, e.g., fast reroute [18] or in-network caching [37] and load balancing [2, 42].
+
+tracing flows with multipath routing. the routing of a flow may change over time (e.g., when using flowlet load balancing [2, 42]) or multiple paths can be taken simultaneously when appropriate transport protocols such as multipath tcp are used [25]. in those cases, the values (i.e., switch ids) for some hops will be different. here, pint can detect routing changes when observing a digest that is not consistent with the part of the path inferred so far. for example, if we know that the sixth switch on a path is  $m_6$ , and a baseline packet  $p_j$  comes with a digest from this hop that is different than  $h(m_6, p_j)$ , then we can conclude that the path has changed. the number of packets needed to identify a path change depends on the fraction of the path that has been discovered. if path changes are infrequent, and pint knows the entire path before the change, a baseline packet will not be consistent with the known path (and thus signify a path change) with probability  $1 - 2^{-q}$ . overall, in the presence of flowlet routing, pint can still trace the path of each flowlet, provided enough packets for each flowlet-path are received at the sink. pint can also profile all paths simultaneously at the cost of additional overhead (e.g., by adding a path checksum to packets we can associate each with the path it followed).
+
+current implementation. at the time of writing, the pint execution plan is manually selected. we envision that an end to end system that implements pint would include a query engine that automatically decides how to split the bit budget.
+
+# 8 related work
+
+many previous works aim at improving data plane visibility. some focus on specific flows selected by operators [56, 78, 87] or only on randomly selected sampled flows [10, 21]. such approaches are insufficient for applications that need global visibility on all flows, such as path tracing. furthermore, the flows of interest may not be known in advance, if we wish to debug high-latency or malicious flows.
+
+other works can be classified into three main approaches: (1) keep information out-of-band; (2) keep flow state at switches; or (3) keep information on packets. the first approach applies when the data plane status is recovered by using packet mirroring at switches or by employing specially-crafted probe packets. mirroring every packet creates scalability concerns for both trace collection and analysis. the traffic in a large-scale data center network with hundreds of thousands of servers can quickly introduce terabits of mirrored traffic [28, 62]. assuming a cpu core can process tracing traffic at 10 gbps, thousands of cores would be required for trace analysis [87], which is prohibitively expensive. moreover, with mirroring it is not possible to retrieve information related to switch status, such as port utilization or queue occupancy, that are of paramount importance for applications such as congestion control or network troubleshooting. while such information can be retrieved with specially-crafted probes [74], the feedback loop may be too slow for applications like high precision congestion control [46]. we can also store flow information at switches and periodically export it to a collector [45, 69]. however, keeping state for a large number of active flows (e.g., up to 100k [62]), in the case of path tracing, is challenging for limited switch space (e.g., 100 mb [51]). this is because operators need the memory for essential control functions such as acl rules, customized forwarding [68], and other network functions and applications [37, 51]. another challenge is that we may need to export data plane status frequently (e.g., every  $10\mathrm{ms}$ ) to the collector, if we want to enable applications such as congestion control. this creates significant bandwidth and processing overheads [45].
+
+proposals that keep information on packets closely relate to this work [36, 72, 75], with int being considered the state-of-the-art solution. some of the approaches, e.g., path dump [72], show how to leverage properties of the topology to encode only part of each path (e.g., every other link). nonetheless, this still imposes an overhead that is linear in the path length, while pint keeps it constant. alternative approaches add small digests to packets for tracing paths [64, 65, 70]. however, they attempt to trace back to potential attackers (e.g., they do not assume unique packet ids or reliable ttl values as these can be forged) and require significantly more packets for identification, as we show in section 6. in a recent effort to reduce overheads on packets, similarly to this work, taffet et al. [71] propose having switches use reservoir sampling to collect information about a packet's path and congestion that the packet encounters as it passes through the network. pint takes the process several steps further, including approximations and coding (xor-based or network coding) to reduce the cost of adding information to packets as much as possible. additionally, our work rigorously proves performance bounds on the number of packets required to recover the data plane status as well as proposes trade-offs between data size and time to recover.
+
+# 9 conclusion
+
+we have presented pint, a probabilistic framework to in-band telemetry that provides similar visibility to int while bounding the per-packet overhead to a user-specified value. this is important because overheads imposed on packets translate to inferior flow completion time and application-level goodput. we have proven performance bounds (deferred to appendix a due to lack of space)
+
+for pint and have implemented it in p4 to ensure it can be readily deployed on commodity switches. pint goes beyond optimizing int by removing the header and using succinct switch ids by restricting the bit-overhead to a constant that is independent of the path length. we have discussed the generality of pint and demonstrated its performance on three specific use cases: path tracing, data plane telemetry for congestion control and estimation of experienced median/tail latency. using real topologies and traffic characteristics, we have shown that pint enables the use cases, while drastically decreasing the required overheads on packets with respect to int.
+
+acknowledgements. we thank the anonymous reviewers, jiaqi gao, muhammad tirmazi, and our shepherd, rachit agarwal, for helpful comments and feedback. this work is partially sponsored by epsrc project ep/p025374/1, by nsf grants #1829349, #1563710, and #1535795, and by the zuckerman foundation.
+
+# references
+
+[1] 2020. pint open source code: https://github.com/probabilisticint. (2020). https://github.com/probabilisticint  
+[2] mohammad alizadeh, tom edsall, sarang dharmapurkar, ramanan vaidyanathan, kevin chu, andy fingerhut, vinh the lam, francis matus, rong pan, navindra yadav, and george varghese. 2014. conga: distributed congestion-aware load balancing for datacenters. in acm sigcomm.  
+[3] mohammad alizadeh, albert greenberg, david a. maltz, jitendra padhye, parveen patel, balaji prabhakar, sudipta sengupta, and murari sridharan. 2010. data center tcp (dctcp). in acm sigcomm.  
+[4] mohammad alizadeh, abdul kabbani, tom edsall, balaji prabhakar, amin vahdat, and masato yasuda. 2012. less is more: trading a little bandwidth for ultra-low latency in the data center. in usenix nsdi.  
+[5] arvind arasu and gurmeet singh manku. 2004. approximate counts and quantiles over sliding windows. in acm pods.  
+[6] behnaz arzani, selim ciraci, luiz chamon, yibo zhu, hongqiang harry liu, jitu padhye, boon thau loo, and geoff outhred. 2018. 007: democratically finding the cause of packet drops. in usenix nsdi.  
+[7] tom barbette, cyril soldani, and laurent mathy. 2015. fast userspace packet processing. in ieee/acm ancs.  
+[8] barefoot. [n. d.]. barefoot deep insight. https://barefootnetworks.com/products/brief-deep-insight/. ([n. d.]).  
+[9] barefoot networks. 2018. barefoot deep insight. https://www.barefootnetworks.com/static/app/pdf/di-ug42-003ea-prodbrief.pdf. (2018).  
+[10] ran ben basat, xiaoqi chen, gil einziger, shir landau feibish, danny raz, and minlan yu. 2020. routing oblivious measurement analytics. in ifip networking.  
+[11] ran ben basat, gil einziger, isaac keslassy, ariel orda, shay vargaftik, and erez waisbard. 2018. memento: making sliding windows efficient for heavy hitters. in acm conext.  
+[12] ran ben-basat, xiaqi chen, gil einziger, and ori rottenstreich. 2018. efficient measurement on programmable switches using probabilistic recirculation. in ieee icnp.  
+[13] ran ben-basat, gil einziger, and roy friedman. 2018. fast flow volume estimation. *pervasive mob. comput.* (2018).  
+[14] broadcom. [n. d.]. broadcom bcm56870 series. https://www.broadcom.com/products/ethernet-connectivity/switching/prataxgs/bcm56870-series. ([n. d.]).  
+[15] robert l carter and mark e crovella. 1997. server selection using dynamic path characterization in wide-area networks. in ieee infocom.  
+[16] sdx central. [n. d.]. at&t runs open source white box. https://www.sdxcentral.com/articles/news/att-runs-open-source-white-box-switch-live-network/2017/04/. ([n.d.]).  
+[17] xiaogqi chen, shir landau feibish, yaron koral, jennifer rexford, ori rottenstreich, steven a monetti, and tzuu-yi wang. 2019. fine-grained queue measurement in the data plane. in acm conext.  
+[18] marco chiesa, roshan sedar, gianni antichi, michael borokhovich, andrzej kamisiundefinedski, georgios nikolaidis, and stefan schmid. 2019. purr: a primitive for reconfigurable fast reroute. in acm conext.  
+[19] baek-young choi, sue moon, rene cruz, zhi-li zhang, and christophe diot. 2007. quantile sampling for practical delay monitoring in internet backbone networks. computer networks.  
+[20] damu ding, marco savi, and domenico siracusa. 2020. estimating logarithmic and exponential functions to track network traffic entropy in p4. in ieee/ifip noms.  
+[21] n. g. duffield and matthias grossglauer. 2001. trajectory sampling for direct traffic observation. in ieee/acm ton.  
+[22] nandita dukkipati and nick mckeown. 2006. why flow-completion time is the right metric for congestion control. acm sigcomm ccr (2006).  
+[23] david felber and rafael ostrovsky. 2017. a randomized online quantile summary in  $o((1 / \varepsilon)\log (1 / \varepsilon))$  words. in theory of computing.  
+[24] philippe flajolet, daniele gardy, and loys thimonier. 1992. birthday paradox, coupon collectors, caching algorithms and self-organizing search. discrete applied mathematics (1992).  
+[25] alan ford, costin raiciu, mark j. handley, and olivier bonaventure. 2013. tcp extensions for multipath operation with multiple addresses. (2013).  
+[26] yilong geng, shiyu liu, zi yin, ashish naik, balaji prabhakar, mendel rosenblum, and amin vahdat. 2019. simon: a simple and scalable method for sensing, inference and measurement in data center networks. in usenix nsdi.  
+[27] dimitrios gkounis, vasileios kotronis, christos liaskos, and xenofantas dimitropoulos. 2016. on the interplay of link-flooding attacks and traffic engineering. acm sigcomm ccr (2016).  
+[28] chuanxiong guo, lihua yuan, dong xiang, yingnong dang, ray huang, dave maltz, zhaoyi liu, vin wang, bin pang, hua chen, zhi-wei lin, and varugis kurien. 2015. pingmesh: a large-scale system for data center network latency measurement and analysis. in acm sigcomm.  
+[29] dongsu han, robert grandl, aditya akella, and srinivasan seshan. 2013. fcp: a flexible transport framework for accommodating diversity. acm sigcomm ccr (2013).
+
+[30] nikhil handigol, brandon heller, vimalkumar jeyakumar, david mazieres, and nick mckeown. 2014. i know what your packet did last hop: using packet histories to troubleshoot networks. in usenix nsdi.  
+[31] brandon heller, srini seetharaman, priya mahadevan, yiannis yiakoumis, puneet sharma, sujata banerjee, and nick mckeown. 2010. elastictree: saving energy in data center networks. in usenix nsdi.  
+[32] t ho, r koetter, m medard, dr karger, and m effros. 2003. the benefits of coding over routing in a randomized setting. in ieee isit.  
+[33] ieee. [n. d.]. standard 802.3. https://standards.ieee.org/standard/802_3-2015.html. ([n. d.]).  
+[34] nikita ivkin, zhuolong yu, vladimir braverman, and xin jin. 2019. qpipe: quantiles sketch fully in the data plane. in acm conext.  
+[35] svante janson. 2018. tail bounds for sums of geometric and exponential variables. statistics & probability letters (2018).  
+[37] xin jin, xiaozhou li, haoyu zhang, robert soule, jeongkeun lee, nate foster, changhoon kim, and ion stoica. 2017. netcache: balancing key-value stores with fast in-network caching. in acm sosp.  
+[38] raj joshi, ting qu, mun choon chan, ben leong, and boon thau loo. 2018. burstradar: practical real-time microburst monitoring for datacenter networks. in acm apsys.  
+[39] zohar s. karnin, kevin j. lang, and edo liberty. 2016. optimal quantile approximation in streams. in ieee focs.  
+[40] dina katabi, mark handley, and charlie rohrs. 2002. congestion control for high bandwidth-delay product networks. in acm sigcomm.  
+[41] naga katta, aditi ghag, mukesh hira, isaac keslassy, aran bergman, changhoon kim, and jennifer rexford. 2017. clove: congestion-aware load balancing at the virtual edge. in acm conext.  
+[42] naga katta, mukesh hira, changhoon kim, anirudh sivaraman, and jennifer rexford. 2016. hula: scalable load balancing using programmable data planes. in acm sosr.  
+[43] anurag khandelwal, rachit agarwal, and ion stoica. 2019. confluo: distributed monitoring and diagnosis stack for high-speed networks. in usenix nsdi.  
+[44] simon knight, hung x nguyen, nickolas falkner, rhys bowden, and matthew roughan. 2011. the internet topology zoo. ieee jsac (2011).  
+[45] yuliang li, rui miao, changhoon kim, and minlan yu. 2016. flowradar: a better netflow for data centers. in usenix nsdi.  
+[46] yuliang li, rui miao, hongqiang harry liu, yan zhuang, fei feng, lingbo tang, zheng cao, ming zhang, frank kelly, mohammad alizadeh, and minlan yu. 2019. hpcc: high precision congestion control. in acm sigcomm.  
+[47] junda liu, aurojit panda, ankit singla, brighten godfrey, michael schapira, and scott shenker. 2013. ensuring connectivity via data plane mechanisms. in usenix nsdi.  
+[48] gurmeet singh manku, sridhar rajagopalan, and bruce g. lindsay. 1998. approximate medians and other quantiles in one pass and with limited memory. in acm sigmod.  
+[49] andrew mcgregor, a. pavan, srikanta tirthapura, and david p. woodruff. 2016. space-efficient estimation of statistics over sub-sampled streams. algorithmica (2016).  
+[50] ahmed metwally, divyakant agrawal, and amr el abbadi. 2005. efficient computation of frequent and top-k elements in data streams. in icdt.  
+[51] rui miao, hongyi zeng, changhoon kim, jeongkeun lee, and minlan yu. 2017. silkroad: making stateful layer-4 load balancing fast and cheap using switching asics. in acm sigcomm.  
+[52] mininet. [n. d.]. mininet: an instant virtual network on your laptop. http://mininet.org/. ([n. d.]).  
+[53] radhika mittal, vinh the lam, nandita dukkipati, emily blem, hassan wassel, monia ghobadi, amin vahdat, yaogong wang, david wetherall, and david zats. 2015. timely: rtt-based congestion control for the datacenter. in acm sigcomm.  
+[54] radhika mittal, alexander shpiner, aurojit panda, eitan zahavi, arvind krishnamurthy, sylvia ratnasamy, and scott shenker. 2018. revisiting network support for rdma. in acm sigcomm.  
+[55] robert morris. 1978. counting large numbers of events in small registers. in communications of acm, acm.  
+[56] srinivas narayana, mina tashmasbi arashloo, jennifer rexford, and david walker. 2016. compiling path queries. in usenix nsdi.  
+[57] srinivas narayana, anirudh sivaraman, vikram nathan, prateesh goyal, venkat arun, mohammad alizadeh, vimalkumar jeyakumar, and changhoon kim. 2017. language-directed hardware design for network performance monitoring. in acm sigcomm.  
+[58] netronome. [n. d.]. netronome agilio cx smartnic. https://www.netronome.com/blog/in-band-network-geometry-theory-its-not-rocket-science/. ([n. d.]).  
+[59] donald j newman. 1960. the double dixie cup problem. the american mathematical monthly (1960).
+
+[60] remi oudin, gianni antichi, charalampos rotsos, andrew w. moore, and steve uhlig. 2019. oflops-sume and the art of switch characterization. ieee jsac (2019).  
+[61] diana popescu, noa zilberman, and andrew w. moore. 2017. characterizing the impact of network latency on cloud-based applications àz performance. in technical report, number 914, ucam-cl-tr-914. university of cambridge.  
+[62] arjun roy, hongyi zeng, jasmeet bagga, george porter, and alex c. snoeren. 2015. inside the social network's (datacenter) network. in acm sigcomm.  
+[63] pegah sattari. 2007. revisiting ip traceback as a coupon collector $\mathring{a}$ zs problem. in phd dissertation. university of california, irvine.  
+[64] pegah sattari, minas gjoka, and athina markopoulou. 2010. a network coding approach to iptraceback. in ieee symposium on network coding (netcod).  
+[65] stefan savage, david wetherall, anna karlin, and tom anderson. 2000. practical network support for ip traceback. in acm sigcomm.  
+[66] robert schweller, ashish gupta, elliot parsons, and yan chen. 2004. reversible sketches for efficient and accurate change detection over network data streams. in acm imc.  
+[67] naveen kr. sharma, antoine kaufmann, thomas anderson, arvind krishnamurthy, jacob nelson, and simon peter. 2017. evaluating the power of flexible packet processing for network resource allocation. in usenix nsdi.  
+[68] anirudh sivaraman, changhoon kim, ramkumar krishnamoorthy, advait dixit, and mihai budiu. 2015. dc.p4: programming the forwarding plane of a datacenter switch. in acm sosr.  
+[69] alex c. snoeren, craig partridge, luis a. sanchez, christine e. jones, fabrice tchakountio, stephen t. kent, and w. timothy strayer. 2001. hash-based ip traceback. in acm sigcomm.  
+[70] dawn xiaodong song and adrian perrig. 2001. advanced and authenticated marking schemes for ip traceback. in ieee infocom.  
+[71] philip taffet and john mellor-crummey. 2019. understanding congestion in high performance interconnection networks using sampling. in acm sc.  
+[72] praveen tammana, rachat agarwal, and myungjin lee. 2016. simplifying datacenter network debugging with pathdump. in usenix osdi.  
+[73] praveen tammana, rachit agarwal, and mjungjin lee. 2018. distributed network monitoring and debugging with switchpointer. in usenix nsdi.  
+[74] cheng tan, ze jin, chuanxiong guo, tianrong zhang, haitao wu, karl deng, dongming bi, and dong xiang. 2019. netbouncer: active device and link failure localization in data center networks. in usenix nsdi.  
+[75] the p4.org applications working group. [n. d.]. in-band network telemetry (int) dataplane specification. https://github.com/p4lang/p4-applications/blob/master/docs/telemetry_report.pdf. ([n. d.]).  
+[76] the university of washington ns-3 consortium. [n. d.]. ns3 official website. https://www.nsnam.org/. ([n. d.]).  
+[77] wolfgang theilmann and kurt rothermel. 2000. dynamic distance maps of the internet. in ieee infocom.  
+[78] olivier tilmans, tobias bühler, ingmar poese, stefano vissicchio, and laurent vanbever. 2018. stroboscope: declarative network monitoring on a budget. in usenix nsdi.  
+[79] muhammad tirmazi tirmazi, ran ben basat, jiaqi gao, and minlan yu. 2020. cheetah: accelerating database queries with switch pruning. in acm sigmod.  
+[80] p van mieghem, gerard hooghiemstra, and remco hofstad. 2001. a scaling law for the hopcount in internet. in pam.  
+[81] vladimir n vapnik and a ya chervonenkis. 2015. on the uniform convergence of relative frequencies of events to their probabilities. measures of complexity (2015).  
+[82] jeffrey s vitter. 1985. random sampling with a reservoir. transactions on mathematical software (1985).  
+[83] xilinx. [n. d.]. 10g/25g ethernet subsystem. https://www.xilinx.com/products/intellectual-property/ef-di-25gemac.html. ([n. d.]).  
+[84] xilinx. [n. d.]. ultrascale integrated 100g ethernet subsystem. https://www.xilinx.com/products/intellectual-property/cmac.html. ([n. d.]).  
+[85] xilinx. [n. d.]. xilinx to showcase unprecedented programmability and visibility. https://www.xilinx.com/news/press/2018/barefoot-networks-and-xilinx.html. ([n. d.]).  
+[86] minlan yu, lavanya jose, and rui miao. 2013. software defined traffic measurement with opensketch. in usenix nsdi.  
+[87] yibo zhu, nanxi kang, jiaxin cao, albert greenberg, guohan lu, ratul mahajan, dave maltz, lihua yuan, ming zhang, ben y. zhao, and haitao zheng. 2015. packet-level telemetry in large datacenter networks. in acm sigcomm.
+
+# a analysis
+
+# a.1 dynamic per-flow aggregation
+
+we now survey known results that theorem 1 and theorem 2 are based on.
+
+quantiles. classical streaming results show that by analyzing a uniformly selected subset of  $o(\varepsilon_s^{-2}\log \varepsilon_s^{-1})$  elements, one can estimate all possible quantiles [48, 81] to within an additive error of  $\varepsilon_{s}$ . it is also known that if one is interested in a specific quantile (e.g., median), a subset size of  $o(\varepsilon_s^{-2})$  is enough.
+
+in our case, for each switch  $s_i$  through which flow  $x$  is routed, we get a sampled substream of  $s_{i,x}$  where each packet carries a value from it with probability  $1 / k$ . this is not a fixed-size subset, but a bernoulli sample. nevertheless, felber and ostrovsky show that a bernouli sample with the same expected size is enough [23]. therefore, for a specific quantile (e.g., median) we need to get  $o(\varepsilon_s^{-2})$  samples for each of the  $k$  switches on the path. using a standard chernoff bound argument, we have that if  $z = o(k\varepsilon_s^{-2})$  packets reach the pint sink, all hops on the path will get at least  $o(\varepsilon_s^{-2})$  samples with probability  $1 - e^{-\omega (z / k)} = 1 - e^{-\omega (\varepsilon_s^{-2})}$ .
+
+to compress the amount of per-flow storage needed for computing the quantiles, we can use a  $\widetilde{o} (\varepsilon_a^{-1})$  space sketch such as kll [39]. we run separate sketch for each of the  $k$  hops, thus needing  $\widetilde{o} (k\varepsilon_{a}^{-1})$  per-flow storage in total. the resulting error would be  $\varepsilon = \varepsilon_{s} + \varepsilon_{a}$  as the sampling adds an additive error of  $\varepsilon_{s}$  and the sketching an additive error of  $\varepsilon_{a}$ .
+
+frequent values. using a standard chernoff bound argument, one can use a  $o(\varepsilon_s^{-2})$ -sized substring of  $s_{i,x}$ , one can estimate the fraction in which each specific value appears, up to an additive error of  $\varepsilon_s$ . we can then use a heavy hitters algorithm like space saving [50] to estimate the frequency of values in the sampled substring to within an additive error of  $\varepsilon_a$ , using  $o(\varepsilon_a^{-1})$  space. as before, to get the correct estimations for all hops, we need a factor  $k$  multiplicative overhead to both the number of packets and space.
+
+# a.2 static per-flow aggregation
+
+before we can analyze the algorithm (§a.2.2), we start with some auxiliary results.
+
+a.2.1 auxiliary results. the first lemma gives a bound on how many independent coins with probability  $p$  we need to flip until we get  $k$  successes.
+
+lemma 4. let  $k \in \mathbb{n}$  and  $p, \delta \in (0,1)$ .
+
+denote  $n = \frac{k + 2\ln\delta^{-1} + \sqrt{2k\ln\delta^{-1}}}{p}$  and let  $x\sim bin(n,p)$ . then
+
+$$
+\pr [ x \leq k ] \leq \delta .
+$$
+
+proof. using the chernoff bound we have that for any  $\gamma > 0$ :
+
+$$
+\pr [ x <   \mathbb {e} [ x ] (1 - \gamma) ] \leq e ^ {- \gamma^ {2} \mathbb {e} [ x ] / 2}.
+$$
+
+we set  $\gamma = \sqrt{\frac{2\ln\delta^{-1}}{np}}$ , which means that  $\gamma^2\mathbb{e}[x] / 2 = \ln \delta$  and therefore  $\operatorname*{pr}[x < \mathbb{e}[x](1 - \gamma)] \leq \delta$ .
+
+finally,
+
+$$
+\mathbb {e} [ x ] (1 - \gamma) = n p (1 - \gamma) = n p - \sqrt {2 n p \ln \delta^ {- 1}}.
+$$
+
+denote  $x = \sqrt{np}$ , then we want to show that
+
+$$
+x ^ {2} - x \sqrt {2 \ln \delta^ {- 1}} - k \geq 0,
+$$
+
+which holds for
+
+$$
+x > \frac {\sqrt {2 \ln \delta^ {- 1}} + \sqrt {2 \ln \delta^ {- 1} + 4 k}}{2} = \frac {\sqrt {\ln \delta^ {- 1}} + \sqrt {\ln \delta^ {- 1} + 2 k}}{\sqrt {2}}.
+$$
+
+this gives
+
+$$
+\begin{array}{l} n = x ^ {2} / p \geq \frac {\left(\sqrt {\ln \delta^ {- 1}} + \sqrt {\ln \delta^ {- 1} + 2 k}\right) ^ {2}}{2 p} \\ = \frac {k + 2 \ln \delta^ {- 1} + \sqrt {2 k \ln \delta^ {- 1}}}{p}. \\ \end{array}
+$$
+
+![](images/fa9d6e3725d00254417feabc28f3974ab4755fea649dee563458dce40fa379e0.jpg)
+
+the next theorem provides a high-probability bound on the double dixie cup problem [59]. specifically, consider trying to collect at least  $z$  copies from each of  $k$  coupons, where at each stage you get a random coupon. the following bounds the number of samples you need.
+
+theorem 5. after seeing
+
+$$
+n = k \cdot \left(z - 1 + \ln (k / \delta) + \sqrt {(z - 1 + \ln (k / \delta)) ^ {2} - (z - 1) ^ {2} / 4}\right)
+$$
+
+samples, our algorithm has at least  $z$  copies of each of the  $k$  coupons.
+
+proof. therefore, the number of copies of the  $i$ 'th coupon is a binomial random variable we denote by  $y_{i} \sim \operatorname{bin}(n, 1 / k)$ . our goal is to show that getting  $y_{i} < z$  is unlikely; to that end, we use the chernoff inequality that states that  $\operatorname*{pr}[y_i \leq \mathbb{e}[y_i](1 - \gamma)] \leq e^{-\mathbb{e}[y_i]\gamma^2 / 2}$  for any  $\gamma \in (0,1]$ . we set  $\gamma = 1 - k(z - 1) / n$  to get
+
+$$
+\begin{array}{l} \pr \left[ y _ {i} <   z \right] = \pr \left[ y _ {i} \leq z - 1 \right] = \pr \left[ y _ {i} \leq \mathbb {e} \left[ y _ {i} \right] (1 - \gamma) \right] \\ \leq e ^ {- \mathbb {e} [ y _ {i} ] \gamma^ {2} / 2} = e ^ {- n / 2 k \cdot (1 - k (z - 1) / n) ^ {2}} \\ = e ^ {- (n / 2 k - (z - 1) + k (z - 1) ^ {2} / 2 n)} = e ^ {- (x - (z - 1) + (z - 1) ^ {2} / 4 x)}, \\ \end{array}
+$$
+
+where  $x = n / (2k)$ . we want  $\operatorname*{pr}[x_i < z] \leq \delta / k$ , which according to the above follows from
+
+$$
+\begin{array}{l} x - (z - 1) + (z - 1) ^ {2} / 4 x \geq \ln k / \delta \longleftrightarrow \\ x \geq 0. 5 \cdot \left(z - 1 + \ln (k / \delta) + \sqrt {(z - 1 + \ln (k / \delta)) ^ {2} - (z - 1) ^ {2} / 4}\right). \\ \end{array}
+$$
+
+the last inequality follows directly from our choice of  $n$ . finally, we use the union bound to get that after  $n$  samples all coupons get at least  $z$  copies except with probability  $k \cdot \operatorname{pr}[y_i < z] \leq \delta$ .
+
+we proceed with a tail bound on the partial coupon collector problem, in which we wish to get  $n$  out of  $r$  possible coupons, where at each timestamp we get a random coupon. our proofs relies on the following result for a sharp bound on the sum of geometric random variables:
+
+theorem 6. ([35]) let  $\{a_1, \ldots, a_n\}$  be independent geometric random variables such that  $a_i \sim \operatorname{geo}(p_i)$  and  $p_1 \geq \ldots \geq p_n$ . then the sum  $a = \sum_{i=1}^{n} a_i$  satisfies:
+
+$$
+\pr \left[ a > \mathbb {e} [ a ] \cdot \lambda \right] \leq e ^ {- p _ {n} \mathbb {e} [ a ] (\lambda - 1 - \ln \lambda)}.
+$$
+
+additionally, we will use the following fact.
+
+fact 7. for any positive real number  $\varepsilon \in \mathbb{r}^{+}$
+
+$$
+1 + \varepsilon + \sqrt {2 \varepsilon} - \ln (1 + \varepsilon + \sqrt {2 \varepsilon}) \geq 1 + \varepsilon .
+$$
+
+we now prove our result.
+
+theorem 8. let  $\mathbb{e}[a] = r(h_r - h_{r-n})$  denote the expected number of samples required for seeing  $n$  distinct coupons. with probability  $1-\delta$ , the number of samples required for seeing at least  $n$  distinct coupons is at most
+
+$$
+\mathbb {e} [ a ] + \frac {r \ln \delta^ {- 1}}{(r - n)} + \sqrt {\frac {2 r \mathbb {e} [ a ] \ln \delta^ {- 1}}{(r - n)}}.
+$$
+
+proof. we wish to use theorem 6; notice that we need  $\lambda -\ln \lambda \geq$ $1 + \frac{\ln\delta^{-1}}{p_n\mathbb{e}[a]}$  which implies
+
+$$
+e ^ {- p _ {n} \mathbb {e} [ a ] (\lambda - 1 - \ln \lambda)} \leq \delta .
+$$
+
+according to fact 7, for  $\varepsilon = \frac{\ln\delta^{-1}}{p_n\mathbb{e}[a]}$ , it is enough to set
+
+$$
+\lambda = 1 + \frac {\ln \delta^ {- 1}}{p _ {n} \mathbb {e} [ a ]} + \sqrt {\frac {2 \ln \delta^ {- 1}}{p _ {n} \mathbb {e} [ a ]}}.
+$$
+
+plugging in  $p_n = (1 - (n - 1) / r) > (r - n) / r$  we have that the required number of required packets is at most
+
+$$
+\begin{array}{l} \lambda \cdot \mathbb {e} [ a ] = \left(\mathbb {e} [ a ] + \frac {\ln \delta^ {- 1}}{p _ {n}} + \sqrt {\frac {2 \mathbb {e} [ a ] \ln \delta^ {- 1}}{p _ {n}}}\right) \\ \leq \left(\mathbb {e} [ a ] + \frac {r \ln \delta^ {- 1}}{(r - n)} + \sqrt {\frac {2 r \mathbb {e} [ a ] \ln \delta^ {- 1}}{(r - n)}}\right). \\ \end{array}
+$$
+
+for example, if  $r = 2n$ , we have  $\mathbb{e}[a] \approx 1.39n$  and the number of packets is
+
+$$
+\begin{array}{l} \left(\mathbb {e} [ a ] + 2 \ln \delta^ {- 1} + \sqrt {4 \mathbb {e} [ a ] \ln \delta^ {- 1}}\right) \\ \approx \left(1. 3 9 n + 2 \ln \delta^ {- 1} + 2. 3 5 \sqrt {n \ln \delta^ {- 1}}\right). \quad \square \\ \end{array}
+$$
+
+next, we show a bound on the number of samples needed to collect  $\mathcal{k}(1 - \psi)$  in a coupon collector process [24] on  $\mathcal{k}$  coupons.
+
+lemma 9. let  $\mathcal{k} \in \mathbb{n}^+$  and  $\psi \in (0,1/2]$ . the number of samples required for collecting all but  $\psi\mathcal{k}$  coupons is at most
+
+$$
+\begin{array}{l} \mathcal {k} \ln \psi^ {- 1} + \psi^ {- 1} \ln \delta^ {- 1} + \sqrt {2 \mathcal {k} \psi^ {- 1} \ln \psi^ {- 1} \ln \delta^ {- 1}} \\ = o (\mathcal {k} \ln \psi^ {- 1} + \psi^ {- 1} \ln \delta^ {- 1}). \\ \end{array}
+$$
+
+proof. for  $i = 1, \ldots, \mathcal{k}(1 - \psi)$ , let  $a_i \sim geo(1 - (i - 1) / \mathcal{k})$  denote the number of samples we need for getting the  $i$ 'th distinct coupon, and let  $a = \sum_{i=1}^{k(1 - \psi)} a_i$ . we have that
+
+$$
+\mathbb {e} [ a ] = \sum_ {i = 1} ^ {\mathcal {k} (1 - \psi)} \frac {\mathcal {k}}{\mathcal {k} - (i - 1)} = \mathcal {k} \left(h _ {\mathcal {k}} - h _ {\mathcal {k}} \psi\right) = \mathcal {k} \ln \psi^ {- 1}.
+$$
+
+according to theorem 8, it is enough to obtain the following number of samples
+
+$$
+\begin{array}{l} \mathbb {e} [ a ] + \frac {\mathcal {k} \ln \delta^ {- 1}}{\mathcal {k} (1 - (1 - \psi))} + \sqrt {\frac {2 \mathcal {k} \mathbb {e} [ a ] \ln \delta^ {- 1}}{\mathcal {k} (1 - (1 - \psi))}} \\ = \mathcal {k} \ln \psi^ {- 1} + \psi^ {- 1} \ln \delta^ {- 1} + \sqrt {2 \mathcal {k} \psi^ {- 1} \ln \psi^ {- 1} \ln \delta^ {- 1}}. \\ \end{array}
+$$
+
+finally, we note that  $\sqrt{\mathcal{k}\psi^{-1}\ln\psi^{-1}\ln\delta^{-1}}$  is the geometric mean of  $\mathcal{k}\ln \psi^{-1}$  and  $\psi^{-1}\ln \delta^{-1}$  and thus:
+
+$$
+\begin{array}{l} \mathcal {k} \ln \psi^ {- 1} + \psi^ {- 1} \ln \delta^ {- 1} + \sqrt {2 \mathcal {k} \psi^ {- 1} \ln \psi^ {- 1} \ln \delta^ {- 1}} \\ \leq \left(\mathcal {k} \ln \psi^ {- 1} + \psi^ {- 1} \ln \delta^ {- 1}\right) (1 + 1 / \sqrt {2}) \\ = o \left(\mathcal {k} \ln \psi^ {- 1} + \psi^ {- 1} \ln \delta^ {- 1}\right). \\ \end{array}
+$$
+
+![](images/475bafe91ab38ae4dfa05d182b2b28e0da72fc459398c85aafd2db1bdd5fd5ed.jpg)
+
+a.2.2 analysis of the algorithm. we denote by  $\mathfrak{d} \triangleq \frac{d}{\log^* d}$  the number of hops we aim to decode using the xor layers. our algorithm has  $\lceil \log^* \mathfrak{d} \rceil + 1$  layers, where layer 0 runs the baseline scheme and the remaining  $\mathcal{l} \triangleq \lceil \log^* \mathfrak{d} \rceil$  layers use xor. we denote by  $\uparrow \uparrow$  knuth's iterated exponentiation arrow notation, i.e.,  $x \uparrow \uparrow 0 = 1$  and
+
+$$
+x \uparrow \uparrow y = x ^ {x ^ {x ^ {\cdot^ {\cdot^ {\cdot}}}}} ^ {x ^ {\cdot^ {\cdot^ {\cdot^ {\cdot}}}}} ^ {x} \bigg \} _ {y - \text {t i m e s}}.
+$$
+
+the sampling probability in layer  $\ell$  is then set to
+
+$$
+p _ {\ell} = \frac {e \uparrow \uparrow (\ell - 1)}{\mathfrak {d}}.
+$$
+
+each packet it hashed to choose a layer, such that layer 0 is chosen with probability  $\tau = \left(1 - \frac{1}{1 + \log\log^{*}\mathfrak{d}}\right) = 1 - o(1)$  and otherwise one of layers  $1,\ldots ,\mathcal{l}$  is chosen uniformly. the pseudo code for the final solution is given in algorithm 1.
+
+# algorithm 1 pint processing procedure at switch  $s$
+
+input: a packet  $p_j$  with b-bits digest  $p_j$ .dig.
+
+output: updated digest  $p_j$ .dig.
+
+initialization:
+
+$$
+\tau = \frac {\log \log^ {*} \mathfrak {d}}{1 + \log \log^ {*} \mathfrak {d}}, \forall \ell \in \{1, \dots , \mathcal {l} \}: p _ {\ell} = \frac {e \uparrow \uparrow (\ell - 1)}{\mathfrak {d}}.
+$$
+
+let  $i$  such that the current switch is the  $i^{\prime}th$  so far
+
+1:  $\mathfrak{h} \leftarrow \mathcal{h}(p_j)$  distributed uniformly on [0, 1]  
+2: if  $\mathfrak{h} <   \tau$  then  
+3: if  $g(p_j, i) < 1 / i$  then  
+4:  $p_j.\mathrm{diag}\gets h(s,p_j)$ $\triangleright$  sample with probability  $1 / i$  
+5: else  
+6:  $\ell \gets \left[\mathcal{l}\cdot \frac{\mathfrak{s} - \tau}{1 - \tau}\right]$  choose the layer  
+7: if  $g(p_j, i) < p_\ell$  then  
+8:  $p_j.\mathrm{diag}\gets p_j.\mathrm{diag}\oplus h(s,p_j)$  xor w.p.  $p_{\ell}$
+
+for simplicity, we hereafter assume in the analysis that a packet can encode an entire identifier. this assumption is not required in practice and only serves for the purpose of the analysis. we note that even under this assumption the existing approaches require  $o(k \log k)$  packets. in contrast, we show that except with probability
+
+$\delta = e^{-o(k^{0.99})}$  the number of packets required for decoding a  $k$ -hops path in our algorithm is just
+
+$$
+\mathcal {x} = k \log \log^ {*} k \cdot (1 + o (1)). ^ {1 1}
+$$
+
+note that  $\log \log^* k$  is a function that grows extremely slowly, e.g.,  $\log \log^* p < 2$  where  $p$  is the number of atoms in the universe. our assumption on the error probability  $\delta$  allows us to simplify the expressions and analysis but we can also show an
+
+$$
+o \left(k \log \log^ {*} k + \log^ {*} k \log \delta^ {- 1}\right)
+$$
+
+bound on the required number of packets thus the dependency on  $\delta$  is minor.
+
+for our proof, we define the quantities
+
+$$
+\begin{array}{l} q \triangleq k _ {1} + \ln \left(\frac {4 \log^ {*} k _ {1}}{\delta}\right) + \sqrt {2 k _ {1} \ln \left(\frac {4 \log^ {*} k _ {1}}{\delta}\right)} \\ = o \left(\frac {k}{\log^ {*} k} + \log \delta^ {- 1}\right) = o \left(\frac {k}{\log^ {*} k}\right) \\ \end{array}
+$$
+
+and
+
+$$
+\begin{array}{l} \mathcal {s} \triangleq \frac {q + 2 \ln \left(\frac {4 \mathcal {l}}{\delta}\right) + \sqrt {2 q \ln \left(\frac {4 \mathcal {l}}{\delta}\right)}}{c \cdot e ^ {- c}} \\ = o \left(\frac {k}{\log^ {*} k} + \log \delta^ {- 1}\right) = o \left(\frac {k}{\log^ {*} k}\right). \\ \end{array}
+$$
+
+note that  $\mathcal{q}$  and  $s$  are not known to our algorithm (which is only aware of  $d$ ) and they are used strictly for the analysis. our proof follows the next roadmap:
+
+(1) when a flow has at least  $\mathcal{x} \triangleq k \log \log^* k \cdot (1 + o(1))$  packets, baseline (layer 0) gets at least  $\mathcal{x} \cdot (1 - o(1)) = k \log \log^* k \cdot (1 + o(1))$  digests and xor (layers 1 and above) gets at least  $\omega(\mathcal{x} / \log \log^* k) = \omega(k)$  digests with probability  $1 - \delta / 6$ .  
+(2) when baseline (layer 0) gets at least  $\mathcal{x} \cdot (1 - o(1))$  digests, it decodes all hops but  $k_{1} \triangleq \frac{k}{\log^{*}k}$  with probability  $1 - \delta /6$ .  
+(3) when at least  $\omega (k)$  packets reach xor (layers 1 and above), with probability  $1 - \delta /6$  each layer gets at least  $s$  digests.  
+(4) when a layer  $\ell \in \{1,\dots ,\mathcal{l}\}$  gets  $\mathcal{s}$  digests, with probability  $1 - \delta /6\mathcal{l}$ , at least  $q$  of the digests contain exactly one of the  $k_{\ell}$  undecoded switches.  
+(5) when a layer  $\ell \in \{1, \dots, \mathcal{l} - 1\}$  gets  $q$  of digests that contain exactly one of the  $k_{\ell} \triangleq k_1 / (e \uparrow \uparrow (\ell - 1))$  undecoded switches, it decodes all hops but at most  $k_{\ell + 1}$  with probability  $1 - \delta / 6\mathcal{l}$ .  
+(6) when the last layer  $\mathcal{l}$  gets  $q$  of digests that contain exactly one of the  $k_{\ell}$  undecoded switches, it decoded all the remaining hops with probability  $1 - \delta / 6\mathcal{l}$ .
+
+we then use the union bound over all bad events to conclude that the algorithm succeeds with probability at least  $1 - \delta$ .
+
+a.2.3 proof of part (1). the first step is to observe that by a straightforward application of the chernoff bound, since layer 0 is chosen with probability  $1/2$ , the number of packets that it receives is with probability  $1 - \delta/6$ :
+
+$$
+\mathcal {x} _ {0} = \tau \cdot \mathcal {x} \pm o \left(\sqrt {\tau \cdot \mathcal {x} \cdot \log \delta^ {- 1}}\right).
+$$
+
+since  $\mathcal{x} = \omega (\log \delta^{-1})$ , we have that
+
+$$
+\mathcal {x} _ {0} \geq \mathcal {x} (\tau - o (1)) = k \log \log^ {*} k \cdot (1 + o (1)).
+$$
+
+a.2.4 proof of part (2). applying lemma 9 for  $\psi = \frac{1}{\log^*k}$ , we get that after
+
+$$
+\begin{array}{l} k \ln \log^ {*} k + \log^ {*} k \ln \delta^ {- 1} + \sqrt {2 k \log^ {*} k \ln \log^ {*} k \ln \delta^ {- 1}} \\ = k \log \log^ {*} k \cdot (1 + o (1)) \\ \end{array}
+$$
+
+packets from layer 0 the number of hops that are not decoded is at most  $k_{1} \triangleq k \cdot \psi = \frac{k}{\log^{*}k}$  with probability  $1 - \delta / 6$ . that is, we use  $k_{1}$  to denote the number of undecoded hops that are left for layers 1 and above.
+
+a.2.5 proof of part (3). when at least  $\omega(k)$  reach xor, the number of digests that the levels get is a balls and bins processes with the levels being the bins. according to theorem 5:
+
+after seeing
+
+$$
+\begin{array}{l} \mathcal {l} \cdot \left(\mathcal {s} - 1 + \ln (6 \mathcal {l} / \delta) + \sqrt {(\mathcal {s} - 1 + \ln (6 \mathcal {l} / \delta)) ^ {2} - (\mathcal {s} - 1) ^ {2} / 4}\right) \\ = o \left(\mathcal {l} \cdot \left(\mathcal {s} + \log (\mathcal {l} / \delta)\right)\right) \\ = o \left(\log^ {*} k \cdot \left(\frac {k}{\log^ {*} k} + \log \delta^ {- 1} + \log (\delta^ {- 1} \log^ {*} k)\right)\right) = o (k) \\ \end{array}
+$$
+
+packets, with probability  $1 - \delta / 6$  our algorithm has at least  $q$  samples in each layer.
+
+a.2.6 proof of part (4). follows from lemma 4 for  $p = c \cdot e^{-c}$ ,  $k = q$  and  $\delta' = \frac{\delta}{6\mathcal{l}}$ .  
+a.2.7 proof of part (5). follows from lemma 9 with  $\mathcal{k} = k_{\ell}$  and  $\psi = \frac{k_{\ell + 1}}{k_{\ell}}$
+
+a.2.8 proof of part (6). the last layer is samples needs to decode
+
+$$
+k _ {\mathcal {l}} \leq \frac {k _ {1}}{e \uparrow \uparrow (\mathcal {l} - 1)} = \frac {k _ {1}}{\log \mathfrak {d}} = o \left(\frac {k _ {1}}{\log k _ {1}}\right)
+$$
+
+and samples with probability
+
+$$
+p _ {\mathcal {l}} = \frac {e \uparrow \uparrow (\mathcal {l} - 1)}{\mathfrak {d}} = \frac {\log \mathfrak {d}}{\mathfrak {d}} = \theta \left(\frac {\log k _ {1}}{k _ {1}}\right).
+$$
+
+therefore, with a constant probability, a digest would be xor-ed by exactly one of the  $k_{\mathcal{l}}$  undecoded hops, and the number of such packets needed to decode the remainder of the path is  $o(k_{\mathcal{l}} \log k_{\mathcal{l}}) = o(k_1)$ .
+
+# a.3 revised algorithm to improve the lower order term's constant
+
+consider changing the algorithm to sample layer 0 with probability
+
+$$
+\tau^ {\prime} \triangleq \frac {1 + \log \log^ {*} d}{2 + \log \log^ {*} d} = 1 - \frac {1}{2 + \log \log^ {*} d}.
+$$
+
+then when getting  $\mathcal{x}' = k \cdot \left( \log \log^* k + 1 + \frac{1}{ce^{1 - c}} + o(1) \right)$ , we will have
+
+$$
+k \cdot (\log \log^ {*} k + 1 + o (1))
+$$
+
+packets that reach layer 0, which would leave only
+
+$$
+k _ {1} ^ {\prime} \triangleq \frac {k}{e \cdot \log^ {*} k}
+$$
+
+undecoded hops to layers 1 and above. as above, the number of packets required for the upper layers to decode the missing hops is
+
+$$
+\frac {k _ {1} ^ {\prime} \log^ {*} k _ {1} ^ {\prime}}{c e ^ {- c}} \leq \frac {k}{c e ^ {1 - c}}.
+$$
+
+since  $ce^{-c} \leq 1 / e$  for any  $c > 0$ , we get that this is a strict improvement in the number of packets that are required for the path decoding. for example, if  $d = k$  (i.e.,  $c = 1$ ), we reduce the required number of packets from  $k(\log \log^* k + e + o(1))$  to  $k(\log \log^* k + 2 + o(1))$ .
+
+# a.4 an extension - detecting routing loops
+
+real-time detection of routing loops is challenging, as switches need to recognize looping packets without storing them. interestingly, we can leverage pint to detect loops on the fly. to do so, we check whether the current switch's hash matches the one on the packet. specifically, before choosing whether to sample or not, the switch checks whether  $p_j \cdot \mathrm{dig} = h(s, p_j)$ . if there is a loop and  $s$  was the last switch to write the digest, it will be detected. unfortunately, such an approach may result in a significant number of false positives. for example, if we use  $\mathsf{b} = 16$ -bit hashes, the chance of reporting a false loop over a path of length 32 would be roughly  $0.05\%$ , which means several false positives per second on a reasonable network.
+
+to mitigate false positives, we propose requiring multiple matches, corresponding to multiple passes through the loop. we use an additional counter  $c$  to track the number of times a switch hash matched the digest. when  $c = 0$ , the switches follow the same sampling protocol as before. however, if  $c > 0$  then the digest is no longer changed, and if  $c$  exceeds a value of  $t$  then we report a loop. this changes the loop detection time, but the switch that first incremented  $c$  may report the loop after at most  $t$  cycles over the loop. this approach adds  $\left\lceil \log_2(t + 1) \right\rceil$  bits of overhead, but drastically reduces the probability of false positives. for example, if  $t = 1$  and  $b = 15$ , we still have an overhead of sixteen bits per packet, but the chance of reporting false loops decreases to less than  $5 \cdot 10^{-7}$ . if we use  $t = 3$  and  $b = 14$ , the false reporting rate further decreases to  $5 \cdot 10^{-13}$ , which allows the system to operate without false alarms in practice.
+
+algorithm 2 pint processing at  $s$  with loop detection  
+input: a packet  $p_j$  with b-bits digest  $p_j$ .dig and a counter  $p_j$ .c. output: updated digest  $p_j$ .dig or loop message.  
+1: if  $p_j$ .dig = h(s,  $p_j$ ) then  
+2: if  $p_j$ .c = t then return loop  
+3:  $p_j$ .c ←  $p_j$ .c + 1  
+let i such that the current switch is the i'th so far  
+4: if  $p_j$ .c = 0 and g( $p_j$ , i) < 1/i then  
+5:  $p_j$ .dig ← h(s,  $p_j$ ) ▷ sample with probability 1/i
+
+# b compting hpcc's utilization
+
+we first calculate the logarithm:
+
+$$
+u _ {\text {t e r m}} = \log \left(\frac {t - \tau}{t} \cdot u\right) = \log (t - \tau) - \log t + \log u
+$$
+
+$$
+\begin{array}{l} \operatorname {q l e n} _ {\text {t e r m}} = \log \left(\frac {\operatorname {q l e n} \cdot \tau}{b \cdot t ^ {2}}\right) = \log \operatorname {q l e n} + \log \tau - \log b - 2 \log t \\ b y t e \_ t e r m = \log (\frac {b y t e}{b \cdot t}) = \log b y t e - \log b - \log t \\ \end{array}
+$$
+
+then calculate  $u$  using exponentiation:
+
+$$
+u = 2 ^ {u - t e r m} + 2 ^ {q l e n - t e r m} + 2 ^ {b y t e - t e r m}
+$$
+
+# c arithmetic operations in the data plane
+
+some of our algorithms require operations like multiplication and division that may not be natively supported on the data plane of current programmable switches. nonetheless, we now discuss how to approximate these operations through fixed-point representations, logarithms, and exponentiation. we note that similar techniques have appeared, for example, in [67], [79] and [20].
+
+fixed-point representation: modern switches may not directly support representation of fractional values. instead, when requiring a real-valued variable in the range  $[0,r]$ , we can use  $m$  bits to represent it so that the integer representation  $r\in \{0,1,\dots ,2^m -1\}$  stands for  $r\cdot r\cdot 2^{-m}$ .  $r$  is called scaling factor and is often a power of two for simplicity. for example, if our range is [0, 2], and we use  $m = 16$  bits, then the encoding value 39131 represents  $2\cdot 39131\cdot 2^{-16}\approx 1.19$ .
+
+conveniently, this representation immediately allows using integer operations (e.g., addition or multiplication) to manipulate the variables. for example, if  $x$  and  $y$  are variables with scale factor  $r$  that are represented using  $r(x), r(y)$ , then their sum is represented using  $r(x) + r(y)$  (assuming no overflow, this keeps the scaling factor intact) and their product is  $r(x) \cdot r(y)$  with a scaling factor of  $r^2$ . as a result, we hereafter consider operating on integer values.
+
+computing logarithms and exponentiating: consider needing to approximate  $\log_2(x)$  for some integer  $x$  (and storing the result using a fixed-point representation). if the domain of  $x$  is small (e.g., it is an 8-bit value), we can immediately get the value using a lookup table. conversely, say that  $x$  is an  $m$ -bit value for a large  $m$  (e.g.,  $m = 64$ ). in this case, we can use the switch's tcam to find the most significant set bit in  $x$ , denoted  $\ell$ . that is, we have that  $x = 2^{\ell} \cdot \alpha$  for some  $\alpha \in [1,2)$ . next, consider the next  $q$  bits of  $x$ , denoted by  $x_q$ , where  $q$  is such that it is feasible to store a  $2^q$ -sized lookup table on the switch (e.g.,  $q = 8$ ).<sup>12</sup> then we have that  $x = x_q \cdot 2^{\ell - q}(1 + \varepsilon)$  for a small relative error  $\varepsilon < 2^{-q}$ . therefore, we write
+
+$$
+\log_ {2} (x) = \log_ {2} (x _ {q} \cdot 2 ^ {\ell - q} (1 + \varepsilon)) = (\ell - q) + \log_ {2} (x _ {q}) + \log_ {2} (1 + \varepsilon).
+$$
+
+applying the lookup table to  $x_{q}$ , we can compute  $\widetilde{y} \triangleq (\ell - q) + \log_2(x_q)$  on the data plane and get that  $\widetilde{y} \in [\log_2x - \log_2(1 + \varepsilon), \log_2x]$ .<sup>13</sup> we can further simplify the error expression as  $\log_2(1 + \varepsilon) = \frac{\log_2x}{\log_2(1 + \varepsilon)}$ .
+
+$\varepsilon) \leq \varepsilon / \ln 2 \approx 1.44 \cdot 2^{-q}$ . we also note that computing logarithms with other bases can be done similarly as  $\log_y x = \log_2 x / \log_2 y$ .
+
+for exponentiation, we can use a similar trick. assume that we wish to compute  $2^{x}$  for some real-valued  $x$  that has a fixed-point representation  $r$ . consider using a lookup table of  $2^{q}$  entries for a suitable value of  $q$ , and using the tcam to find the most significant set bit in  $r$ . then we can compute  $2^{x}$  up to a multiplicative factor of  $2^{x\varepsilon}$  for some  $\varepsilon \leq 2^{-q}$ . assuming that  $x$  is bounded by  $r \leq 2^{q}$ , this further simplifies to  $2^{x\varepsilon} \leq 2^{x2^{-q}} \leq 1 + r \cdot 2^{-q}$ . for example, if  $x$  is in the range  $[0, 2]$  and we are using  $q = 8$  then logarithms are computed to within a  $(1 + 2^{-7})$ -multiplicative factor (less than  $1\%$  error).
+
+multiplying and dividing: we overcome the lack of support for arithmetic operations such as multiplication and division using approximations, via logarithms and exponentiation. intuitively, we have
+
+that  $x \cdot y = 2^{\log_2 x + \log_2 y}$  and  $x / y = 2^{\log_2 x - \log_2 y}$ . we have already discussed how to approximate logarithms and exponentiation, while addition and subtraction are currently supported. we note that the errors of the different approximations compound and thus it is crucial to maintain sufficient accuracy at each step to produce a meaningful approximation for the multiplication and division operations.
+
+an alternative approach is to directly use a lookup table that takes the  $q / 2$  most significant bits, starting with the first set bit, of  $x$  and  $y$  and return their product/quotient (as before, this would require a  $2^q$ -sized table). however, going through logarithms may give a more accurate result as the same lookup table can be used for both  $x$  and  $y$ , and its keys are a single value, which allows considering  $q$  bits for the same memory usage.

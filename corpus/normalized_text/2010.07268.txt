@@ -1,0 +1,518 @@
+# wukong: a scalable and locality-enhanced framework for serverless parallel computing
+
+benjamin carver  
+george mason university  
+bcarver2@gmu.edu
+
+ali anwar  
+ibm research-almaden  
+ali.anwar2@ibm.com
+
+jingyuan zhang  
+george mason university  
+jzhang33@gmu.edu
+
+panruo wu  
+university of houston  
+pwu7@uh.edu
+
+ao wang  
+george mason university  
+awang24@gmu.edu
+
+yue cheng  
+george mason university  
+yuecheng@gmu.edu
+
+# abstract
+
+executing complex, burst-parallel, directed acyclic graph (dag) jobs poses a major challenge for serverless execution frameworks, which will need to rapidly scale and schedule tasks at high throughput, while minimizing data movement across tasks. we demonstrate that, for serverless parallel computations, decentralized scheduling enables scheduling to be distributed across lambda executors that can schedule tasks in parallel, and brings multiple benefits, including enhanced data locality, reduced network i/os, automatic resource elasticity, and improved cost effectiveness. we describe the implementation and deployment of our new serverless parallel framework, called wukong, on aws lambda. we show that wukong achieves near-ideal scalability, executes parallel computation jobs up to  $68.17 \times$  faster, reduces network i/o by multiple orders of magnitude, and achieves  $92.96\%$  tenant-side cost savings compared to numpywren.
+
+# acm reference format:
+
+benjamin carver, jingyuan zhang, ao wang, ali anwar, panruo wu, and yue cheng. 2020. wukong: a scalable and locality-enhanced framework for serverless parallel computing. in acm symposium on cloud computing (socc '20), october 19–21, 2020, virtual event, usa. acm, new york, ny, usa, 15 pages. https://doi.org/10.1145/3419111.3421286
+
+# 1 introduction
+
+in recent years, a new cloud computing model called serverless computing or function as a service (faas) [21] has
+
+permission to make digital or hard copies of all or part of this work for personal or classroom use is granted without fee provided that copies are not made or distributed for profit or commercial advantage and that copies bear this notice and the full citation on the first page. copyrights for components of this work owned by others than acm must be honored. abstracting with credit is permitted. to copy otherwise, or republish, to post on servers or to redistribute to lists, requires prior specific permission and/or a fee. request permissions from permissions@acm.org.  
+socc '20, october 19-21, 2020, virtual event, usa  
+© 2020 association for computing machinery.  
+acm isbn 978-1-4503-8137-6/20/10.  
+https://doi.org/10.1145/3419111.3421286
+
+emerged. serverless computing enables a new way of building and scaling applications and services by allowing developers to break traditionally monolithic server-based applications into finer-grained cloud functions. developers write function logic while the service provider performs the notoriously tedious tasks of provisioning, scaling, and managing the backend servers that the functions run on [38].
+
+serverless computing solutions are growing in popularity and finding their way into both commercial clouds (e.g., aws lambda, google cloud functions, and azure functions) and open source projects (e.g., openwhisk). while serverless platforms were originally intended for event-driven, stateless applications [1], a recent trend is the use of serverless computing for more complex, stateful, parallel applications.
+
+some types of compute- and data-intensive applications are inherently parallelizable and can be structured as a directed acyclic graph (dag) of short, fine-grained tasks [2, 36, 39, 49]. the large-scale parallelism and auto-scaling services provided by serverless platforms makes them well-suited for such kinds of burst-parallel fine-grained tasks that characterize dag-based parallel computation workflows. burst-parallel applications include data analytics [39], optimization algorithms [13], and real-time machine learning classifications such as support vector machines (svm) [20, 33, 55]; these applications typically demand low-latency scheduling [49] with large-scale parallelism [26].
+
+faas providers charge function execution time at a fine granularity - aws lambda bills on a per-invocation basis.
+
+workloads with short tasks can take advantage of this fine-grained pay-per-use pricing model to keep monetary costs low. consequently, serverless computing can be leveraged by next-generation, burst-parallel workloads in high-performance computing (hpc) and data analytics.
+
+migrating such applications from a traditional serverful deployment to a serverless platform presents unique opportunities. traditional serverful deployments rely on existing workflow management frameworks such as mapreduce [34], apache spark [54], sparrow [49], and dask [9] to provide
+
+![](images/0c48deae2a1f37c29b93307ea7a0c3132a77d2b63e4d63d00b627ee4fa4146eb.jpg)  
+figure 1: in (a), the central scheduler tracks all task completions, updates all task dependencies, and identifies all ready tasks. the scheduler dispatches ready tasks to lambda executors; or the scheduler deposits ready tasks into a shared work queue, and a pool of lambda executors contend for the queued tasks. intermediate task inputs and outputs are stored outside of the executors, which reduces data locality. in (b), task scheduling is performed by a fleet of lambda executors that schedule and execute their assigned tasks in parallel and cooperate to ensure that task dependencies are satisfied. intermediate task inputs and outputs may be stored inside the executors, which increases data locality. this approach also enables fine-grained and automatic lambda resource elasticity, as lambda executors finish assigned tasks and return (e.g., lambda 2).
+
+a logically centralized scheduler for managing task assignments and resource allocation. the scheduler traditionally has various objectives, including load balancing, maximizing cluster utilization, ensuring task fairness, and so on. however, a traditional serverful scheduler is not required by serverless computing. this is because: (1) faas providers are responsible for managing the "servers" (i.e., where the task executors are hosted); and (2) serverless platforms typically provide a nearly unbounded amount of ephemeral resources. as a result, a hypothetical serverless parallel computing framework may not necessarily care about traditional "scheduling"-related metrics (such as load balancing and cluster utilization), since the framework has no control over where tasks are executed. (the service provider, of course, cares about these metrics.)
+
+yet, designing an efficient serverless-oriented parallel computing framework introduces unique challenges. first, while serverless platforms (e.g., aws lambda) promise to offer superior elasticity and auto-scaling properties, the serverless invocation model imposes non-trivial scheduling overhead.
+
+unlike a typical serverful parallel framework where the central scheduler directly communicates with each worker process using tcp [3, 34], in a serverless setup, the scheduler can dispatch tasks to serverless workers in one of three ways.
+
+figure 1(a) depicts a high-level overview of all three methods. in method #1, the scheduler invokes a lambda function (using the http protocol) to dispatch the task code and execute the task. note that with this method, there is a one-to-one association between tasks and lambda functions. given an average invocation overhead of  $50~\mathrm{ms}$  (typical for aws lambda functions), the scheduler could quickly become a performance bottleneck, especially for large and complex jobs with thousands of tasks. these observations indicate that a naive attempt to simply port an existing serverful dag framework to serverless computing will be unsuccessful. in order to create a performant, cost-effective serverless dag engine, new techniques must be developed to fully take advantage of the characteristics of the serverless platform.
+
+in method #2, the scheduler launches short-lived lambda executors as workers that establish tcp connections with the scheduler and receive rpc requests for task processing. example frameworks include excamera [37] and pywren [42]. task executors within these frameworks may execute several tasks as opposed to just one as with the first method.
+
+similarly, in method #3, the scheduler places tasks in a shared work queue. these tasks are retrieved from the queue by serverless executors; state-of-the-art systems such as numpywren [52] launch stateless lambda executors that connect to a centralized shared queue and constantly retrieve tasks from the queue. frameworks using this method may have a component separate from the central scheduler that is responsible for invoking the aws lambda executors. this is sometimes referred to as a "provisioner". in the latter two approaches, as shown in figure 1(a), a tightly synchronized central scheduler tracks all task completions, updates all task dependencies, and identifies any ready tasks. the scheduler dispatches ready tasks to lambda executors, or the scheduler deposits ready tasks into a shared work queue, and a pool of lambda executors contend for the queued tasks. intermediate task inputs and outputs are stored externally, which reduces data locality.
+
+the second challenge is that serverless platforms come with inherent constraints, including bandwidth-limited, outbound only network connectivity; therefore, serverless workflows must rely on external cloud store for intermediate data storage and exchange, which creates excessive data movement overhead. data locality enhancement is thus critical for minimizing communication costs.
+
+researchers have developed serverless parallel computing frameworks that support parallel job processing [37, 42, 52];
+
+however, these solutions do not fully address the aforementioned performance issues of efficient scheduling and data locality, which leads to long scale-out delays, sub-optimal performance, and higher monetary cost. to this end, we design and build a new serverless parallel computing framework called wukong<sup>2</sup>. wukong is a serverless-oriented, decentralized, locality-aware, and cost-effective parallel computing framework. the key insight of wukong is that partitioning the work of a centralized scheduler (i.e., tracking task completions, identifying and dispatching ready tasks, etc.) across a large number of lambda executors, can greatly improve performance by permitting tasks to be scheduled in parallel, reducing resource contention during scheduling, and making task scheduling data locality-aware, with automatic resource elasticity and improved cost effectiveness.
+
+scheduling is decentralized by partitioning a dag into multiple, possibly overlapping, subgraphs. each subgraph is assigned to a task executor (implemented as an aws lambda function runtime) that is responsible for scheduling and executing tasks in its assigned subgraph. this decentralization brings multiple key benefits:
+
+enhanced data locality and reduced resource contention: decentralization improves the data locality of scheduling. unlike pywren [42] and numpywren [52], which require executors to perform network i/os to obtain each task they execute (since numpywren's task executor is completely stateless), wukong preserves task dependency information on the lambda side. this allows lambda executors to cache intermediate data and schedule the downstream tasks in their subgraph locally, i.e., without constant remote interaction with a centralized scheduler.
+
+h harnessing scale and local optimization opportunities: decentralizing scheduling allows an executor to make local data-aware scheduling decisions about the level of task granularity (or parallelism) appropriate for its subgraph. agile executors can scale out compute resources in the face of burst-parallel workloads by partitioning their subgraphs into smaller graphs that are assigned to other executors for an even higher level of parallel task scheduling and execution. alternately, an executor can execute tasks locally, when the cost of data communication between the tasks outweighs the benefit of parallel execution.
+
+automatic resource elasticity and improved cost effectiveness: decentralization does not require users to explicitly tune the number of active lambdaes running as workers and thus is easier to use, more cost effective, and more resource efficient.
+
+we make the following contributions in this paper.
+
+- we thoroughly explore the problem space of serverless parallel computing framework design. for a range of
+
+parallel computation applications, we identify issues of the state-of-the-art serverless frameworks—task scheduling, data locality, and resource efficiency (monetary cost effectiveness).
+
+- we present the design and implementation of wukong, a new serverless parallel computing framework that solves the identified issues. wukong synergizes a set of optimization techniques, including decentralized scheduling, task clustering, and delayed i/o. these techniques together achieve near-ideal scalability, reduce data movement over the network, enhance data locality, and improve cost effectiveness.  
+- we evaluated wukong extensively on aws. our results show that wukong reduces network i/o by many orders of magnitude and achieves up to  $68.17 \times$  higher performance than numpywren, while reducing the monetary cost by as much as  $92.96\%$ .
+
+# 2 background and motivation
+
+# 2.1 why serverless?
+
+serverless computing handles virtually all system administration tasks, making it easier for developers to use a near-infinite amount of cloud resources, including bundled cpus and memory, object stores, and a lot more [43]. service providers provide a flexible interface for defining serverless functions, which allows developers to focus on core application logic. service providers in turn auto-scale function executions in a demand-driven fashion, hiding tedious server configuration and management tasks from the users.
+
+general constraints and limitations. service providers place limits on the use of cloud resources to simplify resource management. take aws lambda for example: users configure lambda's memory and cpu resources in a bundle. users can choose a memory capacity between 128mb-3008mb in 64mb increments. lambda will then allocate cpu power linearly in proportion to the amount of memory configured. each lambda function can run at most 900 seconds and will be forcibly stopped when the time limit is reached. in addition, lambda only allows outbound tcp network connections and bans inbound connections and the udp protocol.
+
+opportunities. running large-scale, burst-parallel computation jobs has long been challenging for domain scientists due to the complexity of configuring, provisioning, and managing compute clusters [17, 18]. by taking over system administration and automatically providing capability to launch thousands of processes with no advance notice, the emerging serverless computing model seems to provide a foundation that will attract domain scientists and data analysts. however, to fully unleash the potential of serverless computing, an efficient serverless-optimized parallel computing framework is needed.
+
+![](images/20265f0ceaa97050ef727ca85d953820394bf8d3e262e31d9bcd1acd824b52d9.jpg)  
+figure 2: (num)pywren scaling tasks on aws lambda.
+
+![](images/795cd25644934aecaba671604afeec70cbb992bf8fe15e41891d63dc4fbc1225.jpg)  
+figure 3: numpywren gemm read and write amplification.
+
+![](images/43728b7e5e66a47a2ae09837e82fafb06c6f6c4edc629cd7132090694b05ce0f.jpg)  
+figure 4: numpywren tsqr read and write amplification.
+
+# 2.2 challenges
+
+we build on our experience with serverless frameworks to synthesize the performance requirement for an ideal, serverless, parallel computing framework, and discuss why current solutions are not able to meet these performance requirements of burst-parallel applications at both the task scheduling and the data locality level.
+
+challenge to rapidly scale out. a family of burst-parallel computation jobs (e.g., data analytics [49], machine learning classifications [20], etc.) are dominated by short-lived tasks with a span ranging from hundreds of milliseconds (ms) to tens of seconds [39, 42, 49, 55]. such applications pose a difficult scheduling challenge to the serverless computing platforms. this is because, while serverless computing promises to deliver elastic auto-scaling feature in response to bursts of concurrent workloads, serverless function invocations incur non-negligible overhead, thus creating a scheduling bottleneck with slow scaling out.
+
+pywren is a state-of-the-art serverless execution engine [42]. pywren enables users to program mapreduce-like applications on serverless platforms such as aws lambda. numpywren [52] is a system for linear algebra built on top of pywren. numpywren uses pywren's existing infrastructure to deploy their own serverless task executors, which run as a user-defined function within pywren's own lambda executors. in order for numpywren to scale the size of their lambda cluster, numpywren invokes additional pywren executors (using pywren's own api) from their central scheduler. based on this design, numpywren relies heavily on pywren for lambda scaling and management.
+
+figure 2 shows pywren's ability to schedule large numbers of no-op tasks on aws lambda-based executors. ideally, an omniscient serverless scheduler should be able to take full advantage of the massive parallelism offered by serverless computing and rapidly scale to thousands of lambda executors in seconds in response to bursty, highly parallel workloads. pywren uses a centralized scheduling approach, where it employs 64 threads for task scheduling and invocation; it takes almost 2 minutes to scale out to 10,000 lambda executors<sup>3</sup>. to make it worse, a serverless framework like
+
+pywren cannot always keep thousands of lambda executors actively running (unlike the worker servers to a typical serverful parallel framework such as mapreduce [34]), so it has to constantly invoke many lambdas in response to bursts of job tasks.
+
+this serves to illustrate the failure of existing serverless execution frameworks to fully utilize serverless computing's elastic auto-scaling property. challenge of excessive data movement. parallel applications require intermediate data exchange among tasks. direct task-to-task data communication is naturally supported in traditional serverful parallel computing frameworks such as mpi [18], mapreduce [34], and dask [9]. however, data exchange in serverless applications may be supported only indirectly, through the use of remote cloud storage systems.
+
+consider the data exchanged during the execution of  $25k \times 25k$  gemm (general matrix multiplication) and 8,  $192k \times 128$  tsqr (tall skinny qr) on numpywren. figure 3 and figure 4 present a comparison between pure input and output sizes and the amount of data transferred during the two workloads respectively. for gemm, the total quantity of data read is more than  $25 \times$  the size of the input data while the total quantity of data written is more than  $20 \times$  the size of the output. this trend is further exemplified by tsqr. while the amount of data read is only  $2.88 \times$  greater than the input data size, the amount of data written over  $65m \times$  greater than the output size. this is because numpywren and pywren adopt a stateless lambda executor design where a task can be dispatched to any lambda executor; once dispatched to a lambda, the task simply performs the following four steps: 1) reads its input data (the intermediate data generated by one or multiple upstream tasks) from cloud storage (numpywren uses s3), 2) performs computation, 3) writes the intermediate results (as output) to the cloud storage, and 4) returns. while the stateless design seems to be a good fit for serverless platforms, it does not preserve data locality, which results in excessive data movement.
+
+this stresses a strong need for reducing data movement and increasing data locality in serverless frameworks.
+
+# 3 wukong design
+
+in this section, we present the system design of wukong. this design is motivated by the observations that existing
+
+![](images/edf40bbd349909c15b7a52829b3af6b1ac75ce976d52588fd328b79e6cf8eba9.jpg)  
+figure 5: overview of wukong architecture.
+
+serverless parallel frameworks are slow to scale out and are bottlenecked by excessive data movement (§2).
+
+# 3.1 high-level design
+
+figure 5 shows the high-level design of wukong. the design consists of three major components: a static schedule generator which runs on amazon ec2, a pool of lambda executors, and a storage cluster.
+
+scheduling in wukong is decentralized and uses a combination of static and dynamic scheduling. a static schedule is a subgraph of the dag. each static schedule is assigned to a separate executor. an executor uses dynamic scheduling to enforce the data dependencies of the tasks in its static schedule. an executor can invoke additional executors to increase task parallelism, or cluster tasks to eliminate any communication delay between them. executors store intermediate task results in an elastic in-memory key-value storage (kvs) cluster (hosted using aws fargate [5]; see §3.4) and job-related metadata (e.g., counters) in a separate kvs that we call metadata store (mds).
+
+# 3.2 static scheduling
+
+wukong users submit a python computing job to the dag generator, which uses the dask library to convert the job into a dag. the static-schedule generator generates static schedules from the dag. for a dag with  $n$  leaf nodes,  $n$  static schedules are generated. a static schedule for leaf node  $l$  contains all of the task nodes that are reachable from  $l$  and all of the edges into and out of these nodes. the data for a task node includes the task's code and the kvs keys for the task's input data. the schedule for  $l$  is easily computed using a depth-first search (dfs) that starts at  $l$ . lambda executors notify the static scheduler when a final result
+
+![](images/d95bf923a6af541dd3330aec62039efd69b2bf257d54165bee335c6ad91b73c3.jpg)  
+figure 6: static dag (a) and dynamic scheduling (b). wukong's executors coordinate in the area inside the dashed box in (b) using dynamic scheduling. "t1" denotes task 1. "e1" denotes lambda executor 1.
+
+has been stored in redis by sending a message to the static scheduler's subscribe process. upon receiving a message, the static scheduler will download final results and return them to the user automatically.
+
+figure 6(a) shows a dag with two leaf nodes. figure 6(b) shows the two static schedules that are generated from the dag: schedule 1 (blue) and schedule 2 (green).
+
+a static schedule contains three types of operations: task execution, fan-in and fan-out. to simplify our description, when dag task  $\mathsf{tx}$  is followed immediately by task  $\mathsf{ty}$ , and  $\mathsf{tx}$  ( $\mathsf{ty}$ ) has no fan-out (fan-in), we add a trivial fan-out operation between  $\mathsf{tx}$  and  $\mathsf{ty}$  in the static schedule. this fan-out operation has one incoming edge from  $\mathsf{tx}$  and one outgoing edge to  $\mathsf{ty}$ , i.e., there is no actual fan-out. in figures 6(a) and (b), this is the case for dag tasks  $\mathsf{t2}$  and  $\mathsf{t3}$ .
+
+a fan-in task  $\mathsf{t}$  may depend on tasks that will be executed by different executors, e.g., task t4 in figure 6. the dynamic scheduling technique described below ensures that  $\mathsf{t}$ 's data dependencies are satisfied and that  $\mathsf{t}$  is executed by only one executor. note also that a static schedule does not map its tasks to processors; this mapping is done automatically by the aws lambda platform when an executor function instance is invoked with the static schedule and placed on a vm by aws lambda.
+
+# 3.3 task execution & dynamic scheduling
+
+task execution. wukong workflow execution starts when the static scheduler's initial-executor invokers assign each static schedule produced by the static-schedule generator to a separate executor. recall that each static schedule begins with one of the leaf node tasks in the dag. the initial-executor invokes these "leaf node" executors in parallel. after executing its leaf node task, each executor then executes
+
+the tasks along a single path through its schedule. an executor may execute a sequence of tasks before it reaches a fan-out operation with more than one out edge or it reaches a fan-in operation. for such a sequence of tasks, there is no communication required for making the output of the earlier tasks available to later tasks for input. all intermediate task outputs are cached in the executor's local memory with inherently enhanced data locality. executors also look ahead to see what data their tasks may need, which allows them to discard data in their local memory that is no longer needed.
+
+furthermore, executors can increase parallelism by scheduling and invoking new executors to execute the task targets of a fan-out. a group of executors that reach a common fan-in node decrease parallelism by scheduling one of them to execute the fan-in task and the rest to stop. wukong uses dynamic scheduling to resolve conflict on the fly. more importantly, this dynamic scheduling of the tasks in an executor's static schedule leads to a decentralized scheduling model that naturally fits serverless computing, eliminates the need for a centralized scheduler processes that check data dependencies and invoke ready tasks with improved scalability.
+
+dynamic scheduling for fan-out operations. for fanout operations there are two cases:
+
+case 1: none of the  $n$  (where  $n > 1$ ) fan-out edges is a fan-in edge. then  $e$  "becomes" the executor for one of the fan-out's tasks, say  $t$ , by executing  $t$ , and  $e$  "invokes" an executor for the other fan-out tasks.
+
+case 2: one or more of the fan-out edges is also a fan-in edge. for example, fan-out node 3 in figure 6(a) has a fan-out edge that is a fan-in edge to node 4. the selection of a "becomes" edge for  $\mathsf{e}$  is based on the immediate availability of the tasks targeted by the fan-out edges. if no task target's dependencies are satisfied then no task target is immediately available for execution and none of the fan-out edges can be selected as  $\mathsf{e}$ 's "becomes" edge (the fan-in edges have fan-in operations that will be executed next); otherwise, one of the fan-out edges for the available target tasks is selected as the "becomes" edge.
+
+an intermediate objects needed for input by an invoked executor is passed to the executor as an argument if the size of the object is less than the maximum allowed argument size (256k); otherwise, the object is sent to the storage manager, and the associated kvs keys are passed to the invoked executors as arguments.
+
+each of the  $n - 1$  executors invoked by  $\mathsf{e}$  is assigned a static schedule that begins with one of the  $n - 1$  fan-out edges. each of these (possibly overlapping) static schedules corresponds to a sub-graph of  $\mathsf{e}$ 's static schedule. executor  $\mathsf{e}$  continues task execution and scheduling along the remaining fan-out edge and executes the operation encountered on this edge.
+
+in figure 6(b), fan-out edges are labeled either "invokes" or "becomes" to indicate whether the executor invokes a
+
+new lambda executor to execute a fan-out task or executes the fan-out task itself.
+
+since executor invocations, which are in the form of aws lambda function invocations, incur a high overhead (e.g., invoking an aws lambda function takes about 50 milliseconds with the boto3 aws python api), we use a number of dedicated executor-invoker processes that are co-located with the static scheduler (figure 5). when an executor performs a fan-out operation, and a large number of new executors must be invoked, the executor delegates the invocations to the static scheduler. the static scheduler evenly distributes task invocation responsibilities among the invoker processes, enabling (near-)linear speedup over sequential invocations. dynamic scheduling for fan-in operations. if task executor  $\mathsf{e}$  executes a fan-in operation with  $n$  (where  $n > 1$ ) in-edges, then  $\mathsf{e}$  and the  $n - 1$  other executors involved in this fan-in operation cooperate to see which one of them will continue their static schedules on the out edge of the fan-in (e.g., node 4 in figure 6).
+
+for a fan-in operation executed by e for fan-in task t, e atomically gets and updates a value in the kvs that tracks the number of t's input dependencies that have been satisfied during execution. there are two cases:
+
+case 1: all of the input dependencies of  $\mathsf{t}$  have been satisfied. then e continues its static schedule by executing  $\mathsf{t}$
+
+case 2: all of the input dependencies of t have not been satisfied. then e sends the intermediate object needed by t to the storage manager.
+
+in figure 6(b), each fan-in task is labeled with the executor that executed the task.
+
+task clustering. storing and retrieving large intermediate objects can be very costly. wukong implements task clustering to avoid large object storage.
+
+task clustering for fan-out operations. if the output object of some fan-out task  $t$  executed by executor e is larger than a user-defined threshold  $t$  (e.g., 200 mb), e will try to cluster the target tasks of t's fan-out edges, i.e., e will execute the target tasks whose dependencies are satisfied instead of invoking new executors for these tasks. for example, the executor that executes task c can also execute tasks f and g to avoid the time and cost of communicating task c's large object output to tasks f and g. in cases like this, the fan-out edges will have multiple edges labeled "becomes".
+
+task clustering for fan-in operations. if  $\mathsf{e}$  executes a fan-in operation for task  $\mathsf{t}$  and the input dependencies of a single task  $\mathsf{t}$  have not been satisfied, then  $\mathsf{e}$  sends the intermediate object needed by  $\mathsf{t}$  to the storage manager. if this object is large,  $\mathsf{e}$  then rechecks  $\mathsf{t}$ 's input dependencies. if  $\mathsf{t}$ 's input dependencies became satisfied while the large intermediate object was being stored,  $\mathsf{e}$  becomes the executor for  $\mathsf{t}$ . this avoids the communication delay that would have occurred when  $\mathsf{t}$  retrieved the large object from storage, but
+
+not the delay that occurs when r stored the object. the delay that occurred when the large object was stored by e can be avoided if the storage operation can be delayed until after t's input dependencies become satisfied.
+
+suppose that when executor e executes the fan-out operation it identifies multiple fan-out tasks that are also fan-in tasks and that have input dependencies that are not satisfied. e will then execute any ready fan-out tasks it finds and delay the decision about how to handle the fan-out tasks that are not ready. (there may be many fan-out tasks that are not also fan-in tasks or that are fan-in tasks with satisfied input dependencies.)
+
+delayed i/o. after executor e executes the ready tasks, e will recheck whether the input dependencies of the unready tasks have since become satisfied. if so, the newly ready tasks can be executed. if at least one unready task becomes ready, the ready task can be executed and the unready tasks can be rechecked again, and so on, for a configurable number of times. our profiling indicates that it is almost always better to wait until all of the unready tasks become ready to avoid the very large communication delay the occurs when many large objects are stored and retrieved potentially at the same time. a pattern of simultaneous large object writes and reads occurred often in the dag workloads that we executed. if unready tasks remain when this process stops, e must send the intermediate objects needed by the unready tasks to storage; however, as described above, e can possibly avoid the communication delay associated with retrieving the objects from storage by checking the unready objects one more time.
+
+# 3.4 storage management
+
+wukong's storage cluster is built atop aws fargate [5], a serverless container engine that can be elastically scaled out/in. the storage cluster includes a number of aws fargate tasks, each of which hosts a redis instance, and a kv store proxy service. the kv store proxy is executed within an ec2 vm along with an additional instance of redis used exclusively for storing static schedules and dependency counters. the user can configure the size of the fargate cluster to dynamically accommodate workloads of different sizes. the user simply specifies how many nodes they would like, and wukong ensures that these nodes are created and available. the fargate nodes are used for the storage of intermediate data generated during a workload's execution. we opt to use redis instead of s3 as redis can provide both high bandwidth for large object workloads and high iops for small object workloads [44, 50], whereas s3's iops is throttled. however, modifying wukong to use s3 is trivial.
+
+the kv store proxy performs various storage operations on behalf of the task executors and the scheduler. at the
+
+```python
+def add(x,y):
+time.sleep(0.5)
+return x + y
+l = range(8)
+while len(l) > 1:
+l = list(map(delayed(add),\ l[0::2], l[1::2]))
+l[0].compute()
+```
+
+![](images/a095c5d510a6af0c136e74c5ef6b31229a2ea3c734f8643a9cdbf1b5a19418e9.jpg)  
+figure 7: tr code.  
+figure 8: tr dag.
+
+start of a workflow, the storage manager receives the workflow dag and the static schedules derived from the dag from the scheduler.
+
+intermediate and final result storage. task executors publish their intermediate and final task output objects to the kv store. final outputs are relayed to a subscriber process in the scheduler for presentation to the client.
+
+small fan-out task invocations. when a task executor performs a fan-out operation that has a small number of out edges, the task executor makes the necessary executor invocations itself.
+
+large fan-out task invocations. when a fan-out has a number of out edges that is larger than a user-specified threshold, the task executor publishes a message that is relayed to a subscriber process in the storage manager that then passes the message on to the proxy. this message contains an id that identifies the fan-out's location in the dag. the proxy uses the dag and the fan-out id to identify the fan-out's out edges in the dag. this allows the proxy, with the assistance of the fan-out invokers in the storage manager, to make the necessary task executor invocations, in parallel. the proxy passes to each executor its intermediate inputs (or their key values in the kv store) and the executor's static schedule.
+
+# 3.5 programming model
+
+wukong reuses dask's python programming interfaces [12] (including high-level apis, such as dask libraries and data structures, and low-level apis, such as dask.delay) for implementing parallel programs. in general, any code written for dask should execute on wukong. figure 7 shows an example code snippet that implements tree reduction (tr) (a detailed description of tr is in §4.1). wukong also reuses dask's dag generator which translates high-level python code into a dag [11]. figure 8 depicts the dag generated for tr with an 8-element array.
+
+# 3.6 fault tolerance
+
+for fault tolerance, we relied on the automatic retry mechanism of aws lambda, which allows for up to two automatic retries of failed function executions. investigating better fault tolerance scheme is part of our future work.
+
+# 4 evaluation
+
+implementation. we have implemented wukong using roughly  $12k$  lines of python code (5, 349 loc for the aws lambda executor runtime, 3, 057 loc for the storage manager, and 3, 577 loc for the static scheduler). we use the dask library [9] to generate dags to use as the input computation graph for wukong.
+
+# 4.1 experimental goals and methodology
+
+our evaluation was performed on aws. the static scheduler ran in an r5n.16xlarge ec2 vm. we used a scale-out redis cluster (multi-redis) as wukong's intermediate storage. the fargate nodes within the storage cluster were each configured to have 30 gb of memory and 4 vcpus. for the multi-redis setup, wukong used 75 nodes for the storage cluster, as we've determined this value to be both performant and cost-effective for many workloads. the mds proxy was co-located on the same r5n.16xlarge vm as a redis instance that was used for storing static schedules and dependency counters. each lambda function was allocated 3 gb of memory and a maximum execution time of seven minutes.
+
+we compared the performance of wukong against both dask distributed (which we refer to simply as "dask") and numpywren [52] / pywren [42]. we chose to compare our performance against dask as both wukong and dask use the exact same input dag and the same algorithms for their computations. we compared the end-to-end performance of wukong against numpywren, and we compared the scalability of wukong against pywren, which is numpywren's underlying lambda execution framework.
+
+we chose to compare wukong against numpywren because both are serverless dag execution frameworks; however, there are significant differences between wukong and numpywren. one difference is that wukong uses dask dags, which explicitly encode tasks and their dependencies. numpywren, on the other hand, uses an implicit dag representation for its programs, which are all implemented in the lambdapack language for linear algebra [52]. the nodes of the dag that represent a lambdapack program are generated on-demand (at runtime).
+
+another difference is that numpywren uses aws s3 as its intermediate data store. in order to make the comparison between wukong and numpywren more fair, we modified numpywren to use a single instance of redis as its intermediate object store. we compared this version of numpywren, which we refer to as "numpywren single redis", with a modified version of wukong that also uses a single instance of redis for intermediate data storage. in addition, we compared numpywren s3 against "wukong multi-redis", which uses a fargate redis cluster for its intermediate object store. this second comparison was performed in order to show the optimal performance achieved by each system.
+
+finally, numpywren only supports linear algebra algorithms and only several of these algorithms are also available in dask. as a result, we are limited in which workloads we can run on both wukong and numpywren.
+
+to better understand wukong's performance, we compared wukong against 2 different dask configurations. both configurations used the same amount of cpu (2,000 cores) and memory (3,000 gb memory). this was the largest vm cluster that we could configure. the first configuration consisted of 1,000 2-core 3gb workers running on 125 c5.4xlarge 16-core 32 gb vms. each vm had eight workers running on it. the second configuration consisted of 125 workers; each worker exclusively ran on a c5.4xlarge vm and was allocated 16 cores and 24 gb memory. the first configuration was selected so that each worker was approximately as powerful as the aws lambda functions used by wukong; it represents a worst-case scenario that stresses the dask scheduler with many workers and incurs high communications due to the lack of data locality, emulating a serverless environment with centralized scheduling. the second configuration represents a best-case scenario where the relatively more powerful workers could process larger data with improved data locality and significantly reduced communications.
+
+additionally, we used the exact same input data partitions for dask and wukong. we scaled the problem size for each benchmark by having each (dask, wukong, or numpywren) worker assigned with (at least) one partition of the input data. as such, a test used only a fraction of the 2,000 cores of the dask cluster, until the problem size was large enough to occupy all the resources. the largest number of partitions (of input data) used during our evaluation was 4,096 for  $16m$  tsqr (which will be described shortly). this number of partitions does not overwhelm either dask configurations as tsqr's dag features large fan-ins in the middle of the job. the large fan-ins result in the number of tasks allocated to each worker decreasing as the workload progresses.
+
+in our evaluation results, each data point is the average of ten runs. the error bars on the graphs of the results indicate the biggest and smallest results obtained. wukong is easy-to-use as it exposes only two configuration knobs to the end users—the input partition size and the number of fargate nodes. (a sensitivity analysis of these two configuration knobs is omitted due to space constraint.)
+
+we evaluated the following parallel applications.
+
+tree reduction (tr): tr sums the n elements of an array using a total of  $n - 1$  operations performed over multiple passes. each pass adds adjacent elements, in parallel, until after  $\log(n)$  passes only a single element remains. tr serves as a microbenchmark for evaluating the effect of task granularity and parallelism on performance. see figure 7 and figure 8 for an example of the python code snippet and generated dag.
+
+![](images/6ab9464e049fad34417b4ce73ac7721bb1fb032f050ab2bd0483bc9a7267a7fc.jpg)  
+figure 9: tr.
+
+![](images/5275bda4e9a222de3ab8d53b761656b59065aa1e724e810b8107d8149c72389d.jpg)  
+figure 10: svd1.
+
+![](images/1a90f5ec542d88412d88a5378d22b9b91ab5dfd0086715737e0cba4f9de73d46.jpg)  
+figure 11: svd2.
+
+![](images/27cbbf864b3e7a459ed54339476d67d466fef5607c665a5235e821c4942c1f01.jpg)  
+figure 12: svc.
+
+![](images/a85d900a7f310aff33e1cc4ef87a5fd8f53a512bab6c7ff2d517a718ca0a9531.jpg)  
+figure 13: gemm.
+
+![](images/1c7e6f99d45884787675d8cb24f29fb6a3e788352dae2242eabffce43d64829c.jpg)  
+figure 14:tsqr (log-scale).
+
+![](images/84b56445938e9057a99942fb2243e65555df6604044091a5e9df9d3ba74752c0.jpg)  
+figure 15: gemm i/o (log).
+
+![](images/c1dc909e0824622be3db236496915c9ec49a5312353f18023e6858921b913334.jpg)  
+figure 16: tsqr i/o (log).
+
+singular value decomposition (svd): we evaluated two variants of svd. the first variant (svd1) computes the svd of a tall skinny matrix. the second variant (svd2) computes the svd of a square (i.e.,  $n \times n$ ) matrix using an approximation algorithm provided by [40]. note that dask's svd algorithm differs considerably from numpywren's, and thus a direct comparison between wukong and numpywren for svd is impossible. for reference, wukong can execute svd  $256k \times 256k$  in 88 seconds on average while [52] reports an average of 77,828 seconds for the same problem size for svd.
+
+support vector classification (svc): svc is a machine learning workload. the benchmark we used is publicly available in the dask-ml documentation [10].
+
+general matrix multiplication (gemm): gemm performs matrix multiplication, an important component of many linear algebra algorithms.
+
+tall-and-skinny qr factorization (tsqr): this workload performs a qr factorization of a tall skinny matrix.
+
+# 4.2 end-to-end performance comparison
+
+tr. the size of the array used for tr was 1024. we also intentionally added a delay to each task of tr. this delay simulates an increased amount of work performed per task. we varied the amount of delay between  $0 - 500\mathrm{ms}$ . figure 9 shows that both configurations of dask outperforms wukong by a large margin for the base case. this is because dask uses tcp to dispatch the  $1024 / 2 = 512$  addition tasks to workers, whereas for wukong the overhead of scaling out to 512 lambda executors dominates. as we add increasing amounts of delay to each task, the performance gap between dask and wukong decreases. once the delay is  $250~\mathrm{ms}$  or more, wukong executes the workload faster than the 1,000-worker dask cluster, as wukong uses decentralized scheduling to rapidly scale out to 512 workers. this experiment shows an interesting tradeoff between per-task execution time and serverless scaling cost - wukong performs best when each
+
+task performs a non-trivial amount of work, as this compensates for the overhead of spinning up additional lambdas.
+
+svd. we tested seven problem sizes for both svd1 and svd2 (see figure 10 and figure 11). for nearly all problem sizes, wukong out-performed the 1,000-worker dask cluster, completing the job anywhere from  $62.02\%$  to  $69.09\%$  faster than dask. this performance difference results from the benefits of wukong's decentralized scheduling techniques, which greatly reduce the overhead of executing tasks on a large number of workers. the 1,000-worker dask was bottlenecked by its central scheduler due to the increasing load from the one thousand workers.
+
+the 125-worker dask cluster consistently outperformed wukong. this is because each dask worker is provisioned with more resources (i.e., more cpus, greater network bandwidth, a larger amount of ram per worker, etc.), which significantly increases data locality and reduces cross-worker communications. more importantly, for svd2, wukong was able to scale to considerably larger problem sizes than what the 1,000-worker dask cluster was capable of handling (crosses in figure 11). the results demonstrate wukong's ability to provide competitive performance with traditional serverful frameworks, while also scaling effectively for increasingly large problem sizes. wukong's ability to scale effectively here is largely because of its use of task clustering and delayed i/o. these techniques dramatically reduce data movement and ensure all downstream tasks which depend on large data are executed on the task executor that already has the data in-memory. a quantitative analysis of the benefits of these techniques is given later in §4.5.
+
+svc. figure 12 shows svc's performance. as with the previous benchmark, dask was able to perform better for smaller problem sizes; however, when we increased the problem size, the performance gap between the two frameworks decreased. as the scale of the problems increased to  $4.0m$  samples and beyond, wukong began to scale more effectively than the 1,000-worker dask cluster. the large parallelism of wukong
+
+![](images/41b8250baedc9694c76dd5c7df6fa6c4061b0e5ec4b5fbf1aadb347da98aa590.jpg)  
+figure 17: svd1 cpu time.
+
+![](images/4c6f3381bcaf44868a28169d88868cec5580b5908db5065590ff49efde2d3c7f.jpg)  
+figure 18: svd1 cost.
+
+enabled the framework to complete the workload in  $46.45\%$  less time; however, the 125-worker dask cluster executed the workload roughly  $50.56\%$  faster than wukong. this is likely due to both the higher network bandwidth and increased data locality of the dask workers.
+
+gemm. like tr, the results of our gemm experiments identify a workload that is difficult to execute in a serverless environment. as shown in figure 13, wukong achieved worse performance than dask. this is because gemm natively requires a number of large data objects to be communicated between tasks before the computation can begin. due to the limited bandwidth available to the intermediate data storage, both wukong and numpywren experience long delays during this phase of the workload.
+
+wukong's performance greatly exceeded that of both numpywren configurations for all problem sizes. for the largest problem size, wukong (single redis shard) executed the workload  $89.76\%$  faster than numpywren (single redis shard). wukong (with fargate) was  $51.51\%$  faster than numpywren (with s3) for  $15k\times 15k$  matrices because wukong reduced the amount of data read from and written to the intermediate kvs, and this reduction on i/os directly translates to performance improvement. as shown in figure 15, wukong read  $49.39\%$  less data than numpywren for the smallest problem size and  $45.24\%$  for the largest; wukong reduced the amount of data written by as much as  $85\%$  for the largest problem size.
+
+tsqr. figure 14 shows that wukong outperformed both numpywren (with s3) and numpywren (single redis shard) for all problem sizes. for the  $4.1m \times 128$  matrix, wukong (single redis shard) was executing the workload  $68.17 \times$  faster, or in  $98.53\%$  less time, than numpywren (single redis shard); and wukong (fargate) is  $9.19 \times$  faster, or in  $89.11\%$  less time, than numpywren (s3). numpywren (single redis shard) failed to execute the next larger problem size, and the largest workload numpywren (s3) was able to execute was  $16.7m \times 128$ . for this workload, wukong was  $13.36 \times$  faster, executing the workload in  $92.51\%$  less time. this again, is because of the significantly reduced reads and writes. wukong's "become" functionality allowed serial tasks along a single subgraph path to execute locally on the same lambda executor; whereas numpywren randomly assigned high priority tasks (which were ready to execute) to any stateless lambda executor. as a result, numpywren wrote  $16,027 \times$
+
+![](images/efb7681c1fe36ad32a6834634692888899284eb1d8c30c9bd6f5d2ff6f32b05b.jpg)  
+(a) cpu usage comparison.
+
+![](images/4bc90dcb4c4a2c948c72409103101782188797f6b0be45aec141ac90ec04a441.jpg)  
+(b) cost comparison.
+
+![](images/6173ff6583036e138225fc06c2cb02120208b77c5f8ede395457534aa603a3c3.jpg)  
+figure 19: gemm cpu usage and cost timeline.  
+(a) cpu usage comparison.  
+figure 20: tsqr cpu usage and cost timeline.
+
+![](images/ed3a1b2d1f55262c96fb23f5b4ad24c2775e3e409f96c2ede07a4e29a6aed0d2.jpg)  
+(b) cost comparison
+
+more data for the smallest problem size and  $15,631 \times$  more data for the largest problem size, which resulted in dramatic performance degradation (figure 16).
+
+# 4.3 cpu time and monetary cost
+
+figure 17 presents a comparison between wukong (multi-redis) and both dask clusters on their total cpu time (core seconds) for svd1. note that this comparison only considers cores actively used by dask for each problem size. wukong uses more core seconds than dask-125 for the first three problem sizes, as dask-125 finishes the job significantly faster than wukong. for  $1.0m$  and above, wukong uses less core seconds than dask-125. dask-1000 incurs the longest cpu time as it is the slowest of the three. the disparity between the two frameworks increases as the problem size grows.
+
+figure 18 presents a comparison of the monetary cost to execute svd1 for varying problem sizes. this cost analysis only considers the dask vms actively used for each given workload size. at first, wukong is more expensive than dask-125. as the problem size increases, the cost of executing the workload on wukong increases at a much slower rate than the cost of running the workload on dask-125. by the largest problem size, the price of executing the workload on wukong is equal to that of executing the workload on dask-125. additionally, wukong achieves faster performance, lower cost, and more efficient cpu usage than dask-1000 using non-spot pricing for all except the smallest problem size. these results demonstrate wukong's pay-per-use property.
+
+figure 19 shows a comparison between various configurations of wukong single redis, dask, and numpywren single redis on the number of vcpus and cumulative cost used during gemm  $25k \times 25k$ . these configurations include both
+
+![](images/d59bb048b05eab0e54d9b1d0ebda665436380eaefd32bcae29cbb9c99af0f07f.jpg)  
+(a) no-op
+
+![](images/6f62ff2f5709aa86647b7ad5941fa41116733dc2b6c1da30f27129933d9135d0.jpg)  
+(b) sleep (100 ms)
+
+![](images/9ec290ac5743587b67f9d626b523a06c48cf06c709061c1dae0f87a2f7d0787a.jpg)  
+(c) sleep (250 ms)
+
+![](images/ac909cff136acf20fd89ad104a0b85da50b633d76f3ef7c6a278b061db5eb6fa.jpg)  
+(d) sleep (500 ms)
+
+![](images/0304d4f7ecf203a546e552af5365f1f43e0ce2d0f0425b4e6f9a2e76cb799115.jpg)  
+(e) no-op
+
+![](images/9a79445ac5a1b0110d9208ee9200d39f8deb65a4a296afc6886a19cca23be7f4.jpg)  
+(f) sleep (100 ms)
+
+![](images/fc778cc8b9d18adf7a4c42af29f670a630710e6f555d98e17f28339c884aeb4f.jpg)  
+(g) sleep (250 ms)
+
+![](images/63bdf6d7c3a2168e61ad8e927404e3dbd3fb46c170f82f77f6abc6fdce148821.jpg)  
+(h) sleep (500 ms)
+
+![](images/a40f7a699a54aed5d55535e0d741c8588b253bf2f9550b7da8eccffa9f8e356b.jpg)  
+(i) no-op  
+figure 21: figure 21(a)-(d) - strong scaling: time (y-axis) to execute 10,000 tasks over  $n$  lambda executors (x-axis). figure 21(e)-(h) - weak scaling: time to execute 10 tasks per lambda. figure 21(i)-(l) - serverless scaling: time to execute  $n$  task on  $n$  lambda. for each row, plots are for (from left to right) tasks of 0, 100, 250, and 500 ms.
+
+![](images/5bfda005025b57cafcff6f6a77aaeca9bcadabb66aacd1f7137b5d3eca4bf7ba.jpg)  
+(j) sleep (100 ms)
+
+![](images/77d6d4905520ab62374eb953ac299889157024d2351e3d7cab680fc7ee3f6149.jpg)  
+(k) sleep (250 ms)
+
+![](images/8aafceff79d9f357bf27f68fffa8de4ddf50418168a4caef6b6b2b7d9d5ea92d.jpg)  
+(i) sleep (500 ms)
+
+dask configurations and three configurations of numpywren single redis. by design, numpywren allows users to specify the initial<sup>4</sup> number of lambda executors (workers) for a job. we configured numpywren to use 50, 169, and 338 workers. numpywren-169 was selected because the maximum concurrency achieved by wukong during this workload was 169 lambdas. we tested a scaled-out version of numpywren that used twice as many starting workers (338) as well as a scaled-down version using 50 workers. notably, numpywren-50 was the fastest configuration, followed by numpywren-169 and finally numpywren-338. this suggests that increasing the number of numpywren's parallelism significantly increases contention, possibly at the framework's central queue or scheduler, leading to performance degradation.
+
+wukong was both cheaper and used less vcpus during the execution of the workload than all three numpywren configurations. specifically, wukong was  $33.47\%$  cheaper and  $77.57\%$  faster than the best-performing numpywren configuration. more importantly, wukong is autonomous and does not require users to explicitly tune the parallelism, which improves the usability.
+
+similarly, figure 20 shows a comparison for tsqr  $4.0m$ . the first configuration of numpywren used 128 workers while the second used 256 workers. these are based on the number of leaf tasks in wukong's workload (512), though we found that using 512 numpywren workers resulted in worse performance. wukong used less cpu resources and was significantly cheaper than all other frameworks. it also out-performed all other frameworks except for dask-125. specifically, wukong completed the workload in  $87.41\%$  less time and  $92.96\%$  more cheaply than the best-performing numpywren configuration (i.e.,  $14.22 \times$  cheaper and  $7.94 \times$  faster). lastly, while wukong did not out-perform dask-125, wukong was  $95.67\%$  cheaper than dask-1000 and  $45.70\%$  cheaper than dask-125 for this workload. wukong did not reach more than 106 vcpus during the workload's execution as many of the leaf tasks performed only a small amount of work before writing their data to the kvs and exiting. that is, by the time additional leaf tasks are scheduled, previously-invoked leaf tasks were already finishing their execution, forming a scheduling pipeline.
+
+# 4.4 elastic scaling
+
+we next evaluate wukong's scalability on traditional strong / weakening scaling and serverless scaling metrics, and compare it against (num)-pywren. the maximum concurrency we got from amazon was 5,000 concurrent lambdas. in this experiment, for both (num)-pywren and wukong, all the
+
+![](images/9aac2243e64283c0d6e0d865f921bc7cd3134c30d2b1d2153caa17747c1c8b8a.jpg)  
+figure 22: svd2 50k x 50k aggregated execution time breakdown with and without task clustering and delay i/o.
+
+executors in the lambda pool got warmed up before accepting task requests, eliminating the cold start concerns. the lambda pool scaled from zero.
+
+strong scaling. for strong scaling, we varied the number of lambdas to be launched to execute 10,000 tasks. in order to simulate workloads with various computation loads, we added a delay of  $100\mathrm{ms}$ ,  $250\mathrm{ms}$ , and finally  $500\mathrm{ms}$  to each task. each test was repeated three times. figure 21(a)-(d) show that, in all cases, wukong exhibited near-ideal strong scaling behavior, scaling significantly better than (num)-pywren in all cases, thereby demonstrating the effectiveness of our decentralized scheduling mechanism. it was not until the  $500\mathrm{ms}$  delay case that (num)-pywren exhibited a downward trend in execution time as the number of lambda executors scaled. this is because: 1)  $500\mathrm{ms}$  tasks tend to run longer, and 2) with more lambda executors and a fixed total amount of tasks, each lambda gets assigned less number of tasks.
+
+weak scaling. for weak scaling, we executed ten tasks per worker and varied the number of lambda executors from 250 to 1,000. as shown in figure 21(e)-(h), wukong exhibited near-ideal weak scaling behavior for all sleep delays and worker configurations. notably, thanks to the decentralized scheduling, wukong was able to scale to 1,000 lambda executors much more effectively than (num)pywren, which experienced increasingly large delays as the number of lambdas increased.
+
+serverless scaling. finally, we test serverless scaling – executing  $n$  tasks on  $n$  lambda executors, with each lambda effectively executing one single task. figure 21(i)-(l) plots the results. we observe that (num)-pywren took an increasing amount of time to finish executing  $n$  tasks on  $n$  lambdas, and executing 10,000 tasks took almost two minutes. in contrast, wukong rapidly scales out to 10,000 tasks in few seconds, almost approaching the behavior of an omniscient serverless execution framework. this again demonstrates the efficacy of wukong's decentralized scheduling.
+
+![](images/159ee1ee5c29f04743160de93dc1a2912505b4c62e191123fb2f96c4ef92cf31.jpg)  
+figure 23: contributions of optimizations to wukong's performance of svd2.
+
+# 4.5 factor analysis
+
+task clustering and delay i/o. finally, we look at the impact of task clustering and delaying i/o on wukong's performance. clustering and delay i/o prevent tasks with large intermediate data from writing their data to redis. instead, these tasks attempt to execute downstream tasks locally. any downstream tasks that cannot immediately be executed because their dependencies are not satisfied are put into a queue. the dependencies of the queued tasks are routinely rechecked until the dependencies are satisfied or a maximum delay time is reached. by delaying i/o, more tasks can be clustered and expensive network i/os data can be avoided, decreasing the workload runtime dramatically.
+
+figure 22 displays two aggregations of time for the activities performed for svd2. in both cases, "publishing messages", "task execution", and "serialization/deserialization" each took roughly the same amount of time (in aggregate); however, the difference between the times for task invocation and especially redis i/o is significant. with the two optimizations disabled, task invocations and redis i/o made up an aggregate 14.80 and 565.21 seconds, respectively. when the optimizations were enabled, task invocation took an aggregate 2.05 seconds while redis i/o took just 20.36 seconds. there is  $7.21 \times$  more aggregate time spent invoking tasks and  $27.76 \times$  more aggregate network i/o performed with clustering disabled.
+
+we analyze wukong's performance by breaking down the performance gap between a baseline and wukong with all optimizations enabled (figure 23). the use of the fargate multi-redis storage cluster results in a  $20.85\%$  performance improvement over using aws elasticache for intermediate data storage. when using fargate, the i/o performed during the workload is spread across a large number of redis instances, resulting in reduced network contention and consequently reduced i/o latency. (using a large number of elasticache instances is cost prohibitive.) when clustering (without delayed i/o) is enabled, performance improves by another  $48.82\%$  as a significant amount of large object i/os is eliminated. finally, enabling delayed i/o results in a  $46.21\%$
+
+improvement relative to the use of clustering and fargate alone. overall, wukong is  $4.6 \times$  faster when all optimizations are used, demonstrating the effectiveness of these techniques.
+
+# 5 related work
+
+researchers have identified new stateful parallel applications for serverless computing. these efforts have lead to serverless parallel computing frameworks [6, 16, 25, 28, 30, 36, 37, 41, 42, 50, 52], which have been built using methods 2 and 3 describes in §1. however, none of them explicitly addresses the data locality issue of stateful serverless parallel applications. wukong goes beyond existing work with a novel locality-aware decentralized scheduling approach for complex dag jobs.
+
+funcx [32] is an open faas platform that enables high performance "serverless supercomputing" over existing hpc infrastructures. wukong is orthogonal to funcx and should be portable to existing commercial and open-source faas platforms [4, 8, 15, 19, 35]. porting wukong to other serverless platforms is part of our future work.
+
+sand [24] is a serverless platform that increases data locality by running some or all of the functions/tasks for a given workload within the same container on the same server, but as separate processes. wukong is a serverless application framework that increases data locality by executing multiple dependent tasks in the same wukong executor function, and hence in the same process, container, and server. thus, sand improves data locality in the serverless platform layer, while wukong improves locality in the application framework layer running atop the serverless platform.
+
+infinicache [53] is a distributed memory cache that exploits the memory of serverless functions for object caching. wukong complements infinicache in that wukong can use infinicache to cache intermediate data.
+
+general-purpose serverless orchestration frameworks include aws step functions [6], azure durable functions [7], fission workflows [14], and hyperflow [16, 47]. but these frameworks are not well-suited for supporting large, complex jobs, because they require manual workflow configurations (e.g., json) [46].
+
+a large body of research has explored distributed scheduling [27, 29, 48, 49, 51]. however, these solutions all target serverful scheduling with serverful deployment specific optimization objectives. wukong targets serverless computing and takes advantage of the massive parallelism of serverless computing for high efficiency.
+
+# 6 discussion and lessons
+
+wukong is not intended to replace established, serverful processing frameworks such as spark [54] and tensorflow [23]. rather, because wukong is less powerful but easier to use
+
+than these serverful frameworks, wukong targets users who lack a strong cs background, but who work on lighter-weight and smaller computing-related problems, in areas such as data analytics and machine learning, particularly those whose solutions can be implemented using numerical python libraries.
+
+our initial attempt to port dask to a serverless platform was unsuccessful due to the poor performance of the resulting framework [31]. there were several major bottlenecks in this original design. for one, the use of a centralized scheduler to assign tasks to lambda executors was too slow for all but the smallest workloads. specifically, the centralized scheduler was unable to process thousands of concurrent network connections with lambda executors. additionally, the centralized scheduler struggled to rapidly invoke lambda functions when scaling out for large workloads. finally, lambda executors spent an overwhelming majority of their time reading and writing intermediate data. [31] presents a preliminary study about these performance bottlenecks.
+
+to address these performance issues, we developed our decentralized scheduling technique. while this technique significantly improved performance, there were still bottlenecks due to a lack of data locality. specifically, reading and writing very large intermediate objects dominated end-to-end execution time, particularly for workloads such as svd. to address these bottlenecks, we developed task clustering and delayed i/o. though these techniques have been used in serverful contexts [29, 45], they had never been utilized in a serverless context. with the addition of these two techniques, large object reads and writes were eliminated, which greatly improved performance and resource utilization.
+
+# 7 conclusion
+
+we have presented wukong, a new serverless parallel computing framework that uses locality-enhanced, decentralized scheduling (atop aws lambda), task clustering, and delayed i/o to achieve high performance, near-ideal scalability, and data locality while being cost-effective. our evaluation demonstrates the effectiveness of decentralized scheduling, task clustering, and delayed i/o in reducing both the execution time and cost of executing workloads. further, we have shown that wukong exhibits near-ideal scaling behavior, reduces the execution time by as much as  $98.53\%$  compared to numpywren, and reduces network i/o by multiple orders of magnitude. finally, wukong can reduce costs by upwards of  $92.96\%$  and  $95.67\%$  compared to numpywren and dask, respectively.
+
+wukong's source code is available at:
+
+https://mason-leap-lab.github.io/wukong.
+
+# acknowledgments
+
+we are grateful to the anonymous reviewers for their valuable comments and suggestions that improved the paper. this work is sponsored in part by nsf grants ccf-1919075, ccf-1919113, oac-2007976, george mason university, an aws cloud research grant, and google cloud platform research credits.
+
+# references
+
+[1] [n.d.]. 2018 serverless community survey: huge growth in serverless usage. https://serverless.com/blog/2018-serverless-community-survey-huge-growth-usage/.  
+[2] [n.d.]. alibaba cluster trace program (new 2018 version. https://github.com/alibaba/clusterrdata/blob/master/cluster-tracev2018/trace_2018.md.  
+[3] [n.d.]. apache hadoop. https://hadoop.apache.org/.  
+[4] [n.d.]. apache openwhisk: open source serverless cloud platform. https://openwhisk.apache.org/.  
+[5] [n.d.]. aws fargate: serverless compute for containers. https://aws.amazon.com/fargate/.  
+[6] [n.d.]. aws step functions. https://aws.amazon.com/step-functions/.  
+[7] [n.d.]. azure durable functions overview. https://docs.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-overview?tabs=csharp.  
+[8] [n.d.]. azure functions. https://azure.microsoft.com/en-us/services/functions/.  
+[9] [n.d.]. dask: scalable analytics in python. https://dask.org/.  
+[10] [n.d.]. dask: scalable machine learning in python. https://daskml.readthedocs.io/en/latest/#.  
+[11] [n.d.]. dask task graphs. https://docs.dask.org/en/latest/graphs.html.  
+[12] [n.d.]. dask user interfaces. https://docs.dask.org/en/latest/user-interfaces.html.  
+[13] [n.d.]. developing convex optimization algorithms in dask parallel: math is fun. https://matthewrocklin.com/blog/work/2017/03/22/daskglm-1.  
+[14] [n.d.]. fission workflows. https://github.com/fission/fission-workflows.  
+[15] [n.d.]. google cloud functions. https://cloud.google.com/functions/.  
+[16] [n.d.]. hyperflow: a scientific workflow execution engine. https://github.com/hyperflow-wms/hyperflow.  
+[17] [n.d.]. kubernetes: production-grade container orchestration. https://kubernetes.io/.  
+[18] [n.d.]. mpi forum. https://www.mpi-forum.org/.  
+[19] [n.d.]. openfaas: serverless functions, made simple. https://www.openfaas.com/.  
+[20] [n.d.]. scikit-learn support vector machines. https://scikit-learn.org/stable/modules/svm.html#svm-classification.  
+[21] [n.d.]. serverless: build and run applications without thinking about servers. https://aws.amazon.com/serverless/.  
+[22] [n.d.]. serverless: cold start war. https://mikhail.io/2018/08/serverless-cold-start-war/.  
+[23] martin abadi, paul barham, jianmin chen, zhifeng chen, andy davis, jeffrey dean, matthieu devin, sanjay ghemawat, geoffrey irving, michael isard, manjunath kudlur, josh levenberg, rajat monga, sherry moore, derek g. murray, benoit steiner, paul tucker, vijay vasudevan, pete warden, martin wicke, yuan yu, and xiaoqiang zheng. 2016. tensorflow: a system for large-scale machine learning. in 12th usenix symposium on operating systems design and implementation (osdi 16). usenix association, savannah, ga, 265-283. https://www.usenix.org/conference/osdi16/technical-sessions/presentation/abadi
+
+[24] istemi ekin akkus, ruichuan chen, ivica rimac, manuel stein, klaus satzke, andre beck, paarijaat aditya, and volker hilt. 2018. {sand}: towards high-performance serverless computing. (2018), 923–935. https://www.usenix.org/conference/atc18/presentation/akkus  
+[25] lixiang ao, liz izhikevich, geoffrey m. voelker, and george porter. [n.d.]. sprocket: a serverless video processing framework. in acm socc '18.  
+[26] krste asanović, ras bodik, bryan christopher catanzaro, joseph james gebis, parry husbands, kurt keutzer, david a. patterson, william lester plishker, john shalf, samuel webb williams, and katherine a. yelick. 2006. the landscape of parallel computing research: a view from berkeley. technical report ucb/eecs-2006-183. eecs department, university of california, berkeley. http://www2.eecs.berkeley.edu/pubs/techrpts/2006/eecs-2006-183.html  
+[27] yadu babuji, anna woodard, zhuozhao li, daniel s. katz, ben clifford, rohan kumar, lukasz lacinski, ryan chard, justin m. wozniak, ian foster, michael wilde, and kyle chard. [n.d.]. parsl: pervasive parallel programming in python. in acm hpdc '19.  
+[28] daniel barcelona-pons, marc sánchez-artigas, gerard paris, pierre sutra, and pedro garcía-lópez. [n.d.]. on the faas track: building stateful distributed applications with serverless architectures. in acm middleware '19.  
+[29] george bosilca, aurelien bouteiller, anthony danalis, thomas herault, pierre lemarinier, and jack dongarra. 2012. dague: a generic distributed dag engine for high performance computing. parallel comput. 38, 1-2 (jan. 2012), 37-51. https://doi.org/10.1016/j.parco.2011.10.003  
+[30] joao carreira, pedro fonseca, alexey tumanov, andrew zhang, and randy katz. 2019. cirrus: a serverless framework for end-to-end ml workflows. in proceedings of the acm symposium on cloud computing (santa cruz, ca, usa) (socc '19). acm, new york, ny, usa, 13-24. https://doi.org/10.1145/3357223.3362711  
+[31] benjamin carver, jingyuan zhang, ao wang, and yue cheng. 2019. in search of a fast and efficient serverless dag engine. in 2019 ieee/acm fourth international parallel data systems workshop (pdsw). 1-10.  
+[32] ryan chard, yadu babuji, zhuozhao li, tyler skluzacek, anna woodard, ben blaiszik, ian foster, and kyle chard. 2020. funcx: a federated function serving fabric for science. in proceedings of the 29th international symposium on high-performance parallel and distributed computing (stockholm, sweden) (hpdc '20). association for computing machinery, new york, ny, usa, 65-76. https://doi.org/10.1145/3369583.3392683  
+[33] corinna cortes and vladimir vapnik. 1995. support-vector networks. mach. learn. 20, 3 (sept. 1995), 273–297. https://doi.org/10.1023/a:1022627411411  
+[34] jeffrey dean and sanjay ghemawat. 2008. mapreduce: simplified data processing on large clusters. commun. acm 51, 1 (jan. 2008), 107-113. https://doi.org/10.1145/1327452.1327492  
+[35] fission. [n.d.]. serverless functions for kubernetes. https://fission.io/.  
+[36] sadjad fouladi, francisco romero, dan iter, qian li, shuvo chatterjee, christos kozyrakis, matei zaharia, and keith winstein. [n.d.]. from laptop to lambda: outsourcing everyday jobs to thousands of transient functional containers. in usenix atc 19.  
+[37] sadjad fouladi, riad s. wahby, brennan shacklett, karthikeyan vasuki balasubramaniam, william zeng, rahul bhalerao, anirudh sivaraman, george porter, and keith winstein. [n.d.]. encoding, fast and slow: low-latency video processing using thousands of tiny threads. in usenix nsdi 17.  
+[38] jim gray. 1985. why do computers stop and what can be done about it?  
+[39] jing guo, zihao chang, sa wang, haiyang ding, yihui feng, liang mao, and yungang bao. [n.d.]. who limits the resource efficiency of
+
+my datacenter: an analysis of alibaba datacenter traces. in  $acm$  iwqos '19.  
+[40] nathan halko, per-gunnar martinsson, and joel a. tropp. [n.d.]. finding structure with randomness: probabilistic algorithms for constructing approximate matrix decompositions. ([n.d.]). arxiv:0909.4061 http://arxiv.org/abs/0909.4061  
+[41] v. ishakian, v. muthusamy, and a. slominski. 2018. serving deep learning models in a serverless platform. in 2018 ieee international conference on cloud engineering (ic2e). 257-262. https://doi.org/10.1109/ic2e.2018.00052  
+[42] eric jonas, qifan pu, shivaram venkataraman, ion stoica, and benjamin recht. [n.d.]. occupy the cloud: distributed computing for the  $99\%$ . in acm socc '17.  
+[43] eric jonas, johann schleier-smith, vikram sreekanti, chia-che tsai, anurag khandelwal, qifan pu, vaishaal shankar, joao menezes carreira, karl krauth, neeraja yadwadkar, joseph gonzalez, raluca ada popa, ion stoica, and david a. patterson. 2019. cloud programming simplified: a berkeley view on serverless computing. technical report.  
+[44] ana klimovic, yawen wang, patrick stuedi, animesh trivedi, jonas pfefferle, and christos kozyrakis. 2018. pocket: elastic ephemeral storage for serverless analytics. in 13th usenix symposium on operating systems design and implementation (osdi 18). usenix association, carlsbad, ca, 427-444. https://www.usenix.org/conference/osdi18/presentation/klimovic  
+[45] yu-kwong kwok and ishfaq ahmad. 1999. static scheduling algorithms for allocating directed task graphs to multiprocessors. acm comput. surv. (1999).  
+[46] pedro garcía lópez, marc sánchez-artigas, gerard paris, daniel barcelona pons, álvaro ruiz ollobarren, and david arroyo pinto. [n.d.]. comparison of faas orchestration systems. ([n. d.]), 148-153. https://doi.org/10.1109/ucc-companion.2018.00049 arxiv:1807.11248  
+[47] maciej malawski, adam gajek, adam zima, bartosz balis, and kamil figiela. 2017. serverless execution of scientific workflows: experiments with hyperflow, aws lambda and google cloud functions. future generation computer systems (nov. 2017). https://doi.org/10.1016/j_future.2017.10.029  
+[48] philipp moritz, robert nishihara, stephanie wang, alexey tumanov, richard liaw, eric liang, melih elibol, zongheng yang, william paul, michael i. jordan, and ion stoica. 2018. ray: a distributed framework for emerging ai applications. in 13th usenix symposium on operating systems design and implementation (osdi 18). usenix association, carlsbad, ca, 561-577. https://www.usenix.org/conference/osdi18/presentation/moritz  
+[49] kay ousterhout, patrick wendell, matei zaharia, and ion stoica. [n.d.]. sparrow: distributed, low latency scheduling. in acm sosp '13.  
+[50] qifan pu, shivaram venkataraman, and ion stoica. [n.d.]. shuffling, fast and slow: scalable analytics on serverless infrastructure. in usenix nsdi 19.  
+[51] malte schwarzkopf, andy konwinski, michael abd-el-malek, and john wilkes. 2013. omega: flexible, scalable schedulers for large compute clusters. in proceedings of the 8th acm european conference on computer systems (prague, czech republic) (eurosys '13). acm, new york, ny, usa, 351–364. https://doi.org/10.1145/2465351.2465386  
+[52] vaishaal shankar, karl krauth, qifan pu, eric jonas, shivaram venkataraman, ion stoica, benjamin recht, and jonathan ragankelley. 2018. numpywren: serverless linear algebra. arxiv preprint arxiv:1810.09679 (2018).  
+[53] ao wang, jingyuan zhang, xiaolong ma, ali anwar, lukas rupprecht, dimitrios skourtis, vasily tarasov, feng yan, and yue cheng. 2020. infinicache: exploiting ephemeral serverless functions to build a cost-effective memory cache. in 18th usenix conference on file and storage
+
+technologies (fast 20). usenix association, santa clara, ca, 267-281. https://www.usenix.org/conference/fast20/presentation/wang-ao  
+[54] matei zaharia, mosharaf chowdhury, tathagata das, ankur dave, justin ma, murphy mccauly, michael j. franklin, scott shenker, and ion stoica. [n.d.]. resilient distributed datasets: a fault-tolerant abstraction for in-memory cluster computing. in usenix nsdi 12.  
+[55] kaihua zhu, hao wang, hongjie bai, jian li, zhihuan qiu, hang cui, and edward y. chang. 2008. parallelizing support vector machines on distributed computers. in advances in neural information processing systems 20, j. c. platt, d. koller, y. singer, and s. t. roweis (eds.). curran associates, inc., 257-264. http://papers.nips.cc/paper/3202-parallelizing-support-vector-machines-on-distributed-computers.pdf

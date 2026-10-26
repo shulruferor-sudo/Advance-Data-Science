@@ -1,0 +1,687 @@
+# never give up: learning directed exploration strategies
+
+adrià puigdomènech badia* pablo sprechmann* alex vitvitskyi daniel guo
+
+bilal piot steven kaptuowski olivier tieleman martin arjovsky
+
+alexander pritzel andew bolt charles blundell
+
+deepmind {adriap, psprechmann, avlife, danielguo, piot, skapturowski, tieleman, apritzel, abolt, cblundell}@google.com
+
+# abstract
+
+we propose a reinforcement learning agent to solve hard exploration games by learning a range of directed exploratory policies. we construct an episodic memory-based intrinsic reward using k-nearest neighbors over the agent's recent experience to train the directed exploratory policies, thereby encouraging the agent to repeatedly revisit all states in its environment. a self-supervised inverse dynamics model is used to train the embeddings of the nearest neighbour lookup, biasing the novelty signal towards what the agent can control. we employ the framework of universal value function approximators (uvfa) to simultaneously learn many directed exploration policies with the same neural network, with different trade-offs between exploration and exploitation. by using the same neural network for different degrees of exploration/exploitation, transfer is demonstrated from predominantly exploratory policies yielding effective exploitative policies. the proposed method can be incorporated to run with modern distributed rl agents that collect large amounts of experience from many actors running in parallel on separate environment instances. our method doubles the performance of the base agent in all hard exploration in the atari-57 suite while maintaining a very high score across the remaining games, obtaining a median human normalised score of  $1344.0\%$ . notably, the proposed method is the first algorithm to achieve non-zero rewards (with a mean score of 8,400) in the game of pitfall! without using demonstrations or hand-crafted features.
+
+# 1 introduction
+
+the problem of exploration remains one of the major challenges in deep reinforcement learning. in general, methods that guarantee finding an optimal policy require the number of visits to each state-action pair to approach infinity. strategies that become greedy after a finite number of steps may never learn to act optimally; they may converge prematurely to suboptimal policies, and never gather the data they need to learn. ensuring that all state-action pairs are encountered infinitely often is the general problem of maintaining exploration (françois-lavet et al., 2018; sutton & barto, 2018). the simplest approach for tackling this problem is to consider stochastic policies with a non-zero probability of selecting all actions in each state, e.g.  $\epsilon$ -greedy or boltzmann exploration. while these techniques will eventually learn the optimal policy in the tabular setting, they are very inefficient and the steps they require grow exponentially with the size of the state space. despite these shortcomings, they can perform remarkably well in dense reward scenarios (mnih et al., 2015). in sparse reward settings, however, they can completely fail to learn, as temporally-extended exploration (also called deep exploration) is crucial to even find the very few rewarding states (osband et al., 2016).
+
+recent approaches have proposed to provide intrinsic rewards to agents to drive exploration, with a focus on demonstrating performance in non-tabular settings. these intrinsic rewards are proportional to some notion of saliency quantifying how different the current state is from those already visited (bellemare et al., 2016; haber et al., 2018; houthooft et al., 2016; oh et al., 2015; ostrovski et al., 2017; pathak et al., 2017; stadie et al., 2015). as the agent explores the environment and becomes familiar with it, the exploration bonus disappears and learning is only driven by extrinsic rewards. this is a sensible idea as the goal is to maximise the expected sum of extrinsic rewards. while very good results have been achieved on some very hard exploration tasks, these algorithms face a fundamental limitation: after the novelty of a state has vanished, the agent is not encouraged to visit it again, regardless of the downstream learning opportunities it might allow (bellemare et al., 2016; ecoffet et al., 2019; stanton & clune, 2018). other methods estimate predictive forward models (haber et al., 2018; houthooft et al., 2016; oh et al., 2015; pathak et al., 2017; stadie et al., 2015) and use the prediction error as the intrinsic motivation. explicitly building models like this, particularly from observations, is expensive, error prone, and can be difficult to generalize to arbitrary environments. in the absence of the novelty signal, these algorithms reduce to undirected exploration schemes, maintaining exploration in a non-scalable way. to overcome this problem, a careful calibration between the speed of the learning algorithm and that of the vanishing rewards is required (ecoffet et al., 2019; ostrovski et al., 2017).
+
+the main idea of our proposed approach is to jointly learn separate exploration and exploitation policies derived from the same network, in such a way that the exploitative policy can concentrate on maximising the extrinsic reward (solving the task at hand) while the exploratory ones can maintain exploration without eventually reducing to an undirected policy. we propose to jointly learn a family of policies, parametrised using the uvfa framework (schaul et al., 2015a), with various degrees of exploratory behaviour. the learning of the exploratory policies can be thought of as a set of auxiliary tasks that can help build a shared architecture that continues to develop even in the absence of extrinsic rewards (jaderberg et al., 2016). we use reinforcement learning to approximate the optimal value function corresponding to several different weightings of intrinsic rewards.
+
+we propose an intrinsic reward that combines per-episode and life-long novelty to explicitly encourage the agent to repeatedly visit all controllable states in the environment over an episode. episodic novelty encourages an agent to periodically revisit familiar (but potentially not fully explored) states over several episodes, but not within the same episode. life-long novelty gradually down-modulates states that become progressively more familiar across many episodes. our episodic novelty uses an episodic memory filled with all previously visited states, encoded using the self-supervised objective of pathak et al. (2017) to avoid uncontrollable parts of the state space. episodic novelty is then defined as similarity of the current state to previously stored states. this allows the episodic novelty to rapidly adapt within an episode: every observation made by the agent potentially changes the per-episode novelty significantly. our life-long novelty multiplicatively modulates the episodic similarity signal and is driven by a random network distillation error (burda et al., 2018b). in contrast to the episodic novelty, the life-long novelty changes slowly, relying upon gradient descent optimisation (as opposed to an episodic memory write for episodic novelty). thus, this combined notion of novelty is able to generalize in complex tasks with large, high dimensional state spaces in which a given state is never observed twice, and maintain consistent exploration both within an episode and across episodes.
+
+this paper makes the following contributions: (i) defining an exploration bonus combining life-long and episodic novelty to learn exploratory strategies that can maintain exploration throughout the agent's training process (to never give up), (ii) to learn a family of policies that separate exploration and exploitation using a conditional architecture with shared weights, (iii) experimental evidence that the proposed method is scalable and performs on par or better than state-of-the-art methods on hard exploration tasks. our work differs from savinov et al. (2018) in that it is not specialised to navigation tasks, our method incorporates a long-term intrinsic reward and is able to separate exploration and exploitation policies. unlike stanton & clune (2018), our work relies on no privileged information and combines both episodic and non-episodic novelty, obtaining superior results. our work differs from beyer et al. (2019) in that we learn multiple policies by sharing weights, rather than just a common replay buffer, and our method does not require exact counts and so can scale to more realistic domains such as atari. the paper is organized as follows. in section 2 we describe the proposed intrinsic reward. in section 3, we describe the proposed agent and general framework. in section 4 we present experimental evaluation.
+
+![](images/0eb2459752a300c74c2e5194f1f41f92b26c3b0f0afd4c7269e53162f155f09b.jpg)  
+figure 1: (left) training architecture for the embedding network (right) ngu's reward generator.
+
+# 2 the never-give-up intrinsic reward
+
+we follow the literature on curiosity-driven exploration, where the extrinsic reward is augmented with an intrinsic reward (or exploration bonus). the augmented reward at time  $t$  is then defined as  $r_t = r_t^e + \beta r_t^i$ , where  $r_t^e$  and  $r_t^i$  are respectively the extrinsic and intrinsic rewards, and  $\beta$  is a positive scalar weighting the relevance of the latter. deep rl agents are typically trained on the augmented reward  $r_t$ , while performance is measured on extrinsic reward  $r_t^e$  only. this section describes the proposed intrinsic reward  $r_t^i$ .
+
+our intrinsic reward  $r_t^i$  satisfies three properties: (i) it rapidly discourages revisiting the same state within the same episode, (ii) it slowly discourages visits to states visited many times across episodes, (iii) the notion of state ignores aspects of an environment that are not influenced by an agent's actions.
+
+we begin by providing a general overview of the computation of the proposed intrinsic reward. then we provide the details of each one of the components. the reward is composed of two blocks: an episodic novelty module and an (optional) life-long novelty module, represented in red and green respectively in fig. 1 (right). the episodic novelty module computes our episodic intrinsic reward and is composed of an episodic memory,  $m$ , and an embedding function  $f$ , mapping the current observation to a learned representation that we refer to as controllable state. at the beginning of each episode, the episodic memory starts completely empty. at every step, the agent computes an episodic intrinsic reward,  $r_{t}^{\mathrm{episodic}}$ , and appends the controllable state corresponding to the current observation to the memory  $m$ . to determine the bonus, the current observation is compared to the content of the episodic memory. larger differences produce larger episodic intrinsic rewards. the episodic intrinsic reward  $r_{t}^{\mathrm{episodic}}$  promotes the agent to visit as many different states as possible within a single episode. this means that the notion of novelty ignores inter-episode interactions: a state that has been visited thousands of times gives the same intrinsic reward as a completely new state as long as they are equally novel given the history of the current episode.
+
+a life-long (or inter-episodic) novelty module provides a long-term novelty signal to statefully control the amount of exploration across episodes. we do so by multiplicatively modulating the exploration bonus  $r_t^{\text{episodic}}$  with a life-long curiosity factor,  $\alpha_t$ . note that this modulation will vanish over time, reducing our method to using the non-modulated reward. specifically, we combine  $\alpha_t$  with  $r_t^{\text{episodic}}$  as follows (see also fig. 1 (right)):
+
+$$
+r _ {t} ^ {i} = r _ {t} ^ {\text {e p i s o d i c}} \cdot \min  \left\{\max  \left\{\alpha_ {t}, 1 \right\}, l \right\} \tag {1}
+$$
+
+where  $l$  is a chosen maximum reward scaling (we fix  $l = 5$  for all our experiments). mixing rewards this way, we leverage the long-term novelty detection that  $\alpha_{t}$  offers, while  $r_{t}^{i}$  continues to encourage our agent to explore all the controllable states.
+
+**embedding network:**  $f: \mathcal{o} \to \mathbb{r}^p$  maps the current observation to a  $p$ -dimensional vector corresponding to its controllable state. consider an environment that has a lot of variability independent of the agent's actions, such as navigating a busy city with many pedestrians and vehicles. an agent could
+
+visit a large number of different states (collecting large cumulative intrinsic rewards) without taking any actions. this would not lead to performing any meaningful form of exploration. to avoid such meaningless exploration, given two consecutive observations, we train a siamese network (bromley et al., 1994; koch et al., 2015)  $f$  to predict the action taken by the agent to go from one observation to the next (pathak et al., 2017). intuitively, all the variability in the environment that is not affected by the action taken by the agent would not be useful to make this prediction. more formally, given a triplet  $\{x_{t},a_{t},x_{t + 1}\}$  composed of two consecutive observations,  $x_{t}$  and  $x_{t + 1}$ , and the action taken by the agent  $a_{t}$ , we parameterise the conditional likelihood as  $p(a|x_{t},x_{t + 1}) = h(f(x_{t}),f(x_{t + 1}))$ , where  $h$  is a one hidden layer mlp followed by a softmax. the parameters of both  $h$  and  $f$  are trained via maximum likelihood. this architecture can be thought of as a siamese network with a one-layer classifier on top, see fig. 1 (left) for an illustration. for more details about the architecture, see app. h.1, and hyperparameters, see app. f.
+
+episodic memory and intrinsic reward: the episodic memory  $m$  is a dynamically-sized slot-based memory that stores the controllable states in an online fashion (pritzel et al., 2017). at time  $t$ , the memory contains the controllable states of all the observations visited in the current episode,  $\{f(x_0), f(x_1), \ldots, f(x_{t-1})\}$ . inspired by theoretically-justified exploration methods turning state-action counts into a bonus reward (strehl & littman, 2008), we define our intrinsic reward as
+
+$$
+r _ {t} ^ {\text {e p i s o d i c}} = \frac {1}{\sqrt {n \left(f \left(x _ {t}\right)\right)}} \approx \frac {1}{\sqrt {\sum_ {f _ {i} \in n _ {k}} k \left(f \left(x _ {t}\right) , f _ {i}\right)} + c} \tag {2}
+$$
+
+where  $n(f(x_{t}))$  is the counts for the visits to the abstract state  $f(x_{t})$ . we approximate these counts  $n(f(x_{t}))$  as the sum of the similarities given by a kernel function  $k: \mathbb{r}^{p} \times \mathbb{r}^{p} \to \mathbb{r}$ , over the content of  $m$ . in practice, pseudo-counts are computed using the  $k$ -nearest neighbors of  $f(x_{t})$  in the memory  $m$ , denoted by  $n_{k} = \{f_{i}\}_{i=1}^{k}$ . the constant  $c$  guarantees a minimum amount of "pseudo-counts" (fixed to 0.001 in all our experiments). note that when  $k$  is a dirac delta function, the approximation becomes exact but consequently provides no generalisation of exploration required for very large state spaces. following blundell et al. (2016); pritzel et al. (2017), we use the inverse kernel for  $k$ ,
+
+$$
+k (x, y) = \frac {\epsilon}{\frac {d ^ {2} (x , y)}{d _ {m} ^ {2}} + \epsilon} \tag {3}
+$$
+
+where  $\epsilon$  is a small constant (fixed to  $10^{-3}$  in all our experiments),  $d$  is the euclidean distance and  $d_m^2$  is a running average of the squared euclidean distance of the  $k$ -th nearest neighbors. this running average is used to make the kernel more robust to the task being solved, as different tasks may have different typical distances between learnt embeddings. a detailed computation of the episodic reward can be found in alg. 1 in app. a.1.
+
+integrating life-long curiosity: in principle, any long-term novelty estimator could be used as a basis for the modulator  $\alpha_{t}$ . we found random network distillation (burda et al., 2018b, rnd) worked well, is simple to implement and easy to parallelize. the rnd modulator  $\alpha_{t}$  is defined by introducing a random, untrained convolutional network  $g:\mathcal{o}\to \mathbb{r}^k$ , and training a predictor network  $\hat{g}:\mathcal{o}\rightarrow \mathbb{r}^k$  that attempts to predict the outputs of  $g$  on all the observations that are seen during training by minimizing  $\mathrm{err}(x_t) = ||\hat{g} (x_t;\theta) - g(x_t)||^2$  with respect to the parameters of  $\hat{g},\theta$ . we then define the modulator  $\alpha_{t}$  as a normalized mean squared error, as done in burda et al. (2018b):  $\alpha_{t} = 1 + \frac{\mathrm{err}(x_{t}) - \mu_{e}}{\sigma_{e}}$ , where  $\sigma_{e}$  and  $\mu_{e}$  are running standard deviation and mean for  $\mathrm{err}(x_t)$ . for more details about the architecture, see app. h.2, and hyperparameters, see app. f.
+
+# 3 the never-give-up agent
+
+in the previous section we described an episodic intrinsic reward for learning policies capable of maintaining exploration in a meaningful way throughout the agent's training process. we now demonstrate how to incorporate this intrinsic reward into a full agent that maintains a collection of value functions, each with a different exploration-exploitation trade-off.
+
+using intrinsic rewards as a means of exploration subtly changes the underlying markov decision process (mdp) being solved: if the augmented reward  $r_t = r_t^e + \beta r_t^i$  varies in ways unpredictable from the action and states, then the decision process may no longer be a mdp, but instead be a partially observed mdp (pomdp). solving podmps can be much harder than solving mdps, so to
+
+avoid this complexity we take two approaches: firstly, the intrinsic reward is fed directly as an input to the agent, and secondly, our agent maintains an internal state representation that summarises its history of all inputs (state, action and rewards) within an episode. as the basis of our agent, we use recurrent replay distributed dqn (kapturowski et al., 2019, r2d2) as it combines a recurrent state, experience replay, off-policy value learning and distributed training, matching our desiderata.
+
+unlike most of the previously proposed intrinsic rewards (as seen in section 1), the never-give-up intrinsic reward does not vanish over time, and thus the learned policy will always be partially driven by it. furthermore, the proposed exploratory behaviour is directly encoded in the value function and as such it cannot be easily turned off. to overcome this problem, we proposed to jointly learn an explicit exploitative policy that is only driven by the extrinsic reward of the task at hand.
+
+proposed architecture: we propose to use a universal value function approximator (uvfa)  $q(x, a, \beta_i)$  to simultaneously approximate the optimal value function with respect to a family of augmented rewards of the form  $r_t^{\beta_i} = r_t^e + \beta_i r_t^i$ . we employ a discrete number  $n$  of values  $\{\beta_i\}_{i=0}^{n-1}$  including the special case of  $\beta_0 = 0$  and  $\beta_{n-1} = \beta$  where  $\beta$  is the maximum value chosen. in this way, one can turn-off exploratory behaviour simply by acting greedily with respect to  $q(x, a, 0)$ . even before observing any extrinsic reward, we are able to learn a powerful representation and set of skills that can be quickly transferred to the exploitative policy. in principle, one could think of having an architecture with only two policies, one with  $\beta_0 = 0$  and one with  $\beta_1 > 0$ . the advantage of learning a larger number of policies comes from the fact that exploitative and exploratory policies could be quite different from a behaviour standpoint. having a larger number of policies that change smoothly allows for more efficient training. for a detailed description of the specific values of  $\beta_i$  we use in our experiments, see app.a. we adapt the r2d2 agent that uses the dueling network architecture of wang et al. (2015) with an lstm layer after a convolutional neural network. we concatenate to the output of the network a one-hot vector encoding the value of  $\beta_i$ , the previous action  $a_{t-1}$ , the previous intrinsic reward  $r_t^i$  and the previous extrinsic reward  $r_t^e$ . we describe the precise architecture in app. h.3 and hyperparameters in app. f.
+
+rl loss functions: as a training loss we use a transformed retrace double q-learning loss. in app. e we provide the details of the computation of the retrace loss (munos et al., 2016). in addition, we associate for each  $\beta_{i}$  a  $\gamma_{i}$ , with  $\gamma_0 = 0.997$ , and  $\gamma_{n - 1} = 0.99$ . we remark that the exploitative policy  $\beta_{0}$  is associated with the highest discount factor  $\gamma_0 = \gamma_{\mathrm{max}}$  and the most exploratory policy  $\beta_{n - 1}$  with the smallest discount factor  $\gamma_0 = \gamma_{\mathrm{min}}$ . we can use smaller discount factors for the exploratory policies because the intrinsic reward is dense and the range of values is small, whereas we would like the highest possible discount factor for the exploitative policy in order to be as close as possible from optimizing the undiscounted return. for a detailed description of the specific values of  $\gamma_{i}$  we use in our experiments, see app. a.
+
+distributed training: recent works in deep rl have achieved significantly improved performance by running on distributed training architectures that collect large amounts of experience from many actors running in parallel on separate environment instances (andrychowicz et al., 2018; barth-maron et al., 2018; burda et al., 2018b; espeholt et al., 2018; horgan et al., 2018; kapturowski et al., 2019; silver et al., 2016). our agent builds upon the work by kapturowski et al. (2019) to decouple learning from acting, with actors (256 unless stated otherwise) feeding experience into a distributed replay buffer and the learner training on randomly sampled batches from it in a prioritized way (schaul et al., 2015b). please refer to app. a for details.
+
+# 4 experiments
+
+we begin by analyzing the exploratory policy of the never give up (ngu) agent with a single reward mixture. we perform such analysis by using a minimal example environment in section 4.1. we observe the performance of its learned policy, as well as highlight the importance of learning a representation for abstract states. in section 4.2, we analyze the performance of the full ngu agent, evaluating its effectiveness on the arcade learning environment (ale; bellemare et al. (2013)). we measure the performance of the agent against baselines on hard exploration games, as well as dense reward games. we expand on the analysis of the ngu agent by running it on the full set of atari games, as well as showing multiple ablations on important choices of hyperparameters of the model.
+
+![](images/3529aad316ffa91de323a25b22301af7867bc31bb5d34b70055c6d4cbbfcf9f4.jpg)  
+figure 2: (left and center) sample screens of random disco maze. the agent is in green, and pathways in black. the colors of the wall change at every time step. (right) learning curves for random projections vs. learned controllable states and a baseline rnd implementation.
+
+![](images/88a7e6fbe2dc10d8e44daad361ca1903b1e47bc9c5a4d7d8303c4d0f5798bdfb.jpg)
+
+![](images/8bbce7e7a1f8ac34992a5b3b6f0319cec7755ef0e1ea948c7aa469767bf110f6.jpg)
+
+# 4.1 controlled setting analysis
+
+in this section we present a simple example to highlight the effectiveness of the exploratory policy of the ngu agent, as well as the importance of estimating the exploration bonus using a controllable state representation. to isolate the effect of the exploratory policy, we restrict the analysis to the case of a single exploratory policy ( $n = 1$ , with  $\beta = 0.3$ ). we introduce a gridworld environment, random disco maze, implemented with the pycolab game engine (stepleton, 2017), depicted in fig. 2 (left). at each episode, the agent finds itself in a new randomly generated maze of size  $21 \times 21$ . the agent can take four actions {left, right, up, down}, moving a single position at a time. the environment is fully observable. if the agent steps into a wall, the episode ends and a new maze is generated. crucially, at every time step, the color of each wall fragment is randomly sampled from a set of five possible colors, enormously increasing the number of possible states. this irrelevant variability in color presents a serious challenge to algorithms using exploration bonuses based on novelty, as the agent is likely to never see the same state twice. this experiment is purely exploratory, with no external reward. the goal is to see if the proposed model can learn a meaningful directed exploration policy despite the large visual distractions providing a continual stream of observation novelty to the agent. fig. 2 shows the percentage of unique states (different positions in the maze) visited by agents trained with the proposed model and one in which the mapping  $f$  is a fixed random projection (i.e.  $f$  is untrained). the proposed model learns to explore any maze sampled from the task-distribution. the agent learns a strategy that resembles depth-first search: it explores as far as possible along each branch before backtracking (often requiring backtracking a few dozen steps to reach an unexplored area). the model with random projections, as well as our baseline of rnd, do not show such exploratory behaviour<sup>1</sup>. both models do learn to avoid walking into walls, doing so would limit the amount of intrinsic reward it would receive. however, staying alive is enough: simply oscillating between two states will produce different (and novel) controllable states at every time step.
+
+# 4.2 atari results
+
+in this section, we evaluate the effectiveness of the ngu agent on the arcade learning environment (ale; (bellemare et al., 2013)). we use standard atari evaluation protocol and pre-processing as described in tab. 8 of app. f.4, with the only difference being that we do not use frame stacking. we restrict ngu to using the same setting and data consumption as r2d2, the best performing algorithm on atari (kapturowski et al., 2019). while we compare our results with the best published methods on this benchmark, we note that different baselines use very different training regimes with very different computational budgets. comparing distributed and non-distributed methods is in general difficult. in an effort to properly assess the merits of the proposed model we include two additional baselines: as ngu is based on r2d2 using the retrace loss (instead of its n-step objective) we include this as a baseline, and since we use rnd as a reward modulator, we also include r2d2 with retrace using the rnd intrinsic reward. these methods are all run for 35 billion frames using the same protocol as that of r2d2 (kapturowski et al., 2019). we detail the use of compute resources of the algorithms in app. d. we report the return averaged over 3 different seeds.
+
+architecture: we adopt the same core architecture as that used by the r2d2 agent to facilitate comparisons. there are still a few choices to make, namely: the size of the learned controllable states,
+
+![](images/7d0188fcd44b1dcea4a2494f4d67e82f099c48aa461f85be6182bcc8e36e0825.jpg)  
+figure 3: human normalized scores on dense reward and hard exploration games.
+
+the clipping factor  $l$  in (1), and the number of nearest neighbours to use for computing pseudo-counts in (2). we selected these hyperparameters by analysing the performance of the single policy agent,  $\mathrm{ngu}(n = 1)$ , on two representative exploration games: montezuma's revenge and pitfall!. we report this study in app. b. we used the same fixed set of hyperparameters in all the remaining experiments.
+
+ngu agent: we performed further ablations in order to better understand several major design choices of the full ngu agent on a set of 8 atari games: the set of 5 dense reward games chosen to select the hyperparameters of mnih et al. (2015), as well as 3 hard exploration games (montezuma's revenge, pitfall!, and private eye). for a detailed description of the results on these games as well as results on more choices of hyperparameters, please see app.c. the ablations we perform are on the number of mixtures  $n$ , the impact of the off-policy data used (referred to as cmr below), the maximum magnitude of  $\beta$  (by default 0.3 if not explicitly mentioned), the use of rnd to scale the intrinsic reward, and the performance of the agent in absence of extrinsic rewards. we denote by cross mixture ratio (cmr) the proportion in the training batches of experience collected using different values of  $\beta_{i}$  from the one being trained. a cmr of 0 means training each policy only with data produced by the same  $\beta_{i}$ , while a cmr of 0.5 means using equal amounts of data produced by  $\beta_{i}$  and  $\beta_{j\neq i}$ . our base agent ngu has a cmr of 0.
+
+the results are shown in fig. 3. several conclusions can be extracted from these results: firstly, sharing experience from all the actors (with cmr of 0.5) slightly harms overall average performance on hard exploration games. this suggests that the power of acting differently for different conditioning mixtures is mostly acquired through the shared weights of the model rather than shared data. secondly, we observe an improvement, on average, from increasing the number of mixtures  $n$  on hard exploration games. thirdly, as one can observe in analyzing the value of  $\beta$ , the value of  $\beta = 0.3$  is the best average performing value, whereas  $\beta = 0.2$  and  $\beta = 0.5$  make the average performance worse on those hard exploration games. these values indicate, in this case, the limits in which ngu is either not having highly enough exploratory variants ( $\beta$  too low) or policies become too biased towards exploratory behavior ( $\beta$  too high). further, the use of the rnd factor seems to be greatly beneficial on these hard exploration games. this matches the great success of existing literature, in which long-term intrinsic rewards appear to have a great impact (bellemare et al., 2016; ostrovski et al., 2017; choi et al., 2018). additionally, as outlined above, the motivation behind studying these variations on this set of 8 games is that those hyperparameters are of general effect, rather than specific to exploration. however, surprisingly, with the exception of the case of removing the extrinsic reward, they seem to have little effect on the dense reward games we analyze (with all error bars overlapping). this suggests that ngu and its hyperparameters are relatively robust: as extrinsic rewards become dense, intrinsic rewards (and their relative weight to the extrinsic rewards) naturally become less relevant. finally, even without extrinsic reward  $r^e$ , we can still obtain average superhuman performance on the 5 dense reward games we evaluate, indicating that the exploration policy of ngu is an adequate high performing prior for this set of tasks. that confirms the findings of burda et al. (2018a), where they showed that there is a high degree of alignment between the intrinsic curiosity objective and the hand-designed extrinsic rewards of many game environments. the heuristics of surviving and exploring what is controllable seem to be highly general and beneficial, as we have seen in the disco maze environment in section 4.1, as well as on atari.
+
+<table><tr><td>algorithm</td><td>gravitar</td><td>mr</td><td>pitfall!</td><td>privateeye</td><td>solaris</td><td>venture</td></tr><tr><td>human</td><td>3.4k</td><td>4.8k</td><td>6.5k</td><td>69.6k</td><td>12.3k</td><td>1.2k</td></tr><tr><td>best baseline</td><td>15.7k</td><td>11.6k</td><td>0.0</td><td>11k</td><td>5.5k</td><td>2.0k</td></tr><tr><td>rnd</td><td>3.9k</td><td>10.1k</td><td>-3</td><td>8.7k</td><td>3.3k</td><td>1.9k</td></tr><tr><td>r2d2+rnd</td><td>15.6k±0.6k</td><td>10.4k±1.2k</td><td>-0.5±0.3</td><td>19.5k±3.5k</td><td>4.3k±0.6k</td><td>2.7k±0.0k</td></tr><tr><td>r2d2(retrace)</td><td>13.3k±0.6k</td><td>2.3k±0.4k</td><td>-3.5±1.2</td><td>32.5k±4.7k</td><td>6.0k±1.1k</td><td>2.0k±0.0k</td></tr><tr><td>ngu(n=1)-rnd</td><td>12.4k±0.8k</td><td>3.0k±0.0k</td><td>15.2k±9.4k</td><td>40.6k±0.0k</td><td>5.7k±1.8k</td><td>46.4±37.9</td></tr><tr><td>ngu(n=1)</td><td>11.0k±0.7k</td><td>8.7k±1.2k</td><td>9.4k±2.2k</td><td>60.6k±16.3k</td><td>5.9k±1.6k</td><td>876.3±114.5</td></tr><tr><td>ngu(n=32)</td><td>14.1k±0.5k</td><td>10.4k±1.6k</td><td>8.4k±4.5k</td><td>100.0k±0.4k</td><td>4.9k±0.3k</td><td>1.7k±0.1k</td></tr></table>
+
+table 1: results against exploration algorithm baselines. best baseline takes the best result among r2d2 (kapturowski et al., 2019), dqn + pixelcnn (ostrovski et al., 2017), dqn + cts (bellemare et al., 2016), rnd (burda et al., 2018b), and ppo + coex (choi et al., 2018) for each game.
+
+![](images/f69e92eafd2e4f1de3f4ed5299da3d9b64c927d18de583457b4bbe4b2c2ee5c9.jpg)  
+figure 4: human normalized scores on the 6 hard exploration games.
+
+**hard exploration games:** we now evaluate the full ngu agent on the six hard exploration games identified by bellemare et al. (2016). we summarise the results on tab. 1. the proposed method achieves on similar or higher average return than state-of-the-art baselines on all hard exploration tasks. remarkably, to the best of our knowledge, this is the first method without use of privileged information that obtains a positive score on pitfall!, with  $\mathrm{ngu}(n = 1)$ -rnd obtaining a best score of 15,200. moreover, in 4 of the 6 games,  $\mathrm{ngu}(n = 32)$  appears to substantially improve against the single mixture case  $\mathrm{ngu}(n = 1)$ . this shows how the exploitative policy is able to leverage the shared weights with all the intrinsically-conditioned mixtures to explore games in which it is hard to do so, but still optimize towards maximizing the final episode score. in fig. 4 we can see these conclusions more clearly: both in terms of mean and median human normalized scores, ngu greatly improves upon existing algorithms.
+
+while direct comparison of the scores is interesting, the emphasis of this work is on learning directed exploration strategies that encourage the agent to cover as much of the environment as possible. in fig. 4.2 (left) we observe the average episodic return of ngu run with and without rnd on pitfall!.  $\mathrm{ngu}(n = 32)$  is able to learn a directed exploration policy capable of exploring an average of 46 rooms per episode, crossing 14 rooms before receiving the first extrinsic reward. we also observe that, in this case, using rnd makes our model be less data efficient. this is also the case for  $\mathrm{ngu}(n = 1)$  as observed on  $\mathrm{ngu}(n = 1)$ -rnd in tab. 1, the best performing pitfall! agent. we conjecture three main hypotheses to explain this: firstly, on pitfall! (and unlike montezuma's revenge) rooms are frequently aliased to one another, thus the agent does not obtain a large reward for discovering new rooms. this phenomenon would explain the results seen in fig. 4.2 (right), in which rnd greatly improves the results of  $\mathrm{ngu}(n = 32)$ . secondly, the presence of a timer in the observation acts as a spurious source of novelty which greatly increases the number of unique states achievable even within a single room. thirdly, as analyzed in section 3.7 of burda et al. (2018b), rnd-trained agents often keep 'interacting with danger' instead of exploring further, and pitfall! is a game in which this can be highly detrimental, due to the high amount of dangerous elements in each room. finally, we observe that  $\mathrm{ngu}(n = 1)$  obtains better results than  $\mathrm{ngu}(n = 32)$ . our intuition is that, in this case, a single policy should be simpler to learn and can achieve quite good results on this task, since exploration and exploitation policies are greatly similar.
+
+dense reward games: tab. 2 shows the results of our method on dense reward games.  $\mathrm{ngu}(n = 1)$  underperforms relative to r2d2 on most games (indeed the same can be said of r2d2(retrace) that serves as the basis of ngu). since the intrinsic reward signal may be completely misaligned with the goal of the game, these results may be expected. however, there are cases such as pong, in which  $\mathrm{ngu}(n = 1)$  catastrophically fails to learn to perform well. here is where  $\mathrm{ngu}(n = 32)$  solves
+
+![](images/80548ab72c9c1583a1c26440283ea308acabfd34fc4022a3caf577ea0e8795f0.jpg)
+
+![](images/e7a98f36a53a17705175c822679a9214f26d8312a5d85f66e0c79e76948b3734.jpg)
+
+figure 5: mean episodic return for agents trained (left) pitfall! and (right) montezuma's revenge.  
+
+<table><tr><td>algorithm</td><td>pong</td><td>qbert</td><td>breakout</td><td>space invaders</td><td>beam rider</td></tr><tr><td>human</td><td>14.6</td><td>13.4k</td><td>30.5</td><td>1.6k</td><td>16.9k</td></tr><tr><td>r2d2</td><td>21.0</td><td>408.8k</td><td>837.7</td><td>43.2k</td><td>188.2k</td></tr><tr><td>r2d2+rnd</td><td>20.7±0.0</td><td>353.5k±41.0k</td><td>815.8±5.3</td><td>54.5k±2.8k</td><td>85.7k±9.0k</td></tr><tr><td>r2d2(retrace)</td><td>20.9±0.0</td><td>415.6k±55.8k</td><td>838.3±7.0</td><td>35.0k±13.0k</td><td>111.1k±5.0k</td></tr><tr><td>ngu(n=1)-rnd</td><td>-8.1±1.7</td><td>647.1k±50.5k</td><td>864.0±0.0</td><td>45.3k±4.9k</td><td>166.5k±8.6k</td></tr><tr><td>ngu(n=1)</td><td>-9.4±2.6</td><td>684.7k±8.8k</td><td>864.0±0.0</td><td>43.0k±3.9k</td><td>114.6k±2.3k</td></tr><tr><td>ngu(n=32)</td><td>19.6±0.1</td><td>465.8k±84.9k</td><td>532.8±16.5</td><td>44.6k±1.2k</td><td>68.7k±11.1k</td></tr></table>
+
+table 2: results against baselines on dense reward games.
+
+this issue: the exploitative policy learned by the agent is able to reliably learn to play the game. nevertheless,  $\mathrm{ngu}(n = 32)$  has limitations: even though its learned policies are vastly superhuman and empirically reasonable, they do not match r2d2 on breakout and beam rider. this suggests that the representations learned by using the intrinsic signal still slightly interfere with the learning process of the exploitative mixture. we hypothesize that alleviating this further by having non-shared representations between mixtures should help in solving this issue.
+
+results on all atari 57 games: the proposed method achieves an overall median score of  $1354.4\%$ , compared to  $95\%$  for nature dqn baseline,  $191.8\%$  for impala,  $1920.6\%$  for r2d2, and  $1451.8\%$  for r2d2 using retrace loss. please refer to app. g for separate results on individual games. even though its overall median score is lower than r2d2, ngu maintains good performance on all games, performing above human level on 51 out of the 57 games. this also shows further confirmation that the learned exploitative mixture is still able to focus on maximizing the score of the game, making the algorithm able to obtain great performance across all games.
+
+analysis of multiple mixtures: in fig. 6, we can see  $\mathrm{ngu}(n = 32)$  evaluated with  $\beta_0 = 0$  (used in all reported numerical results) against  $\mathrm{ngu}(n = 32)$  evaluated with  $\beta_{31} = 0.3$ . we can observe different trends in the games: on  $q^{*}$  bert the policies of the agent seem to converge to the exploitative policy regardless of the  $\beta$  condition, with its learning curve being almost identical to the one shown for r2d2 in kapturowski et al. (2019). as seen in app. g, this is common in many games. the second most common occurrence is what we see on pitfall! and beam rider, in which the policies quantitatively learn very different behaviour. in these cases, the exploitative learns to focus on its objective, and sometimes it does so by benefiting from the learnings of the exploratory policy, as it is the case in pitfall!², where r2d2 never achieves a positive score. finally, there is the exceptional case of montezuma's revenge, in which the reverse happens: the exploratory policy obtains better score than the exploitative policy. in this case, extremely long-term credit assignment is required in order for the exploitative policy to consolidate the knowledge of the exploratory policy. this is because, to achieve scores that are higher than 16k, the agent needs to go to the second level of the game, going through many non-greedy and sometimes irreversible actions. for a more detailed analysis of this specific problem, see app. i.2.
+
+# 5 conclusions
+
+we present a reinforcement learning agent that can effectively learn on both sparse and dense reward scenarios. the proposed agent achieves high scores in all atari hard-exploration games, while still maintaining a very high average score over the whole atari-57 suite. remarkably, it is, to the best of our knowledge, the first algorithm to achieve non-zero rewards on the challenging game of pitfall! without relying on human demonstrations, hand-crafted features, or manipulating the state of the environment. a central contribution of this work is a method for learning policies that can maintain
+
+![](images/07cee2c2d6e3640bf5e4d88aa6dca767fcee85f48603b098cfa1ee8ac085a234.jpg)
+
+![](images/a6e4a2e45745f6c7c39d411e5a75a568b95a3c921273881dcd7d5f00ce2f627a.jpg)
+
+![](images/0aa3f4d7df509259aeb5a8a98ea5461bacf062e0948374a9937dd2e2813a2260.jpg)  
+figure 6:  $\mathrm{ngu}(\mathrm{n} = 32)$  behavior for  $\beta_0$  (blue) and  $\beta_{31}$  (orange).
+
+![](images/b0e8fa737b1a470e7ed74f7c495006a6d509df50c7f1516edaa467e57bd7070b.jpg)
+
+exploration throughout the training process. in the absence of extrinsic rewards, the method produces a policy that aims at traversing all controllable states of the mdp in a depth-first manner. we highlight that this could have impact beyond this specific application and/or algorithmic choices. for instance, one could use it as a behaviour policy to facilitate learning models of the environment or as a prior for planning methods.
+
+the proposed method is able to leverage large amounts of compute by running on distributed training architectures that collect large amounts of experience from many actors running in parallel on separate environment instances. this has been crucial for solving most challenging tasks in deep rl in recent years (andrychowicz et al., 2018; espeholt et al., 2018; silver et al., 2016), and this method is able to utilize such compute to obtain strong performance on the set of hard-exploration games on atari. while this is certainly a desirable feature and allows ngu to achieve a remarkable performance, it comes at the price of high sample complexity, consuming a large amount of simulated experience taking several days of wall-clock time. an interesting avenue for future research lies in improving the data efficiency of these agents.
+
+further, the episodic novelty measure relies on the notion of controllable states to drive exploration. as observed on the atari hard-exploration games, this strategy performs well on several tasks, but it may not be the right signal for some environments. for instance, in some environments it might take more than two consecutive steps to see the consequences of the actions taken by the agent. an interesting line for future research is learning effective controllable states beyond a simple inverse dynamics model.
+
+additionally, the proposed work relies on the assumption that while different, one can find good exploratory and exploitative policies that are similar enough to be effectively represented using a shared parameterization (implemented using the uvfa framework). this can be limiting when the two policies are almost adversarial. this can be seen in games such as 'surround' and 'ice hockey'.
+
+finally, the hyperparameter  $\beta$  depends on the scale of the extrinsic reward. thus, environments with significantly different extrinsic reward scales, might require different values of  $\beta$ . an interesting avenue forward is the dynamic adaptation of  $\beta$ , which could be done by using techniques such as population based training (pbt)(jaderberg et al., 2017) or meta-gradients(xu et al., 2018). another advantage of dynamically tuning this hyperparameter would be to allow for the model to become completely exploitative when the agent has reached a point in which further exploring does not lead to improvements on the exploitative policy. this is not trivially achievable however, as including such a mechanism would require calibrating the adaptation to be aligned to the speed of learning of the exploitative policy.
+
+# acknowledgments
+
+we thank daan wierstra, steph hughes-fitt, andrea banino, meire fortunato, melissa tan, benigno uria, borja ibarz, mohammad gheshlaghi azar, remi munos, bernardo avila pires, andre barreto, vali irimia, sam ritter, david raposo, tom schaul and many other colleagues at deepmind for helpful discussions and comments on the manuscript.
+
+# references
+
+marcin andrychowicz, bowen baker, maciek chociej, rafal jozefowicz, bob mcgrew, jakub pachocki, arthur petron, matthias plappert, glenn powell, alex ray, et al. learning dexterous in-hand manipulation. arxiv preprint arxiv:1808.00177, 2018.  
+gabriel barth-maron, matthew w hoffman, david budden, will dabney, dan horgan, alistair muldal, nicolas heess, and timothy lillicrap. distributed distributional deterministic policy gradients. arxiv preprint arxiv:1804.08617, 2018.  
+marc bellemare, sriram srinivasan, georg ostrovski, tom schaul, david saxton, and remi munos. unifying count-based exploration and intrinsic motivation. in advances in neural information processing systems, pp. 1471-1479, 2016.  
+marc g bellemare, yavar naddaf, joel veness, and michael bowling. the arcade learning environment: an evaluation platform for general agents. journal of artificial intelligence research, 47: 253-279, 2013.  
+lucas beyer, damien vincent, olivier teboul, sylvain gelly, matthieu geist, and olivier pietquin. mulex: disentangling exploitation from exploration in deep rl. arxiv preprint arxiv:1907.00868, 2019.  
+charles blundell, benigno uria, alexander pritzel, yazhe li, avraham ruderman, joel z leibo, jack rae, daan wierstra, and demis hassabis. model-free episodic control. arxiv preprint arxiv:1606.04460, 2016.  
+jane bromley, isabelle guyon, yann lecun, eduard säckinger, and roopak shah. signature verification using a" siamese" time delay neural network. in advances in neural information processing systems, pp. 737-744, 1994.  
+yuri burda, harri edwards, deepak pathak, amos storkey, trevor darrell, and alexei a efros. large-scale study of curiosity-driven learning. arxiv preprint arxiv:1808.04355, 2018a.  
+yuri burda, harrison edwards, amos storkey, and oleg klimov. exploration by random network distillation. arxiv preprint arxiv:1810.12894, 2018b.  
+jongwook choi, yijie guo, marcin moczulski, junhyuk oh, neal wu, mohammad norouzi, and honglak lee. contingency-aware exploration in reinforcement learning. arxiv preprint arxiv:1811.01483, 2018.  
+adrien ecoffet, joost huizinga, joel lehman, kenneth o stanley, and jeff clune. go-exlore: a new approach for hard-exploration problems. arxiv preprint arxiv:1901.10995, 2019.  
+lasse espeholt, hubert soyer, remi munos, karen simonyan, volodymir mnih, tom ward, yotam doron, vlad firoiu, tim harley, iain dunning, et al. impala: scalable distributed deep-rl with importance weighted actor-learner architectures. arxiv preprint arxiv:1802.01561, 2018.  
+vincent françois-lavet, peter henderson, riashat islam, marc g bellemare, joelle pineau, et al. an introduction to deep reinforcement learning. foundations and trends® in machine learning, 11 (3-4):219-354, 2018.  
+nick haber, damian mrowca, stephanie wang, li f fei-fei, and daniel l yamins. learning to play with intrinsically-motivated, self-aware agents. in advances in neural information processing systems, pp. 8388-8399, 2018.  
+dan horgan, john quan, david budden, gabriel barth-maron, matteo hessel, hado van hasselt, and david silver. distributed prioritized experience replay. arxiv preprint arxiv:1803.00933, 2018.  
+rein houthooft, xi chen, yan duan, john schulman, filip de turck, and pieter abbeel. vime: variational information maximizing exploration. in advances in neural information processing systems, pp. 1109-1117, 2016.
+
+max jaderberg, volodymyr mnih, wojciech marian czarnecki, tom schaul, joel z leibo, david silver, and koray kavukcuoglu. reinforcement learning with unsupervised auxiliary tasks. arxiv preprint arxiv:1611.05397, 2016.  
+max jaderberg, valentin dalibard, simon osindero, wojciech m czarnecki, jeff donahue, ali razavi, oriol vinyals, tim green, iain dunning, karen simonyan, et al. population based training of neural networks. arxiv preprint arxiv:1711.09846, 2017.  
+steven kaptuowski, georg ostrovski, will dabney, john quan, and remi munos. recurrent experience replay in distributed reinforcement learning. in international conference on learning representations, 2019.  
+hyoungseok kim, jaekyeom kim, yeonwoo jeong, sergey levine, and hyun oh song. emi: exploration with mutual information maximizing state and action embeddings. arxiv preprint arxiv:1810.01176, 2018.  
+gregory koch, richard zemel, and ruslan salakhutdinov. siamese neural networks for one-shot image recognition. in icml deep learning workshop, volume 2, 2015.  
+volodymyr mnih, koray kavukcuoglu, david silver, andrei a rusu, joel veness, marc g bellemare, alex graves, martin riedmiller, andreas k fidjeland, georg ostrovski, et al. human-level control through deep reinforcement learning. nature, 518(7540):529, 2015.  
+rémi munos, tom stepleton, anna harutyunyan, and marc bellemare. safe and efficient off-policy reinforcement learning. in advances in neural information processing systems, pp. 1046-1054, 2016.  
+junhyuk oh, xiaoxiao guo, honglak lee, richard l lewis, and satinder singh. action-conditional video prediction using deep networks in atari games. in advances in neural information processing systems, pp. 2863-2871, 2015.  
+ian osband, charles blundell, alexander pritzel, and benjamin van roy. deep exploration via bootstrapped dqn. in advances in neural information processing systems, pp. 4026-4034, 2016.  
+georg ostrovski, marc g bellemare, aäron van den oord, and rémi munos. count-based exploration with neural density models. in proceedings of the 34th international conference on machine learning-volume 70, pp. 2721-2730. jmlr.org, 2017.  
+deepak pathak, pulkit agrawal, alexei a efros, and trevor darrell. curiosity-driven exploration by self-supervised prediction. in proceedings of the ieee conference on computer vision and pattern recognition workshops, pp. 16-17, 2017.  
+tobias pohlen, bilal piot, todd hester, mohammad gheshlaghi azar, dan horgan, david budden, gabriel barth-maron, hado van hasselt, john quan, mel večerík, et al. observe and look further: achieving consistent performance on atari. arxiv preprint arxiv:1805.11593, 2018.  
+alexander pritzel, benigno uria, sriram srinivasan, adrià puigdomènech, oriol vinyals, demis hassabis, daan wierstra, and charles blundell. neural episodic control. icml, 2017.  
+nikolay savinov, anton raichuk, raphaël marinier, damien vincent, marc pollefeys, timothy lillicrap, and sylvain gelly. episodic curiosity through reachability. arxiv preprint arxiv:1810.02274, 2018.  
+tom schaul, daniel horgan, karol gregor, and david silver. universal value function approximators. in international conference on machine learning, pp. 1312-1320, 2015a.  
+tom schaul, john quan, ioannis antonoglou, and david silver. prioritized experience replay. corr, abs/1511.05952, 2015b.  
+david silver, aja huang, chris j maddison, arthur guez, laurent sifre, george van den driessche, julian schrittwieser, ioannis antonoglou, veda panneershelvam, marc lanctot, et al. mastering the game of go with deep neural networks and tree search. nature, 529(7587):484-489, 2016.
+
+bradly c stadie, sergey levine, and pieter abbeel. incentivizing exploration in reinforcement learning with deep predictive models. arxiv preprint arxiv:1507.00814, 2015.  
+christopher stanton and jeff clune. deep curiosity search: intra-life exploration can improve performance on challenging deep reinforcement learning problems. arxiv preprint arxiv:1806.00553, 2018.  
+tom stepleton. the pycolab game engine. https://github.com/deepmind/pycolab/tree/master/pycolab, 2017.  
+alexander l strehl and michael l littman. an analysis of model-based interval estimation for markov decision processes. journal of computer and system sciences, 74(8):1309-1331, 2008.  
+richard s sutton and andrew g barto. reinforcement learning: an introduction. mit press, 2018.  
+ziyu wang, tom schaul, matteo hessel, hado van hasselt, marc lanctot, and nando de freitas. *dueling network architectures for deep reinforcement learning.* arxiv preprint arxiv:1511.06581, 2015.  
+david warde-farley, tom van de wiele, tejas kulkarni, catalin ionescu, steven hansen, and volodymyr mnih. unsupervised control through non-parametric discriminative rewards. arxiv preprint arxiv:1811.11359, 2018.  
+zhongwen xu, hado p van hasselt, and david silver. meta-gradient reinforcement learning. in advances in neural information processing systems, pp. 2396-2407, 2018.
+
+# a evaluation setup
+
+the evaluation we do is also identical to the one done in r2d2 kapturowski et al. (2019): a parallel evaluation worker, which shares weights with actors and learners, runs the q-network against the environment. this worker and all the actor workers are the two types of workers that draw samples from the environment. for atari, we apply the standard dqn pre-processing, as used in r2d2. more concretely, this is how actors, evaluators, and learner are run:
+
+# learner:
+
+- sample from the replay buffer a sequence of augmented rewards  $r_t$ , intrinsic rewards  $r_t^i$ , observations  $x$ , actions  $a$  and discounts  $\gamma_i$ .  
+- use q-network to learn from  $(r_t, x, a)$  with retrace using the procedure used by r2d2. as specified in fig. 1,  $r_t^i$  is sampled because it is fed as an input to the network.  
+- use last 5 frames of the sampled sequences to train the action prediction network as specified in section 2. this means that, for every batch of sequences, all time steps are used to train the rl loss, whereas only 5 time steps per sequence are used to optimize the action prediction loss.  
+- (if using rnd) also use last 5 frames of the sampled sequences to train the predictor of rnd as also specified in section 2.
+
+# evaluator and actor
+
+- obtain  $x_{t}, r_{t}^{e}, r_{t - 1}^{i}$ , and discount  $\gamma_{i}$ .  
+- with these inputs, compute forward pass of r2d2 to obtain  $a_{t}$ .  
+- with  $x_{t}$ , compute  $r_{t}^{i}$  using the embedding network as described in section 2.  
+- (actor) insert  $x_{t}, a_{t}, r_{t} = r_{t}^{e} + \beta_{i}r_{t}^{i}, \gamma_{i}$ , and  $r_{t}^{i}$  in the replay buffer.  
+- step on the environment with  $a_{t}$ .
+
+# distributed training
+
+as in r2d2, we train the agent with a single gpu-based learner, performing approximately 5 network updates per second (each update on a mini-batch of 64 length-80 sequences, as explained below, and each actor performing  $\sim 260$  environment steps per second on atari. we assign to each actor a fixed value in the set  $\{\beta_i\}_{i = 0}^{n - 1}$  and the actor acts according to an  $\epsilon$ -greedy version of this policy. more concretely for the  $j$ -th actor we assign the value  $\beta_{h}$  with  $h = j \mod n - 1$ . in our experiments, we use the following  $\beta_{i}$ :
+
+$$
+\beta_ {i} = \left\{ \begin{array}{l l} 0 & \text {i f} i = 0 \\ \beta & \text {i f} i = n - 1 \\ \beta \cdot \sigma (1 0 ^ {\frac {2 i - (n - 2)}{n - 2}}) & \text {o t h e r w i s e} \end{array} \right.
+$$
+
+where  $\sigma$  is the sigmoid function. this choice of  $\beta_{i}$ , as you can see in fig.7(a), allows to focus more on the two extreme cases which are the fully exploitative policy and very exploratory policy.
+
+in the replay buffer, we store fixed-length sequences of  $(x,a,r)$  tuples. in all our experiments we collect sequences of length 80 timesteps, where adjacent overlap by 40 time-steps. these sequences never cross episode boundaries. additionally, we store in the replay the value of the  $\beta_{i}$  used by the actor as well as the initial recurrent state, that we use to initialize the network at training time. please refer to kapturowski et al. (2019) for a detailed experimental of trade-offs on different treatments of recurrent states in replay. given a single batch of trajectories we unroll both online and target networks on the same sequence of states to generate value estimates. we use prioritized experience replay. we followed the same prioritization scheme proposed in kapturowski et al. (2019) using a mixture of max and mean of the td-errors with priority exponent  $\eta = 1.0$ . in addition, we associate for each  $\beta_{i}$  a  $\gamma_{i}$  such that:
+
+$$
+\gamma_ {i} = 1 - \exp \left(\frac {(n - 1 - i) \log (1 - \gamma_ {\max }) + i \log (1 - \gamma_ {\min })}{n - 1}\right), \tag {4}
+$$
+
+where  $\gamma_{\mathrm{max}}$  is the maximum discount factor and  $\gamma_{\mathrm{min}}$  is the minimal discount factor. this form allows to have discount factors evenly spaced in log-space between  $1 - \gamma_{\mathrm{max}}$  and  $1 - \gamma_{\mathrm{min}}$ . for more intuition, we provide a graph of the  $\{\gamma_i\}_{i = 0}^{n - 1}$  in fig.7(b) in app.a. we remark that the exploitative policy  $\beta_0$  is associated with the highest discount factor  $\gamma_0 = \gamma_{\mathrm{max}}$  and the most exploratory policy  $\beta_{n - 1}$  with the smallest discount factor  $\gamma_0 = \gamma_{\mathrm{min}}$ . we can use smaller discount factors for the exploratory policies because the intrinsic reward is dense and the range of values is small, whereas we would like the highest possible discount factor for the exploitative policy in order to be as close as possible to optimizing the undiscounted return. in our experiments, we use  $\gamma_{\mathrm{max}} = 0.997$  and  $\gamma_{\mathrm{min}} = 0.99$ .
+
+![](images/8c0fc4976870b29a181f6c08ca6407611e7315c4c762e6c1e8953775a2dac734.jpg)  
+(a) values taken by the  $\{\beta_i\}_{i = 0}^{n - 1}$
+
+![](images/a52e4ec5e2daa3783e6709ecd8f725951bb17eaa97406a3b9dd9f0a57dd93d09.jpg)  
+(b) values taken by the  $\{\gamma_i\}_{i = 0}^{n - 1}$  
+figure 7: values taken by the  $\{\beta_i\}_{i=0}^{n-1}$  and the  $\{\gamma_i\}_{i=0}^{n-1}$  for  $n = 32$  and  $\beta = 0.3$ .
+
+# a.1 never-give-up intrinsic reward algorithm
+
+we present the algorithm for computing the intrinsic reward in alg. 1. we follow the notations defined in sec. 2 in the paragraph relative to the episodic intrinsic reward:
+
+-  $m$  the episodic memory containing at time  $t$  the previous embeddings  $\{f(x_0), f(x_1), \ldots, f(x_{t-1})\}$ .  
+-  $k$  is the number of nearest neighbours.  
+-  $n_{k} = \{f_{ij}\}_{i=1}^{k}$  is the set of  $k$ -nearest neighbours of  $f(x_{t})$  in the memory  $m$ .  
+-  $k$  the kernel defined as  $k(x,y) = \frac{\epsilon}{\frac{d^2(x,y)}{d_m^2} + \epsilon}$  where  $\epsilon$  is a small constant,  $d$  is the euclidean distance and  $d_m^2$  is a running average of the squared euclidean distance of the  $k$ -nearest neighbors.
+
+-  $c$  is the pseudo-counts constant.  
+-  $\xi$  cluster distance.  
+-  $s_m$  maximum similarity.
+
+# a.2 complexity analysis
+
+the space complexity is constant. the number of weights that the network has can be computed from the architecture seen in app. f. furthermore, for our episodic memory buffer, we pre-allocate memory at the beginning of training, with size detailed in app. f. in cases in which the episode is longer than the size of the memory, the memory acts a ring buffer, deleting oldest entries first.
+
+time complexity is  $o(m \cdot n)$ , where  $n$  is the number of frames, and  $m$  is the size of our memory. this is due to the fact that we do one forward pass per frame, and we compute the distance from the embeddings produced by the embeddings network to the contents of our memory in order to retrieve the  $k$ -nearest neighbors.
+
+algorithm 1: computation of the episodic intrinsic reward at time  $t$ :  $r_t^{\mathrm{episodic}}$ .  
+input:  $m$ ;  $k$ ;  $f(x_{t})$ ;  $c$ ;  $\epsilon$ ;  $\xi$ ;  $s_{m}$ ;  $d_{m}^{2}$   
+output:  $r_{t}^{\text{episodic}}$   
+1 compute the  $k$ -nearest neighbours of  $f(x_{t})$  in  $m$  and store them in a list  $n_{k}$   
+2 create a list of floats  $d_{k}$  of size  $k$   
+/* the list  $d_{k}$  will contain the distances between the embedding  $f(x_{t})$  and its neighbours  $n_{k}$ .*/  
+3 for  $i \in \{1, \dots, k\}$  do  
+4  $\left| d_{k}[i] \gets d^{2}(f(x_{t}), n_{k}[i]) \right|$   
+5 end  
+6 update the moving average  $d_{m}^{2}$  with the list of distances  $d_{k}$   
+/* normalize the distances  $d_{k}$  with the updated moving average  $d_{m}^{2}$ .*/  
+7  $d_{n} \gets \frac{d_{k}}{d_{m}^{2}}$   
+/* cluster the normalized distances  $d_{n}$  i.e. they become 0 if too small and  $0_{k}$  is a list of  $k$  zeros.*/  
+8  $d_{n} \gets \max(d_{n} - \xi, 0_{k})$   
+/* compute the kernel values between the embedding  $f(x_{t})$  and its neighbours  $n_{k}$ .*/  
+9  $k_{v} \gets \frac{\epsilon}{d_{n} + \epsilon}$   
+/* compute the similarity between the embedding  $f(x_{t})$  and its neighbours  $n_{k}$ .*/  
+10  $s \gets \sqrt{\sum_{i=1}^{k} k_{v}[i]} + c$   
+/*compute the episodic intrinsic reward at time  $t$ :  $r_{t}^{i}$ .*/  
+11 if  $s > s_{m}$  then  
+12  $\left| r_{t}^{\text{episodic}} \gets 0 \right|$   
+13 else  
+14  $\left| r_{t}^{\text{episodic}} \gets \frac{1}{s} \right|$
+
+# b ablations for  $\mathrm{ngu}(\mathbf{n} = 1)$
+
+as mentioned in section 4.2, we here show ablations on the size of the learned controllable states, the clipping factor  $l$  in (1), and the number of nearest neighbours to use for computing pseudo-counts in (2).
+
+due to the lack of a pure exploitative mode, as seen in 4.2,  $\mathrm{ngu}(\mathrm{n} = 1)$  fails to perform well in dense reward games. therefore, in order to obtain high signal from these ablations, we analyze the performance of  $\mathrm{ngu}(\mathrm{n} = 1)$  on the two most popular sparse reward games: montezuma's revenge and pitfall!.
+
+# b.1 size of controllable states
+
+in fig. 8 and fig. 9 we can see the performance of  $\mathrm{ngu}(\mathrm{n} = 1)$  with different sizes of the size of the controllable state on pitfall! and montezuma's revenge respectively. as we can observe, that there is small to no impact on pitfall!, with scores that sometimes reach more than 25,000 points. on montezuma's revenge 32 is the value that is consistently better than 64. a size of 16 as the controllable state size sometimes solves the level, but is in general less stable.
+
+# b.2 nearest neighbors used
+
+we proceed to show a similar analysis on fig. 10 and fig. 11 regarding the amount of nearest neighbors on pitfall! and montezuma's revenge respectively. as we can see, there are slight gains
+
+![](images/f9a5f6d770cb69da884e2c985b7bacba358a74ed6cbabca057b34d99695e346b.jpg)  
+figure 8: mean episodic return for agents trained pitfall!.
+
+![](images/525052ae708c54c61b50b3650c8142a337023708db2acb14a5e2c7989e679b3e.jpg)  
+figure 10: mean episodic return for agents trained pitfall!.
+
+![](images/8e5320462be76fee99ddafc45357389d095fe084c5c320fd21233b8989eeebc6.jpg)  
+figure 9: mean episodic return for agents trained montezuma's revenge.
+
+![](images/f636923cb1737398a6dfb8d3e5237ff75857c6e59e9866095520a16cb18c2c36.jpg)  
+figure 11: mean episodic return for agents trained montezuma's revenge.
+
+from using more neighbors on pitfall!, whereas there is a clear difference in performance in using 10 neighbors in montezuma's revenge when compared to using 5 or 30 neighbors.
+
+# b.3 clipping factor l
+
+finally, we show the performance of  $\mathrm{ngu}(\mathrm{n} = 1)$  on fig. 12 and fig. 13 regarding the clipping factor  $l$  pitfall! and montezuma's revenge respectively. as we can observe, pitfall! is again robust to the value of this hyperparameter, with marginally worse performance in the case of  $l = 10$ . this is expected, as rnd is generally detrimental to the performance of ngu on pitfall!, as seen in section 4.2. on the other hand, the highest value of clipping appears to work best on montezuma's revenge. in our initial investigations, we observed that clipping this value was required on montezuma's revenge to make the algorithm stable. further analysis is required in order to show the range of values of  $l$  that are higher than 10 and are detrimental to the performance of  $\mathrm{ngu}(\mathrm{n} = 1)$  on this task.
+
+# c ablations for ngu(n=32)
+
+# c.1 general ablations
+
+tab. 3 shows the results for all the ablations we performed on 8 games for  $\mathrm{ngu}(n = 32)$ . we can see that the conclusions of sec. 4.2 hold, with a few additional facts to observe:
+
+- the best score in montezuma's revenge is obtained by using a non-zero cross mixture ratio, even though it is relatively close to the score obtained by  $\mathrm{ngu}(n = 32)$ .  
+-  $n = 2$  and  $n = 8$  have lower average human normalized score on the set of 3 hard exploration games when compared to  $n = 16$  or  $n = 32$ . concretely on the set of hard
+
+![](images/dc9fa3d401e5c85c094c744b5d479d3268cfa12d2577dc010ff206f37fdc7825.jpg)  
+figure 12: mean episodic return for agents trained pitfall!.
+
+![](images/b3a05838c1773a68c9cccf00d58b317c06b0b7c99df210909f64d26340545169.jpg)  
+figure 13: mean episodic return for agents trained montezuma's revenge.
+
+<table><tr><td>algorithm</td><td>pong</td><td>qbert</td><td>breakout</td><td>space 
+invaders</td><td>beam rider</td><td>mr</td><td>pitfall!</td><td>privateeye</td></tr><tr><td>human</td><td>14.6</td><td>13.4k</td><td>30.5</td><td>1.6k</td><td>16.9k</td><td>4.8k</td><td>6.5k</td><td>69.6k</td></tr><tr><td>ngu(n=32)</td><td>19.6±0.1</td><td>465.8k±84.9k</td><td>532.8±16.5</td><td>44.6k±1.2k</td><td>68.7k±11.1k</td><td>10.4k±1.6k</td><td>8.4k±4.5k</td><td>100.0k±0.4k</td></tr><tr><td>n=2</td><td>20.6±0.1</td><td>457.7k±128.0k</td><td>576.0±24.9</td><td>48.0k±6.2k</td><td>71.8k±9.0k</td><td>11.1k±1.4k</td><td>-1.6±0.9</td><td>40.6k±0.1k</td></tr><tr><td>n=8</td><td>20.0±0.3</td><td>481.8k±41.2k</td><td>524.1±28.3</td><td>43.1k±5.5k</td><td>64.0k±3.8k</td><td>7.8k±0.3k</td><td>-1.9±0.4</td><td>38.5k±1.6k</td></tr><tr><td>n=16</td><td>17.2±1.0</td><td>444.2k±61.7k</td><td>549.0±11.0</td><td>46.4k±3.5k</td><td>73.9k±5.3k</td><td>9.5k±0.8k</td><td>5.0k±1.2k</td><td>52.0k±20.7k</td></tr><tr><td>cmr=0.5</td><td>19.0±0.3</td><td>502.9k±73.9k</td><td>516.9±20.1</td><td>40.3k±7.1k</td><td>74.5k±5.9k</td><td>12.0k±0.8k</td><td>5.1k±2.4k</td><td>58.8k±16.9k</td></tr><tr><td>β=0.2</td><td>20.3±0.2</td><td>350.1k±24.7k</td><td>525.0±38.2</td><td>43.9k±1.3k</td><td>75.6k±10.9k</td><td>6.9k±0.1k</td><td>3.3k±1.4k</td><td>40.6k±0.0k</td></tr><tr><td>β=0.5</td><td>16.8±1.2</td><td>480.4k±59.2k</td><td>451.6±17.2</td><td>40.2k±4.8k</td><td>62.3k±5.9k</td><td>11.3k±0.5k</td><td>1.3k±0.5k</td><td>44.5k±3.2k</td></tr><tr><td>w/o rnd</td><td>19.7±0.4</td><td>550.3k±64.4k</td><td>553.7±19.1</td><td>47.6k±3.7k</td><td>87.1k±9.1k</td><td>3.0k±0.0k</td><td>7.7k±0.9k</td><td>40.5k±0.1k</td></tr><tr><td>w/o re</td><td>-8.4±1.9</td><td>28.1k±1.1k</td><td>383.0±10.0</td><td>5.5k±0.3k</td><td>6.4k±0.2k</td><td>3.4k±0.7k</td><td>600.4±468.9</td><td>7.5k±2.2k</td></tr></table>
+
+table 3: ablation results on 8 atari games.  
+
+<table><tr><td>algorithm</td><td>gravitar</td><td>solaris</td><td>venture</td></tr><tr><td>human</td><td>3.4k</td><td>12.3k</td><td>1.2k</td></tr><tr><td>ngu(n=32)</td><td>14.1k±0.5k</td><td>4.9k±0.3k</td><td>1.7k±0.1k</td></tr><tr><td>β=0.2</td><td>14.2k±0.3k</td><td>6.4k±1.4k</td><td>2.3k±0.2k</td></tr><tr><td>β=0.5</td><td>13.5k±0.4k</td><td>5.5k±1.4k</td><td>2.0k±0.1k</td></tr></table>
+
+table 4: further ablation results on hard exploration games.
+
+exploration games of tab. 3, they only achieve super-human performance on montezuma's revenge.
+
+- even though we have seen that the results of  $\beta = 0.2$  and  $\beta = 0.5$  have lower average on the 3 hard exploration games of tab. 3, they still individually outperform rnd, r2d2, r2d2(retrace), and r2d2+rnd on pitfall! and private eye.  
+- in the case of private eye the distance in score might be misleading, as rewards are very sparse of large value. for instance, after reaching a score of  $40\mathrm{k}$ , if we ignore minor rewards, there are only two rewards to be collected of around  $30\mathrm{k}$  points. this creates what seems to be large differences in scores.  
+- on breakout, a high score is achieved without extrinsic reward. this is due to the fact that the exploratory policy learns to survive, which eventually leads to a high score.
+
+# c.2 further ablations on hard exploration
+
+on tab.4 we show further results on the case of  $\beta = 0.2$  and  $\beta = 0.5$ . we compare them to human performance as well as the base  $\mathrm{ngu}(n = 32)$ , with  $\beta = 0.3$ .
+
+as we can observe, in this case the difference in terms of relative performance among games is less pronounced than the ones observed on tab. 3. in fact, results are slightly better for both values of  $\beta$  on all 3 games, with a maximum difference of  $1.5\mathrm{k}$  points on solaris between  $\beta = 0.3$  and  $\beta = 0.2$ . we hypothesize that this is due to the nature of these specific games: the policies learnt on these three games seem to focus on exploitation rather than extended exploration of the environment, and in that case, similar to what we see for dense reward games in sec. 4.2, the method shows less variability with respect to this hyperparameter.
+
+# d algorithm computation comparison
+
+on tab. 5 we can see a comparison of the computation used between different algorithms.
+
+computation is still difficult to compare even when taking actor steps and parameter updates into account: distributed the number of actors in distributed setups will affect how much data the learner will be able to consume, but also how off-policy such data is (e.g. in r2d2, if a learner is learning from many actors, the data that is sampled from the replay buffer will be more recent than with fewer actors).
+
+# e details on the retrace algorithm
+
+retrace (munos et al., 2016) is an off-policy reinforcement learning algorithm that can be used for evaluation or control. in the evaluation setting the goal is mainly to estimate the action-value function  $q^{\pi}$  of a target policy  $\pi$  from trajectories drawn from a behaviour policy  $\mu$ . in the control
+
+<table><tr><td>algorithm</td><td>number of actors</td><td>total number of frames</td></tr><tr><td>r2d2 kapturowski et al. (2019)</td><td>256</td><td>35 b</td></tr><tr><td>r2d2(retrace)</td><td>256</td><td>35 b</td></tr><tr><td>r2d2 + rnd</td><td>256</td><td>35 b</td></tr><tr><td>ngu-rnd(n=1)</td><td>256</td><td>35 b</td></tr><tr><td>ngu (n=1)</td><td>256</td><td>35 b</td></tr><tr><td>ngu (n=32)</td><td>256</td><td>35 b</td></tr><tr><td>dqn + pixelcnn ostrovski et al. (2017)</td><td>1</td><td>150 m</td></tr><tr><td>dqn + cts bellemare et al. (2016)</td><td>1</td><td>150 m</td></tr><tr><td>rnd** burda et al. (2018b)</td><td>1024</td><td>16 b (2 b)</td></tr><tr><td>ppo + coex choi et al. (2018)</td><td>1024</td><td>2 b</td></tr></table>
+
+table 5: comparison in number of steps.
+
+**to obtain its best reported result on montezuma's revenge 16b (which we compare against), the results table of the work are with 2b.
+
+setting the target policy, or more precisely the sequence of target policies, depends on the sequence of  $q$ -functions that will be generated through the process of approximating  $q^*$ . to do so, we consider trajectories  $\tau$  starting from the state-action couple  $(x, a)$  and then following the behaviour policy  $\mu$  of the form:
+
+$$
+\tau = \left(x _ {t}, a _ {t}, r _ {t}, x _ {t + 1}\right) _ {t \in \mathbb {n}}, \tag {5}
+$$
+
+with  $(x_0, a_0) = (x, a), \forall t \geq 1, a_t \sim \mu(\cdot|x_t), \forall t \geq 0, r_t = r(x_t, a_t)$  and  $\forall t \geq 0, x_{t+1} \sim p(\cdot|x_t, a_t)$ . the expectation  $\mathbb{e}_{\mu}$  is over all admissible trajectories  $\tau$  generated by the behaviour policy  $\mu$  starting in state  $x$  doing action  $a$  and then following the behaviour policy  $\mu$ .
+
+the general retrace operator  $\mathcal{t}$ , that depends on  $\mu$  and  $\pi$ , is:
+
+$$
+\mathcal {t} q (x, a) = q (x, a) + \mathbb {e} _ {\mu} \left[ \sum_ {t \geq 0} \gamma^ {t} \left(\prod_ {s = 1} ^ {t} c _ {s}\right) \delta_ {t} \right], \tag {6}
+$$
+
+where the temporal difference  $\delta_t$  is defined as:
+
+$$
+\delta_ {t} = r _ {t} + \gamma \sum_ {a \in a} \pi (a | x _ {t + 1}) q \left(x _ {t + 1}, a\right) - q \left(x _ {t}, a _ {t}\right), \tag {7}
+$$
+
+and the cutting traces coefficients  $c_{s}$  as:
+
+$$
+c _ {s} = \lambda \min  \left(1, \frac {\pi \left(a _ {s} \mid x _ {s}\right)}{\mu \left(a _ {s} \mid x _ {s}\right)}\right). \tag {8}
+$$
+
+theorem 2 of munos et al. (2016) explains in which conditions the sequence of  $q$ -functions:
+
+$$
+q _ {k + 1} = \mathcal {t} _ {k} q _ {k}, \tag {9}
+$$
+
+where  $\mathcal{t}_k$  depends on the policy-couple  $(\mu_k,\pi_k)$  converges to the optimal  $q$ -value  $q^{*}$ . in particular one of the conditions is that the sequence of target policies  $\pi_{k}$  is greedy or  $\epsilon$ -greedy with respect to  $q_{k}$  (more details can be found in munos et al. (2016)).
+
+in practice, at a given time  $t$ , we can only consider finite sampled sequences  $(x_{s},a_{s},r_{s},x_{s + 1})_{s = t}^{t + k}$  starting from  $(x_{t},a_{t})$  and then following the behaviour policy  $\mu$ . therefore, we define the finite sampled-retrace operator as:
+
+$$
+\hat {t} q \left(x _ {t}, a _ {t}\right) = q \left(x _ {t}, a _ {t}\right) + \sum_ {s = t} ^ {t + k - 1} \gamma^ {s - t} \left(\prod_ {i = t + 1} ^ {s} c _ {i}\right) \delta_ {s}. \tag {10}
+$$
+
+in addition, we use two neural networks. one target network  $q(x,a;\theta^{-})$  and an online network  $q(x,a;\theta)$ . the target network is used to compute the target value  $\hat{y}_t$  that the online network will try to fit:
+
+$$
+\begin{array}{l} \hat {y} _ {t} = \hat {t} q \left(x _ {t}, a _ {t}; \theta^ {-}\right), (11) \\ = q \left(x _ {t}, a _ {t}; \theta^ {-}\right) + \sum_ {s = t} ^ {t + k - 1} \gamma^ {s - t} \left(\prod_ {i = t + 1} ^ {s} c _ {i}\right) \left(r _ {s} + \gamma \sum_ {a \in a} \pi (a | x _ {s + 1}) q \left(x _ {s + 1}, a; \theta^ {-}\right) - q \left(x _ {s}, a _ {s}; \theta^ {-}\right)\right). (12) \\ \end{array}
+$$
+
+in the control scenario the policy chosen  $\pi(a|x)$  is greedy or  $\epsilon$ -greedy with respect to the online network  $q(x, a; \theta)$ . then, the online network is optimized to minimize the loss:
+
+$$
+l \left(x _ {t}, a _ {t}, \theta\right) = \left(q \left(x _ {t}, a _ {t}; \theta\right) - \hat {y} _ {t}\right) ^ {2}. \tag {13}
+$$
+
+more generally, one can use transformed retrace operators(pohlen et al., 2018):
+
+$$
+\mathcal {t} ^ {h} q (x, a) = \mathbb {e} _ {\mu} \left[ h \left(h ^ {- 1} \left(q (x, a)\right) + \sum_ {t \geq 0} \gamma^ {t} \left(\prod_ {s = 1} ^ {t} c _ {s}\right) \delta_ {t} ^ {h}\right) \right], \tag {14}
+$$
+
+where  $h\in \mathbb{r}^{\mathbb{r}}$  is a real-function and the temporal difference  $\delta_t^h$  is defined as:
+
+$$
+\delta_ {t} ^ {h} = r _ {t} + \gamma \sum_ {a \in a} \pi (a | x _ {t + 1}) h ^ {- 1} (q (x _ {t + 1}, a)) - h ^ {- 1} (q (x _ {t}, a _ {t})). \tag {15}
+$$
+
+the role of the function  $h$  is to reduce (squash) the scale of the action-value function to make it easier to approximate for a neural network without changing the optimal property of the operator  $\mathcal{t}$ . in particular, we use the function  $h$ :
+
+$$
+\forall z \in \mathbb {r}, h (z) = \operatorname {s i g n} (z) (\sqrt {| z | + 1} - 1) + \epsilon z, \tag {16}
+$$
+
+$$
+\forall z \in \mathbb {r}, h ^ {- 1} (z) = \operatorname {s i g n} (z) \left(\left(\frac {\sqrt {1 + 4 \epsilon (| z | + 1 + \epsilon)} - 1}{2 \epsilon}\right) - 1\right), \tag {17}
+$$
+
+with  $\epsilon = 10^{-2}$
+
+# f hyperparameters
+
+# f.1 selection of hyperparameters
+
+in order to select the hyperparameters used for  $\mathrm{ngu}(n = 32)$  for all 57 atari games, which are shown on tab. 6, we ran a grid search with the ranges shown on tab. 9. we used 3 seeds on the set of 8 atari games shown in tab. 3. regarding the hyperparameters concerning the kernel  $k$  (kernel  $\epsilon$  and the number of neighbors used), we fixed them after determining suitable ranges of the intrinsic reward in our initial experimentation on atari. after running the grid search with those hyperparameters, we selected the combination with the highest amount games (out of 8) that held a score greater than our human benchmark. as one can see on the multiple mixtures ablations seen on tab. 3, as well as the single mixture ablations on app b, the only agent that achieved superhuman performance on the set of 8 games is  $\mathrm{ngu}(n = 32)$ .
+
+finally, in order to obtain the r2d2+rnd baseline, we ran a sweep over the  $\beta$  hyperparameter with values 0.1, 0.3, and 0.5, over the 8 games shown in tab. 3. coincidentally, like  $\mathrm{ngu}(n = 32)$ , the best value of  $\beta$  was determined to be 0.3.
+
+# f.2 common hyperparameters
+
+these are the hyperparameters used in all the experiments. we expose a full list of hyperparameters here for completeness. however, as one can see, the r2d2-related architectural hyperparameters are identical to the original r2d2 hyperparameters. shown in tab. 6.
+
+<table><tr><td>hyperparameter</td><td>value</td></tr><tr><td>number of seeds</td><td>3</td></tr><tr><td>cross mixture ratio</td><td>0.0</td></tr><tr><td>number of mixtures n</td><td>32</td></tr><tr><td>optimizer</td><td>adamoptimizer (for all losses)</td></tr><tr><td>learning rate (r2d2)</td><td>0.0001</td></tr><tr><td>learning rate (rnd and action prediction)</td><td>0.0005</td></tr><tr><td>adam epsilon</td><td>0.0001</td></tr><tr><td>adam beta1</td><td>0.9</td></tr><tr><td>adam beta2</td><td>0.999</td></tr><tr><td>adam clip norm</td><td>40</td></tr><tr><td>discount ri</td><td>0.99</td></tr><tr><td>discount re</td><td>0.997</td></tr><tr><td>batch size</td><td>64</td></tr><tr><td>trace length</td><td>80</td></tr><tr><td>replay period</td><td>40</td></tr><tr><td>retrace λ</td><td>0.95</td></tr><tr><td>r2d2 reward transformation</td><td>sign(x) · (√|x| + 1 - 1) + 0.001 · x</td></tr><tr><td>episodic memory capacity</td><td>30000</td></tr><tr><td>embeddings memory mode</td><td>ring buffer</td></tr><tr><td>intrinsic reward scale β</td><td>0.3</td></tr><tr><td>kernel ε</td><td>0.0001</td></tr><tr><td>kernel num. neighbors used</td><td>10</td></tr><tr><td>kernel cluster distance ξ</td><td>0.008</td></tr><tr><td>kernel pseudo-counts constant c</td><td>0.001</td></tr><tr><td>kernel maximum similarity sm</td><td>8</td></tr><tr><td>replay priority exponent</td><td>0.9</td></tr><tr><td>replay capacity</td><td>5e6</td></tr><tr><td>minimum sequences to start replay</td><td>6250</td></tr><tr><td>actor update period</td><td>100</td></tr><tr><td>target q-network update period</td><td>1500</td></tr><tr><td>embeddings target update period</td><td>once/episode</td></tr><tr><td>action prediction network l2 weight</td><td>0.00001</td></tr><tr><td>rnd clipping factor l</td><td>5</td></tr><tr><td>evaluation ε</td><td>0.01</td></tr><tr><td>target ε</td><td>0.01</td></tr></table>
+
+table 6: common hyperparameters.
+
+# f.3 disco maze hyperparameters
+
+hyperparameters are shown in tab. 7.
+
+<table><tr><td>hyperparameter</td><td>value</td></tr><tr><td>episodic memory capacity</td><td>5000</td></tr><tr><td>learning rate (r2d2 and action prediction)</td><td>0.001</td></tr><tr><td>replay capacity</td><td>1e6</td></tr><tr><td>intrinsic reward scale β</td><td>0.5</td></tr><tr><td>trace length</td><td>50</td></tr><tr><td>replay period</td><td>50</td></tr><tr><td>retrace λ</td><td>0.97</td></tr><tr><td>retrace loss transformation</td><td>identity</td></tr><tr><td>num. action repeats</td><td>1</td></tr><tr><td>target q-network update period</td><td>100</td></tr><tr><td>q-network filter sizes</td><td>(3,3)</td></tr><tr><td>q-network filter strides</td><td>(1,1)</td></tr><tr><td>q-network num. filters</td><td>(16,32)</td></tr><tr><td>action prediction network filter sizes</td><td>(3,3)</td></tr><tr><td>action prediction network filter strides</td><td>(1,1)</td></tr><tr><td>action prediction network num. filters</td><td>(16,32)</td></tr><tr><td>kernel ε</td><td>0.01</td></tr><tr><td>evaluation ε</td><td>0</td></tr></table>
+
+# f.4 atari pre-processing hyperparameters
+
+hyperparameters are shown in tab. 8.
+
+table 7: disco maze hyperparameters.  
+
+<table><tr><td>hyperparameter</td><td>value</td></tr><tr><td>max episode length</td><td>30 min</td></tr><tr><td>num. action repeats</td><td>4</td></tr><tr><td>num. stacked frames</td><td>1</td></tr><tr><td>zero discount on life loss</td><td>false</td></tr><tr><td>random noops range</td><td>30</td></tr><tr><td>sticky actions</td><td>false</td></tr><tr><td>frames max pooled</td><td>3 and 4</td></tr><tr><td>grayscale/rgb</td><td>grayscale</td></tr><tr><td>action set</td><td>full</td></tr></table>
+
+# f.5 hyperparameter ranges
+
+on tab. 9 we can see the ranges we used to sweep over in our experiments.
+
+table 8: atari pre-processing hyperparameters.  
+
+<table><tr><td>hyperparameter</td><td>value</td></tr><tr><td>intrinsic reward scale β</td><td>{0.2, 0.3, 0.5}</td></tr><tr><td>number of mixtures n</td><td>{1, 2, 8, 16, 32}</td></tr><tr><td>cross mixture ratio</td><td>{0.0, 0.25, 0.5}</td></tr><tr><td># episodes w/o wiping episodic memory</td><td>{1, 3}</td></tr></table>
+
+table 9: range of hyperparameters sweeps.
+
+# g detailed atari results
+
+![](images/38c167f8e9bd642ac18cc191e4aa9aa2da2dd9db1793877fd57f639b62d6f906.jpg)
+
+![](images/6ea77c5e936c925cf0e3985ac9e79dd9bf006c6d12f829c8025952ac69024094.jpg)
+
+![](images/6dd3c146dbc56337bc2c1f0ad36dd743d59e63dfc754948588be44ad239373f9.jpg)
+
+![](images/0b75b0fd2613cb22095931a8a549678e0e9d6daa27987fb08cb02c73bad0859b.jpg)
+
+![](images/40fa5923750908ff4a5761e8d3176b957eb531fcc46f844397a38283f8128a52.jpg)
+
+![](images/77c8d5ece712a60c278a64ccb30e0fd925eda4e32906baad47df2f4d4699e63f.jpg)
+
+![](images/b0efcadffb9f434adca058e8db2ad4b3c3f12153e4ac080c0c46563b1b44d262.jpg)
+
+![](images/45d02dc6da83c0c6d62b8350a9f8c67fdb2bcece8bf549f0eb0896337dfa0b76.jpg)
+
+![](images/3f82b529784b55c4355b242b56a7943cf9b4f77964ed0fb1bdd2fe806ad941bb.jpg)
+
+![](images/a5ad28924bb5856ece63b9abba6f7d8a1297b4f238e0bdf26f6808f7498432ee.jpg)
+
+![](images/057c08f448890a36906f2f931495cbcdfe6f440c275901be9b85f6e8959aee2a.jpg)
+
+![](images/9671ea2a630a7ad7e5ab434095740855360c1a2f77d8695a03eae3363b54fc49.jpg)
+
+![](images/4b88992e4edd664312ae8d97eb2406922896767a8555aaed4d867aad4afe0aa0.jpg)
+
+![](images/a2c944c7e3c4ecfd391bf2a70065b94b7529f85305f8cd1b589f128e3c24ce1e.jpg)
+
+![](images/b78bfac66c755c545971708958f4679e1b686c1b0b344f4cbb3837eb6d9a71c4.jpg)
+
+![](images/d0233c14708dca36c45baa8e9d61aed67a2a5301429e9f2a77490898987c6e0c.jpg)
+
+![](images/ad47e66ea9ffec01829b79ce4a41d33ca8caa9680650a09e132249848799a169.jpg)
+
+![](images/3abc2160cc780d9380dcf683d6435c0bf927b5b41fab9ad72d90f3c1d611cc18.jpg)
+
+![](images/615d0892bc475b8769b23695dd446e7ae4e0b7441a670f90ee7b579a27593fe6.jpg)
+
+![](images/cc73b0c1b1d8a3e6d93496d830e6a0b4daf8e8baaf060977412a3ccb7a506f6d.jpg)
+
+![](images/95c1c78c43194e23dfa1294c83c34a6969b05d0da31bb226f1e4b1cd0d5b3b07.jpg)
+
+![](images/5a35e0ab362b90ba5bfaf6b60313b04c136400d7946dcf5ebb5c40e007b196bd.jpg)
+
+![](images/4eb2e0a5765f4c4e9ebb944736064dd098346efa9a575086db456b8579a14d4c.jpg)
+
+![](images/80c75444a8ff64ca0a44f413a8b57789176b4f4a57b6016e03bc46345d854ea0.jpg)
+
+![](images/ee843d2e8e70ac95a57efb8b79674f902cf0475b1121a3675d7c148be7da2f5b.jpg)
+
+![](images/311678778f400cbdb314a5774d5d7bb77c0e85b4030622efe667270389f4b76d.jpg)
+
+![](images/3e96e6d073d22105c670af06f7762bbeb722158be2715ed4a194ad1bf80a82b2.jpg)
+
+![](images/e7c43c0ccbf557a00a327069c2d324c95c7d77b9c8ec88e0b1f00679bb21bbbb.jpg)
+
+![](images/f58758ebb672344aa7fedb32973d11ef6fc9b8dfbc96715fe16669ec996f5c22.jpg)
+
+![](images/48675a5c5eb0a310b18e2defff363cc1a653acdde97f23cf4c3fb0aa3ee504be.jpg)
+
+![](images/5da938906968f56b82304f16d8e842a6ac3b4b386144093a2138e753dfbf1b2c.jpg)
+
+![](images/ef448c6f324d791cd1e0294d5b910523912d2f57964cdb792fa7d05856a47c2f.jpg)
+
+![](images/5e41a287d06d81c651f5bfffa1f618031657f8a5b38d72221b916ac00bae513c.jpg)
+
+![](images/ead326eee81b579f54632c7bd1a9b4a52fcd051fc17584355eb90fac2036ced2.jpg)
+
+![](images/d1faa717f8e5e399255a559e16f3e911cfb22829a9a4c13117bccd6dba81924b.jpg)
+
+![](images/cca53b27fa35cf0415b0a3aa635e8bf31ad57e07599cbf642fca920746331448.jpg)
+
+![](images/f87a554f976b3d5db2420c49326834809de2dbab8b6043d87d9a2f997cb687a8.jpg)
+
+![](images/020b9e656601280fa1c09228707519b41c78d0b48e2c263af75b03b588592498.jpg)
+
+![](images/81aa742b17feee59f3a707c5de5d4002c084fdd5037cf0703b6fc5eb707e029f.jpg)
+
+![](images/722575735f42586493dfa7502416064d7abab7cbf57115774ed38918ca55724d.jpg)
+
+![](images/ac41477cbc70718b27bafb8a19b6423084a6fb2f5b08e4470de2f0e83f6633e2.jpg)
+
+![](images/c7a1f68f812571c63a2d3bca1d9c10f55a03d9a19140d74e4ed94b2c579f94b2.jpg)
+
+![](images/55a98ce638251f4785c9dd3a339e380f5e22de3febb80b5ddb9eda30a4fbaae7.jpg)
+
+![](images/8c2ed5cb3f344c660769da7129c2c7f1a563e4b316af56181d9a2b5958486ea6.jpg)
+
+![](images/2f4df2e242ff406d41f06e0662d7145853b8507e272c91ee3b1f1aefa7771446.jpg)
+
+![](images/f747af19ba0967b2fd9ad2f41e5f43d44869f113c7f91ddb556c003ab49cb19c.jpg)
+
+![](images/b9756e9ab972fdffaf550a5d947422f1e0d764f07d058d5625efac44944d7b44.jpg)
+
+![](images/d999411eb9a6e820fc36fdc3b995774948b15458df051ebcd1a2d1484d22f0e7.jpg)
+
+![](images/5f787b3cd4d1b240b50fb0eb4b094059d6347e4b11ce67952367fecaad5acaff.jpg)
+
+![](images/37e147bb43cdd21d1d03928145375721048d3a42ba3d4ecc1b565d0b5e545736.jpg)
+
+![](images/60bb0a7b7621525e524bd548fb2c751f83426473bbea2145d266c50dc71e42e4.jpg)
+
+![](images/2d72ea6b154aae79e6d5a906cafecdf35c7b26341d73bd939353bc88023b1d40.jpg)
+
+![](images/88fab9df500fbb50c1fe09f06747fdf70c5cf225b6e2d14b55b9cc20ceca9017.jpg)
+
+![](images/5d34a543a0fe35bf60985f0f59ed960e70903d109b92efa5be86d8563d3d7f3e.jpg)
+
+![](images/bf7a735411e1ae5f2db9c849dc81d214ebf635b47fa340aaaea32950d13f3a00.jpg)
+
+![](images/5f86fc39e533a1ec1d82c039ae814e09ed95d92e3eb9a5bde34e0f2c8ecb08ae.jpg)  
+figure 14: r2d2(retrace) (green), ngu(n=32) with eval  $\beta = 0.0$  (blue) and eval  $\beta = 0.3$  (orange).
+
+![](images/21024aec81706539fa4b4b10132f6c5e573b7421224370b1bebc0556ac4e377f.jpg)
+
+<table><tr><td>game</td><td>r2d2(retrace)</td><td>ngu(32) eval beta=0.0</td><td>ngu(32) eval beta=0.3</td></tr><tr><td>alien</td><td>189.1k±15.6k</td><td>248.1k±22.4k</td><td>225.5k±36.9k</td></tr><tr><td>asteroids</td><td>338.5k±4.5k</td><td>230.5k±4.0k</td><td>181.6k±2.8k</td></tr><tr><td>time pilot</td><td>446.8k±3.9k</td><td>344.7k±31.0k</td><td>336.1k±32.9k</td></tr><tr><td>tutankham</td><td>452.2±20.0</td><td>191.1±1.2</td><td>125.7±5.2</td></tr><tr><td>up n down</td><td>678.8k±1.3k</td><td>620.1k±13.7k</td><td>575.2k±10.4k</td></tr><tr><td>venture</td><td>2.0k±0.0k</td><td>1.7k±0.1k</td><td>779.9±188.7</td></tr><tr><td>video pinball</td><td>948.6k±5.2k</td><td>965.3k±12.8k</td><td>596.7k±120.0k</td></tr><tr><td>wizard of wor</td><td>120.2k±7.6k</td><td>106.2k±7.0k</td><td>85.1k±12.3k</td></tr><tr><td>atlantis</td><td>1654.9k±1.5k</td><td>1653.6k±2.3k</td><td>1638.0k±4.6k</td></tr><tr><td>yars revenge</td><td>990.4k±2.9k</td><td>986.0k±3.2k</td><td>993.8k±1.5k</td></tr><tr><td>zaxxon</td><td>94.8k±23.7k</td><td>111.1k±11.8k</td><td>190.1k±6.9k</td></tr><tr><td>bank heist</td><td>15.0k±5.7k</td><td>17.4k±12.0k</td><td>1.4k±0.0k</td></tr><tr><td>battle zone</td><td>733.1k±45.2k</td><td>691.7k±22.6k</td><td>571.5k±45.4k</td></tr><tr><td>beam rider</td><td>103.9k±1.1k</td><td>63.6k±8.6k</td><td>31.9k±0.6k</td></tr><tr><td>berzerk</td><td>69.3k±5.8k</td><td>36.2k±4.7k</td><td>27.3k±0.8k</td></tr><tr><td>bowling</td><td>253.0±1.2</td><td>211.9±8.4</td><td>161.8±4.9</td></tr><tr><td>boxing</td><td>100.0±0.0</td><td>99.7±0.0</td><td>3.8±1.4</td></tr><tr><td>breakout</td><td>839.7±6.0</td><td>559.2±29.0</td><td>387.6±51.0</td></tr><tr><td>centipedes</td><td>700.2k±19.8k</td><td>577.8k±3.1k</td><td>574.6k±7.0k</td></tr><tr><td>chopper command</td><td>999.9k±0.0k</td><td>999.9k±0.0k</td><td>974.1k±14.7k</td></tr><tr><td>amidar</td><td>28.2k±0.2k</td><td>17.8k±1.2k</td><td>8.5k±0.4k</td></tr><tr><td>crazy climber</td><td>294.2k±25.7k</td><td>313.4k±7.7k</td><td>357.0k±8.3k</td></tr><tr><td>defender</td><td>675.6k±3.2k</td><td>664.1k±1.8k</td><td>656.3k±7.2k</td></tr><tr><td>demon attack</td><td>143.9k±0.0k</td><td>143.5k±0.0k</td><td>136.6k±3.3k</td></tr><tr><td>double dunk</td><td>24.0±0.0</td><td>-14.1±2.4</td><td>-21.5±0.7</td></tr><tr><td>enduro</td><td>2.4k±0.0k</td><td>2.0k±0.1k</td><td>682.5±24.0</td></tr><tr><td>fishing derby</td><td>86.8±0.9</td><td>32.0±1.9</td><td>-29.3±4.1</td></tr><tr><td>freeway</td><td>33.2±0.1</td><td>28.5±1.1</td><td>21.2±0.5</td></tr><tr><td>frostbite</td><td>10.5k±3.8k</td><td>206.4k±150.0k</td><td>67.9k±45.6k</td></tr><tr><td>gopher</td><td>117.8k±0.9k</td><td>113.4k±0.6k</td><td>86.6k±7.4k</td></tr><tr><td>gravitar</td><td>12.9k±0.6k</td><td>14.2k±0.5k</td><td>13.2k±0.3k</td></tr><tr><td>assault</td><td>36.7k±3.0k</td><td>34.8k±5.4k</td><td>1.9k±0.6k</td></tr><tr><td>hero</td><td>54.5k±3.0k</td><td>69.4k±5.7k</td><td>64.2k±7.0k</td></tr><tr><td>ice hockey</td><td>85.1±0.6</td><td>-4.1±0.3</td><td>-0.5±0.2</td></tr><tr><td>jamesbond</td><td>30.8k±2.3k</td><td>26.6k±2.6k</td><td>22.4k±0.3k</td></tr><tr><td>kangaroo</td><td>14.7k±0.1k</td><td>35.1k±2.1k</td><td>16.9k±2.0k</td></tr><tr><td>krull</td><td>131.1k±12.7k</td><td>127.4k±17.1k</td><td>26.7k±2.2k</td></tr><tr><td>kung fu master</td><td>220.7k±3.9k</td><td>212.1k±11.2k</td><td>203.2k±10.8k</td></tr><tr><td>montezuma revenge</td><td>2.3k±0.4k</td><td>10.4k±1.5k</td><td>16.8k±6.8k</td></tr><tr><td>ms pacman</td><td>40.3k±1.1k</td><td>40.8k±1.1k</td><td>38.1k±1.6k</td></tr><tr><td>name this game</td><td>70.6k±8.3k</td><td>23.9k±0.5k</td><td>15.6k±0.3k</td></tr><tr><td>phoenix</td><td>935.2k±13.5k</td><td>959.1k±2.7k</td><td>933.3k±4.7k</td></tr><tr><td>asterix</td><td>994.3k±0.9k</td><td>950.7k±23.1k</td><td>953.1k±21.7k</td></tr><tr><td>pitfall</td><td>-5.2±1.7</td><td>7.8k±4.0k</td><td>1.3k±0.9k</td></tr><tr><td>pong</td><td>20.9±0.0</td><td>19.6±0.2</td><td>-9.7±1.4</td></tr><tr><td>private eye</td><td>31.5k±5.4k</td><td>100.0k±0.4k</td><td>65.6k±14.3k</td></tr><tr><td>qbert</td><td>398.6k±46.4k</td><td>451.9k±82.1k</td><td>449.0k±108.2k</td></tr><tr><td>riverraid</td><td>38.9k±0.6k</td><td>36.7k±2.3k</td><td>42.6k±4.0k</td></tr><tr><td>road runner</td><td>105.2k±16.8k</td><td>128.6k±28.7k</td><td>103.9k±7.1k</td></tr><tr><td>robotank</td><td>142.4±0.8</td><td>9.1±0.7</td><td>24.9±2.5</td></tr><tr><td>seaquest</td><td>1000.0k±0.0k</td><td>1000.0k±0.0k</td><td>1000.0k±0.0k</td></tr><tr><td>skiing</td><td>-11081.7±97.7</td><td>-22977.9±5059.9</td><td>-21907.4±3647.5</td></tr><tr><td>solaris</td><td>5.6k±1.1k</td><td>4.7k±0.3k</td><td>1.3k±0.1k</td></tr><tr><td>space invaders</td><td>33.4k±12.2k</td><td>43.4k±1.3k</td><td>12.0k±1.9k</td></tr><tr><td>star gunner</td><td>412.8k±4.1k</td><td>414.6k±66.8k</td><td>452.5k±53.0k</td></tr><tr><td>surround</td><td>9.8±0.0</td><td>-9.6±0.2</td><td>-7.3±0.4</td></tr><tr><td>tennis</td><td>24.0±0.0</td><td>10.2±3.5</td><td>-3.5±5.7</td></tr></table>
+
+table 10: scores over all 57 atari games.
+
+# h network architectures
+
+# h.1 architecture of the embedding network with inverse dynamics prediction
+
+![](images/4ea4171ebe4ddd9a7895463b79ce1d44096518b6b16b2543b3645f44b29d0d9a.jpg)  
+figure 15: embedding network architecture.
+
+# h.2 architecture of the random network distillation
+
+![](images/8214ac2a328f68be11670826aeb020bc7ec8941605342162b3a98b6d2bae6127.jpg)  
+figure 16: rnd network architecture.
+
+![](images/772f40b64fd99f9292e6e42d9f7923e0c66dd8181453087ea7f3abf1fdebb459.jpg)
+
+![](images/2273d08e37048eeb5b61aa79b11677abb926851214740d86e7abca93df5dd784.jpg)  
+(a) sketch of the r2d2 agent
+
+![](images/c6017be532f5e8b7bbced26ea87b96ca59382172ee1d4e3edc27905f206e619e.jpg)  
+(b) detailed r2d2 agent  
+figure 17: r2d2 agent architecture.
+
+# h.3 architecture of the r2d2 agent
+
+# i controllable states
+
+in this section we evaluate properties of the learned controllable states. we further present a study of the performance of the algorithm when having access to oracle controllable states containing only the necessary information. we use montezuma's revenge as a case-study.
+
+# i.1 inspecting the properties of learned controllable states
+
+as explained in section 2, we train the embedding network  $f$  using an inverse dynamics model as done by pathak et al. (2017). intuitively, the controllable states should contain the information relevant to the action performed by the agent given two consecutive observations. however it might contain other type of information as long as it can be easily ignored by our simple classifier,  $g$ .
+
+as noted in burda et al. (2018b), for this game, one can identify a novel state by using five pieces of information: the  $(x,y)$  position of the player, a room identifier, the level number, and the number of keys held. this information can be easily extracted from the ram state of the game as described in section i.3 below. one question that we could ask is whether this information is present (or easily decodable) or not in the learned controllable state. we attempted to answer this question by training a linear classifier to predict the  $(x,y)$  coordinates and the room identified from the learned controllable state. importantly we do not backpropagate the errors to the embedding network  $f$ . figure 19 shows the average results over the episodes as the training of the agent progresses. we can see that the squared error in predicting the  $(x,y)$  position of the agent stabilises to a more or less constant value, which suggests that it can successfully generalise to new rooms (we do not observe an increase in the error when new rooms are discovered). the magnitude of the error is of the order of 12 units, which less than  $10\%$  of the range (see section i.3). this is to be expected, as it is the most important information for predicting which action was taken. it shows that the information is quite accessible and probably has a significant influence in the proposed novelty measure. the room identifier, on the other hand, is information that is not necessary to predict the action taken by the agent. unlike the previous case, one can see jumps in the error as training progresses as the problem becomes harder.
+
+![](images/6657d9c130e8844a90fe3c3e9ad6a774d3588a1967a27fa7f0561096ed42339a.jpg)
+
+![](images/018018f3e746a9aa918af70d534543ab801f3a6897424fe14ef11771b3df8b64.jpg)  
+figure 18: prediction loss from learned controllable states of the position (top) and room (bottom) on montezuma's revenge against minibatch updates.
+
+it stabilises around an error slightly above  $20\%$ , which is reasonably good considering that random chance is  $96\%$ . this means that even if there is nothing specifically encouraging this information to be there, it is still present and in turn can influence the proposed novelty signal.
+
+an avenue of future work is to research alternative methods for learning controllable states that directly search for retaining all relevant information. while very good results can be obtained with one of the simple alternative of an inverse dynamics model, it is reasonable to think that better results could be attained when using a better crafted one. to inform this question, we investigate in the next section what results could we obtain if we explicitly use as controllable states the quantities that we were trying to predict in this section.
+
+# i.2 montezuma's revenge with hand-crafted controllable states
+
+in the previous section we analysed the properties of the learned controllable states. a valid question to ask is: how would the ngu work if we had access to an oracle controllable state containing only the relevant information? this analysis is a form of upper bound performance for a given agent architecture. we ran the  $\mathrm{ngu(n = 1)}$  model with two ablations: without rnd and without extrinsic rewards. instead of resetting the memory after every episode, we do it after a small number of consecutive episodes, which we call a meta-episode. this structure plays an important role when the agent faces irreversible choices. in this setting, approaches using non-episodic exploration bonuses are even more susceptible to suffer from the "detachment" problem described in ecoffet et al. (2019). the agent might switch between alternatives without having exhausted all learning opportunities, rendering choosing the initial option uninteresting from a novelty perspective. the episodic approach with a meta-episode of length one would be forced to make similar choices. however, when run with multiple episodes it can offer an interesting alternative. in the first episode, the agent starts with an empty episodic memory can choose arbitrarily one of the options. in the second episode, the episodic memory contains all the experience collected in the first episode. the agent is then rewarded for not repeating the strategy followed in the first one, as revisiting those states will lead to lower intrinsic reward. thus, the agent is encouraged to learn diverse behaviour across episodes without needing to choose between alternatives nor being susceptible to the detachment problem. results are summarized in fig. 19. we report the average episodic return (left) as well as the average number of visited rooms per meta-episode (right). the model achieves higher scores than the one using learned controllable states (as reported in section 4.2).
+
+incorporating long-term novelty in the exploration bonus, encourages the agent to concentrate in the less explored areas of the environment. similarly to what we observed with learned controllable states, this provides a boost both in data efficiency as well as final performance, obtaining close to 15,000 average return and visiting an average of 25 rooms per episode. in this run, three out of five seeds reach the second level of the game, one of which reaches the third level with an average of fifty different rooms per episode. we also observe that, when running in the absence of extrinsic rewards, the agent remarkably still achieves a very high extrinsic reward. secondly, the agent is able
+
+![](images/0979344176025652853c37b3272a0c4c316cd9be4c2566508fcaf5510a681e36.jpg)  
+figure 19: mean episodic return (left) and mean number of visited rooms per episode (right) vs environment frames for agents trained montezuma's revenge with hand-crafted controllable states.
+
+![](images/0b64456fe87d2d72c4a0114c1ac04e4da60d8712d965ae63939baa828eb0f499.jpg)
+
+to consistently reach a large number of rooms and explore more than 20 rooms without any extrinsic guidance.
+
+as noted in burda et al. (2018b), in montezuma's revenge each level contains 6 doors and 4 keys. if the agent walks through a door holding a key, it receives a reward of 300 consuming the key in the process. in order to clear a level, the agent needs open two doors located just before the final room. during exploration, the agent needs to hold on to two keys to see what it could do with them later in the episode, sacrificing the immediate reward of opening more accessible doors. any agent that acts almost greedily will struggle with what looks like a high level choice. with the right representation and using meta-episodes, our method can handle this problem in an interesting way. when the number of keys held is represented in the controllable state, the agent chooses a different key-door combination on each of the three episodes in which we do not wipe our episodic memory. at the end of training, in the first episode after wiping the episodic memory, our agent shows a score of  $14,660 \pm 196$ , while the third episode the agent shows a score of  $34,040 \pm 9,835$ , exploring on average over 30 rooms and consistently going to the second level<sup>3</sup>. the agent learns a complex exploratory policy spanning several episodes that can handle irreversible choices and overcome "distractor" rewards. we do not observe different key-door combinations across episodes when using learned controllable states. presumably the signal of the number of held keys in the learned controllable states is not strong enough to treat them as sufficiently different.
+
+the results describe in this section support the idea that significant gains can be obtained by improving the representation of the controllable states, suggesting that the study of learning better representations is an interesting line for future work. recent works have explored ways of measuring novelty by learning controllable aspects of an environment (kim et al., 2018; warde-farley et al., 2018), and we believe that some of these ideas could be also useful in this setting.
+
+# i.3 hand-crafted state features for montezuma's revenge
+
+we obtain the hand-crafted features for montezuma's revenge by observing the ram state of the game at every time step. more concretely:
+
+- x and y can be observed at positions 0xaa and 0xab respectively, represented by integers with a range of  $[0, 153] \times [0, 122]$ .  
+- room id and level number can be found in positions 0x83 and 0xb9 respectively. we provide this information as a single integer to our agent in the form of  $r_{id} + 24 * l_n$  where  $r_{id} \in \{0, \dots, 23\}$  is the room id, and  $l_n$  is the level number.  
+- byte 0xc1 is the player's inventory. we count the number of keys being held (and provide this information to the agent) by adding the bits  $\{2, \ldots, 6\}$ , which correspond to the binary slots for keys.

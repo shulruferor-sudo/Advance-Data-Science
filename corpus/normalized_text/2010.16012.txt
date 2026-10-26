@@ -1,0 +1,733 @@
+# to push or to pull: on reducing communication and synchronization in graph computations
+
+maciej besta<sup>1</sup>, michal podstawski<sup>2,3</sup>, linus groner<sup>1</sup>, edgar solomonik<sup>4</sup>, torsten hoefler<sup>1</sup>
+
+$^{1}$ department of computer science, eth zurich;
+
+<sup>2</sup>perform group katowice; <sup>3</sup>katowice institute of information technologies;
+
+$^{4}$ department of computer science, university of illinois at urbana-champaign
+
+maciej.besta@inf.ethz.ch, michal.podstawski@performgroup.com, gronerl@student.ethz.ch, solomon2@illinois.edu, htor@inf.ethz.ch
+
+# abstract
+
+we reduce the cost of communication and synchronization in graph processing by analyzing the fastest way to process graphs: pushing the updates to a shared state or pulling the updates to a private state. we investigate the applicability of this push-pull dichotomy to various algorithms and its impact on complexity, performance, and the amount of used locks, atomics, and reads/writes. we consider 11 graph algorithms, 3 programming models, 2 graph abstractions, and various families of graphs. the conducted analysis illustrates surprising differences between push and pull variants of different algorithms in performance, speed of convergence, and code complexity; the insights are backed up by performance data from hardware counters. we use these findings to illustrate which variant is faster for each algorithm and to develop generic strategies that enable even higher speedups. our insights can be used to accelerate graph processing engines or libraries on both massively-parallel shared-memory machines as well as distributed-memory systems.
+
+# ccs concepts
+
+- computer systems organization  $\rightarrow$  parallel architectures; multicore architectures; distributed architectures; theory of computation  $\rightarrow$  design and analysis of algorithms; graph algorithms analysis; shortest paths; parallel algorithms; shared memory algorithms; massively parallel algorithms; computing methodologies  $\rightarrow$  parallel computing methodologies; parallel algorithms; shared memory algorithms.
+
+this is an arxiv version of a paper published at acm hpdc'17 under the same title
+
+# code:
+
+https://spcl.inf.ethz.ch/research/parallel_programming/pushpull
+
+# 1 introduction
+
+graph processing underlies many computational problems in social network analysis, machine learning, computational science, and others [38]. designing efficient parallel graph algorithms is challenging due to several properties of graph computations such as irregular communication patterns or little locality [57]. these properties lead to expensive synchronization and movements of large data amounts on shared- and distributed-memory (sm, dm) systems.
+
+direction optimization in breadth-first search (bfs) [4] is one of the mechanisms that are used to alleviate these issues. it combines the traditional top-down bfs (where vertices in the active frontier iterate over all unvisited neighbors) with a bottom-up scheme
+
+(where unvisited vertices search for a neighboring vertex in the active frontier [55]). combining these two approaches accelerates bfs by  $\approx 2.4\mathrm{x}$  on real-world graphs such as citation networks [4].
+
+we first illustrate that distinguishing between bottom-up and top-down bfs can be generalized to many other graph algorithms, where updates can be either pushed by a thread to the shared state (as in the top-down bfs), or pulled to a thread's private state (as in the bottom-up bfs). as another example, consider a pagerank (pr) computation and assume a thread x is responsible for a vertex  $v$ . x can either push  $v$ 's rank to update  $v$ 's neighbors, or it can pull the ranks of  $v$ 's neighbors to update  $v$  [60]. despite many differences between pr and bfs (e.g., pr is not a traversal), pr can similarly be viewed in the push-pull dichotomy.
+
+this notion sparks various questions. can pushing and pulling be applied to any graph algorithm? how to design push and pull variants of various algorithms? is pushing or pulling faster? when and why? does it depend on the utilized programming model and abstraction? when and how can pushing or pulling be accelerated?
+
+we seek to answer these and other questions and provide the first extensive analysis on the push-pull dichotomy in graph processing. now, this dichotomy was identified for some algorithms [4, 60] and was used in several graph processing frameworks, such as ligra [52] and gemini [65]. yet, none of these works analyzes the differences in formulations, complexity, and performance between the two approaches for various algorithms, environments, or models.
+
+as a motivation, consider figure 1 with the results of our push/pull variants of graph coloring [11]. they unveil consistent advantages of pushing. the figure also shows the speedup from a strategy grs ("greedy-switch") that (1) reduces the number of memory access with a traversal-based graph coloring, and (2) switches between push- or pull-based scheme and an optimized greedy variant.
+
+![](images/3b1defadd80d4cb6f44b813cf57e6ee44b7d0fb2411d74ca78afe0ce69952b3e.jpg)  
+(a) orkut network.
+
+![](images/4da2a2803a4d99da6e896d26f936a39852b94fa0ba56fc505c546d1a76a87bd1.jpg)  
+(b) livejournal graph.
+
+![](images/a54731776014e3b19fb5f8df2cd7662dad740b460ac1d930f5f494d05ad82b34.jpg)  
+(c) ca road graph.  
+figure 1: (§ 6.1) boman graph coloring [11] results and (§ 6.2) the analysis of the strategy greedy-switch (grs); single node of a cray xc30, 16 threads.
+
+we provide the following contributions:
+
+- we apply the push-pull dichotomy to various classes of graph algorithms and obtain detailed formulations of centrality schemes, traversals, calculating minimum spanning trees, graph coloring, and triangle counting. we also show that several existing graph processing schemes are included in the push-pull dichotomy.  
+- we analyze pushing and pulling with pram and derive the differences in the amount of synchronization and communication in both variants of the considered algorithms.  
+- we analyze performance of push- and pull-based algorithms for both sm and dm systems that represent fat-memory nodes and supercomputers. various programming models are incorporated, including threading, message passing (mp), and remote memory access (rma) [25] for various classes of graphs. for detailed insights, we gather performance data (e.g., cache misses or issues braches and atomic instructions) using papi counters.  
+- we incorporate strategies to reduce the amount of synchronization in pushing and memory accesses in pulling and illustrate that they accelerate various algorithms.  
+- we provide performance insights that can be used to enhance graph processing engines or libraries.  
+- finally, we discuss whether the push-pull dichotomy is applicable in the algebraic formulation of graph algorithms.
+
+# 2 models, notation, concepts
+
+we first describe the necessary concepts.
+
+# 2.1 machine model and simulations
+
+parallel random access machine (pram) [22] is a well-known model of a parallel computer. there are  $p$  processors that exchange data by accessing cells of a shared memory of size  $m$  cells. they proceed in tightly-synchronized steps: no processor executes an instruction  $i + 1$  before all processors complete an instruction  $i$ . an instruction can be a local computation or a read/write from/to the memory. we use  $s$  and  $w$  to denote time and work: the longest execution path and the total instruction count. there are three pram variants with different rules for concurrent memory accesses to the same cell. erew prevents any concurrent accesses. crew allows for concurrent reads but only one write at a time. crcw enables any concurrent combination of reads/writes and it comes with multiple flavors that differently treat concurrent writes. we use the combining crcw (crcw-cb) [30]: the value stored is an associative and commutative combination of the written values.
+
+now, a simulation of one pram machine on another is a scheme that enables any instruction from the former to be executed on the latter. simulation schemes are useful when one wants to port an algorithm developed for a stronger model that is more convenient for designing algorithms (e.g., crcw) to a weaker one that models hardware more realistically (e.g., crew). the used simulations are:
+
+simulating crcw/crew on crew/erew any crcw with  $m$  cells can be simulated on an mp-cell crew/erew with a slowdown of  $\theta (\log n)$  and memory  $mp$  (similarly to simulating a crew on an erew) [30].
+
+limiting  $p$  (lp) a problem solvable on a  $p$ -processor pram in  $s$  time can be solved on a  $p'$ -processor pram ( $p' < p$ ) in time  $s' = \lceil \frac{sp}{p'} \rceil$  for a fixed memory size  $m$ .
+
+# 2.2 graph model, layout, and notation
+
+a tuple  $(v,e)$  models an undirected graph  $g$ ;  $v$  is a set of vertices and  $e \subseteq v \times v$  is a set of edges;  $|v| = n$  and  $|e| = m$ .  $d(v)$  and  $n(v)$  are the degree and the neighbors of a vertex  $v$ . the (non-negative) weight of an edge  $(v,w)$  is  $\mathcal{w}_{(v,w)}$ . we denote the maximum degrees for a given  $g$  as  $\hat{d}$ ,  $\hat{d}_{in}$  (in-degree), and  $\hat{d}_{out}$  (out-degree). the average degree is denoted with a bar  $(\bar{d})$ .  $g$ 's diameter is  $d$ .
+
+the neighbors of each  $v$  form an array. the arrays of all the vertices form a contiguous array accessed by all the threads; we also store offsets into the array that determine the beginning of the array of each vertex. the whole representation takes  $n + 2m$  cells.
+
+we partition  $g$  by vertices (1d decomposition) [16]. we denote the number of used threads/processes as  $p$ . we name a thread (process) that owns a given vertex  $v$  as  $t[v]$ . we focus on label-setting algorithms. in some of the considered schemes (e.g., pagerank) the number of iterations  $l$  is a user-specified parameter.
+
+# 2.3 atomic operations
+
+atomic operations (atomics) appear to the system as if they occur instantaneously. they are used in lock-free graph computations to perform fine-grained updates [29, 44]. here, we use cpu atomics that operate on integers. we now present the relevant operations:
+
+fetch-and-add(*target, arg) (faa): it increases *target by arg and also returns *target's previous value.
+
+compare-and-swap(*target, compare, value, *result) (cas): if *target == compare then *target = value and *result = true are set, otherwise *target is not changed and *result = false.
+
+# 2.4 communication & synchronization
+
+unless stated otherwise, we associate communication with: intra- or inter-node reads and writes, messages, and collective operations other than barriers. synchronization will indicate: any atomic operations, locks, and any form of barrier synchronization.
+
+# 3 push-pull:applicability
+
+we first analyze what algorithms can be expressed in the push-pull (pp) dichotomy; we revisit existing schemes and discuss new cases.
+
+# 3.1 pagerank (pr)
+
+pr [15] is an iterative centrality algorithm that obtains the rank of each vertex  $v$ :  $r(v) = (1 - f) / |v| + \sum_{w \in n(v)} (f \cdot r(w) / d(w))$ ;  $f$  is the damp factor [15]. pr is used to rank websites.
+
+pushing and pulling? pr can be expressed in both [60]. in the former,  $t[v]$  updates all  $v$ 's neighbors with a value  $r(v) / d(v)$  (it pushes the value from  $v$  to  $n(v)$ ). in the latter,  $t[v]$  updates  $v$  with values  $r(u) / d(u), u \in n(v)$  (it pulls the updates from  $n(v)$  to  $v$ ).
+
+# 3.2 triangle counting (tc)
+
+in tc, one counts the number of triangles that each vertex  $v \in v$  is a part of; a triangle occurs if there exist edges  $\{v, w\}, \{w, u\}, \{v, u\}$ , where  $u, w \in v$  and  $u, w \neq v, u \neq w$ . tc is used in various statistics and machine learning schemes [48] and libraries such as igraph [19].
+
+pushing and pulling? this algorithm is also expressible in both schemes. consider a thread  $t[v]$  that counts the number of triangles associated with a vertex  $v$  ( $tc(v)$ ). it iterates over  $n(v)$  and, for each
+
+$u \in n(v)$ , it iterates over  $n(u)$  and checks if  $\exists w \in v, v \neq w \neq u$  such that  $w \in n(u) \cap n(v)$ ; the final sums are divided by 2 at the end. if yes, then, in the push variant, it increments either one of  $tc(u)$  and  $tc(w)$  while in the pull scheme it increments  $tc(v)$ .
+
+# 3.3 breadth-first search (bfs)
+
+the goal of bfs [18] is to visit each vertex in  $g$ . the algorithm starts with a specified root vertex  $r$  and visits all its neighbors  $n(r)$ . then, it visits all the unvisited neighbors of the root's neighbors, and continues to process each level of neighbors in one step. bfs represents graph traversals and is used the hpc benchmark graph500 [44].
+
+pushing and pulling? there exist both variants. the former is the traditional top-down bfs where  $t[v]$  (if  $v$  is in a frontier) checks each unvisited  $u \in n(v)$  and adds it to the next frontier  $f$  (it pushes the updates from  $v$  to  $n(v)$ ). the latter is the bottom-up approach [4, 55]: in each iteration every unvisited vertex  $u$  is tested if it has a parent in  $f$  (the updates are pulled from  $n(u)$  to  $u$ ).
+
+# 3.4 single source shortest path (sssp)
+
+sssp outputs the distance from a selected source vertex  $s$  to all other vertices. we consider  $\delta$ -stepping (sssp- $\delta$ ) [42] that combines the well-known dijkstra's and bellman-ford algorithms by trading work-optimality for more parallelism. it groups vertices into buckets and only vertices in one bucket can be processed in parallel. sssp has applications in, e.g., operations research.
+
+pushing and pulling? both are applicable when relaxing edges of each vertex  $v$  from the current bucket. in the former,  $v$  pushes relaxation requests to its neighbors in the buckets with unsettled vertices. in the latter, vertices in unsettled buckets look for their neighbors in the current bucket and perform (pull) relaxations. a similar scheme was used in the dm implementation of sssp-δ [17].
+
+# 3.5 betweenness centrality (bc)
+
+bc measures the importance of a vertex  $v$  based on the number of shortest paths that lead through  $v$ . let  $\sigma_{st}$  be the number of shortest paths between two vertices  $s, t$ , and let  $\sigma_{st}(v)$  be the number of such paths that lead through  $v$ . bc of  $v$  equals  $bc(v) = \sum_{s \neq v \neq t \in v} \frac{\sigma_{st}(v)}{\sigma_{st}}$ . here, we consider brandes' algorithm [14, 46, 54]. define the dependency of a source vertex  $s$  on  $v$  as:  $\delta_s(v) = \sum_{t \in v} \frac{\sigma_{st}(v)}{\sigma_{st}}$ . then, we have  $bc(v) = \sum_{s \neq v \in v} \delta_s(v)$  where  $\delta_s(v)$  satisfies the following recurrence:  $\delta_s(v) = \sum_{w : v \in pred(s, w)} \frac{\sigma_{sv}}{\sigma_{sw}} (1 + \delta_s(w))$ ;  $pred(s, w)$  is a list of immediate predecessors of  $w$  in the shortest paths from  $s$  to  $w$ . brandes' scheme uses this recurrence to compute  $bc(v)$  in two phases. first, bfs or sssp traversals compute  $pred(s, v)$  and  $\sigma_{sv}$ ,  $\forall_{s, v \in v}$ , obtaining a tree  $t$  over  $g$ . next,  $t$  is traversed backwards (from the highest to the lowest distance) to compute  $\delta_s(v)$  and  $bc(v)$  based on the equations above. bc is a complex centrality scheme used in biology, transportation, and terrorism prevention [2].
+
+pushing and pulling? both parts of brandes bc can be expressed using push and pull. the first phase can compute shortest path information using either top-down or bottom-up bfs or push-and pull-based versions of sssp. the second phase (backward accumulation) may also be cast as bfs from a starting frontier. in particular, one can either push partial centrality scores to predecessors or pull them from lists of successors [39].
+
+# 3.6 graph coloring (gc)
+
+gc assigns colors to vertices so that no two incident vertices share the same color and the number of colors is minimized. we consider boman graph coloring (bgc) [11]. here, each iteration has two phases. in phase 1, colors are assigned to vertices owned by each thread (i.e., to each partition  $\mathcal{p} \in \mathcal{p}$ ) separately without considering other partitions ( $\mathcal{p}$  denotes a set of all partitions). the maximum number of available colors can be specified as a parameter  $c$ . in phase 2, border vertices (i.e., vertices with at least one edge leading to another partition; they form a set  $\mathcal{b}$ ) are verified for conflicts. if there are any, the colors are reassigned. this may cause conflicts within partitions, which are resolved during the next iteration. more iterations  $l$  may improve a solution (fewer colors used). gc has multiple applications in scheduling and pattern matching.
+
+pushing and pulling? both can be used in phase 2. for every border vertex  $v$ , each  $u \in n(v)$  ( $t[u] \neq t[v]$ ) is analyzed. if  $v$  and  $u$  share the assigned color, then either  $u$ 's or  $v$ 's color is scheduled for a change (the update is pushed to or pulled from  $n(v)$ ).
+
+# 3.7 minimum spanning tree (mst)
+
+the goal of mst is to derive a spanning tree of  $g$  with the lowest sum of the included edge weights. the classical sequential algorithms: prim [18] and kruskal [18] lack parallelism. therefore, we focus on the boruvka [13] algorithm (more details on pushing and pulling in prim and kruskal are still provided in the technical report). in boruvka, each vertex is first associated with its own supervetex. in each iteration, two incident supervertices are merged into one along an edge  $e_m$  of a minimum weight. the algorithm proceeds until there is only one supervetex left. the selected minimum edges form the mst. mst algorithms are utilized in problems such as the design of broadcast trees [18].
+
+pushing and pulling in boruvka? first, selecting  $e_m$  adjacent to a given supervex can be done by pushing (each supervex overrides adjacent supervertices and their tentative minimal edges if it has a less expensive one) or by pulling (each supervex picks its own  $e_m$ ). next, merging adjacent supervertices can also be done with pushing or pulling. assume that each thread owns a number of supervertices. now, it can either push the changes to the supervertices owned by other threads, or pull the information on the adjacent supervertices and only modify its owned ones.
+
+# 3.8 push-pull insights
+
+first, we present a generic difference between pushing and pulling. recall that  $t[v]$  indicates the thread that owns  $v$ . define  $t \rightsquigarrow v$  to be true if  $t$  modifies  $v$  during the execution of a given algorithm ( $t \rightsquigarrow v \leftrightarrow t$  modifies  $v$ ). then
+
+$$
+\left(\text {a l g o r i t h m u s e s p u s h i n g}\right) \leftrightarrow \left(\exists_ {t \in \{1.. t \}, v \in v} t \sim v \wedge t \neq t [ v ]\right)
+$$
+
+$$
+(\text {a l g o r i t h m u s e s p u l l i n g}) \leftrightarrow \left(\forall_ {t \in \{1.. t \}, v \in v} t \sim v \rightarrow t = t [ v ]\right)
+$$
+
+in pushing, any thread  $t$  may access and modify any vertex  $v \in v$  so that we may have  $t \neq t[v]$ . in pulling,  $t$  can only modify its assigned vertices:  $t[v] = t$  for any  $v$  modified by  $t$ . in § 4, we show that this property determines that pulling requires less synchronization
+
+compared to pushing. however, pushing can often be done with less work, when only a subset of vertices needs to update its neighbors.
+
+second, our analysis shows that the push-pull dichotomy can be used in two algorithm classes: iterative schemes (pr, tc, gc, boruvka mst) that derive some vertex properties and perhaps proceed in iterations until some convergence condition is met, and traversals (bfs, sssp- $\delta$ , bc).
+
+# 4 theoretical analysis
+
+we now derive detailed specifications of push and pull algorithm variants and use them to investigate the differences between pushing and pulling. we (1) identify read and write conflicts, (2) conduct complexity analyses, and (3) investigate the amount of required atomics or locks. we focus on the crcw-cb and crew models. there exist past works on the parallel complexity of the considered algorithms [3, 11, 26, 35, 39, 42, 46]. yet, we are the first to investigate the differences between pushing and pulling variants.
+
+algorithm listings our schemes have multiple variants as many nested loops can be parallel; we indicate them with [in par]. unless specified otherwise, we only consider the loops without square brackets in complexity analyses. we mark the read/write conflicts in the parts of the code related to pushing or pulling with  $\mathbb{r} / \mathbb{w}$ , respectively. we indicate the data type in the modified memory cell to be either integer ( $\mathbf{n}$ ) or float ( $\mathbf{u}$ ). finally, we use (grey backgrounds) to indicate pushing/pulling variants.
+
+cost derivations we consider up to one processor per vertex,  $p \leq n$  (and  $p > \hat{d}$ ). thus, pulling avoids write-conflicts, as each thread accumulates updates for a given vertex. still, pushing can update the same vertices multiple times at every iteration.
+
+we formulate cost analyses of all algorithms via the primitives  $k$ -relaxation and  $k$ -filter.  $k$ -relaxation corresponds to simultaneously propagating updates from/to  $k$  vertices to/from one of their neighbors for pushing/pulling.  $k$ -filter is used to extract the vertices updated in one or more  $k$ -relaxations, and is non-trivial only when pushing updates. we let  $\bar{k} = \max(1, k / p)$  and quantify the cost of these primitives. when pulling,  $k$ -relaxation takes  $o(\bar{k})$  time and  $o(k)$  work. a  $k$ -filter invocation requires  $o(\log(p) + \bar{k})$  time and  $o(\min(k, n))$  work via a prefix sum.
+
+when pushing, the cost of  $k$ -relaxation depends on the pram model. in the crcw-cb model,  $k$ -relaxation takes  $o(\bar{k})$  time and  $o(k)$  work. in the crew model,  $k$ -relaxation can be processed in  $o(\bar{k}\log (\hat{d}))$  time via binary-tree reductions. to update each vertex of degree  $d$  in the crew model, we use a binary merge-tree with  $d$  leaves. over all trees, at most  $k$  of  $m$  leaves contain actual updates. we can avoid work for all nodes that are the roots of subtrees that do not contain updates, effectively computing a forest of incomplete binary trees with a total of  $k$  leaves and maximum height  $o(\log (\hat{d}))$ . each of  $p$  processors propagates  $k / p$  updates up the complete binary merge-tree associated with its vertices (requiring no setup time) in  $o(\bar{k}\log (\hat{d}))$  time with a total of  $o(k\log (\hat{d}))$  work.
+
+# 4.1 pagerank
+
+pr (algorithm 1) performs  $o(l)$  steps of power iteration. for each step of power iteration,  $k_{i}$ -relaxation is called for  $i \in \{1, \dots, \hat{d}\}$  with  $\sum_{i=1}^{\hat{d}} = m$ . thus the pram complexities of pr are  $(1) o(l / p +$
+
+algorithm 1: (§ 4.1) push- and pull-based pagerank.  
+```txt
+1/\*input:agraph  $g$  ,anumberofsteps  $l$  ,thedampparameter  $f$    
+2output:an array of ranks pr[1..n]  $\ast /$    
+3   
+4 functionpr(g,l,f){   
+5pr[1..v]  $=$  [f..f]；//initialize pr values.   
+6for  $(l = 1$  .  $l <   l$  ++l）{   
+7new_pr[1..n]  $=$  [0..0];   
+8 for  $v\in v$  do in par{ update_pr();new_pr[v]  $+ = (1 - f) / n$  ;pr[v]  $=$  new_pr[v];   
+10}）}   
+11   
+12functionupdate_pr() {   
+13for  $u\in n(v)$  do[inpar]{ {new_pr[u]  $+ =$  (f·pr[v]/d(v)f;} pushing   
+15{new_pr[v]  $+ =$  (f·pr[u]/d(u)r;} puling   
+16}）   
+17}
+```
+
+$\hat{d})$  ) time and  $o(lm)$  work using pulling, (2)  $o(l(m / p + \hat{d}))$  time and  $o(lm)$  work in pushing in crcw-cb, and (3)  $o(l\log (\hat{d})(m / p + \hat{d}))$  time and  $o(lm\log (\hat{d}))$  work using pushing in crew.
+
+conflicts pushing/pulling entail  $o(lm)$  write/read conflicts.
+
+atoms/locks pulling does not require any such operations. contrarily, pushing comes with write conflicts to floats. to the best of our knowledge, no cpus offer atomics operating on such values. thus,  $o(lm)$  locks are issued.
+
+# 4.2 triangle counting
+
+tc is shown in algorithm 2; this is a simple parallelization of the well-known nodeiterator scheme [49]. it employs  $k_{i}$ -relaxation for  $i \in \{1, \dots, \hat{d}^2\}$  with  $\sum_{i=1}^{\hat{d}} = o(m\hat{d})$ . thus the pram complexities of tc are (1)  $o(\hat{d}(m / p + \hat{d}))$  time and  $o(m\hat{d})$  work using pulling, (2)  $o(\hat{d}(m / p + \hat{d}))$  time and  $o(m\hat{d})$  work using pushing in crcw-cb, and (3)  $o(\hat{d}\log(\hat{d})(m / p + \hat{d}))$  time and  $o(m\hat{d}\log(\hat{d}))$  work using pushing in crew. one can leverage more than  $n$  processors to lower the pram time-complexity of tc [53].
+
+conflicts both variants generate  $o(m\hat{d})$  read conflicts; pushing also has  $o(m\hat{d})$  write conflicts.
+
+atoms/locks we use faa atomics to resolve write conflicts.
+
+algorithm 2: (§ 4.2) push- and pull-based triangle counting.  
+```txt
+1/\*input:agraph  $g$  .output:an array of triangle counts   
+2  $\star$  tc[1..n] that each vertex belongs to. \*/   
+3   
+4 function tc(g){tc[1..n] = [0..0]   
+5 for  $v\in v$  do in par   
+6 for  $w_{1}\in n(v)$  do[in par]   
+7 for  $w_{2}\in n(v)$  do[in par]   
+8 if adj(w1,w2) update_tc();   
+9 tc[1..n]  $=$  [tc[1]/2..tc[n]/2];}   
+10 function update_tc(){   
+11 {++tc[w1]；/  $\ast$  or ++tc[w2].  $\ast /\}$  pushing   
+12 {++tc[v];} pulling   
+13 }
+```
+
+# 4.3 breadth-first search
+
+bfs is shown in algorithm 3. we define a generalized version of bfs, where vertices enter the frontier only after a given number of neighbors have been in the frontier. the standard bfs is obtained by setting this number to 1, but to use bfs from within bc, we will employ a counter specific to each vertex. the bfs pseudo-code also employs a given accumulation operator to compute values for each
+
+vertex as a function of values of its predecessors in the bfs tree. our analysis assumes this operator is commutative and associative. the frontier  $\mathsf{f}$  is represented as a single array while my_f is private for each process and contains vertices explored at each iteration. all my_fs are repeatedly merged into the next f (line 8). we let  $f_{i}$  be the size of f in the  $i$ th iteration of the while loop.
+
+algorithm 3: (§ 4.3) push- and pull-based breadth-first search.  
+```javascript
+1/\*input:agraphg，a set of ready counters and initial values r0 for each node,and an accumulation operator  $\leftarrow$    
+2\*output：r[1..n]where  $r[f[i] = r0[i]$  and other otherwise contains accumulation of all r values of predecessors. \*/   
+3   
+4 function bfs(g,ready,r0,  $\leftarrow$  ）{   
+5 my_f[1..p]  $= [0\dots 0]$  .  $r = r0$  .fcv, such that for each  $\upsilon \in f$  ready[v]=0;   
+6 while(f#0) explore_my_f(); { f  $=$  my_f[1]umy_f[2]u..umy_f[p];}   
+7   
+8   
+9   
+10 function explore_my_f() {   
+11 for  $\upsilon \in f$  do in par pushing for  $w\in n(v)$  do[in par] if ready[w]>0 r[w]←r[v]； for  $w\in n(v)$  do[in par]{ ready[w]--; if ready[w]  $\coloneqq \emptyset$  {my_f[pid]  $=$  my_f[pid]u{w};}   
+12 for  $\upsilon \in v$  do in par{ pulling if ready[v]>0{ for  $w\in n(v)$  do[in par]{ if  $w\in f$  { r[v]←r[w]; ready[v]--; if ready[v]  $= = 0$  {my_f[pid]  $=$  my_f[pid]u{v};}   
+13   
+14
+```
+
+the call to explore_my_f in pulling requires checking all edges, so it takes  $o(m / p + \hat{d})$  time and  $o(m)$  work. the call to explore_my_f in pushing needs  $o(\hat{d})$  consecutive  $f_{i}$ -relaxations, so it takes  $o(\hat{f}_i\hat{d})$  time where  $\hat{f}_i = \max (1,f_i / p)$  and work  $o(f_i\hat{d})$  in crcw-cb (and  $o(\log (\hat{d}))$  more in crew). second, the merge of frontiers can be done via a  $\hat{df}_i$ -relaxation and, in pushing, a  $\hat{df}_i$ -filter. the  $\hat{df}_i$ -filter is not required in pulling, since we check whether each vertex is in the frontier anyway. in pushing, the merge requires  $o(\log (p) + \hat{df}_i / p)$  time and  $o(\min (\hat{df}_i,n))$  work.
+
+thus, for a graph of diameter  $d$  (with  $d$  while-loop iterations) we derive the total cost using the fact that  $\sum_{i=1}^{d} f_i = n$ , obtaining: (1)  $o(d(m / p + \hat{d}))$  time and  $o(dm)$  work in pulling, (2)  $o(m / p + d(\hat{d} + \log(p)))$  time and  $o(m)$  work in pushing in crcw, and (3) a factor of  $o(\log(\hat{d}))$  more time and work in the crew model. it is possible to achieve a lower time-complexity for bfs, especially if willing to sacrifice work-efficiency [23].
+
+conflicts there are  $o(m)$  write conflicts in pushing; pulling involves  $o(dm)$  read conflicts.
+
+atoms/locks pushing requires  $o(m)$  cas atoms.
+
+# 4.4  $\delta$ -stepping sssp
+
+the algorithm works in epochs. in each epoch, a bucket  $b$  is initialized with vertices whose tentative distances are  $[(b - 1)\delta, b\delta)$ , and relaxations are computed until all vertices within distance  $b\delta$  are found. this means that in epoch  $b$ , edges are relaxed only from vertices whose final distances are within  $[(b - 1)\delta, b\delta)$ .
+
+algorithm 4: (§ 4.4) push- and pull-based  $\delta$ -stepping sssp.  
+```txt
+1 /* input: a graph g, a vertex r, the  $\delta$  parameter.  
+2 output: an array of distances d */  
+3  
+4 function  $\delta$ -stepping(g, r,  $\delta$ )  
+5 bckt=[ $\infty\ldots$ ]; d=[ $\infty\ldots$ ]; active=[false..false];  
+6 bckt_set={0}; bckt[r]=0; d[r]=0; active[r]=true; itr=0;  
+7  
+8 for b∈bckt_set do { //for every bucket do...  
+9 do {bckt_empty = false; //process b until it is empty.  
+10 process_buckets(); } while(!bckt_empty); }  
+11  
+function process_buckets() {  
+12 for v∈bckt_set[b] do in par  
+13 if(bckt[v]=b && (itr==0 or active[v])) { pushing  
+14 active[v] = false; //now, expand v's neighbors.  
+15 for w∈n(v) { weight = d[v] + w(v,w);  
+16 if(weight < d[w]) { r //proceed to relax w.  
+17 new_b = weight/δ; bckt[v] = new_b;  
+18 bckt_set(new_b) = bckt_set(new_b) ∪ {w};}  
+19 d[w] = weight; r [if(bckt[w]=b) { active[w]=true; bckt_empty=true;}]}  
+20  
+for v∈v do in par  
+21 if(d[v]>b) { for w∈n(v) do { pulling  
+22 if(bckt[w]=b && (active[w] or itr==0)) { r weight = d[w] + w(w,v) r;  
+23 if(weight < d[v]) { d[v]=weight; new_b=weight/δ;  
+24 if(bckt[v] > new_b) { bckt[v] = new_b; bckt_set = bckt_set ∪ {new_b};}  
+25 if(new_b == b) { active[v]=true; bckt_empty=true;}}  
+26}
+```
+
+let  $l$  be the maximum weighted distance between any pair of vertices in the graph, and let  $l_{\delta}$  be the number of iterations done in any epoch. if  $n_i$  vertices fall into the  $i$ th bucket, at the  $i$ th epoch  $o(l_{\delta}\hat{d})$  executions of  $n_i$ -relaxation will relax edges of vertices in the current bucket and up to  $l_{\delta}$  executions of  $n_i$ -filter will be used to update the set of vertices in the current bucket. so each edge will be relaxed  $o(l_{\delta})$  times. there are a total of  $l / \delta$  epochs, so the complexity of  $\delta$ -stepping is (1)  $o((l / \delta)l_{\delta}(m / p + \hat{d}))$  time and  $o((l / \delta)ml_{\delta})$  work using pulling, (2)  $o(ml_{\delta} / p + (l / \delta)l_{\delta}\hat{d})$  time and  $o(ml_{\delta})$  work using pushing in crcw-cb, (3)  $o(\log (\hat{d}))$  more than (2) using pushing in crew. pushing achieves a smaller cost, since we relax the edges leaving each node in only one of  $l / \delta$  epochs. these results may be extrapolated to specific types of graphs considered in the original analysis [42].
+
+conflicts in pushing, there is a write conflict for each of  $o(ml_{\delta})$  edge relaxations. in pulling, there is a read conflict for each of  $o((l / \delta)ml_{\delta})$  edge relaxations.
+
+atoms/locks in pushing, each edge relaxation can be performed via a cas atomic (in total  $o(ml_{\delta})$  of these).
+
+# 4.5 betweenness centrality
+
+bc is illustrated in algorithm 5. for each source vertex, we first compute a bfs to count the multiplicities of each shortest path and store all predecessors that are on some shortest path for each destination vertex. the list of predecessors is then used to define a shortest path tree. to calculate the partial centrality scores, this tree is traversed via bfs starting from the tree leaves. we use the ready array to ensure tree-nodes enter the frontier only once the partial centrality updates of all of their children are accumulated.
+
+this algorithm (parallel brandes) was described in detail [14, 39]. the approach is dominated by  $2n$  bfs invocations, the cost of which is analyzed in  $\s 4.3$ . for directed graphs, sssp (e.g.,  $\delta$ -stepping) must be used to compute each shortest-path tree. given the shortest-path tree the partial centrality scores can be computed via bfs in the same way as for undirected graphs. computationally, the most significant difference of bc from sssp and bfs, is the presence of additional parallelism. many source vertices can be processed
+
+independently, so up to  $o(n^{2})$  processors can be used by running  $n$  independent instances of bfs or sssp.
+
+conflicts and atomics/locks the number of conflicts as well as atomics or locks matches that of bfs or sssp and can vary by the factor of up to  $o(n)$  (depending on the amount of additional parallelism). yet, since the accumulation operator for the second bfs uses floating point numbers, locks are required instead of atomics. this can be alleviated by maintaining sets of successors instead of predecessors as proposed by bader et al. [2], which we identify as another opportunity for using either pushing or pulling. we elaborate on it in the technical report.
+
+algorithm 5: (§ 4.5) push- and pull-based betweenness centrality.  
+```txt
+1 /* input: a graph  $g$ . output: centrality scores bc[1..n]. */
+2
+3 function bc(g) { bc[1..n] = [0..0]
+4 define  $\pi$  so that any  $\pi \ni u = (\text{index}_u, \text{pred}_u, \text{mult}_u, \text{part}_u)$ ;
+5 define  $u \leftarrow \text{pred} v$  with  $u, v \in \pi$  so that  $u$  becomes  $u = (\text{index}_u, \text{pred}_u \cup \text{index}_v, \text{mult}_u + \text{mult}_v, \text{part}_u)$ ;
+6 define  $u \leftarrow \text{part}_v$  with  $u, v \in \pi$  so that  $u$  becomes  $u = (\text{index}_u, \text{pred}_u, \text{mult}_u, \text{part}_u + (\text{mult}_u / \text{mult}_v)(1 + \text{part}_v))$ ;
+7
+8 for  $s \in v$  do [in par] {
+9 ready = [1, ..., 1]; ready[s] = \emptyset;
+10 r = bfs(g, ready, [(1, 0, 0, 0)..(s, 0, 1, 0)..(n, 0, 0, 0)], <=pred)];
+11 define graph  $g' = (v, e')$  where  $(u, v) \in e'$  iff index_v ∈ pred_u;
+12 let ready[u] be the in-degree of  $u \in v$  in  $g'$ ;
+13 r = bfs(g', ready, r, <=part');
+14 for (index_u, pred_u, mult_u, part_u) ∈ r do [in par]
+15 bc[u] += part_u; }
+```
+
+# 4.6 boman graph coloring
+
+we present bgc in algorithm 6. the algorithm proceeds for  $l$  iterations, a quantity that is sensitive to both the schedule of threads and the graph structure. to limit the memory consumption, we bound the maximum count of colors to  $c$ . we use an opaque function init that partitions  $g$  and thus initializes the set of border vertices  $\mathcal{b}$  and all the partitions  $\mathcal{p} = \{\mathcal{p}_1\dots \mathcal{p}_s\}$ . the algorithm alternates between doing sequential graph coloring (seq_color_partition) and adjusting colors of bordering vertices. the adjustment of colors of bordering vertices corresponds to an invocation of  $|\mathcal{b}|$ -relaxation, in the worst case  $|\mathcal{b}| = \theta(n)$ . therefore, the complexity of bgc is (1)  $o(l(m / p + \hat{d}))$  time and  $o(lm)$  work using pulling, (2)  $o(l(m / p + \hat{d}))$  time and  $o(lm)$  work using pushing in crcw-cb, (3)  $o(\log (\hat{d}))$  more than (2) using pushing in crew.
+
+conflicts pushing/pulling require  $o(lm)$  write/read conflicts.
+
+atoms/locks in pushing and pulling the write conflicts can be resolved via cases (a total of  $o(lm)$  of these).
+
+```txt
+1 // input: a graph g. output: an array of vertex colors c[1..n].  
+2 // in the code, the details of functions seq_color_partition and  
+3 // init are omitted due to space constrains.  
+4  
+5 function boman-gc(g) {  
+6 done = false; c[1..n] = [0..0]; //no vertex is colored yet  
+7 //avail[i][j] = 1 means that color j can be used for vertex i.  
+8 avail[1..n][1..c] = [1..1][1..1]; init(b, p);  
+9 while (!done) {  
+10 for p ∈ p do in par{seq_color_partition(p);}  
+11 fix_conflicts();}  
+12  
+13 function fix_conflicts() {  
+14 for v ∈ b in par do{for u ∈ n(v) do  
+15 if (c[u] == c[v]) {  
+16 {avail[u][c[v]] = 0 w i;}  
+17 {avail[v][c[v]] = 0 r i;}  
+18 }  
+19 }
+```
+
+algorithm 6: (§ 4.6) push- and pull-based boman graph coloring.
+
+algorithm 7: (§ 4.7) push- and pull-based boruvka mst.  
+```txt
+1 function mst_boruvka(g) {
+2 sv_flag=[1..v]; sv=[{1}. {v}]; mst=[0..0];
+3 avail_svs={1..n}; max_e_wgt=max_v,w∈v(w(v,w)+1);
+4
+5 while avail_svs.size() > 0 do {avail_svs_new = 0};
+6 for flag ∈ avail_svs do in par {min_e_wgt[flag] = max_e_wgt;}
+7 for flag ∈ avail_svs do in par {
+8 for v ∈ sv[flag] do {
+9 for w ∈ n(v) do [in par] {
+10 if (sv_flag[w] ≠ flag) ∧ pushing
+11 (w(v,w) < min_e_wgt[sv_flag[w]]) # {
+12 min_e_wgt[sv_flag[w]] = w(v,w) w #;
+13 min_e_v[sv_flag[w]] = w; min_e_w[sv_flag[w]] = v w i;
+14 new_flag[sv_flag[w]] = flag w i; }
+15 if (sv_flag[w] ≠ flag) ∧ (w(v,w) < min_e_wgt[flag]) r {
+16 min_e_wgt[flag] = w(v,w); min_e_v[flag] = v;
+17 min_e_w[flag] = w; new_flag[flag] = sv_flag[w], r
+18 } }
+19 while flag = merge_order.pop() do {
+20 neigh_flag = sv_flag[min_e_w[flag)];
+21 for v ∈ sv[flag] do sv_flag[flag] = sv_flag[neigh_flag];
+22 sv[neigh_flag] = sv[flag] ∪ sv[neigh_flag];
+23 mst[neigh_flag] = mst[flag] ∪ mst[neigh_flag]
+24 u {(min_e_v[flag], min_e_w[flag])}; }
+25
+```
+
+# 4.7 boruvka minimum spanning tree
+
+push- and pull-based boruvka is shown in algorithm 7. due to space constraints, it only displays pushing/pulling when selecting the minimum edge adjacent to each supervetex. the algorithm starts with  $n$  supervertices and reduces their number by two at every iteration. the supervetex connectivity graph can densify throughout the process with supervertices having degree  $\theta(n)$ . however, the supervertices will always contain no more than  $m$  edges overall. determining the minimum-weight edge for all supervertices requires  $o(n^2 / p)$  time and  $o(m)$  work assuming each supervetex is processed sequentially. merging the vertices requires  $o(\log(n))$  time and  $o(n)$  work via a tree contraction [24] (our implementation uses a more simplistic approach). merging the edges connected to each vertex can be done via  $o(n)$  invocations of a  $k$ -relaxation, where  $k = o(n)$  at the first iteration and then the bound decreases geometrically. over all  $\log(n)$  steps, the complexity of boruvka is (1)  $o(n^2 / p)$  time and  $o(n^2)$  work using pulling, (2)  $o(n^2 / p)$  time and  $o(n^2)$  work using pushing in crcw-cb, (3)  $o(\log(n))$  more than (2) using pushing in crew.
+
+theoretically, known pram algorithms for finding connectivity and minimal spanning forests [1] are much faster in time complexity. still, our simple scheme is fairly efficient in practice as supervertex degree generally grows much slower than in the worst case.
+
+conflicts pushing/pulling require  $o(n^{2})$  write/read conflicts.
+
+atoms/locks the write conflicts in pushing can be handled via cas atomics (in total  $o(n^{2})$  of them).
+
+# 4.8 further analytical considerations
+
+we discuss some further extensions to our cost analyses. please note that due to space constraints, several additional analyses can be found in the technical report.
+
+more parallelism our analysis considered parallelism with  $p \leq o(n)$ . however, our pseudocodes specify additional potential sources of parallelism in many of the algorithms. up to  $m$  processors can be used in many cases (and even more for tc), but in this scenario, the distinction between pushing and pulling disappears.
+
+directed graphs pushing and pulling differ interestingly for directed graphs. pushing entails iterating over all outgoing edges of a subset of the vertices, while pulling entails iterating over all incoming edges of all (or most) of the vertices. thus, instead of  $\hat{d}$  some cost bounds would depend on  $\hat{d}_{out}$  and  $\hat{d}_{in}$  for pushing and pulling, respectively; more details are in the technical report.
+
+# 4.9 discussion & insights
+
+we finally summarize the most important insights.
+
+write/read conflicts pushing entails more write conflicts that must be resolved with locks or atomics (read conflicts must be resolved only under the erew model). an exception is bc where the difference lies in the type of the data that causes conflicts (floats for pushing and integers for pulling as was remarked in the past work [39]). moreover, traversals (bfs, bc (part 2), sssp) entail more read conflicts with pulling (e.g.,  $o(dn\hat{d})$  in the bfs based on pulling and none in the push-based bfs).
+
+atoms/locks we now summarize how conflicts translate into used atomics or locks. in many algorithms, pulling removes atomics or locks completely (tc, pr, bfs,  $\delta$ -stepping, mst). in others (bc), it changes the type of conflicts from f to i, enabling the utilization of atomics and removing the need for locks [31].
+
+communication/synchronization the above analyses show that pulling reduces synchronization compared to pushing (e.g., fewer atoms in tc). in contrast, pushing limits communication (e.g., the number of memory reads in bfs).
+
+complexity pulling in traversals (bfs, bc, sssp-  $\delta$  ) entails more time and work (e.g., see bfs). on the other hand, in schemes such as pr that update all vertices at every iteration, pulling avoid write conflicts. as a result, for pr and tc, pulling is faster than pushing in the pram crew model by a logarithmic factor.
+
+# 5 accelerating pushing & pulling
+
+our analysis in § 4 shows that most push- and pull-based algorithms entail excessive counts of atomics/locks and reads/writes, respectively. we now describe strategies to reduce both.
+
+partition-awareness (pa, in pushing) we first decrease the number of atoms by transforming the graph representation to limit memory conflicts. for this, we partition the adjacency array of each  $v$  into two parts: local and remote. the former contains the neighbors  $u \in n(v)$  that are owned by  $t[v]$  and the latter groups the ones owned by other threads. all local and remote arrays form two contiguous arrays; offsets for each array are stored separately. this increases the representation size from  $n + 2m$  to  $2n + 2m$  but also enables detecting if a given vertex  $v$  is owned by the executing thread (to be updated with a non-atomic) or if it is owned by a different thread (to be updated with an atomic). this strategy can be applied to pr, tc, and bgc. consider pr as an example. each iteration has two phases. first, each thread updates its own vertices with non-atomics. second, threads use atoms to update vertices owned by other threads. here, the exact number of atoms depends on the graph distribution and structure, and is bounded by 0 (if  $\forall_{v \in v} \forall_{w \in n(v)} t[v] \neq t[w]$ ) and 2m (if  $\forall_{v \in v} \forall_{w \in n(v)} t[v] = t[w]$ ). the former occurs if  $g = (v, e)$  is bipartite (i.e.,  $v = u \cup w, u \cap w = \emptyset$ ) and each thread only owns vertices from either  $u$  or  $w$ . the latter occurs if each thread owns all vertices in some  $g$ 's connected
+
+component. the number of non-atomics stays similar. we show this example in algorithm 8. the overhead from a barrier (line 10) is outweighed by fewer write conflicts (none in line 8).
+
+![](images/573900a32b1fd9f44ce733edb8a0f03a1292f27f2fb09c3d82f4f82f17fded9d.jpg)  
+algorithm 8: (§ 5) using partition-awareness for push-based pagerank.
+
+frontier-exploit (fe, in pushing/pulling) the number of excessive reads/writes can be reduced by accessing only a fraction of vertices in each iteration (the frontier-exploit strategy), similarly to bfs. for example, consider bgc. in each iteration, every vertex is verified for potential conflicts, entailing many memory reads, regardless of whether pushing or pulling is used. to reduce the number of such reads, a set of vertices  $f \subseteq v$  that form a stable set (i.e., are not neighbors) is selected at first and is marked with a specified color  $c_{0}$  (we denote different colors with  $c_{i}, i \in \mathbb{n}$ ). then, the algorithm enters the main loop. in each iteration  $i \geq 1$ , all neighbors of vertices in  $f$  that have not yet been colored are assigned a color  $c_{i}$ ; at the end of each iteration,  $f$  is set to  $\emptyset$  and the newly marked neighbors become the elements of  $f$ . while iterating, for each vertex  $v \in f$ , if any of its neighbors  $u \in n(v)$  has the same color  $(c_{i})$ , then a conflict occurs and either  $v$  or  $u$  (depending on the selected strategy) is assigned a color  $c_{i+1}$  that was not used before. this scheme resembles a bfs traversal with multiple sources selected at the beginning and marked with a color  $c_{0}$ , and a frontier constituted by vertices in  $f$ . in pushing, the vertices in  $f$  look for their uncolored neighbors and mark them with  $c_{i}$ . in pulling, uncolored vertices look for colored neighbors that are in  $f$ .
+
+generic-switch (gs, in pushing/pulling) next, we use the idea of switching between pushing and pulling; we want to not only reduce communication, but also limit the iteration count. we refer to the strategy as generic-switch. as an example, consider the above-described bgc enhanced with frontier-exploit. pushing itself results in the excessive number of iterations. this is because, when the number of vertices to be colored is low (our experiments indicate  $< 0.1n$ ), threads often conflict with each other, requiring more iterations. switching to pulling may prevent new iterations as no conflicts are generated. yet, using pulling too early would entail excessive memory accesses (few vertices are colored). thus, one must carefully select a switching moment or strategy, for example switch if the ratio of the number of the colored vertices to the generated conflicts (in a given iteration) exceeds a certain threshold.
+
+greedy-switch (grs, in pushing/pulling) generic-switch not always brings the desired speedups. for example, bgc with frontier-exploit may still need many iterations to color a small fraction of the remaining vertices due to many conflicts between threads that share vertices. in such cases, it is more advantageous to completely switch from a parallel variant (regardless of whether it does pushing or pulling) to an optimized greedy scheme.
+
+<table><tr><td rowspan="2">event</td><td colspan="3">orc (pr)</td><td colspan="3">rca (pr)</td><td colspan="2">ijn (tc)</td><td colspan="2">rca (tc)</td><td colspan="2">orc (bgc)</td><td colspan="2">rca (bgc)</td><td colspan="2">pok (sssp-δ)</td><td colspan="2">rca (sssp-δ)</td></tr><tr><td>push</td><td>push+pa</td><td>pull</td><td>push</td><td>push+pa</td><td>pull</td><td>push</td><td>pull</td><td>push</td><td>pull</td><td>push</td><td>pull</td><td>push</td><td>pull</td><td>push</td><td>pull</td><td>push</td><td>pull</td></tr><tr><td>l1 misses</td><td>335m</td><td>382m</td><td>572m</td><td>2,062m</td><td>10,560m</td><td>2,857m</td><td>10,815b</td><td>10,684b</td><td>4,290m</td><td>4,150m</td><td>3,599b</td><td>4,555b</td><td>76,117m</td><td>75,401m</td><td>54,57m</td><td>469m</td><td>11,01k</td><td>76,19m</td></tr><tr><td>l2 misses</td><td>234m</td><td>289m</td><td>446m</td><td>640k</td><td>7,037m</td><td>1,508m</td><td>700m</td><td>645m</td><td>2,303m</td><td>2,215m</td><td>3,656b</td><td>4,418b</td><td>74,48m</td><td>73,92m</td><td>50,74m</td><td>472m</td><td>9,46k</td><td>75,56m</td></tr><tr><td>l3 misses</td><td>64,75m</td><td>53,49m</td><td>181m</td><td>348m</td><td>537k</td><td>866k</td><td>439m</td><td>404m</td><td>1,075m</td><td>1,030m</td><td>36,94m</td><td>186m</td><td>229k</td><td>226k</td><td>8,52m</td><td>11,43m</td><td>308</td><td>279k</td></tr><tr><td>tlb misses (data)</td><td>130m</td><td>142m</td><td>129m</td><td>12,21k</td><td>274k</td><td>21628</td><td>66,44m</td><td>56,05m</td><td>37,45k</td><td>18,37k</td><td>229m</td><td>411m</td><td>4,046m</td><td>3,801m</td><td>3,763m</td><td>26,17m</td><td>403</td><td>513k</td></tr><tr><td>tlb misses (inst)</td><td>1188</td><td>336</td><td>1161</td><td>220</td><td>250</td><td>218</td><td>1090</td><td>660</td><td>214</td><td>233</td><td>141k</td><td>507k</td><td>510</td><td>577</td><td>1,984k</td><td>11,22k</td><td>71</td><td>370</td></tr><tr><td>atomics</td><td>234m</td><td>219m</td><td>0</td><td>5,533m</td><td>5,374m</td><td>0</td><td>1,066b</td><td>0</td><td>724k</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td></tr><tr><td>locks</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>219m</td><td>219m</td><td>5,358m</td><td>5,358m</td><td>902k</td><td>44.60m</td><td>370</td><td>5.523m</td></tr><tr><td>reads</td><td>1,196b</td><td>1,183b</td><td>1,187b</td><td>43,39m</td><td>62,59m</td><td>37,49m</td><td>3,169t</td><td>3,158t</td><td>158m</td><td>135m</td><td>17,90b</td><td>23,04b</td><td>419m</td><td>404m</td><td>2.435b</td><td>2.339b</td><td>42,32k</td><td>454m</td></tr><tr><td>writes</td><td>474m</td><td>460m</td><td>237m</td><td>14,99m</td><td>14,86m</td><td>7,499m</td><td>10,71b</td><td>1,066b</td><td>18,97m</td><td>725k</td><td>3,866b</td><td>4,201b</td><td>97,44m</td><td>96,95m</td><td>718m</td><td>663m</td><td>9,545k</td><td>100m</td></tr><tr><td>branches (uncond)</td><td>234m</td><td>222m</td><td>1971</td><td>5,533m</td><td>7,340m</td><td>533</td><td>8,585b</td><td>616k</td><td>19,48m</td><td>631</td><td>2,714b</td><td>2,902b</td><td>67,58m</td><td>67,40m</td><td>441m</td><td>421m</td><td>5,171k</td><td>64.3m</td></tr><tr><td>branches (cond)</td><td>474m</td><td>466m</td><td>240m</td><td>15m</td><td>18,79m</td><td>9.467m</td><td>3,173t</td><td>3,173t</td><td>156m</td><td>156m</td><td>23,62b</td><td>32,46b</td><td>524m</td><td>495m</td><td>2.27b</td><td>2,192b</td><td>35,03k</td><td>518m</td></tr></table>
+
+table 1: (§ 6.1) papi events for pr, bgc (average per iteration), and tc, sssp-△ (total count) for the sm setting (daint, xc30,  $t = 16$ ).
+
+conflict-removal (cr, pushing/pulling) the final strategy (see algorithm 9) completely removes conflicts in both pushing and pulling. consider bgc as an example. instead of solving conflicts over border vertices (the set  $\mathcal{b}$ ) in each iteration, one can first use an optimized scheme (e.g., greedy sequential) to color them without any conflicts (thus, this scheme is advantageous if  $|\mathcal{b}|$  is small compared to  $|v|$ ). the remaining vertices can then be colored in parallel; no conflicts occur either as every  $v \in \mathcal{b}$  is already colored.
+
+1 //the code below corresponds to lines 9-11 in algorithm 6.
+
+2 seq_color_partition( $\mathcal{b}$ )
+
+3 for  $\mathcal{p} \in \mathcal{p}$  do in par {seq_color_partition(\mathcal{p});}
+
+algorithm 9: (§ 5) example of conflict-removal with bgc.
+
+# 6 performance analysis
+
+finally, we investigate the performance of push/pull variants and the described acceleration strategies. due to a large amount of data we present and discuss in detail a small representative subset; the remainder is in the report (see the link on page 1).
+
+selected benchmarks & parameters we consider the push-and pull-based variants, strategies from § 5, strong- and weak-scaling, hyper-threading (ht), and static/dynamic openmp scheduling. two types of synthetic graphs are used: power-law kronecker [36] and erdős-rényi [21] graphs with  $n \in \{2^{20}, \dots, 2^{28}\}$  and  $\overline{d} \in \{2^1, \dots, 2^{10}\}$ . we also use real-world graphs (table 2) of various sparsities: low  $\overline{d}$  and large  $d$  (road networks), low  $\overline{d}$  and  $d$  (purchase graphs), and large  $\overline{d}$  with low  $d$  (communities). the graphs have up to 268m vertices and 4.28b edges.
+
+<table><tr><td>type</td><td>id</td><td>n</td><td>m</td><td>d</td><td>d</td></tr><tr><td>r-mat graphs</td><td>rmat</td><td>33m-268m</td><td>66m-4.28b</td><td>2-16</td><td>19-33</td></tr><tr><td rowspan="2">social networks</td><td>orc</td><td>3.07m</td><td>117m</td><td>39</td><td>9</td></tr><tr><td>pok</td><td>1.63m</td><td>22.3m</td><td>18.75</td><td>11</td></tr><tr><td>ground-truth [61] community</td><td>ljn</td><td>3.99m</td><td>34.6m</td><td>8.67</td><td>17</td></tr><tr><td>purchase network</td><td>am</td><td>262k</td><td>900k</td><td>3.43</td><td>32</td></tr><tr><td>road network</td><td>rca</td><td>1.96m</td><td>2.76m</td><td>1.4</td><td>849</td></tr></table>
+
+table 2: (§ 6) the analyzed graphs with skewed degree distributions.
+
+used programming models we use threading to harness sm systems. for dm machines, we use message passing (mp, also denoted as msg-passing) and remote memory access (rma) [25]. in
+
+mp, processes communicate explicitly and synchronize implicitly with messages [8]. in rma, processes communicate and synchronize explicitly by accessing remote memories with puts, gets, or atomics, and ensuring consistency with flushes [6, 9, 25].
+
+counted events we incorporate the total of nine performance counters for detailed analyses of: cache misses (l1, l2, l3), reads and writes, conditional/unconditional branches, and data/instruction tlb misses. we also manually count issued atomics [50] and acquired locks [50]. memory operations and cache/tlb misses are important as many graph algorithms are memory-bound [5]. branches were also shown to impact performance in graph processing [28]. finally, in distributed settings we count sent/received messages, issued collective operations, and remote reads/writes/atomics.
+
+experimental setup and architectures we use the following systems to cover various types of machines:
+
+- cray xc nodes from the cscs supercomputing systems. we use xc50 and xc40 nodes from the piz daint machine. an xc50 node contains a 12-core intel xeon e5-2690 cpu with 64 gib ram. each xc40 node contains an 18-core intel xeon e5-2695 cpu with 64 gib ram. we also show results for xc30 nodes (with an 8-core intel e5-2670 sandy bridge cpu and 32 gib ram) from a past daint version. finally, we also provide results for xc40 nodes from a past piz dora system (referred to as xc40*); they contained 12-core intel haswells e5-2690 and 64 gib ram. all nodes are ht-enabled. the interconnection [7] in all the cases is based on cray's aries and it implements the dragonfly topology [33]. this machines represents massively parallel hpc systems.  
+- trivium v70.05 is a server with intel core i7-4770 (with four 3.4 ghz haswell 2-way multi-threaded cores). each core has 32 kb of l1 and 256 kb of l2 cache. the cpu has 8 mb of shared l3 cache and 8 gb of ram. this option represents commodity machines.
+
+infrastructure and implementation details we use the papi library (v5.4.1.1) to access performance counters. we spawn one mpi process per core (or per one ht resource if applicable). we use cray-mpich (v.7.2.2) for mp and the fompi library (v0.2.1) [25] for rma. we also use openmp 4.0 and tbb from the intel programming environment 6.0.3. we compile the code (with the -o3 flag) with  $\mathrm{g + + }$  v4.9.2 (on trivium) and cray gnu 5.2.40  $\mathrm{g + + }$  (on cscs systems). the information refers to the current daint system; others are covered in the technical report.
+
+# 6.1 shared-memory analysis
+
+we first analyze the differences in the sm setting. the representative papi data for selected schemes is in table 1. for each scheme, we discuss in more detail the results for graphs with: large  $\overline{d}$  and low  $d$ , and low  $\overline{d}$  and large  $d$ .
+
+pagerank pr results can be found in table 3. in graphs with both high  $\overline{d}$  (orc, ljn, poc) and low  $\overline{d}$  (rca, am), pulling outperforms pushing by  $\approx 3\%$  and  $\approx 19\%$ , respectively. the former requires no atomics, but its speedup is moderate as it also generates more cache misses and branches as it accesses various neighbors, requiring more random memory reads.
+
+<table><tr><td rowspan="2">g</td><td colspan="5">pagerank [ms]</td><td colspan="5">triangle counting [s]</td></tr><tr><td>orc</td><td>pok</td><td>ljn</td><td>am</td><td>rca</td><td>orc</td><td>pok</td><td>ljn</td><td>am</td><td>rca</td></tr><tr><td>pushing</td><td>572</td><td>129</td><td>264</td><td>4.62</td><td>6.68</td><td>11.78k</td><td>139.9</td><td>803.5</td><td>0.092</td><td>0.014</td></tr><tr><td>pulling</td><td>557</td><td>103</td><td>240</td><td>2.46</td><td>5.42</td><td>11.37k</td><td>135.3</td><td>769.9</td><td>0.083</td><td>0.014</td></tr></table>
+
+table 3: (§ 6.1) time per iteration for pagerank [ms] and the total time to compute for triangle counting [s] (sm setting, daint, xc30,  $t = 16$ ).
+
+triangle counting we now proceed to tc (table 3). large amounts of time are due to the high computational complexity ( $\s$  4.2); this is especially visible in graphs with high  $\overline{d}$ . here, pulling always outperforms pushing (by  $\approx 4\%$  for orc and  $\approx 2\%$  for rca). this is due to atomics but also more cache misses caused by atomics.
+
+graph coloring the bgc results are presented in figure 1. pushing is always faster than pulling (by  $\approx 10\%$  for orc and  $\approx 9\%$  for rca for iteration 1). more detailed measurements indicate that the number of locks acquired is the same in both variants, but pushing always entails fewer cache/tlb misses and issued reads and writes.
+
+$\delta$ -stepping the outcomes for orc and am can be found in figure 2). both push and pull variants use locks. yet, a higher number of memory accesses issued in most iterations in the pull-based scheme limits performance. as expected, the difference decreases after several iterations because the frontier grows (with pushing), requiring more memory accesses. this is especially visible in graphs with high  $\overline{d}$  where pulling outperforms pushing (e.g., iteration 6 for orc). moreover, illustrate in figure 2c that the larger  $\delta$  is, the smaller the difference between pushing and pulling becomes.
+
+![](images/b17a3741d80958c1783f29b0471a0667c19c5b1acf020d70ed6eedb794c0157b.jpg)  
+(a) the arc graph.
+
+![](images/374a14723191c57a2e84b718a6a29bfab0cfe1c762c531e61b9b7af0d2232a56.jpg)  
+(b) the am graph.
+
+![](images/6279c0d9f63a599657a49541609b0529e5c5b68dfb6fa45bca6e19037ac3813f.jpg)  
+(c) varying  $\delta$  (orc).  
+figure 2: (§ 6.1) sssp-△ sm analysis (xc30,  $t = 16$ ).
+
+breadth-first search the results are similar to sssp- $\delta$ ; pushing outperforms pulling in most cases. this is most visible for rca (high  $d$ , low  $\overline{d}$ ) due to many memory accesses.
+
+minimum spanning trees we illustrate the mst results in figure 4. we analyze time to complete each of the three most time-consuming phases of each iteration: find minimum (fm; looking for minimum-weight edges), build merge tree (bmt; preparing metadata for merging), and merge (m; merging of subtrees). now, pushing is faster than pulling in bmt and comparable in m. yet, it is slower in the most computationally expensive fm. in summary, performance trends are similar to those of tc: pushing is consistently slower ( $\approx 20$  for  $t = 4$ ) than pulling. this is because the latter entails no expensive write conflicts.
+
+betweenness centrality the results for bc can be found in figure 5. we present the running times of both bfs traversals and the total bc runtime. in each case, pushing is slower than pulling because of the higher amount of expensive write conflicts that entail more synchronization in both bc parts.
+
+# 6.2 acceleration strategies
+
+we now evaluate the acceleration strategies (§ 5).
+
+partition-awareness (pa) we start with adding pa to pr (table 6a). in graphs with higher  $\overline{d}$  (orc, ljn, poc), pushing+pa outperforms pulling (by  $\approx 24\%$ ). this is because pa decreases atomics (by  $7\%$ ) and comes with fewer cache misses ( $\approx 30\%$  for l1,  $\approx 34\%$  for l2, and  $\approx 69\%$  for l3) than pulling. in sparser graphs (rca, am), surprisingly pushing+pa is the slowest ( $\approx 205\%$  than pushing). this is because fewer atomics issued in pushing+pa ( $\approx 4\%$ ) are still dominated by more branches ( $\approx 23\%$ ), reads ( $\approx 44\%$ ), and cache misses ( $\approx 53\%$  for l3). we conjecture that in graphs with high  $\overline{d}$ , pa enhances pushing as the latter entails more atomics that dominate the performance. this is visible as both variants reduce the number of cache misses if adjacency lists are long and use better cache prefetchers. then, for low  $\overline{d}$ , adjacency lists are short on average, giving more cache misses in pushing+pa and pushing, making pulling the fastest. the worst performance of pushing+pa is due to the synchronization overheads (it splits each iteration into two phases separated by a barrier) that are no longer compensated with more effective cache utilization.
+
+frontier-exploit (fe), generic/greedy-switch (gs/grs) we now apply these strategies to bgc, ensuring the same number of colors for each coloring. all three strategies entail very similar (< 1% of difference) times to compute each iteration. here, we select grs and compare it to simple pushing/pulling; see figure 1. faster iterations are due to fewer memory accesses as predicted in § 5. next, we show that the strategies differ in the number of iterations, see table 6b. the largest iteration count (especially visible foe orc/ljn) is due to fe. as predicted, this is because of conflicts. both switching strategies reduce the iteration count.
+
+# 6.3 distributed-memory analysis
+
+we also conduct a distributed-memory analysis.
+
+6.3.1 pagerank. first, we use rma for push- and pull-based pr. the former uses remote atomics (mpi_accumulate) to modify ranks. the latter read the ranks with remote gets (mpi_get). next, we design pr with mp. here, we use the collective mpi_alltoa1v [43] to exchange the information on the rank updates among processes. this variant is unusual as it combines pushing and pulling: each
+
+![](images/513e81c169522bab68b40fa2c9f922f748e642e716c6c3bfeeacde701ca95c62.jpg)  
+(a) pr, orc.
+
+![](images/5865896276225881a8f01d71c37706208643ef2acdd6bdafa86988afc457caf1.jpg)  
+(b) pr, ljn.
+
+![](images/54591f3054016c6cb5856e185877ea39fc27086b8e3eb2a783ccc1d32164f107.jpg)  
+(c) pr, rmat,  $n = 2^{25}$ .
+
+![](images/17d6e7dade42c7a727a55fa2e32bec306915c6796d8794b15d66eae428836586.jpg)  
+(d) pr, rmat,  $n = 2^{27}$ .
+
+![](images/bc5b6eb89a9c951ab12425a272c6618786d4997f3a180ce40fc46d79eff946c3.jpg)  
+(e) tc, orc.
+
+![](images/24e75c162d827f285a60bae0ea01d1b187c92411a3bdda14825544d09714da0d.jpg)  
+(f) tc, ljn.
+
+![](images/5dc755cc6a5f1737c4b8e20dc6db4f910e1d04bec9da7371cb4612eacf971c54.jpg)  
+figure 3: (§ 6.3) the results of the scalability analysis in the dm setting, strong scaling (rmat graphs: xc40,  $t = 24$ ; real-world graphs: xc40*,  $t = 24$ ).  
+(a) "find minimum".
+
+![](images/269ac78c1ee4009d5de173bb8704b185aafacde7ea719a3f87f83a49c2896804.jpg)  
+(b) "build merge tree".
+
+![](images/87dba761228ff5e909f34d2428aa3de7244a7f73a7d83f492ea5cd035af5c1f1.jpg)  
+(c) "merge".
+
+![](images/85941d6cfe15623a1d3134b12e1cb38088ddfe6a3c12631d50b2c2e26c5e1e19.jpg)  
+figure 4: (§ 6.1) illustration of the mst analysis, each subplot relates to a different phase (xc40, ht enabled, the orc graph,  $t = 16$ ).  
+(a) first bfs runtime  
+figure 5: (§ 6.1) illustration of the bc analysis (scalability, xc40, ht enabled, the orc graph,  $t = 16$ ).  
+figure 6: (§ 6.2) acceleration strategy analysis (sm, daint, xc30,  $t = 16$ ). time per iteration (ms) for pagerank (the left table). number of iterations to finish for bgc (the right table).
+
+![](images/1cdf4e44d252858f1692547059e2d21bfacbcde108b9a88e4b3e0a27f40a0779.jpg)  
+(b) second bfs runtime
+
+![](images/199bb3975aa340d1a6c4f9913823a2f4f9dcfc12d638940e8e0292cc8921d2fe.jpg)  
+(c) total runtime.
+
+<table><tr><td>g</td><td>push</td><td>+pa</td></tr><tr><td>orc</td><td>557.985</td><td>425.928</td></tr><tr><td>pok</td><td>103.907</td><td>87.577</td></tr><tr><td>ljn</td><td>240.943</td><td>145.475</td></tr><tr><td>am</td><td>2.467</td><td>5.193</td></tr><tr><td>rca</td><td>5.422</td><td>13.705</td></tr></table>
+
+<table><tr><td>g</td><td>push</td><td>+fe</td><td>+gs</td><td>+grs</td></tr><tr><td>orc</td><td>49</td><td>173</td><td>49</td><td>49</td></tr><tr><td>pok</td><td>49</td><td>48</td><td>49</td><td>47</td></tr><tr><td>ljn</td><td>49</td><td>334</td><td>49</td><td>49</td></tr><tr><td>am</td><td>49</td><td>10</td><td>10</td><td>9</td></tr><tr><td>rca</td><td>49</td><td>5</td><td>5</td><td>5</td></tr></table>
+
+process contributes to the collective by both providing a vector of rank updates (it pushes) and receiving updates (it pulls).
+
+performance the performance outcomes (strong scaling) can be found in figure 3. mp consistently outperforms rma (by  $>10\mathrm{x}$ ); pushing is the slowest. this may sound surprising as mp comes with overheads due to buffer preparation. contrarily to rma, the
+
+communicated updates must first be placed in designated send buffers. yet, the used mpi_accumulate is implemented with costly underlying locking protocol. next, pulling suffers from communication overheads as it fetches both the degree and the rank of each neighbor of each vertex.
+
+memory consumption rma variants only use  $o(1)$  storage (per process) in addition to the adjacency list. contrarily, pr with mp may require up to  $o((nd) / p)$  storage (per process) for send and receive buffers.
+
+6.3.2 triangle counting. similarly to pr, we develop push- and pull-based tc with rma and with mp. in pushing, we increase remote counters with an faa. the mp-based tc uses messages to instruct which counters are augmented. to reduce communication costs, updates are buffered until a given size is reached.
+
+performance the results are in figure 3. rma variants always outperform mp; pulling is always faster than pushing ( $<1\%$  for orc and  $\approx 25\%$  for ljn for  $p = 48$ ). this is different from pr as the counters in tc are integer and the utilized rma library offers fast path codes of remote atomic faas that access 64-bit integers. the mp variant is the slowest because of the communication and buffering overheads.
+
+memory consumption both rma schemes fetch  $n(v)$  of each analyzed vertex  $v$  to check for potential triangles. this is done with multiple mpi_gets, with two extremes: a single get that fetches all the neighbors, or one get per neighbor. the former requires the largest amount of additional memory ( $o(\hat{d})$  storage per process) but least communication overheads. the latter is the opposite.
+
+# 6.4 further analyses
+
+we now show that the relative differences between pushing and pulling do not change significantly when varying the used machine. we verify that pr comes with the most relevant difference; see table 4. results vary most in denser graphs (orc,pok,ljn); for example pushing outperforms pulling on trivium while the opposite is true on dora. contrarily, the results are similar for rca and am. thus, the overheads from branches, reads, and cache misses (that are the highest in graphs with lowest  $\bar{d}$  ) dominate performance.
+
+# 6.5 push-pull insights
+
+we finally summarize the most important insights on the push-pull performance for the considered systems.
+
+<table><tr><td>trivium:</td><td>orc</td><td>pok</td><td>ljn</td><td>am</td><td>rca</td></tr><tr><td>push</td><td>1426.966</td><td>191.340</td><td>373.134</td><td>6.199</td><td>16.818</td></tr><tr><td>pull</td><td>1583.094</td><td>279.261</td><td>421.396</td><td>2.819</td><td>12.504</td></tr><tr><td>push+pa</td><td>1289.123</td><td>190.541</td><td>400.634</td><td>8.549</td><td>52.068</td></tr><tr><td colspan="6">daint (xc40):</td></tr><tr><td>push</td><td>499.463</td><td>123.784</td><td>248.602</td><td>5.744</td><td>7.753</td></tr><tr><td>pull</td><td>456.532</td><td>86.812</td><td>206.604</td><td>2.828</td><td>5.810</td></tr><tr><td>push+pa</td><td>378.548</td><td>78.883</td><td>128.255</td><td>6.157</td><td>14.102</td></tr></table>
+
+table 4: (§ 6.4) time to compute one iteration in pr [ms] (sm setting with full parallelism (ht enabled); trivium,  $t = 8$ ; dora, xc40,  $t = 24$ ).
+
+shared-memory settings first, some algorithms are the fastest with pushing (sssp- $\delta$ , bfs, and pr for dense graphs) except for some data points (e.g., iteration 6 for arc in sssp- $\delta$ ). this contradicts the intuition that pulling comes with less overheads from atomics. yet, they either entail more reads that dominate performance (e.g., sssp- $\delta$ ) or use cache prefetchers less effectively by not accessing contiguous structures (e.g., pr). the results for pr+pa illustrate that atomics do not always dominate performance; this can happen if effects such as cache misses become less dominant. second, sssp- $\delta$  on sm systems is surprisingly different from the variant for the dm machines presented in the literature, where pulling is faster [17]. this is because intra-node atomics are less costly than messages. next, ht accelerates each considered scheme, maintaining the relative differences between pushing and pulling. finally, several pulling schemes (in bgc and mst) are faster than their push counterparts.
+
+distributed-memory settings the choice of pr and tc illustrates that two algorithms with push and pull variants having similar algorithm designs may come with substantially different performance patterns. intuitively, rma should ensure highest performance in both pr and tc as both require the same mpi_accumulate remote atomic function. yet, the different operand type results in different underlying implementations and thus results. with the setting considered in this work, rma and mp ensured best performance for tc and pr, respectively.
+
+# 7 discussion
+
+we now discuss various aspects of push and pull variants.
+
+# 7.1 push-pull: linear algebra
+
+various graph algorithms can be expressed with linear algebra (la) operations such as matrix-vector (mv) multiplication. it enables a concise specification by abstracting from details such as scheduling vertices for processing in the next iteration [32]. we now illustrate that it is possible to frame la-based graph algorithms in push and pull variants.
+
+brief recap a crucial notion is the adjacency matrix of  $g$  (denoted as  $\mathbf{a}$ ) that encodes  $g$ 's structure. the element in row  $i$  and column  $j$  of  $\mathbf{a}$  equals 1 iff there is an edge from vertex  $j$  to vertex  $i$ , and equals 0 otherwise. for simplicity, we focus on unweighted graphs, but our conclusions apply to the weighted case.
+
+the graph algorithms that we consider can be cast as matrix-vector multiplications (mvs)  $\mathbf{a} \otimes \mathbf{x}^{(k)}$ , where  $\mathbf{x}^{(k)}$  is the algorithm state in iteration  $k$  and  $\otimes$  is matrix-vector multiplication operator over an appropriate semiring. the adjacency matrix  $\mathbf{a}$  is generally
+
+sparse, while  $\mathbf{x}^{(k)}$  may or may not be sparse depending on the computation. for example, in pr, each  $\mathbf{x}^{(k)}$  is dense, while in bfs, the sparsity of  $\mathbf{x}^{(k)}$  depends on the number of vertices in the  $k$ th frontier. we refer to the case when the vector is dense as spmv, and when the vector is sparse, spmspv. the dichotomy between push and pull algorithm variants is mirrored by the dichotomy between the compressed sparse column (csc) and compressed sparse row (csr) representations of a.
+
+a csr representation stores each row of a contiguously. the  $i$ th row of a contains all vertices with an edge to vertex  $i$ . consequently, performing an spmv in the csr layout involves iterating over each row and multiplying each nonzero element in the row by appropriate entries of the vector. thus, each entry of the output can be computed independently by a thread. this scheme is equivalent to pulling updates for each vertex. for spmv, csr (pulling) works extremely well, but for spmspv, it is not clear how to efficiently exploit the sparsity of the vector  $\mathbf{x}^{(k)}$ .
+
+a csc representation stores each column of a contiguously. the  $i$ th row of a contains all vertices with an edge from vertex  $i$ . consequently, performing an spmv in the csc layout involves iterating over each column and multiplying each nonzero element in the column by the same entry of the vector, while accumulating to different elements of the output vector. here, atomics or a reduction tree are necessary to combine updates to each output vector element. this scheme is equivalent to pushing updates from each vertex, as each thread is naturally assigned a different column of a and nonzero entry of  $\mathbf{x}^{(k)}$ . for spmspv, csc (pushing) facilitates exploiting the sparsity of the vector by simply ignoring columns of a that match up to zeros in  $\mathbf{x}^{(k)}$ .
+
+# 7.2 push-pull: programming models
+
+push/pull differences depend on the programming model:
+
+**threading/rma** the difference lies in the used atomics. an example is tc: no atoms (pulling) and faa (pushing).
+
+mp (point-to-point messages) in iterative algorithms with fixed communication patterns (e.g., tc) pushing gives more speedup as pulling increases the message count. in traversals, pushing-pulling switching offers highest performance [4, 17].
+
+mp (collectives) in collectives such as mpi_a11toa11v, all processes both push and pull the data, eliminating the distinction between these two.
+
+# 7.3 push-pull: code complexity
+
+push and pull variants considered in this work come with similar code complexity. still, pull schemes can be more challenging in achieving high performance. consider the inner loop in pr where a thread iterates over  $n(v)$  of a given  $v$ . in pushing, updates are conducted simply with atomics. contrarily, in pulling, one must also fetch the degrees of neighbors. this is similar for other pull variants and poses more challenges in making the code fast.
+
+# 7.4 push-pull: gather-apply-scatter
+
+finally, we discuss the relationship between the push-pull dichotomy and the well-know gather-apply-scatter (gas) abstraction [27]. in gas, one develops a graph algorithm by specifying the gather, apply, and scatter functions. they run in parallel for each vertex
+
+$v$  and respectively: bring some data from  $v$ 's neighbors, use it to modify  $v$ 's value, and write the result to a data structure. we now describe two algorithms designed with gas (sssp and gc) [27] and show how to develop them with pushing or pulling.
+
+sssp here, each vertex  $v$  is processed in parallel by selecting  $v$ 's incident edge  $e$  that offers a path to the selected root  $s$  with the lowest distance. if it is lower than the current distance from  $v$  to  $s$ , the value is updated accordingly and  $n(s)$  are scheduled for processing in the next iteration. now, push or pull can be applied when  $v$  updates its distance to  $s$ . in the former, a neighboring vertex that performed a relaxation in the previous iteration updates its neighbors (pushes the changes) with new distances. in the latter, each vertex scheduled for updates iterates over its neighbors (pulls the updates) to perform a relaxation by itself.
+
+gc every vertex  $v$  collects the set of colors on  $n(v)$  to compute a new unique color. next, the new colors are scattered among  $n(v)$ . any conflicting vertices are then scheduled for the color recomputation in the next iteration. this algorithm is a special case of bgc: each vertex constitutes a separate partition (i.e.,  $\forall_{v \in v} \forall_{u \in n(v)} t[v] \neq t[u]$ ). thus, the same approach can be incorporated.
+
+# 8 related work
+
+push and pull algorithm variants several graph algorithms that approach the pushing and pulling distinction have been proposed. the bottom-up (pull) bfs was described by suzumura et al. [55] while beamer et al. [4] introduced a direction-optimizing bfs that switches between top-down (push) and bottom-up (pull) variants. madduri et al. [39] proposed several improvements to bc, one of which inverts the direction of modifications in the backward traversal to eliminate critical sections. whang et al. [60] described pulling and pushing in pr. finally, chakaravarthy et al. [17] inverts the direction of message exchanges in the distributed  $\delta$ -stepping algorithm. all these schemes are solutions to single problems. we embrace and generalize them in the push-pull analysis.
+
+pushing/pulling in graph frameworks various graph processing frameworks were introduced, for example pbgl [29], pregel [40], graphblas [41], galois [34], hama [51], powergraph [27], graphlab [37], and spark [62]. some use pushing and pulling in certain ways, by: sending and receiving messages (pregel), using the gas abstraction (powergraph), switching between sparse and dense graph structures (ligra [52]), switching the direction of updates in a distributed environment (gemini [65]), using pushing and pulling in 3d task-partitioning [63], or pushing and pulling to/from disk [59]. yet, none of them comes with an analysis on the push-pull dichotomy, focusing on the framework design. finally, doekemeijer et al. [20] list graph processing frameworks that have push- or pull-based communication. our theoretical analysis and performance observations can serve to help better understand and improve graph processing frameworks.
+
+accelerating strategies the grace framework [45] partitions the graph similarly to partition-awareness, but its goal is to reduce caching overheads instead of atomics in pushing. ligra uses a scheme similar to generic-switch as it switches between sparse and dense graph representations [52]. finally, salihoglu et al. [47]
+
+enhance pregel-based systems with various schemes. among others, similarly to greedy-switch, they propose to switch from a pregel-based distributed scheme to a sequential algorithm variant.
+
+pushing/pulling outside graph processing borokhovich et al. [12] analyzed gossip algorithms in network coding for information spreading using push, pull, and exchange communication schemes. swamy et al. [56] designed an asymptotically optimal push-pull method for multicasting over a random network. intel tbb uses a push-pull protocol in its flow graphs, biasing communication to prevent polling and to reduce unnecessary retries [58]. an analysis of push and pull in software engineering has also been conducted [64]. none of these works addresses graph processing.
+
+# 9 conclusion
+
+graph processing has become an important part of various cs research and industry fields, including hpc, systems, networking, and architecture. its challenges, described by lumsdaine et al. almost 10 years ago [38], have still not been resolved and accelerating graph computations remains an important goal that must be attained for the ability to process the enormous amounts of data produced today.
+
+in this work, we accelerate graph algorithms by deriving the most advantageous direction of graph updates out of the two options: pushing the updates from the private to the shared state, or pulling the updates in the opposite direction. we illustrate in a detailed analysis that the push-pull (pp) dichotomy, namely using either pushing or pulling, can be applied to various algorithms such as triangle counting, minimum spanning tree computations, or graph coloring. we provide detailed specifications, complexity analyses, and performance data from hardware counters on which variant serves best each algorithm and why pushing and pulling differ. these insights can be used to improve various graph processing engines.
+
+furthermore, we identify that pushing usually suffers from excessive amounts of atomics/locks while pulling entails more memory reads/writes. we use generic strategies to limit the amount of both, accelerating the processing of road networks, citation graphs, social networks, and others.
+
+our analysis illustrates that the decision on using either pushing or pulling is not limited to merely applying updates in pagerank or sending messages in bfs, but is related to a wide class of algorithms, strategies, graph abstractions, and programming models. our pp dichotomy can easily be generalized to other concepts related to graph processing, for example vectorization [10].
+
+# acknowledgments
+
+we thank hussein harake, colin mcmurtrie, and the whole cscs team granting access to the greina, piz dora, and daint machines, and for their excellent technical support.
+
+# references
+
+[1] baruch awerbuch and yossi shiloach. 1987. new connectivity and msf algorithms for shuffle-exchange network and pram. ieee trans. on comp. 36, 10 (1987), 1258-1263.  
+[2] david a bader et al. 2007. approximating betweenness centrality. in algorithms and models for the web-graph. springer, 124-137.
+
+[3] david a bader and guojing cong. 2004. fast shared-memory algorithms for computing the minimum spanning forest of sparse graphs. in par. and dist. proc. symp. (ipdps). ieee, 39.  
+[4] scott beamer, krste asanovic, and david patterson. 2013. direction-optimizing breadth-first search. scientific programming 21, 3-4 (2013), 137-148.  
+[5] scott beamer, krste asanovic, and david patterson. 2015. gail: the graph algorithm iron law. in workshop on ir. app.: arch. and alg. 13.  
+[6] maciej besta and torsten hoefer. 2014. fault tolerance for remote memory access programming models. in proceedings of the 23rd international symposium on high-performance parallel and distributed computing. 37-48.  
+[7] maciej besta and torsten hoefler. 2014. slim fly: a cost effective low-diameter network topology. in sc'14: proceedings of the international conference for high performance computing, networking, storage and analysis. ieee, 348-359.  
+[8] maciej besta and torsten hoefler. 2015. accelerating irregular computations with hardware transactional memory and active messages. in proceedings of the 24th international symposium on high-performance parallel and distributed computing. 161-172.  
+[9] maciej besta and torsten hoefler. 2015. active access: a mechanism for high-performance distributed data-centric computations. in proceedings of the 29th acm on international conference on supercomputing. 155-164.  
+[10] maciej besta, florian marending, edgar solomonik, and torsten hoefer. 2017. slimsell: a vectorizable graph representation for breadth-first search. in 2017 ieee international parallel and distributed processing symposium (ipdps). ieee, 32-41.  
+[11] erik g boman et al. 2005. a scalable parallel graph coloring algorithm for distributed memory computers. in euro-par. 241-251.  
+[12] michael borokhovich et al. 2010. tight bounds for algebraic gossip on graphs. in inf. theory proc. (isit), ieee intl. symp. on. 1758-1762.  
+[13] otakar boruvka. 1926. o jistém problému minimálím. (1926).  
+[14] ulrik brandes. 2001. a faster algorithm for betweenness centrality. j. of math. sociology 25, 2 (2001), 163-177.  
+[15] sergey brin and lawrence page. 1998. the anatomy of a large-scale hypertextual web search engine. in proc. of intl. conf. on world wide web (www7). 107-117.  
+[16] umit catalyurek and cevdet aykanat. 2001. a fine-grain hypergraph model for 2d decomposition of sparse matrices. in proc. of the intl. par. &amp; dist. proc. symp. (ipdps '01). 118--. http://dl.acm.org/citation.cfm?id=645609.663255  
+[17] venkatesan t chakaravarthy et al. 2014. scalable single source shortest path algorithms for massively parallel systems. in par. and dist. proc. symp., ieee intl. 889-901.  
+[18] thomas h. cormen, clifford stein, ronald l. rivest, and charles e. leiserson. 2001. introduction to algorithms (2nd ed.). mcgraw-hill higher education.  
+[19] gabor csardi and tamas nepusz. 2006. the igraph software package for complex network research. interjournal, complex systems 1695, 5 (2006), 1-9.  
+[20] niels doekemeijer and ana lucia varbanescu. 2014. a survey of parallel graph processing frameworks. delft university of technology (2014).  
+[21] p erdős and a rényi. 1976. on the evolution of random graphs. selected papers of alfred rényi 2 (1976), 482-525.  
+[22] steven fortune and james wyllie. 1978. parallelism in random access machines. in proc. of acm symp. on theory of comp. 114-118.  
+[23] hillel gazit et al. 1988. an improved parallel algorithm that computes the bfs numbering of a directed graph. inf. proc. let. 28, 2 (1988), 61-65.  
+[24] hillel gazit et al. 1988. optimal tree contraction in the erew model. in concurrent computations. springer, 139-156.  
+[25] r. gerstenberger, m. besta, and t. hoefler. 2013. enabling highly-scalable remote memory access programming with mpi-3 one sided. in proc. of the acm/ieee supercomputing (sc '13). article 53, 12 pages.  
+[26] ashish goel and kamesh munagala. 2012. complexity measures for map-reduce, and comparison to parallel computing. arxiv preprint arxiv:1211.6526 (2012).  
+[27] joseph e gonzalez et al. 2012. powergraph: distributed graph-parallel computation on natural graphs.. in osdj, vol. 12. 2.  
+[28] oded green et al. 2014. branch-avoiding graph algorithms. arxiv:1411.1460 (2014).  
+[29] douglas gregor and andrew lumsdaine. 2005. the parallel bgl: a generic library for distributed graph computations. par. obj.-or. scientific comp. (poosc) (2005), 2.  
+[30] tim j harris. 1994. a survey of pram simulation techniques. acm comp. surv. (csur) 26, 2 (1994), 187-206.  
+[31] intel, inc. 2015. 64 and ia-32 architectures software developer's manual. (2015).  
+[32] jeremy kepner and john gilbert. 2011. graph algorithms in the language of linear algebra. vol. 22. siam.  
+[33] john kim et al. 2008. technology-driven, highly-scalable dragonfly topology. in ann. intl. symp. on comp. arch. (isca '08). 77-88. https://doi.org/10.1109/ isca.2008.19  
+[34] milind kulkarni et al. 2007. optimistic parallelism requires abstractions. in acm sigplan conf. on prog. lang. des. and impl. (pldi '07). 211-222. https://doi.org/10.1145/1250734.1250759  
+[35] charles e leiserson and tao b schardl. 2010. a work-efficient parallel breadth-first search algorithm (or how to cope with the nondeterminism of reducers). in
+
+proc. of acm symp. on par. in alg. and arch. 303-314.  
+[36] jure leskovec et al. 2010. kronecker graphs: an approach to modeling networks. j. of machine learning research 11, feb (2010), 985-1042.  
+[37] yucheng low et al. 2010. graphlab: a new framework for parallel machine learning. preprint arxiv:1006.4990 (2010).  
+[38] andrew lumsdaine, douglas gregor, bruce hendrickson, and jonathan w. berry. 2007. challenges in parallel graph processing. par. proc. lett. 17, 1 (2007), 5-20.  
+[39] kamesh madduri et al. 2009. a faster parallel algorithm and efficient multithreaded implementations for evaluating betweenness centrality on massive datasets. in par. & dist. proc. (ipdps), ieee intl. symp. on. 1-8.  
+[40] grzegorz malewicz et al. 2010. pregel: a system for large-scale graph processing. in acm sigmod intl. conf. on manag. of data (sigmod '10). 135-146. https://doi.org/10.1145/1807167.1807184  
+[41] tim mattson et al. 2014. standards for graph algorithm primitives. arxiv preprint arxiv:1408.0393 (2014).  
+[42] ulrich meyer and peter sanders. 2003.  $\delta$ -stepping: a parallelizable shortest path algorithm. journal of algorithms 49, 1 (2003), 114-152.  
+[43] mpi forum. 2012. mpi: a message-passing interface standard. version 3. (2012).  
+[44] richard c murphy et al. 2010. introducing the graph 500. cray user's group (cug) (2010).  
+[45] vijayan prabhakaran et al. 2012. managing large graphs on multi-cores with graph awareness.. in usenix annual technical conference, vol. 12.  
+[46] dimitrios prountzos and keshav pingali. 2013. betweenness centrality: algorithms and implementations. in acm sigplan notices, vol. 48. acm, 35-46.  
+[47] semih salihoglu and jennifer widom. 2014. optimizing graph algorithms on pregel-like systems. proceedings of the vldb endowment 7, 7 (2014), 577-588.  
+[48] nadathur satish et al. 2014. navigating the maze of graph analytics frameworks using massive graph datasets. in acm sigmod intl. conf. on man. data, 979-990.  
+[49] thomas schank. 2007. algorithmic aspects of triangle-based network analysis. ph.d. dissertation. university karlsruhe.  
+[50] hermann schweizer, maciej besta, and torsten hoeffer. 2015. evaluating the cost of atomic operations on modern architectures. in 2015 international conference on parallel architecture and compilation (pact). ieee, 445-456.  
+[51] sangwon seo et al. 2010. hama: an efficient matrix computation with the mapreduce framework. in intl. conf. on cloud comp. tech. and science (cloudcom'10), 721-726. https://doi.org/10.1109/cloudcom.2010.17  
+[52] julian shun and guy e bleloch. 2013. ligra: a lightweight graph processing framework for shared memory. in acm sigplan notices, vol. 48. 135-146.  
+[53] j. shun and k. tangwongsan. 2015. multicore triangle computations without tuning. in 2015 ieee 31st intl. conf. on data engineering. 149-160. https://doi.org/10.1109/icde.2015.7113280  
+[54] edgar solomonik, maciej besta, flavio vella, and torsten hoefer. 2017. scaling betweenness centrality using communication-efficient sparse matrix multiplication. in proceedings of the international conference for high performance computing, networking, storage and analysis. 1-14.  
+[55] toyotaro suzumura et al. 2011. performance characteristics of graph500 on large-scale distributed environment. in workload char. (iiswc), ieee intl. symp. on. 149-158.  
+[56] vasuki narasimha swamy et al. 2013. an asymptotically optimal push-pull method for multicasting over a random network. inf. theory, ieee tran. on 59, 8 (2013), 5075-5087.  
+[57] adrian tate, amir kamil, anshu dubey, armin größlinger, brad chamberlain, brice goglin, carter edwards, chris j newburn, david padua, didem unat, et al. 2014. programming abstractions for data locality. (2014).  
+[58] michael voss. understanding the internals of tbb::graph : balancing push and pull. (????).  
+[59] zhigang wang et al. 2016. hybrid pulling/pushing for i/o-efficient distributed and iterative graph computing. in acm intl. conf. on man. of data. 479-494.  
+[60] joyce jiyoung whang et al. 2015. scalable data-driven pagerank: algorithms, system issues, and lessons learned. in euro-par: par. proc. 438-450.  
+[61] jaewon yang and jure leskovec. 2015. defining and evaluating network communities based on ground-truth. knowledge and information systems 42, 1 (2015), 181-213.  
+[62] matei zaharia et al. 2012. resilient distributed datasets: a fault-tolerant abstraction for in-memory cluster computing. in proc. of the usenix conf. on net. sys. design and impl. (nsdi'12). 2-2. http://dl.acm.org/citation.cfm?id=2228298.2228301  
+[63] mingxing zhang et al. 2016. exploring the hidden dimension in graph processing. in usenix symp. on op. sys. des. and impl. (osdi 16).  
+[64] yang zhao. 2003. a model of computation with push and pull processing. ph.d. dissertation. citeseer.  
+[65] xiaowei zhu et al. 2016. gemini: a computation-centric distributed graph processing system. in usenix symp. on op. sys. des. and impl. (osdi 16).

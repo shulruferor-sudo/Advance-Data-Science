@@ -1,0 +1,484 @@
+# fastif: scalable influence functions for efficient model interpretation and debugging
+
+han guo $^{1,2,3}$  nazneen fatema rajani $^{1}$  peter hase $^{3}$  mohit bansal $^{3}$  caiming xiong $^{1}$
+
+$^{1}$ salesforce research  $^{2}$ carnegie mellon university  $^{3}$ unc chapel hill
+
+{nazneen.rajani, cxiong}@salesforce.com
+
+hanguo@cs.cmu.edu, {peter, mbansal}@cs.unc.edu
+
+# abstract
+
+influence functions approximate the "influences" of training data-points for test predictions and have a wide variety of applications. despite the popularity, their computational cost does not scale well with model and training data size. we present fastif, a set of simple modifications to influence functions that significantly improves their run-time. we use  $k$ -nearest neighbors ( $knn$ ) to narrow the search space down to a subset of good candidate data points, identify the configurations that best balance the speed-quality trade-off in estimating the inverse hessian-vector product, and introduce a fast parallel variant. our proposed method achieves about 80x speedup while being highly correlated with the original influence values. with the availability of the fast influence functions, we demonstrate their usefulness in four applications. first, we examine whether influential data-points can "explain" test time behavior using the framework of simulatability. second, we visualize the influence interactions between training and test data-points. third, we show that we can correct model errors by additional fine-tuning on certain influential data-points, improving the accuracy of a trained multinli model by  $2.5\%$  on the hans dataset. finally, we experiment with a similar setup but fine-tuning on datapoints not seen during training, improving the model accuracy by  $2.8\%$  and  $1.7\%$  on hans and anli datasets respectively. overall, our fast influence functions can be efficiently applied to large models and datasets, and our experiments demonstrate the potential of influence functions in model interpretation and correcting model errors. $^{1}$
+
+# 1 introduction
+
+language understanding systems are becoming ever more powerful with the recent advances in
+
+![](images/9d8ebeb794cfae25430fe3d941cd0db8f228b883f682e9ad7801f1c3c279fd44.jpg)  
+figure 1: workflow of fastif w.r.t. a test data-point. first a subset of data-points are selected from the entire training set using knn to reduce search space, then the inverse hessian-vector product  $(s_{\mathrm{test}})$  is estimated based on sec. 3.3. the influence values of data-points are computed using the outputs from these two steps. finally, the most influential data-point(s) are returned.
+
+large-scale pre-training. as these systems become widely adopted for real-world applications, the ability to interpret the model decisions grows increasingly important. an array of interpretation methods now exist for shedding light on models' decision-making processes, with the bulk of work focusing on estimating feature importance (li et al., 2016a; ribeiro et al., 2016b; lundberg and lee, 2017; sundararajan et al., 2017a; ribeiro et al., 2018a) and interpreting internal model representations (donnelly and roegiest, 2019; mu and andreas, 2020; de cao et al., 2020). these approaches aim to identify features a model uses to make decisions or analyze representations obtained from trained models. in contrast, one might also want to know how particular training data points influence model behavior at test time. this kind of goal is an instance of what lipton (2016) terms "algorithmic transparency," or, transparency "at the level of the learning algorithm itself." the ability to do so would allow researchers to identify and respond to data responsible for problematic test-time behavior.
+
+one simple brute-force way to estimate the importance of a training data-point to a test-time decision is the leave-one-out approach (hastie et al.,
+
+2009). alternatively, influence functions (koh and liang, 2017) provide a tractable estimate of the effect without the need to repeatedly retrain the model. yet, influence functions are very expensive to compute for moderate-sized model and training data. for instance, finding the most influential examples w.r.t. an evaluation data-point with a model of about 14.7m parameters in a dataset of about 390k examples – a pretty moderate setting – takes more than 2 hours (please see sec. 5.1 for details). consequently, applications might face the dilemma of either accepting the computation cost or resorting to a smaller-scale setting.<sup>2</sup> but why are influence functions computationally expensive? in our early experiments, we found that the main computational bottleneck lies in the following steps:
+
+1. first, searching for the most positive/negative influential data-point(s) w.r.t. some evaluation data-point(s) is an  $\mathcal{o}(n)$  operation (via enumerating the entire training set), and can take more than two hours in our experiments.  
+2. second, it is expensive to estimate the inverse hessian of model parameters required to compute the influence of a single data-point is expensive (usually in the order of minutes).  
+3. lastly, previous algorithms perform serial computations that can actually be parallelized.
+
+in this work, we present fastif (fast influence functions) to address these challenges through three simple techniques. first, instead of enumerating the full training dataset to find influential data-point, we leverage fast nearest neighbor search (johnson et al., 2017) to narrow the search to a small subset of influence-worthy data-points. this operation reduces the computation by about an order of magnitude. second, we identify a set of hyperparameters for the hessian estimation algorithm that reduces computation time by more than half while preserving estimation quality. finally, we describe a simple parallelizable extension, which gives an additional 2x speedup. as a result, we are able to improve the most influential examples search overall by approximately two orders of magnitude in our experiments.
+
+so what could we do with faster influence functions? we demonstrate the advantage of fast influence functions via several interesting downstream applications. these require computing in
+
+fluence functions repeatedly and were thus almost intractable without such fast influence functions:
+
+1. in sec. 6.1 we examine the "explainability" of influential examples using the framework of simulatability (doshi-velez and kim, 2017; hase and bansal, 2020), and we find that they improve model simulatability.  
+2. we visualize how different training data-points interact with different test data-points in sec. 6.2. the visualizations help us uncover interesting latent structures in the dataset, and the insights could be used to improve model performance.  
+3. in sec. 6.3 we show a simple application of influence functions in correcting model prediction by fine-tuning on certain influential examples. despite its simplicity, our method can improve a multinli model's accuracy on the hans dataset by more than  $5.8\%$  (about  $2.5\%$  more than our baseline).  
+4. influence functions are defined w.r.t. the training data used in the model training. also in sec. 6.3, we extend the above experiment and demonstrate the potential of influence functions to the setting where we want to leverage a new labeled dataset unseen during training. this can improve a multinli model's accuracy on the hans/anli dataset (williams et al., 2018; mccoy et al., 2019; nie et al., 2020) by more than  $5.9\% / 2.7\%$  (about  $2.8\% / 1.7\%$  more than our baseline).
+
+# 2 related work
+
+explainable machine learning. with the rise of model complexity and adoption of large-scale machine learning models, there is an increasing emphasis on interpreting model behaviors (doshi-velez and kim, 2017; ribeiro et al., 2020; wallace et al., 2019; hase and bansal, 2020). for example, previous work has considered interpreting predictions by constructing importance scores over the input tokens (belinkov and glass, 2019), attention-based methods (jain and wallace, 2019; wiegreffe and pinter, 2019; zhong et al., 2019), gradient-based methods (simonyan et al., 2013; shrikumar et al., 2017; sundararajan et al., 2017b; smilkov et al., 2017; feng et al., 2018), perturbation-based methods (li et al., 2016b), local approximation methods (ribeiro et al., 2016a, 2018b), prototype methods (chen et al., 2019; hase et al., 2019), counterfactual and decision boundary methods (joshi et al., 2018; samangouei et al., 2018;
+
+mothilal et al., 2020), natural language generation (camburu et al., 2018; rajani et al., 2019; hase et al., 2020; wegreffe et al., 2020), and recently, knn-based methods (papernot and mcdaniel, 2018; rajani et al., 2020).
+
+influence functions. the use of influence-based diagnostics can be traced back to the seminal papers such as cook (1977); cook and weisberg (1980, 1982); cook (1986). recently, koh and liang (2017) brought influence functions to large-scale deep learning and have been followed up by numerous publications. for example, koh et al. (2018) used them for data poisoning attacks, schulam and saria (2019) for calibrating trust in individual model predictions, brunet et al. (2019) for tracing biases in word embeddings, koh et al. (2019) and basu et al. (2020) for identifying important groups of training data, and feldman and zhang (2020) for studying neural networks memorization.
+
+in the context of influence functions for nlp, han et al. (2020) used them to explain model predictions and unveil data artifacts. yang et al. (2020) used them to estimate the quality of synthetic training samples in the context of data augmentation. meng et al. (2020) explored the combination of gradient-based methods and influence functions to jointly examine training history and test stimuli. their work also tried using influence functions to fix erroneously classified examples, albeit through retraining another model. in our work, we primarily focus on improving the run-time of the influence function, and explore its potential in interpreting model behaviors and efficiently correcting predictions. kobayashi et al. (2020) experimented with training models with instance-specific dropout masks to efficiently compute the influence of one training data-point on one test data-point. our method, on the other hand, both speeds up individual influence function computation (sec. 3.3) and reduces the number of such computations (sec. 3.2). further, it is an inference-time technique; it requires no change to model training and could, in principle, work with any trained model. finally, we also include a more extensive set of experiments/applications on a larger dataset.
+
+# 3 fastif: method details
+
+# 3.1 background
+
+let a data-point be defined as  $z = (x, y)$  for input  $x$  and label  $y$ , and the loss function be
+
+$l(z,\theta)$ . given  $n$  training data-points in the training set  $\mathcal{z}$ , the standard empirical risk minimization tries to solve the following problem,  $\hat{\theta} = \arg \min_{\theta}\frac{1}{n}\sum_{i = 1}^{n}l(z_i,\theta)$ . we want to answer the question: what is the influence of a training datapoint  $z$  on the learned model parameters  $\theta$  and its behavior on a new test data-point  $z_{\mathrm{test}}$ .
+
+leave-one-out methods take the "discrete" way: train two models, one on the full training dataset  $\mathcal{z}$ , and one on the same dataset but with  $z$  removed. the difference in the behavior between these two models is the effect of  $z$ 's presence (or absence). among the many definitions of model behavior, in this work we mainly focus on the loss at the test data-point. influence functions, on the other hand, answer this question via approximating it locally and measure the change in the model behavior via up-weighting the loss of the training data-point by  $\epsilon$ . thus the influence function refers to the change in the model's loss on the test data-point  $z_{test}$  if we up-weight the loss of training data-point  $z$  by  $\epsilon$ ,  $\mathcal{i}(z,z_{test}) := \frac{dl(z_{test},\hat{\theta}_{\epsilon,z})}{d\epsilon}$ . where  $\hat{\theta}_{\epsilon,z}$  are the parameters of the model trained with training data-point  $z$  up-weighted by  $\epsilon$ ,  $\hat{\theta}_{\epsilon,z} = \arg\min_{\theta} \frac{1}{n} \sum_{i=1}^{n} (l(z_i, \theta) + \epsilon l(z, \theta))$ .
+
+measuring  $\mathcal{i}(z,z_{\mathrm{test}})$  via training another model is prohibitively expensive. the influence function (koh and liang, 2017) computes the following tractable approximation,
+
+$$
+\mathcal {i} (z, z _ {\text {t e s t}}) \approx - \nabla_ {\theta} l \left(z _ {\text {t e s t}}, \hat {\theta}\right) ^ {t} h _ {\hat {\theta}} ^ {- 1} \nabla_ {\theta} l (z, \hat {\theta}) \tag {1}
+$$
+
+where  $\hat{\theta}$  is the original parameter vector of model trained using training data-points, and  $h_{\hat{\theta}}$  is the hessian of model parameters. for each test datapoint  $z_{\mathrm{test}}$ , we are usually interested in finding the most positively influential training data-points, and the most negatively influential training datapoints. we can find the most positively influential (i.e., harmful) training data-points  $z^{*}$  by computing the influence values between  $z_{\mathrm{test}}$  and each  $z$  in the training set,
+
+$$
+z ^ {*} = \arg \max  _ {z \in \mathcal {z}} \mathcal {i} (z, z _ {\text {t e s t}}) \tag {2}
+$$
+
+where arg max changes to arg min for finding the most negatively influential (i.e., helpful) data-point. while a much more tractable approximation, this is still unscalable in practice for a few reasons.
+
+<table><tr><td></td><td>original s test (1 gpu)</td><td>fast s test (1 gpu)</td><td>fast s test (4 gpus)</td></tr><tr><td>no knn</td><td>≥ 2 hours (1x)</td><td>/</td><td>/</td></tr><tr><td>knn k = 1e4</td><td>14.72 ±0.21 min (8x)</td><td>6.61 ± 0.03 min (18x)</td><td>2.36 ± 0.02 min (50x)</td></tr><tr><td>knn k = 1e3</td><td>10.93 ± 0.04 min (10x)</td><td>3.13 ± 0.05 min (38x)</td><td>1.46 ± 0.07 min (82x)</td></tr></table>
+
+table 1: averages and standard deviations of influence functions runtime measured on 10 multinli examples.
+
+first, enumerating all the data-points in the training set to find the arg max/arg min influence values is expensive for large datasets. second, evaluating the inverse-hessian  $h_{\hat{\theta}}^{-1}$  is very expensive for large neural-network models (koh and liang, 2017; agarwal et al., 2017). in this work, we address those challenges by presenting simple but effective methods. we summarize the speed improvements in multinli settings in table 1 and sec. 5.1, and our method in fig. 1.
+
+# 3.2 speeding up the arg max using  $k\mathbf{n}\mathbf{n}$
+
+a naive implementation of eq. 2 is expensive because the computation cost grows with the dataset size. in practice, however, we are primarily concerned with data-points that are most influential. we hypothesize that we could constrain the expensive search to a subset of promising data points,  $\hat{\mathcal{z}}\subseteq \mathcal{z}$ , that are likely to be influential, without a significant impact on quality,
+
+$$
+z ^ {*} = \arg \max  _ {z \in \hat {\mathcal {z}}} \mathcal {i} (z, z _ {\text {t e s t}}) \tag {3}
+$$
+
+notice that the arg max is now performed over  $\hat{\mathcal{z}}\subseteq \mathcal{z}$ . we select the subset  $\hat{\mathcal{z}}$  as the top- $k$  nearest neighbors of  $z_{\mathrm{test}}$  based on the  $\ell_2$  distance between extracted features of the data-points following khandelwal et al. (2019) and rajani et al. (2020). this operation is extremely fast using highly-optimized nearest neighbor search libraries such as faiss (johnson et al., 2017). in sec. 5.2, we will examine the quality of nearest neighbors in terms of retrieving influence-worthy data-points.
+
+# 3.3 speeding up the inverse hessian
+
+the next computational bottleneck lies in estimating the inverse hessian of model parameters in eq. 1. computing the hessian for the full training dataset is expensive, and inverting it is similarly prohibitive: with  $n$  training data-points and  $p$  parameters, this computation requires  $\mathcal{o}(np^2 + p^3)$  operations, and is very expensive for large dataset/model (please see sec. 3 in koh and liang (2017) for details). we start by describing the method proposed in koh and liang (2017).
+
+first, notice that for each test data-point  $z_{\mathrm{test}}$ , we can pre-compute and cache the following quantity,
+
+$$
+s _ {\text {t e s t}} = h _ {\hat {\theta}} ^ {- 1} \nabla_ {\theta} l \left(z _ {\text {t e s t}}, \hat {\theta}\right) \tag {4}
+$$
+
+we can then efficiently compute the influence for each data-point  $z$ ,  $\mathcal{i}(z,z_{\mathrm{test}}) = -s_{\mathrm{test}}\cdot \nabla_{\theta}l(z_i,\hat{\theta})$ . next, the method approximates  $s_{\mathrm{test}}$  via a combination of (1) implicit hessian-vector products (hvps) to avoid explicitly computing/storing  $h_{\hat{\theta}}^{-1}$ , (2) using a mini-batch of data-points to obtain a stochastic unbiased estimate of the hessian, and (3) neumann series (sec 3.1 in agarwal et al. (2017)) to iteratively estimate the inverse. we refer interested readers to agarwal et al. (2017) for details regarding the lissa (linear time stochastic second-order algorithm) algorithm and to sec. 4.2 in koh and liang (2017) for details regarding nonconvexity and non-convergence. the algorithm can be summarized as:
+
+- step 1. let  $v \coloneqq \nabla_{\theta}l(z_{\mathrm{test}},\hat{\theta})$ , and initialize the inverse hvp estimation  $\hat{h}_{0,\hat{\theta}}^{-1}v = v$ .  
+- step 2. for  $j \in \{1, 2, \dots, j\}$ , recursively compute the inverse hvp estimation using a batch size  $b$  of randomly sampled data-point(s)  $z$ ,  $\hat{h}_{j,\hat{\theta}}^{-1}v = v + \left(i - \hat{\nabla}_{\hat{\theta}}^{2}l(z,\hat{\theta})\right)\hat{h}_{j - 1,\hat{\theta}}^{-1}v$ , where  $j$  is a sufficiently large integer so that the above quantity converges.  
+- step 3. repeat step 1-2  $t$  times independently, and return the averaged inverse hvp estimations.
+
+we can see that the computation cost and approximation quality depends on:  $j$  the number of recursive iterations,  $t$  the number of independent runs, and  $b$  the batch size. typically,  $j$  is chosen such that the approximation converges, the number of repetition is simply set  $t = 1$ , and the batch size is set to the largest value that the gpu can afford. experiments in sec. 5.3 examine the speed-quality trade-off under various configurations. contrary to the common settings, the experimental observations lead us to propose a few simple changes: (1) choose a  $j$  so that approximation converges; (2) choose a small batch size; (3) make up for the noisiness of small batch size using larger  $t$ , which can be distributed over multiple gpus (sec. 3.4). in
+
+![](images/e170f940e0294337ae06cfe395628ed5321e48705c2c371561bc3161b2b8e36d.jpg)  
+figure 2: parallel computation of influence functions.
+
+our experiments, we pick  $j\in \{1000,1500,2000\}$  based on convergence, we found that even  $b = 1$  suffices, and we choose  $t\in [1,4]$ .
+
+# 3.4 details on parallelization (fig. 2)
+
+the modifications described in sec. 3.2 and 3.3 are designed with parallelizability taken into account. notably, the advantage of using multiple repetitions in sec. 3.3 is that it allows parallel-computation. we can apply asynchronous parallel computation to compute the  $s_{\mathrm{test}}$ , use one synchronization point to average the result using all-reduce, and then asynchronously compute the influence of a subset of data-points that are pre-selected using knn.
+
+# 4 experimental setup
+
+we use the multinli dataset in analysis experiments (sec. 5), and we include multinli, hans, anli, and amazon-wilds datasets (english) in the applications (sec. 6) (mccoy et al., 2019; williams et al., 2018; nie et al., 2020; koh et al., 2020). our model is based on pre-trained bert-base model fine-tuned on downstream tasks (devlin et al., 2019; wolf et al., 2019). we freeze the first 9 layers based on results in lee et al. (2019) to reduce computation cost, which leaves us with about 14.7m trainable parameters. we use weight decay of 0.005 during training as recommended by basu et al. (2021). please see the appendix for experiment details. table 3 in the appendix summarizes key experiment details such as the number of evaluation data-points and repetitions used in experiments. we use v100 gpus in experiments.
+
+# 5 experimental results and analysis
+
+# 5.1 summary of computation times
+
+table 1 presents the summary of computation times. the run-time statistics are computed over 10 evaluation examples on the full multinli training dataset (please see sec. 4 for details). we can see that adding  $k$  nn helps reduce the time by about an order of magnitude, fast  $s_{\text{test}}$  cuts the time by additional  $55 - 70\%$ , and parallelism further reduces the time by more than two fold. with  $k = 1e3$ , fast  $s_{\text{test}}$  approximation, and 4 gpus, we are able to find influential training data-points of an evaluation data-point in about 1.5 minutes, more than 80 times faster than the original influence functions, which would take more than 2 hours.
+
+# 5.2 recall of  $k\mathbf{nn}$
+
+to examine knn's recall, we ask: if a data-point is influential, will it be included in the subset selected by the knn? we define the recall score  $r@m$  as the percentage of top-  $m$  ground-truth influential data-points that are selected by the knn, where we let the top-  $m$  influential data-points computed without knn (i.e., on the full dataset) be the top-  $m$  ground-truth influential data-points.
+
+results. fig. 3 (a) shows the experiments results. overall, the recall scores show that knn is useful in selecting data-points that are likely to be influential. the recall scores for the most influential (i.e., using the absolute value) data-points are close to  $60\%$  with  $k = 5 \times 10^4$ , and  $20\%$  with  $k = 5 \times 10^3$ . these  $k$ 's are about order(s) of magnitude smaller than the size of the full training dataset (more than  $3.9 \times 10^5$  examples). note that random selection would lead to recall around  $15\%$  ( $k = 5 \times 10^4$ ) and  $1.5\%$  ( $k = 5 \times 10^3$ ) in the two settings. one interesting observation is that, the recall scores for the most harmful data-points tend to be higher than the most helpful ones when the predictions are correct, but lower when the predictions are incorrect.
+
+# 5.3 inverse hvp approximation
+
+we look at the speed-quality trade-off of the hessian approximation. our experiments show that the speed-up does not greatly affect the quality.
+
+![](images/c1f018af0bc6209536950e8349d01b4b344f5df70ef7d42c90f3e66cd3d2fde0.jpg)  
+figure 3: please see appendix figs. 8,9,10 for higher resolution versions. (a) the recall of  $k\mathrm{nn}$  in terms of finding influential data-points. the lines/err bars represent the means/standard deviations across 100 correct/incorrect predictions. (b) computational time (left) and estimation error norm (right) of hessian approximation. (c) change in loss on the data-point after retraining, where we remove  $m_{\mathrm{remove}} \in \{1,5,25,50,100\}$  data-points.
+
+<table><tr><td>comparison</td><td>pearson</td><td>spearman</td><td>kendall</td></tr><tr><td>fast (k=103) vs full</td><td>99.8±0.3</td><td>99.5±1.3</td><td>96.9±2.8</td></tr><tr><td>fast (k=104) vs full</td><td>99.9±0.1</td><td>99.7±0.6</td><td>96.8±2.3</td></tr><tr><td>fast (k=103 vs 104)</td><td>99.9±0.2</td><td>99.6±0.8</td><td>96.6±2.4</td></tr></table>
+
+table 2: correlations between influence values.
+
+results. fig. 3 (b) shows the results of the experiments. for the two figures on the left, we can observe that the computation cost (measured in time) grows with both the batch size and number of recursive iterations  $j$ . similarly, the estimation error<sup>7</sup> (the figures on the right) shows that the error decreases with both the batch size and  $j$  in general.
+
+further, we notice that when the batch size is small (e.g.,  $b = 1$ ), we can make up the loss in quality by increasing  $t$ , which is inherently parallelizable (sec. 3.4). overall, these suggest that we could trade off a small drop in quality with a significant speed-up by the combination of (1) small  $b$ , (2) medium  $j$ , and (3) large  $t$ .
+
+# 5.4 quality of influence estimations
+
+finally, we want to ensure that the final computed influence scores are of sufficient quality. first, we compute the correlations of influence values between one that computes influence functions with both  $k$  nn and fast  $s_{\mathrm{test}}$  approximation (fast) and
+
+one without them (full). next, we compare the quality of computed influences by actually retraining the models. if the influence function correctly identifies helpful and harmful data-points, retraining without helpful points should result in the evaluation loss rising (i.e., positive change in loss), and retraining without harmful points should result in the loss falling (i.e., negative change in loss).
+
+results. table 2 shows that the correlations are high for all measures considered. the results show that fast influence functions achieve  $>95\%$  correlations with full influence functions. these demonstrate that using the fast influence functions achieve reasonable qualities at just a fraction of the total cost. next, fig. 3 (c) shows the retraining results, where we separate the results for cases based on whether the prediction is correct, and averaged across data-points within this bucket. we can see that overall loss increases when we remove helpful data, decreases when we remove harmful datapoints. further, the performance (measured by the change in loss) between using the fast influence functions and full influence functions (i.e., no knn and fast  $s_{\mathrm{test}}$  approximation) is similar, and both perform better than random selection in general. note that with a large training set, individual data points tend to have a limited effect on the generalization error. we see a larger effect as a larger
+
+number of points are removed.
+
+# 6 applications of fastif
+
+# 6.1 explainability of influential examples
+
+motivation. knowing which points are influential to the model loss may give us insight into our model/training algorithm, and therefore we want to test whether influence functions can be used to improve model explainability. to do so, we need a framework for evaluating the quality of explanations given in terms of influential data points.
+
+approach. here we will mainly focus on the concept of simulatability. doshi-velez and kim (2017) explained that a model is simulatable when a person can predict its behavior on new inputs. thus, we will measure an explanation's quality in terms of its effect on model simulatability. specifically, we train another simulator model to predict the predictions of the task model (treviso and martins, 2020; hase et al., 2020). the simulator model is trained with the same data as the task model, but the labels are replaced with the task model's predictions. we then fine-tune the simulator on data identified as influential for the task model's performance on test data-points. if the simulator model can better predict what the task model will do by fine-tuning on this data (i.e., achieving lower loss), the influential data points are said to be a good "explanation" of the task model's behavior. this approach is similar to pruthi et al. (2020), who also treat explanations as targets to fit a model to.
+
+experiment results. we can observe from fig. 4 that, when the prediction is correct, finetuning on helpful data-points improves the simulator's ability to predict the task model's behavior. similarly, when the prediction is incorrect, finetuning on data-points that are harmful (to the task model's loss on ground-truth labels) improves the simulator's predictions of the task model. further, the effect on the loss from influential data-points is greater than random selection of data-points overall. this demonstrates that influential examples can serve as explanations of the task model's behavior.
+
+# 6.2 effect visualization
+
+motivation. investigating how different training data-points interact with test data-points is also useful, because such exploratory data analysis can discover interesting relationships between data-slices (i.e., subsets of data with specific attributes).
+
+approach. we conduct experiments on two models, one trained on multinli and the other on hans. we then compute influence functions on their corresponding training data-points and build circular bipartite graphs. the nodes represent training (inner circle) and evaluation (outer circles) datapoints (incorrect predictions), and the strength and color of edges represent the influence values.
+
+experiment results fig. 5 visualizes the results, where the left half corresponds to the model trained on multinli and the right half corresponds to the model trained on hans.
+
+left hand side. appendix table 5 summarizes a few key statistics about the plots on the left hand side. interestingly, we observe that while there are more multinli training data-points that are harmful to hans/multinli evaluation data-points, their (harmful) influences are in general much lower than the helpful counterparts. this suggests that a few critical helpful data-points can potentially improve the model's performance on hans. in contrast, a few harmful data-points will have a relatively lower impact on the model's performance. in sec. 6.3, we will leverage this insight to improve model performance on hans. this could also be connected to the observation we have in sec. 5.2 where the recall scores of  $k$  nn tend to be higher for helpful data-points for incorrect predictions.
+
+further, we measure the influence correlation between different data slices. table 6 in the appendix suggests that, for the datasets considered here, if training data-points are influential (either harmful or helpful) to one of the data slices, these data-points will likely be similarly influential to other data slices (if influential at all).
+
+right hand side. since here the training data is hans, we further segment the hans training data-points based on the subset they are in, using different colors and radii. interestingly, we find that training data-points in the "lexical overlap" are noticeably more influential (either helpful and harmful) to all the hans evaluation dataset subsets. note that, by the construction of the dataset, the "lexical overlap" heuristic includes other heuristics as special cases. hence, we conclude that visualization of data influences can be used to discover latent structure in datasets.
+
+# 6.3 error correction
+
+motivation. in addition to model interpretation and exploratory data analysis, one might also con
+
+![](images/4662ec20fb932b3cee8d2d5ce89955bad14724ffefba2e91021c65cd56ebf61d.jpg)  
+figure 4: simulator loss on 4 test data-points (more figures in the appendix), where the simulator is fine-tuned on different types of data-points with ground truth labels using various learning rates. the lines refer to the mean performance averaged across 10 fine-tuning data-points, and the shaded area covers the max/min performance.
+
+![](images/c2eb54ee61ddea5eb89bab9fa140667a9e40ba3f764e4d724f174ec1ef9eeed8.jpg)  
+figure 5: visualization of the interaction between evaluation and training data-points.
+
+sider ways to efficiently correct the wrong model predictions, which is often useful in practice. luckily, the influence function not only implies which data-points are harmful, but also which data-points that are helpful. this suggests a simple way to correct/fix model prediction(s): taking gradient steps with the model on the helpful data-points. this approach naturally leads to another interesting question. instead of taking gradient steps on data from the original data-points, can the same approach be used to suggest new training data-points that were not seen during training? this is interesting as the original formulations of influence functions are defined on the data-points used during training. our experiments show that, when the new training data-points are "similar" to the original training data-points, this approach can be helpful.
+
+approach. we first sample a small batch of validation data-points ("anchor" data-points), compute influence scores of training data-points w.r.t. the anchor data-points, and then update model parameters by taking gradient steps on influential training data-points w.r.t. these anchor data-points. these steps are repeatedly applied multiple times. please see sec. c.3 for more details such as a step-by-step algorithm and dataset splits.
+
+experiment results. fig. 6 (a) shows the results for the model trained on multinli, evaluated on
+
+hans, and the augmented data come from the original training dataset (multinli).<sup>8</sup> overall, we can see that fine-tuning on helpful data-points improves the performances compared to random ones, and fine-tuning on harmful data points leads to worse performances. this simple technique brings more than  $5.8\%$  average improvement in accuracy.
+
+as using influence functions requires gradient access to the anchor data-points, we also experiment with directly fine-tuning on them as well ("z-test" in the figure). the results demonstrate the potential of using influence functions to correct model predictions, above and beyond the improvements available from just finetuning on the anchor datapoints (by about  $2.5\%$  in accuracy on average).
+
+we can also observe from fig. 6 (a) that helpful examples tend to have a greater magnitude of effect than harmful examples. this can be connected to the visualization results in sec. 6.2 where we can see (a handful of) helpful data-points have large negative/helpful influences while many data-points have medium positive/harmful influences.
+
+next, we examine the settings where we finetune the model on a new training dataset unseen during training instead of on the original training
+
+![](images/71a706dc96e915cef5b51d8e3b9da97aef3e4b3a605f24a26f1ed02f860ce0a1.jpg)  
+figure 6: performance after repeatedly taking gradient steps on different types of data-points. we use figure titles  $a \rightarrow b \rightarrow c$  to refer to the settings where the model is trained on  $a$ , fine-tuned on  $b$ , and then evaluated on  $c$ . the lines refer to the mean performance averaged across 3 repetitions, and the shaded area covers the max/min performance. when models are evaluated on hans, the influence values are computed w.r.t. each subset of hans validation dataset (shown with different line colors), and we show results on each subset of hans test dataset. please see the appendix for corresponding results on validation datasets.
+
+![](images/11d9a7e47f3e1125ec32bdffc598a55d8dc88eb4798f93ff237c3afd033647b7.jpg)  
+(c)  
+multinli  $\rightarrow$  anl  $\rightarrow$  anli
+
+![](images/33fd09ce6c102a91a32a2899a6ff0c12946eb11f92789d351accf80fc11d2771.jpg)  
+(d)  
+amazon  $\rightarrow$  amazon  $\rightarrow$  amazon
+
+![](images/aa07b4652b0ac0f035575147d61c4344597f2fd20c5f4442bc410f1a994920c0.jpg)  
+figure 7: experiments on anli and amazon-wilds.
+
+![](images/da088703e3a6ed0967a54fa35ac59681b98aefcf3ed0d5d84a9c572640d66f3d.jpg)
+
+dataset (i.e., a data augmentation setup). figs. 6 (b) and 7 (c) show the results for the model trained on multinli, evaluated on hans/anli, and the augmented data come from the hans/anli training dataset. we can observe that random data augmentation works reasonably well. further, augmenting helpful data-points can outperform random data augmentation and using anchor data-points directly in general. in the end, we could improve the average accuracy on hans and anli by more than  $5.9\% /2.7\%$  (about  $2.8\% /1.7\%$  more than using anchor data-points directly) respectively. these results show the potential of influence functions for sample-efficient data augmentation.
+
+finally, we experiment with settings where the model is trained/fine-tuned on the amazon-wilds training dataset, and evaluated on an out-of-distribution (ood) test set. fig. 7 (d) shows that fine-tuning on harmful data-points deteriorates the performance as expected, though fine-tuning on helpful ones has little impact on the performance. we hypothesize that the selected anchor data-points are not representative enough of the evaluation dataset, as fine-tuning on anchor data-points directly also has little impact. this shows that the usefulness of our method likely depends on the quality of chosen anchor data-points.
+
+# 7 conclusions
+
+we present fastif which, via simple modifications, significantly speeds up the computation to influence functions without significantly impacting their performance. our improvements include using knn to pre-select a subset of influence-worthy data-points, identifying a set of hyperparameters for the inverse hvp estimation algorithm, and a parallel implementation that minimizes communication overhead. we empirically examine the effectiveness of these modifications. then, with the availability of fast influence functions, we demonstrate a few interesting applications that were previously intractable: (1) examining the "explainability" of influential data-points, (2) visualizing data influence-interactions, (3) correcting model predictions using original training data, (4) and correcting model predictions using data from a new dataset.
+
+# acknowledgments
+
+we thank the reviewers and shi feng for helpful discussions. hg interned at salesforce research; ph and mb were supported by a salesforce research faculty grant, nsf-career award 1846185, darpa yfa17-d17ap00022, and a royster society phd fellowship.
+
+# 8 ethical considerations
+
+this work presents scalable influence functions for efficient model interpretation and debugging, which would be especially useful for improving model performance for particular categories of model failures after they are identified.
+
+recently, carlini et al. (2020) noticed that an adversary could extract training data from large-scale language models and recover potentially sensitive information. if properly used, the tool could be helpful for checking whether a model might be vulnerable to such attacks (hence, our tool should be used to encourage the detection of such memorization-based models as opposed to being misused to exploit such models). finally, while the fast influence functions are more compute-efficient than alternatives like retraining and full-scale influence functions, they are nevertheless expensive operations. thus, applying fastif to large-scale datasets and models might be restricted to those who have access to adequate computing power (but in fact, this is why the main purpose of this paper is to make influence functions faster and more compute efficient).
+
+# references
+
+naman agarwal, brian bullins, and elad hazan. 2017. second-order stochastic optimization for machine learning in linear time. journal of machine learning research, 18(116):1-40.  
+samyadeep basu, phil pope, and soheil feizi. 2021. influence functions in deep learning are fragile. in international conference on learning representations.  
+samyadeep basu, xuchen you, and soheil feizi. 2020. on second-order group influence functions for black-box predictions. in international conference on machine learning, pages 715-724. pmlr.  
+yonatan belinkov and james glass. 2019. analysis methods in neural language processing: a survey. transactions of the association for computational linguistics, 7:49-72.
+
+marc-etienne brunet, colleen alkalay-houlihan, ashton anderson, and richard zemel. 2019. understanding the origins of bias in word embeddings. in international conference on machine learning, pages 803-811. pmlr.  
+oana-maria camburu, tim rocktäschel, thomas lukasiewicz, and phil blunsom. 2018. e-snli: natural language inference with natural language explanations. in neurips 2018.  
+nicholas carlini, florian tramer, eric wallace, matthew jagielski, ariel herbert-voss, katherine lee, adam roberts, tom brown, dawn song, ulfar erlingsson, et al. 2020. extracting training data from large language models. arxiv preprint arxiv:2012.07805.  
+chaofan chen, oscar li, daniel tao, alina barnett, cynthia rudin, and jonathan k su. 2019. this looks like that: deep learning for interpretable image recognition. in advances in neural information processing systems, pages 8930-8941.  
+r dennis cook. 1977. detection of influential observation in linear regression. technometrics, 19(1):15-18.  
+r dennis cook. 1986. assessment of local influence. journal of the royal statistical society: series b (methodological), 48(2):133-155.  
+r dennis cook and sanford weisberg. 1980. characterizations of an empirical influence function for detecting influential cases in regression. technometrics, 22(4):495-508.  
+r dennis cook and sanford weisberg. 1982. *residuals and influence in regression*. new york: chapman and hall.  
+nicola de cao, michael sejr schlichtkrull, wilker aziz, and ivan titov. 2020. how do decisions emerge across layers in neural models? interpretation with differentiable masking. in proceedings of the 2020 conference on empirical methods in natural language processing (emnlp), pages 3243-3255.  
+jacob devlin, ming-wei chang, kenton lee, and kristina toutanova. 2019. bert: pre-training of deep bidirectional transformers for language understanding. in proceedings of the 2019 conference of the north american chapter of the association for computational linguistics: human language technologies, volume 1 (long and short papers), pages 4171-4186.  
+jonathan donnelly and adam roegiest. 2019. on interpretability and feature representations: an analysis of the sentiment neuron. in european conference on information retrieval, pages 795-802. springer.  
+finale doshi-velez and been kim. 2017. towards a rigorous science of interpretable machine learning. arxiv preprint arxiv:1702.08608.
+
+vitaly feldman and chiyuan zhang. 2020. what neural networks memorize and why: discovering the long tail via influence estimation. advances in neural information processing systems, 33.  
+shi feng, eric wallace, alvin grissom ii, mohit iyyer, pedro rodriguez, and jordan boyd-graber. 2018. pathologies of neural models make interpretations difficult. in proceedings of the 2018 conference on empirical methods in natural language processing, pages 3719-3728.  
+xiaochuang han, byron c. wallace, and yulia tsvetkov. 2020. explaining black box predictions and unveiling data artifacts through influence functions. in acl.  
+peter hase and mohit bansal. 2020. evaluating explainable ai: which algorithmic explanations help users predict model behavior? acl.  
+peter hase, chaofan chen, oscar li, and cynthia rudin. 2019. interpretable image recognition with hierarchical prototypes. in proceedings of the aaai conference on human computation and crowdsourcing.  
+peter hase, shiyue zhang, harry xie, and mohit bansal. 2020. leakage-adjusted simulatability: can models generate non-trivial explanations of their behavior in natural language? findings of emnlp.  
+trevor hastie, robert tibshirani, and jerome friedman. 2009. the elements of statistical learning: data mining, inference, and prediction. springer science & business media.  
+sarthak jain and byron c wallace. 2019. attention is not explanation. in proceedings of the 2019 conference of the north american chapter of the association for computational linguistics: human language technologies, volume 1 (long and short papers), pages 3543-3556.  
+jeff johnson, matthijs douze, and hervé jégou. 2017. billion-scale similarity search with gpus. arxiv preprint arxiv:1702.08734.  
+shalmali joshi, oluwasanmi koyejo, been kim, and joydeep ghosh. 2018. xgems: generating examplars to explain black-box models. arxiv preprint arxiv:1806.08867.  
+urvashi khandelwal, omer levy, dan jurafsky, luke zettlemoyer, and mike lewis. 2019. generalization through memorization: nearest neighbor language models. in international conference on learning representations.  
+sosuke kobayashi, sho yokoi, jun suzuki, and kentaro inui. 2020. efficient estimation of influence of a training instance. in proceedings of sustainnlp: workshop on simple and efficient natural language processing, pages 41-47, online. association for computational linguistics.
+
+pang wei koh and percy liang. 2017. understanding black-box predictions via influence functions. in proceedings of the 34th international conference on machine learning-volume 70, pages 1885-1894. jmlr.org.  
+pang wei koh, shiori sagawa, henrik marklund, sang michael xie, marvin zhang, akshay balsubramani, weihua hu, michihiro yasunaga, richard lanas phillips, sara beery, et al. 2020. wilds: a benchmark of in-the-wild distribution shifts. arxiv preprint arxiv:2012.07421.  
+pang wei koh, jacob steinhardt, and percy liang. 2018. stronger data poisoning attacks break data sanitization defenses. arxiv preprint arxiv:1811.00741.  
+pang wei w koh, kai-siang ang, hubert teo, and percy s liang. 2019. on the accuracy of influence functions for measuring group effects. in advances in neural information processing systems, pages 5254-5264.  
+jaejun lee, raphael tang, and jimmy lin. 2019. what would elsa do? freezing layers during transformer fine-tuning. arxiv preprint arxiv:1911.03090.  
+jiwei li, xinlei chen, eduard hovy, and dan jurafsky. 2016a. visualizing and understanding neural models in nlp. in proceedings of the 2016 conference of the north american chapter of the association for computational linguistics: human language technologies, pages 681-691. association for computational linguistics.  
+jiwei li, will monroe, and dan jurafsky. 2016b. understanding neural networks through representation erasure. arxiv preprint arxiv:1612.08220.  
+zachary c. lipton. 2016. the mythos of model interpretability. in 2016 icml workshop on human interpretability in machine learning.  
+scott m lundberg and su-in lee. 2017. a unified approach to interpreting model predictions. in advances in neural information processing systems 30, pages 4765-4774.  
+tom mccoy, ellie pavlick, and tal linzen. 2019. right for the wrong reasons: diagnosing syntactic heuristics in natural language inference. in proceedings of the 57th annual meeting of the association for computational linguistics, pages 3428-3448.  
+yuxian meng, c. fan, zijun sun, e. hovy, fei wu, and j. li. 2020. pair the dots: jointly examining training history and test stimuli for model interpretability. arxiv, abs/2010.06943.  
+ramaravind k mothilal, amit sharma, and chenhao tan. 2020. explaining machine learning classifiers through diverse counterfactual explanations. in proceedings of the 2020 conference on fairness, accountability, and transparency, pages 607-617.
+
+jesse mu and jacob andreas. 2020. compositional explanations of neurons. arxiv preprint arxiv:2006.14032.  
+yixin nie, adina williams, emily dinan, mohit bansal, jason weston, and douwe kiela. 2020. adversarial nli: a new benchmark for natural language understanding. in proceedings of the 58th annual meeting of the association for computational linguistics, pages 4885-4901.  
+nicolas papernot and patrick mcdaniel. 2018. deep k-nearest neighbors: towards confident, interpretable and robust deep learning. arxiv:1803.04765 [cs, stat]. arxiv: 1803.04765.  
+danish pruthi, bhuwan dhingra, livio baldini soares, michael collins, zachary c. lipton, graham neubig, and william w. cohen. 2020. evaluating explanations: how much do explanations from the teacher aid students? corr, abs/2012.00893.  
+nazneen fatema rajani, ben krause, wengpeng yin, tong niu, richard socher, and caiming xiong. 2020. explaining and improving model behavior with k nearest neighbor representations. arxiv preprint arxiv:2010.09030.  
+nazneen fatema rajani, bryan mccann, caiming xiong, and richard socher. 2019. explain yourself! leveraging language models for commonsense reasoning. in acl 2019.  
+marco tulio ribeiro, sameer singh, and carlos guestrin. 2016a. " why should i trust you?" explaining the predictions of any classifier. in proceedings of the 22nd acm sigkdd international conference on knowledge discovery and data mining, pages 1135-1144.  
+marco tulio ribeiro, sameer singh, and carlos guestrin. 2016b. "why should i trust you?: explaining the predictions of any classifier. knowledge discovery and data mining (kdd).  
+marco tulio ribeiro, sameer singh, and carlos guestrin. 2018a. anchors: high-precision model-agnostic explanations. in aaai conference on artificial intelligence.  
+marco tulio ribeiro, sameer singh, and carlos guestrin. 2018b. anchors: high-precision model-agnostic explanations. in aaai.  
+marco tulio ribeiro, tongshuang wu, carlos guestrin, and sameer singh. 2020. beyond accuracy: behavioral testing of nlp models with checklist. in *association for computational linguistics (acl)*.  
+pouya samangouei, ardavan saeedi, liam nakagawa, and nathan silberman. 2018. explaining: model explanation via decision boundary crossing transformations. in proceedings of the european conference on computer vision (eccv), pages 666-681.
+
+peter schulam and suchi saria. 2019. can you trust this prediction? auditing pointwise reliability after learning. in the 22nd international conference on artificial intelligence and statistics, pages 1022-1031.  
+avanti shrikumar, peyton greenside, and anshul kundaje. 2017. learning important features through propagating activation differences. in international conference on machine learning, pages 3145-3153.  
+karen simonyan, andrea vedaldi, and andrew zisserman. 2013. deep inside convolutional networks: visualising image classification models and saliency maps. workshop at international conference on learning representations.  
+daniel smilkov, nikhil thorat, been kim, fernanda viégas, and martin wattenberg. 2017. smoothgrad: removing noise by adding noise. arxiv preprint arxiv:1706.03825.  
+mukund sundararajan, ankur taly, and qiqi yan. 2017a. axiomatic attribution for deep networks. in proceedings of the 34th international conference on machine learning - volume 70.  
+mukund sundararajan, ankur taly, and qiqi yan. 2017b. axiomatic attribution for deep networks. in international conference on machine learning, pages 3319-3328.  
+marcos treviso and andré f. t. martins. 2020. the explanation game: towards prediction explainability through sparse communication. in proceedings of the third blackboxnlp workshop on analyzing and interpreting neural networks for nlp, pages 107-118, online. association for computational linguistics.  
+eric wallace, jens tuyls, junlin wang, sanjay subramanian, matt gardner, and sameer singh. 2019. alennlp interpret: a framework for explaining predictions of nlp models. in proceedings of the 2019 conference on empirical methods in natural language processing and the 9th international joint conference on natural language processing (emnlp-ijcnlp): system demonstrations, pages 7-12.  
+sarah wegreffe, ana marasovic, and noah a. smith. 2020. measuring association between labels and free-text rationales. corr, abs/2010.12762.  
+sarah wiegrefe and yuval pinter. 2019. attention is not not explanation. in proceedings of the 2019 conference on empirical methods in natural language processing and the 9th international joint conference on natural language processing (emnlp-ijcnlp), pages 11-20.  
+adina williams, nikita nangia, and samuel r bowman. 2018. a broad-coverage challenge corpus for sentence understanding through inference. in proceedings of naacl-hlt, pages 1112-1122.
+
+thomas wolf, lysandre debut, victor sanh, julien chaumont, clement delangue, anthony moi, pierric cistac, tim rault, rémi louf, morgan funtowicz, et al. 2019. huggingface's transformers: state-of-the-art natural language processing. arxiv, pages arxiv-1910.
+
+yiben yang, chaitanya malaviya, jared fernandez, swabha swayamdipta, ronan le bras, ji-ping wang, chandra bhagavatula, yejin choi, and doug downey. 2020. generative data augmentation for commonsense reasoning. in findings of the association for computational linguistics: emnlp 2020, pages 1008-1025, online. association for computational linguistics.
+
+ruiqi zhong, steven shao, and kathleen mckeown. 2019. fine-grained sentiment analysis with faithful attention. arxiv preprint arxiv:1908.06870.
+
+# appendix
+
+# a summary of key experiment details
+
+please see table 3.
+
+# b experimental results and analysis
+
+in this section, we examine the effectiveness of the methods described in sec. 3.2 and 3.3. specifically, we conduct the following set of experiments:
+
+- we measure  $k\mathrm{nn}$ 's recall in terms of retrieving data-points that are potentially influential.  
+- we look at the trade-off in speed/quality of inverse hessian-vector-product approximation with various configurations.  
+- we examine the quality of the influence estimations using all of the proposed techniques, by comparing the correlations between the influence values computed with/without them.
+
+# b.1 recall of knn
+
+in sec. 3.2, we describe the use of  $k\mathrm{nn}$  for preselecting a subset of data-points. this (smaller) set of data-points are then re-ranked using the more expensive influence functions. making this work well requires that the subset selected by  $k\mathrm{nn}$  contains potentially the most influential data-points.
+
+in this section, we examine the  $k$ -nn's recall. we ask the question: if a data-point is influential, will it be included in the subset selected by the  $k$ -nn? to formalize this, we define the recall score  $r@m$  as the percentage of top- $m$  ground-truth influential data-points that are selected by the  $k$ -nn,
+
+$$
+r @ m = \frac {\mid \{\text {r e t r i e v e d} \} \cap \{\text {t o p - m i n f l u e n t i a l} \} \mid}{\mid \{\text {t o p - m i n f l u e n t i a l} \} \mid}
+$$
+
+where we let the top- $m$  influential data-points computed without  $k\mathrm{nn}$  (i.e., on the full dataset) be the top- $m$  ground-truth influential data-points.
+
+details. for each evaluation data-point  $z_{\text{test}}$ , we first compute the ground-truth influential data-points via running influence functions on the multinli training dataset without knn (i.e., {top- $m$  influential}). then, we use knn to select the  $k$  training datapoints (i.e., {retrieved}). we chose  $k \in \{1 \times 10^{1}, 1 \times 10^{2}, 1 \times 10^{3}, 1 \times 10^{4}, 5 \times 10^{4}, 1 \times 10^{5}\}$ . finally, we compute the recall  $r@m$  with  $m \in \{10^{1}, 10^{2}, 10^{3}\}$ . we repeat the aforementioned steps for three types of influential data-points: most positively influential (harmful), most negatively influential (helpful), and most influential (unsigned influence, by taking the absolute value). we select 100 data-points from the mnli evaluation dataset (50 data-points when the model predictions are correct and incorrect) and aggregate the results.
+
+results. fig. 8 shows the experiments results. overall, the recall scores show that  $k\mathrm{nn}$  is useful in selecting data-points that are likely to be influential. the recall scores for the most influential (i.e., using the absolute value) data-points are close to  $60\%$  with  $k = 5 \times 10^4$ , and  $20\%$  with  $k = 5 \times 10^3$ . these  $k$ 's are about order(s) of magnitude smaller than the size of the full training dataset (more than  $3.9 \times 10^5$  examples). note that random selection would lead to recall around  $15\%$  ( $k = 5 \times 10^4$ ) and  $1.5\%$  ( $k = 5 \times 10^3$ ) in the two settings. one interesting observation is that, the recall scores for the most harmful data-points tend to be higher than the most helpful ones when the predictions are correct, but lower when the predictions are incorrect.[10]
+
+# b.2 inverse-hessian-vector-product approximation speed-quality trade-off
+
+we look at the speed-quality trade-off of the hessian approximation tricks, and see if the hessian approximation's speed-up comes at the cost of dramatically lower quality. our experiments show that the speed-up does not greatly affect the quality.
+
+details. we compute the hessian approximations with  $j \in \{700, 800, \dots, 1300\}$ ,
+
+<table><tr><td>section</td><td>details</td></tr><tr><td>sec. 5.2 / b.1</td><td>100 evaluation data-points, knn with k∈{1×10^1, 1×10^2, 1×10^3, 1×10^4, 5×10^4, 1×10^5}, r@m with m∈{10^1, 10^2, 10^3}.</td></tr><tr><td>sec. 5.3 / b.2</td><td>8 evaluation data-points, j∈{700, 800, ..., 1300}, b∈{2^0, 2^1, ..., 2^7}, t∈{1, 4}.</td></tr><tr><td>sec. 5.4 / b.3</td><td>20 evaluation data-points for estimating correlations, and 10 for retraining experiments, knn with k∈{10^3, 10^4}, m_remove∈{1, 5, 25, 50, 100}.</td></tr><tr><td>sec. 6.1 / c.1</td><td>20 evaluation data-points, 1 fine-tuning data-point, 50 learning rates in log-space from 10^-5 to 10^-2.5, and repeat for 10 different fine-tuning data-points.</td></tr><tr><td>sec. 6.2 / c.2</td><td>400 evaluation data-points where the model predictions are incorrect, including 100 from the mnli evaluation dataset and 100 for each of the three subsets from the hans evaluation dataset. we use knn with k = 10^3.</td></tr><tr><td>sec. 6.3 / c.3</td><td>experiments are repeated 3 times, fine-tuning is applied repeatedly for 10 iterations. for each iteration, we select 10 validation data-points as the “anchor” data-points, update parameters for one gradient step on 10 fine-tuning data-points with learning rate 10^-4. for amazon-wilds experiments, we use 50 anchor and fine-tuning data-points.</td></tr></table>
+
+![](images/23a7fc99f503ee41a527ed4791e5235d4be9d5b7cbbd46f1bb2c9f27b7e11888.jpg)  
+table 3: some of the key experiment details.
+
+![](images/51868363fed91247468dcff233e884d6435298a9c13843381c31fb8278694773.jpg)  
+figure 8: the recall of knn in terms of finding influential data-points. the lines and error bars represent the means and standard deviations across 100 correct/incorrect predictions.
+
+![](images/8c9c0ae18621edee67a49a2c0d4934fbf5692478d77297f6377cda55161414db.jpg)
+
+$b\in \{2^0,2^1,\dots,2^7\}$ ,  $t\in \{1,4\}$ , and repeat the experiments for 8 different multinli evaluation data-points (4 for correct/incorrect predictions).
+
+results. fig. 9 shows the results of the experiments. for the two figures on the left, we can observe that the computation cost (measured in time) grows with both the batch size and number of recursive iterations  $j$ . similarly, the estimation error[12] (the figures on the right) shows that the error decreases with both the batch size and  $j$  in general.
+
+further, we notice that when the batch size is small (e.g.,  $b = 1$ ), we can make up the loss in quality by increasing  $t$ , which is inherently parallelizable (main paper sec. 3.4). overall, these suggest that we could trade off a small drop in quality with a significant speed-up by the combination of (1) small  $b$ , (2) medium  $j$ , and (3) large  $t$ .<sup>13</sup>
+
+<table><tr><td>comparison</td><td>pearson</td><td>spearman</td><td>kendall</td></tr><tr><td>fast (k=103) vs full</td><td>99.8±0.33</td><td>99.5±1.34</td><td>96.9±2.81</td></tr><tr><td>fast (k=104) vs full</td><td>99.9±0.10</td><td>99.7±0.55</td><td>96.8±2.27</td></tr><tr><td>fast (k=103 vs k=104)</td><td>99.9±0.18</td><td>99.6±0.75</td><td>96.6±2.35</td></tr></table>
+
+table 4: correlations between influence values using various measures. the means and standard deviations are computed with 20 evaluation points (balanced between correct and incorrect predictions).
+
+# b.3 quality of influence estimations
+
+finally, we want to ensure that there are no significant cascading estimation errors and that the final computed influence scores are of sufficient quality. think of sec. b.1 and b.2 as "unit-tests" to understand whether each component works well on its own, and in this section, our goal is to understand whether all the components work well together.
+
+first, we compute the correlations of influence values among the following two systems: one that computes influence functions with both knn and fast  $s_{\mathrm{test}}$  approximation (fast, with  $k = 10^{3} / k = 10^{4}$ ), and one that computes influence functions without them (full).
+
+next, we further compare the quality of computed influences by actually retraining the models
+
+![](images/2b8764098bfe4499cb691ead12247fe5ed1daf6b2e8c3b12a86e59d6ec713707.jpg)  
+figure 9: left half: computational time of hessian approximation as a function of batch size and recursive iterations  $j$ . we further break down the figure into two sub-figures: cases when the prediction is correct and those when it is incorrect. right half: estimation error norm as a function of batch size, recursive iterations, whether the prediction is correct, and additionally the number of independent runs  $t$ .
+
+![](images/cca75c31d0880baea8090052da139afc4079c0eae230ebc7a8984749b49fcb32.jpg)
+
+![](images/324f3b67c739c23fc15c03f85c9639dc71d71425eca1e06ea3f0fb89c6e8b1e7.jpg)
+
+![](images/af379f56f8f3baf1b01dea930df0af94b4beea003573686cbd87e4c40248d44c.jpg)
+
+![](images/218fb7a78593dcf37cb0305603e8904c7689730c7299e862bc05930b1a57a778.jpg)  
+figure 10: change in loss on the data-point after retraining, where we remove  $m_{\mathrm{remove}} \in \{1, 5, 25, 50, 100\}$  data-points. we can see that the fast influence algorithms produce reasonable quality estimations at just a fraction of computation cost.
+
+using three systems: (1) a system that computes influence functions with both  $k\mathrm{nn}$  and fast  $s_{\mathrm{test}}$  approximation, (2) a system that computes influence functions without them, and (3) a system that randomly selects data-points.
+
+for each evaluation data-point selected, we find its  $m_{\mathrm{remove}}$  most influential training data-points. then we retrain the model by removing them and measure the change in the loss on the same evaluation data-point. if the influence function correctly identifies helpful and harmful data-points, retraining without helpful points should result in the evaluation loss rising (i.e., positive change in loss), and retraining without harmful points should result in the loss falling (i.e., negative change in loss).
+
+details. for each evaluation data-point selected, we find its influential training data-points using one of the three aforementioned systems. then we retrain the model by removing  $m_{\mathrm{remove}}$  training data-point(s) and measure the change in the
+
+loss on the same evaluation data-point. for system (1), we use  $k\mathrm{nn}$  (with  $k \in \{10^3, 10^4\}$ ) and fast  $s_{\mathrm{test}}$  approximation, and for system (3), we randomly select data-points with each of the three labels. we choose  $m_{\mathrm{remove}} \in \{1, 5, 25, 50, 100\}$  and repeat the experiment for 10 data-points (5 data-points where the prediction is correct and incorrect) that have at least 100 harmful/helpful data-points.
+
+results. first, table 4 shows that the correlations are high for all measures considered. notably, the results show that fast influence functions achieve  $>95\%$  correlations with full influence functions. these demonstrate that using the fast influence functions achieve reasonable qualities at just a fraction of the total cost. next, fig. 10 shows the retraining results, where we separate the results for cases based on whether the prediction is correct, and averaged across data-points within this bucket. we can see that overall loss increases when we remove helpful data, decreases when we remove harmful data-points. further, the performance (measured by the change in loss) between using the fast influence functions and full influence functions (i.e., no k-nn and fast  $s_{\mathrm{test}}$  approximation) is similar, and both perform better than random selection in general.
+
+# c applications of fastif
+
+# c.1 explainability of influential examples
+
+# experiment design.
+
+1. train the "task model"  $f_{\theta_{\mathrm{task}}}$  on the original training dataset  $\{x_i, y_i\}_{i=1}^n$ , and another "simulator model"  $f_{\theta_{\mathrm{simulator}}}$  on the modified training
+
+![](images/e4be886dcd619ea0fe8f71f7393703f870384a7fdd350d1160d10d21c45ec217.jpg)
+
+![](images/d486dd836b6d58aa67943482dfd621533886a91a498e1a3d6a47d3accbcfcf74.jpg)  
+figure 11: simulator loss on 20 evaluation data-points.
+
+<table><tr><td rowspan="2">slice</td><td colspan="2">average |z| (×10-1)</td><td colspan="2"># edges (×105)</td></tr><tr><td>helpful</td><td>harmful</td><td>helpful</td><td>harmful</td></tr><tr><td>h (l)</td><td>8.66</td><td>0.34</td><td>0.05</td><td>0.95</td></tr><tr><td>h (s)</td><td>9.34</td><td>0.66</td><td>0.08</td><td>0.92</td></tr><tr><td>h (c)</td><td>4.65</td><td>1.79</td><td>0.29</td><td>0.71</td></tr><tr><td>m</td><td>136.89</td><td>44.19</td><td>0.27</td><td>0.73</td></tr></table>
+
+table 5: statistics on the visualizations. harmful edges have positive influences, helpful edges have negative influences, but here we use average absolute values (average  $|\mathcal{i}|$ ). # edges refers to the number of (harmful/helpful) edges connecting to the slice. "h (l/s/c)" refers to the three subset of hans, and "m" to the 2-label version of multinli. note that for average  $|\mathcal{i}|$ , comparisons are only meaningful within each row.
+
+<table><tr><td>slice</td><td>hans (l)</td><td>hans (s)</td><td>hans (c)</td><td>mnli</td></tr><tr><td colspan="5">correlation (rounded)</td></tr><tr><td>h (l)</td><td>1.00</td><td>0.99</td><td>0.99</td><td>0.92</td></tr><tr><td>h (s)</td><td>0.99</td><td>1.00</td><td>0.99</td><td>0.91</td></tr><tr><td>h (c)</td><td>0.99</td><td>0.99</td><td>1.00</td><td>0.67</td></tr><tr><td>m</td><td>0.92</td><td>0.91</td><td>0.67</td><td>1.00</td></tr><tr><td colspan="5">number of pairs</td></tr><tr><td>h (l)</td><td>29581</td><td>14917</td><td>3425</td><td>5380</td></tr><tr><td>h (s)</td><td>14917</td><td>25145</td><td>6218</td><td>6270</td></tr><tr><td>h (c)</td><td>3425</td><td>6218</td><td>26621</td><td>13972</td></tr><tr><td>m</td><td>5380</td><td>6270</td><td>13972</td><td>72324</td></tr></table>
+
+table 6: statistics on the correlations and number of pairs (where a training data-point have influences on both data slices) between data slices.
+
+![](images/1bd1114eacffa3a057efcbd592fa46926e331c5bcac7f2c6a7a4198e82ad294b.jpg)  
+figure 12: corresponding performance on validation datasets.  
+figure 13: experiments on anli and amazon-wilds.
+
+dataset  $\{x_{i},\hat{y}_{i}\}_{i = 1}^{n}$  , where  $\hat{y}_i = f_{\theta_{\mathrm{task}}}(x_i)$  is the task model's prediction.
+
+2. given a new test data-point  $x'$  and the task model's prediction, compute the simulator model loss  $\ell = l\big(f_{\theta_{\mathrm{simulator}}}(\boldsymbol{x}'), f_{\theta_{\mathrm{task}}}(\boldsymbol{x}')\big)$ .  
+3. find the most influential data-point(s), and further fine-tune (i.e., take gradient steps with) the simulator model on these data-point(s), to get new parameters  $\theta_{\mathrm{simulator}}^{\prime}$ . compute the new simulator model loss  $\ell^{\prime} = l\big(f_{\theta_{\mathrm{simulator}}^{\prime}}(x^{\prime}),f_{\theta_{\mathrm{task}}}(\boldsymbol{x}^{\prime})\big)$ .  
+4. use the difference between  $\ell$  and  $\ell'$  as the proxy measure of explainability. the intuition is that the difference estimates how much extra information the explanation provides to the simulator
+
+model to forecast the task model's prediction.
+
+details we repeat the experiments over 20 test data-points (10 when the prediction is correct and incorrect), and choose five types of data for fine-tuning: random (with label neutral, entailment, or contradiction), most negative influential, and most positive influential. for a given test data-point and fine-tuning type, we fine-tune on 1 data-point with 50 learning rates in log-space from  $10^{-5}$  to  $10^{-2.5}$ , and repeat for 10 different fine-tuning data-points. the max and mins losses among the 10 fine-tuning data-points are used to construct the confidence intervals. further, during the fine-tuning, the label we used corresponds to the true label (instead of the label predicted by the model).<sup>14</sup>
+
+extended results please see fig. 11.
+
+# c.2 effect visualization
+
+experiment design. we conduct experiments on two models, one trained on multinli and the other trained on the hans dataset. we then compute influence functions on their corresponding training data-points and build circular bipartite graphs. the nodes represent training (inner circle) and evaluation (outer circles) data-points (incorrect predictions), and the strength and color of edges represent the influence values. for visualization purposes, we organize the nodes so that positions of training data-points are determined via optimizing a weighted distance function to their connected test data-points. in the setting with the model trained on hans, we further partition the training datapoints (represented by three inner circles) based on the subset they are in. note that, this is possible only because the influence function calculations are fast enough.
+
+details. in both settings (i.e., visualizations corresponding to the model trained on multinli and hans dataset), we select 400 test data-points where the model predictions are incorrect, including 100 from the mnli evaluation dataset and 100 for each of the three subsets from the hans evaluation dataset. we use  $k$ nn with  $k = 10^3$ .
+
+details on computing correlations. we slightly abuse the notation and define  $\overline{\mathcal{l}}_{i,j}$  as the
+
+average (signed) influence values between the  $i^{th}$  training data-point and  $j^{th}$  data slice. note that each training data-point can influence multiple evaluation data-points. we then compute the correlation between each of the two pairs of data slices  $\rho (\overline{\mathcal{i}}_{,j_1},\overline{\mathcal{i}}_{,j_2})$  .we only include cases where the data-point has influences on both data slices.
+
+# c.3 error correction
+
+# experiment design.
+
+1. for a given test dataset/data-slice, first evaluate the model performance on the data slice.  
+2. next, select a small batch of "anchor" datapoints from the validation dataset/data-slice.  
+3. then, find influential data-point(s) from the training dataset w.r.t. those anchor data-points using influence functions.  
+4. update the model parameters by taking gradient step(s) on these influential data-point(s).  
+5. repeat step 2-4 multiple times.  
+6. re-evaluate the model performance on the test dataset/data-slice.
+
+why fine-tuning? in the ideal scenario, one intuitive way to correct model predictions given influential examples is to retrain the model with these examples added to the training dataset. however, this is expensive as one could imagine.
+
+to see why fine-tuning on influential examples makes sense, recall the definition of influence functions on model parameters,
+
+$$
+\mathcal {i} _ {\text {p a r a m s}} (z) := \left. \frac {d \hat {\theta} _ {\epsilon , z}}{d \epsilon} \right| _ {\epsilon = 0} \approx - h _ {\hat {\theta}} ^ {- 1} \nabla_ {\theta} l (z, \hat {\theta}) \tag {5}
+$$
+
+we can see that by setting the (matrix) learning rate proportional to  $-h_{\hat{\theta}}^{-1}$ , fine-tuning on influential examples is an approximation of retraining the model with the loss of influential examples upweighted. in practice, computing the hessian inverse for each gradient update is expensive, so we could use a scalar learning rate instead (e.g., through diagonal approximation). this reduces to the vanilla fine-tuning setting.
+
+details. the experiment is repeated 3 times, and we compare the performance between using helpful data-points, harmful data-points, and random data-points. since we assume gradient access to the anchor data-points, we further experiment with directly fine-tuning on those anchor data-points.
+
+we mostly follow standard train/validation/test splits for different datasets. for hans, we set
+
+aside  $1\%$  of the evaluation dataset as the validation split, and for amazon-wilds, we use the ood validation/test splits. when the models are evaluated on hans, we use each of the three slices of the hans dataset as the evaluation dataset.
+
+we repeat the step 2-4 for 10 iterations. for each iteration, we sample a batch size of 10 from the validation dataset (i.e., the "anchor" data-points) when computing influence scores, and update model parameters for one gradient step on 10 fine-tuning data-point with learning rate  $10^{-4}$ . for amazon-wilds experiments, we use 50 anchor and fine-tuning data-points instead.
+
+discussion on yang et al. (2020) recently, yang et al. (2020) examined the application of influence functions in filtering out detrimental synthetic training examples. here we use them to select helpful training examples from another non-synthetic dataset. both demonstrate that computing influence values on new examples could be useful. however, yang et al. (2020) (appendix c) reported that with a pool of more than 380k candidates, running influence functions could take more than 8 hours. in our setup (i.e., finding a handful of influential examples), we can find the most helpful examples significantly faster thanks to our fast influence functions (see main paper sec. 5.1). extending our fast influence functions to their setup would be an interesting next-step.
+
+validation results please see figs. 12 and 13.

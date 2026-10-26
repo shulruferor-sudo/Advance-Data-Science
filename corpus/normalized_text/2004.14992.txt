@@ -1,0 +1,541 @@
+# how do decisions emerge across layers in neural models? interpretation with differentiable masking
+
+nicola de cao  $^{1,2}$ , michael schlichtkrull  $^{1,2}$ , wilker aziz  $^{1}$ , ivan titov  $^{1,2}$
+
+<sup>1</sup>university of amsterdam, <sup>2</sup>university of edinburgh
+
+{nicola.decao, m.s.schlichtkrull, w.aziz} @uva.nl  
+ititov@inf.ed.ac.uk
+
+# abstract
+
+attribution methods assess the contribution of inputs to the model prediction. one way to do so is erasure: a subset of inputs is considered irrelevant if it can be removed without affecting the prediction. though conceptually simple, erasure's objective is intractable and approximate search remains expensive with modern deep nlp models. erasure is also susceptible to the *hindsight bias*: the fact that an input can be dropped does not mean that the model 'knows' it can be dropped. the resulting pruning is over-aggressive and does not reflect how the model arrives at the prediction. to deal with these challenges, we introduce differentiable masking. diffmask learns to mask-out subsets of the input while maintaining differentiability. the decision to include or disregard an input token is made with a simple model based on intermediate hidden layers of the analyzed model. first, this makes the approach efficient because we predict rather than search. second, as with probing classifiers, this reveals what the network 'knows' at the corresponding layers. this lets us not only plot attribution heatmaps but also analyze how decisions are formed across network layers. we use diffmask to study bert models on sentiment classification and question answering.<sup>1</sup>
+
+# 1 introduction
+
+deep neural networks have become standard tools in nlp demonstrating impressive improvements over traditional approaches on many tasks (goldberg, 2017). their power typically comes at the expense of interpretability, which may prevent users from trusting predictions (kim, 2015; ribeiro et al., 2016), makes it hard to detect model or data deficiencies (gururangan et al., 2018; kaushik and
+
+![](images/c43aa18a3b6704ea7dbfe79356da390d981c23dbf018dceb11c1bd3355b2aa0a.jpg)  
+figure 1: diffmask: hidden states up to layer  $\ell$  from a model (top) are fed to a classifier  $g$  that predicts a mask  $z$ . we use this to mask the input and re-compute the forward pass (bottom). the classifier  $g$  is trained to mask the input as much as possible without changing the output (minimizing a divergence  $\mathrm{d}_{\star}$ ).
+
+lipton, 2018) or verify that a model is fair and does not exhibit harmful biases (sun et al., 2019; holstein et al., 2019).
+
+these challenges have motivated work on interpretability, both in nlp and generally in machine learning; see belinkov and glass (2019) and jacovi and goldberg (2020) for reviews. in this work, we study post hoc interpretability where the goal is to explain the prediction of a trained model and to reveal how the model arrives at the decision. this goal is usually approached with attribution methods (bach et al., 2015; shrikumar et al., 2017; sundararajan et al., 2017), which explain the behavior of a model by assigning relevance to inputs.
+
+one way to perform attribution is to use erasure where a subset of features (e.g., input tokens) is considered irrelevant if it can be removed without affecting the model prediction (li et al., 2016; feng et al., 2018). the advantage of erasure is that it is conceptually simple and optimizes a well-defined objective. this contrasts with most other attribution methods which rely on heuristic rules to define feature salience; for example, attention-based attri
+
+question: where did the broncos practice for the super bowl? passage: the panthers used the san jose state practice facility and stayed at the san jose marriott. the broncos practiced at stanford university and stayed at the santa clara marriott.
+
+(a) integrated gradient (sundararajan et al., 2017).
+
+question: where did the broncos practice for the super bowl? passage: the panthers used the san jose state practice facility and stayed at the san jose marriott. the broncos practiced at stanford university and stayed at the santa clara marriott.
+
+(c) nlp explainer (guan et al., 2019).
+
+question: where did the broncos practice for the super bowl? passage: the panthers used the san jose state practice facility and stayed at the san jose marriott. the broncos practiced at stanford university and stayed at the santa clara marriott.
+
+(e) our diffmask.
+
+question: where did the broncos practice for the super bowl? passage: the panthers used the san jose state practice facility and stayed at the san jose marriott. the broncos practiced at stanford university, and stayed at the santa clara marriott.
+
+(b) restricting the flow (schulz et al., 2020)
+
+question: where did the broncos practice for the super bowl? passage: the panthers used the san jose state practice facility and stayed at the san jose marriott. the broncos practiced at stanford university, and stayed at the santa clara marriott.
+
+(d) erasure exact search optima.
+
+question: where did the broncos practice for the super bowl? passage: the panthers used the san jose state practice facility and stayed at the san jose marriott. the broncos practiced at stanford university, and stayed at the santa clara marriott.
+
+(f) our diffmask non-amortized.
+
+figure 2: question answering token attribution: (b) and (c), are misleading (i.e., not faithful) as they attribute the prediction mostly to the answer span itself (underlined). our method (d) reveals that the model pays attention to other named entities and the predicate 'practice' in both sentences. predictions of the path-based methods (a) are more spread-out. exact search (e) as well as approximate search (f) leads to pathological attributions.
+
+bution (rocktäschel et al., 2016; serrano and smith, 2019; vashishth et al., 2019) or back-propagation methods (bach et al., 2015; shrikumar et al., 2017; sundararajan et al., 2017). these approaches received much scrutiny in recent years (nie et al., 2018; sixt et al., 2020; jain and wallace, 2019), as they cannot guarantee that the network is ignoring low-scored features. they are often motivated as approximations of erasure (baehrens et al., 2010; simonyan et al., 2014; feng et al., 2018) and sometimes evaluated using erasure as ground-truth (serrano and smith, 2019; jain and wallace, 2019).
+
+despite its conceptual simplicity, subset erasure is not commonly used in practice. first, it is generally intractable, and beam search (feng et al., 2018) or leave-one-out estimates (zintgraf et al., 2017) are typically used instead. these approximations may be inaccurate. for example, leave-one-out can underestimate the contribution of features due to saturation (shrikumar et al., 2017). more importantly, even these approximations remain very expensive with modern deep (e.g., bert-based; devlin et al., 2019) models, as they require multiple computation passes through the model. second, the method is susceptible to the hindsight bias: the fact that a feature can be dropped does not mean that the model 'knows' that it can be dropped and that the feature is not used by the model when processing the example. this results in over-aggressive pruning that does not reflect what information the model uses to arrive at the decision. the issue is pronounced in nlp tasks (see
+
+figure 2d and feng et al., 2018), though it is easier to see on an artificial example (figure 3a). a model is asked to predict if there are more 8s than 1s in the sequence. the erasure attributes the prediction to a single 8 digit, as this reduced example yields the same decision as the original one. however, this does not reveal what the model was relying on: it has counted digits 8 and 1 as otherwise, it would not have achieved the perfect score on the test set.
+
+we propose a new method, differentiable masking (diffmask), which overcomes the aforementioned limitations and results in attributions that are more informative and help us understand how the model arrives at the prediction. diffmask relies on learning sparse stochastic gates (a.k.a., masks), guaranteeing that the information from the masked-out inputs does not get propagated while maintaining end-to-end differentiability without having to resort to reinforce (williams, 1992). the decision to include or disregard an input token is made with a simple model based on intermediate hidden layers of the analyzed model (see figure 1). first, this amortization circumvents the need for combinatorial search making the approach efficient at test time. second, as with probing classifiers (adi et al., 2017; belinkov and glass, 2019), this reveals whether the network 'knows' at the corresponding layer what input tokens can be disregarded. during training inputs are truly masked whenever we sample zeros. after training, attribution scores correspond to the expectation of sampling non-zeros.
+
+the amortization lets us not only plot attribution
+
+![](images/a4641a6bb6f48403bcd21888c728e753e5c0a9c61f048b046883e874e56d3780.jpg)  
+(a) erasure search.
+
+![](images/dfac6f9fe1b42ed290e2a3ee777795c9c6aa0233c6dce630fd952a55c451c120.jpg)  
+(b) schulz et al. (2020).
+
+![](images/bad525c6cdc741ec7e7df183c5e11c5c5cf117f27646cc234a262c0125b03e3c.jpg)  
+(c) sundararajan et al. (2017).
+
+![](images/b19e6c8c7316e0313220e9cf91191d9e5d5f38a9702b84edf26731e700435b4c.jpg)  
+(d) guan et al. (2019)
+
+![](images/1318b552f0d26e9b9c8e180cce8a3632237ed12550b2ec99f8573ad2daa2ef21.jpg)  
+(e) our diffmask conditioned on embedding layer (left) and hidden states (right).
+
+![](images/05c05b1646aef3981cfd38aa265ce7c8bc38dea57d0acc0a633e7aac6d834779.jpg)  
+figure 3: input attributions of several methods on a toy task: given a sequence  $x$  of digits and a query  $\langle n, m \rangle$  (8 and 1 in this example) of two digits, determine whether there are more  $n$  than  $m$  in  $x$ . attributions are computed at the vector level and normalized to sum to 1.
+
+heatmaps, as in figure 2e, but also analyze how decisions are formed across network layers. in our artificial example, we see that in the bottom embedding layer the model cannot discard any tokens, as it does not 'know' which digits need to be counted (figure 3e, left). in the second layer, it 'knows' that these are 8s and 1s, so the rest gets discarded (figure 3e, right). in question answering (see figure 8a), where we use a 24-layer model, it takes 13-16 layers for the model to 'realize' that 'santa clara marriott' is not relevant to the question and discard it. we also adapt our method to measuring the importance of intermediate states rather than inputs. this, as we discuss later, lets us analyze which states in every layer store information crucial for making predictions, giving us insights about the information flow.
+
+contributions we introduce diffmask, a technique addressing limitations of attribution-based methods (especially erasure and its approximations), and demonstrate that it is stable and faithful to the analyzed models. we then use this technique to analyze bert-based models fined-tuned on sentiment classification and question answering.
+
+# 2 method
+
+we aim to understand how a trained model processes an input (i.e., a sequence of embedded to
+
+kens) to produce an output (e.g., a vector of class probabilities). first, for an input  $x = \langle x_1, \ldots, x_n \rangle$ , we obtain the output  $y = f(x)$  of the model along with its hidden states  $\langle h^{(0)}, \ldots, h^{(l)} \rangle$ , where  $h^{(0)} = x$ . we then probe the model using a shallow interpreter network which takes hidden states up to a certain layer  $\ell$  and outputs a binary mask  $z = \langle z_1, \ldots, z_n \rangle$  indicating which input tokens are necessary and which can be disregarded. to assess whether the masked input  $\hat{x} = \langle \hat{x}_1, \ldots, \hat{x}_n \rangle$  is sufficient, we re-feed the model with it and compute the output  $\hat{y} = f(\hat{x})$ . as long as  $\hat{y}$  approximates the original output  $y$  well, we deem the inputs masked by  $z$  unnecessary.
+
+masking, however, as in multiplication by zero, makes a strong assumption about the geometry of the feature space, in particular, it assumes that the zero vector bears no information. instead, we replace some of the inputs by a learned baseline vector  $b$ , i.e.,  $\hat{x}_i = z_i \cdot x_i + (1 - z_i) \cdot b$ .
+
+see figure 1 for an overview. the interpreter model consists of  $l + 1$  classifiers, the  $\ell$ th of which conditions on the stack of hidden states up to  $h^{(\ell)}$  to predict binary 'votes'  $v^{(\ell)} = g_{\phi}^{(\ell)}(h^{(0)},\ldots ,h^{(\ell)})$  towards keeping or masking input tokens. each classifier is a one-hidden-layer mlp, details and hyperparameters are provided in appendix a. for a given depth  $\ell$ , the interpreter decides to mask  $x_{i}$  out as soon as  $v_{i}^{(k)} = 0$  for some  $k\leq \ell$ , i.e.,  $z_{i} = \prod_{k = 0}^{\ell}v_{i}^{(k)}$ . that is, in order to deem  $x_{i}$  unnecessary, it is sufficient to do so based on any subset of hidden states up until  $h^{(\ell)}$ .
+
+clearly, there is no direct supervision to estimate the parameters  $\phi$  of the probe and the baseline  $b$ , thus we borrow erasure's objective: namely, we train the probe to mask-out as many input tokens as possible constrained to keeping  $f(\hat{x}) \approx f(x)$ . since often, the output of  $f$  parameterizes a likelihood (e.g., a categorical distribution), we formulate the constraint in terms of a divergence  $\mathrm{d}_{\star}$  between the two functions' outputs. we cast this, rather naturally, in the language of constrained optimization.
+
+objective a practical way to minimize the number of non-zeros predicted by  $g$  is minimizing the  $l_{0}$  'norm'.2 thus, our  $\mathcal{l}_0$  loss is defined as the
+
+total number of positions that are not masked:
+
+$$
+\mathcal {l} _ {0} (\phi , b | x) = \sum_ {i = 1} ^ {n} \mathbf {1} _ {[ \mathbb {r} \neq 0 ]} (z _ {i}), \tag {1}
+$$
+
+where  $\mathbf{1}(\cdot)$  is the indicator function. we minimize  $\mathcal{l}_0$  for all data-points in the dataset  $\mathcal{d}$  subject to a constraint that predictions from masked inputs have to be similar to the original model predictions:
+
+$$
+\min  _ {\phi , b} \quad \sum_ {x \in \mathcal {d}} \mathcal {l} _ {0} (\phi , b | x) \tag {2}
+$$
+
+$$
+\mathrm {s . t .} \quad \mathrm {d} _ {\star} [ y \| \hat {y} ] \leq m \quad \forall x \in \mathcal {d},
+$$
+
+where  $\hat{y} = f(\hat{x})$ ,  $y = f(x)$ , and the margin  $m \in \mathbb{r}_{>0}$  is a hyperparameter. since non-linear constrained optimisation is generally intractable, we employ lagrangian relaxation (boyd et al., 2004) optimizing instead
+
+$$
+\max  _ {\lambda} \min  _ {\phi , b} \sum_ {x \in \mathcal {d}} \mathcal {l} _ {0} (\phi , b | x) + \lambda \left(\mathrm {d} _ {\star} [ y \| \hat {y} ] - m\right), \tag {3}
+$$
+
+where  $\lambda \in \mathbb{r}_{\geq 0}$  is the lagrangian multiplier.
+
+stochastic masks our objective poses two challenges: i)  $l_{0}$  is discontinuous and has zero derivative almost everywhere, and ii) to output binary masks,  $g$  needs a discontinuous output activation such as the step function. a strategy to overcome both problems is to make the binary variables stochastic and treat the objective in expectation, in which case one option is to resort to reinforce (williams, 1992), another is to use a sparse relaxation to binary variables (louizos et al., 2018; bastings et al., 2019). as we shall see (we compare the two aforementioned options in table 2 and discuss them in section 3.2), the latter proved more effective. thus we opt to use the hard concrete distribution, a mixed discrete-continuous distribution on the closed interval [0, 1]. this distribution assigns a non-zero probability to exactly zero while it also admits continuous outcomes in the unit interval via the reparameterization trick (kingma and welling, 2014). we refer to louizos et al. (2018) for details, but also provide a brief summary in appendix b. with stochastic masks, the objective is computed in expectation, which addresses both sources of non-differentiability. note that during training inputs are truly masked-out whenever we sample exact zeros. after training, attribution scores correspond to the expectation of sampling non-zero masks since any non-zero value corresponds to a leak of information.
+
+masking hidden states to reveal which hidden states store information necessary for realizing the prediction, we modify the probe slightly. for a given depth  $\ell$ , we use a mask  $z^{(\ell)} = g_{\phi}^{(\ell)}(h^{(\ell)})$  to replace some of the states in  $h^{(\ell)} = \langle h_1^{(\ell)},\dots ,h_n^{(\ell)}\rangle$  by a layer-specific baseline  $b^{(\ell)}$ , i.e.  $\hat{h}_i^{(\ell)} = z_i^{(\ell)}\cdot h_i^{(\ell)} + (1 - z^{(\ell)})\cdot b^{(\ell)}$ . the resulting state  $\hat{h}^{(\ell)}$  is used to re-compute subsequent states,  $\hat{h}^{(\ell +1)},\ldots ,\hat{h}^{(l)}$ , as well as the output, which we denote by  $\hat{y}$ . here we do not aggregate 'votes' with a product because for this probe we want to discover whether hidden states are predictive of their own usefulness. see figure 10 in appendix d for an overview of this variant of diffmask.
+
+# 3 experiments
+
+the goal of this work is to uncover a faithful interpretation of an existing model, i.e. revealing, as accurately as possible, the process by which the model arrives at the prediction. human-provided labels, such as human rationales (camburu et al., 2018; deyoung et al., 2020), will not help us in demonstrating this, as humans cannot judge if an interpretation is faithful (jacovi and goldberg, 2020). more precisely, human-provided labels do not show how the model behaves – e.g., annotations of what parts of the input are relevant for solving a particular task do not constitute a guarantee that a model relies on those parts more than others when making a prediction. when we evaluate an attribution method by comparing its outputs with human annotations, we are not measuring whether it provides faithful attributions but only if they are plausible according to humans. this goes against our goals as we aim to use the interpretation method to detect model deficiencies, which are usually cases where the model does not behave like humans. the ground-truth explanations of how a model makes certain predictions depend not only on the data but also on the model, and, unfortunately, are generally not known for real tasks and with complex models. this makes the evaluation and comparison of attribution methods non-trivial.
+
+our strategy is to i) show the effectiveness of diffmask in a controlled setting (i.e., a toy task) where ground-truth is available; ii) test the effectiveness of our relaxation for learning discrete masks (on a real model for sentiment classification); and iii) demonstrate that the method is stable and models behave the same when masking is ap
+
+<table><tr><td>methods</td><td>djs↓</td></tr><tr><td>exact erasure</td><td>0.27</td></tr><tr><td>integrated gradient</td><td>0.27</td></tr><tr><td>schulz et al. (2020)</td><td>0.18</td></tr><tr><td>guan et al. (2019)</td><td>0.24</td></tr><tr><td>diffmask</td><td>0.00</td></tr></table>
+
+table 1: toy task: attribution to hidden states, average divergence in nats between the ground-truth attributions and those by different methods. *the delta distribution does not share support with the ground-truth.
+
+plied. once we have established that diffmask can be trusted, we use it to analyze bert-based models (devlin et al., 2019) fine-tuned on sentiment classification, and on question answering. we report hyperparameters in appendix c, and additional plots, examples and analysis in appendix d.
+
+# 3.1 toy task
+
+our toy task is defined as: given a sequence  $x$  of digits (i.e.,  $x_{i} \in \{0, \dots, 9\}$ ), and a query  $\langle n, m \rangle$  of two digits, determine whether  $\# n > \# m$  in  $x$ .
+
+model the query and input are embedded, concatenated, and then fed to a single-layer feedforward nn, followed by a single-layer unidirectional gru (cho et al., 2014). the classification is done by a linear layer that acts on the last hidden state of the gru. see appendix c.1 for all hyperparameters and a more precise definition of the architecture. unsurprisingly, the model solves the task almost perfectly (accuracy on test is  $>99\%$ ).
+
+ground-truth for hidden-state attribution we plot the distribution of hidden states (we use dimensionality 2, with the purpose of having a bottleneck and to support clear visualization) and observe a linear separation between states of digits present in the query and states not in the query. this means that the role of the feed-forward layer is to decide which digits to keep. since the model solves the task, the role of the gru must then be to count which digit occurred the most. the prediction must be attributed uniformly to all the hidden states corresponding to either  $n$  or  $m$ . for completeness, figure 11 in the appendix d.1 shows this plot.
+
+results we start with an example of input attributions, see figure 3, which illustrates how diff-mask goes beyond input attribution as typically known. the attribution provided by erasure (figure 3a) is not informative: for each datapoint the search always finds a single digit that is sufficient to maintain the original prediction and discards all the other inputs. the perturbation methods by schulz et al. (2020) and guan et al. (2019) (figure 3b and 3d) are also over-aggressive in pruning. they assign low attribution to some items in the query even though those had to be considered when making the prediction. differently from other methods, diff-mask reveals input attributions conditioned on different levels of depth. figure 3e shows both input attributions according to the input itself and according to the hidden layer. it reveals that at the embedding layer there is no information regarding what part of the input can be erased: attribution is uniform over the input sequence. after the model has observed the query, hidden states predict that masking input digits other than  $n$  and  $m$  will not affect the final prediction: attribution is uniform over digits in the query. this reveals the role of the feed-forward layer as a filter for positions relevant to the query. other methods do not allow for this type of inspection. these observations are consistent across the entire test set.
+
+for attribution to hidden states (i.e., the output of the feed-forward layer) we can compare methods in terms of how much their attributions resemble the ground-truth across the test set. table 1 shows how the different approaches deviate from the gold-truth in terms of kullback-leibler  $(\mathrm{d}_{\mathrm{kl}})$  and jensen-shannon  $(\mathrm{d_{js}})$  divergences.
+
+# 3.2 sentiment classification
+
+we turn now to a real task and analyze models finetuned for sentiment classification on the stanford sentiment treebank (sst; socher et al., 2013).
+
+erasure search as learning masks before diving into an analysis of a bert sentiment model, we would like to demonstrate that we can approximate the result of erasure well through our differentiable relaxations. for that, we train a single-layer gru sentiment classifier and compare the analyses by diffmask to solutions provided by
+
+<table><tr><td>metric</td><td>reinforce+</td><td>diffmask</td></tr><tr><td>precision</td><td>74.69</td><td>81.26</td></tr><tr><td>recall</td><td>80.82</td><td>85.89</td></tr><tr><td>f1</td><td>73.57</td><td>80.75</td></tr><tr><td>optimality</td><td>8.83</td><td>32.67</td></tr><tr><td>l0</td><td>33.13</td><td>30.58</td></tr></table>
+
+table 2: sentiment classification: optimization with diffmask and reinforce (not amortised - with a moving average baseline for variance reduction) vs. erasure with exact search. all metrics are computed at token level; optimality is measured at sentence level.
+
+erasure (exact search). to isolate the impact of our objective, we disable amortization, thus estimating hard concrete parameters for each example independently. we compare diffmask to reinforce (williams, 1992) with a moving average baseline for variance reduction. since erasure is prohibitive for long sentences, we limit our evaluation to sentences up to 25 words (54% of the data). table 2 shows that diffmask and reinforce achieve comparable levels of sparsity, but our method reaches an optimal solution much more often (33% of the times vs 9%) and is, on average, closer to an optimal solution (81% f1 vs 75% f1).
+
+faithfulness and plausibility now, we get back to the fully-amortized diffmask approach applied to a 12-layers bert<sub>base</sub> model and verify that there is no performance degradation when applying masking. training hyperparameters are reported in appendix c.2. the f<sub>1</sub> score of the model on the validation set moved from 37.9% to 38.3% while masking 46.3% input tokens, and to 38.9% while masking 67.6% hidden states. the explanations provided by diffmask are also stable. across 5 runs with different seeds, the standard deviation of input attributions are 0.05 and 0.03 for inputs and hidden states, respectively.
+
+while we cannot use human labels to evaluate faithfulness of our method, comparing them and diffmask attribution will tell us whether the sentiment model relies on the same cues as humans. specifically, we compare to sst token level annotation of sentiment. in figure 4a, we show after how many layers on average an input token is dropped, depending on its sentiment label. this suggests that the model relies more heavily on strongly positive or negative words and, thus, is generally consistent with human judgments (i.e., plausible).
+
+![](images/95c2ca29fb9dd946a4684d4945ba8eb764fe1db0651c1ef0ce660e52e10d1e15.jpg)  
+(a) input.
+
+![](images/06f57816a5f20fc59c3479d213a573c6e733e1a3bac6e80e5846d426652bdce3.jpg)  
+(b) hidden states.  
+figure 4: sentiment classification: average number of layers that predict to keep input tokens or hidden states aggregated by token level sentiment annotations.
+
+analysis we used diffmask to analyse the behavior of our bert model. in figure 5, we report the average number of layers that input tokens or hidden states are kept for (or, equivalently, after how many layers they are dropped on average), aggregating by part-of-speech tags (pos). it turns out that determinants, punctuation, and pronouns can be completely discarded from the input across all validation set, while adjectives and nouns should be kept. also the [cls] and [sep] tokens can be ignored indicating that the model does not need such markers. examining the pos tags distribution for hidden states leads to further conclusions. here, the [cls] and [sep] tokens are the most important ones. this is not surprising as the classifier on top of bert uses the [cls] hidden state which gets progressively updated through all layers. both these special tokens are not important as inputs because bert can infer these markers in other layers, however, they are heavily used in the computation.
+
+figure 6e we show a visual example of that. we see that the model, even in the bottom layers, knows that the punctuation and both separators can be dropped from the input. this contrasts with hidden states attribution (figure 6f) which indicates that the separator states (especially [sep]) are very important. by putting this information together, we can hypothesize that the separator is used to aggregate information from the sentence, relying on self-attention. in fact, this aggregation is still happening in layer 12; at the very top layers, states corresponding to almost all non-separator tokens can be dropped.
+
+comparison to other methods in figure 6, we visually compare different techniques on one example form validation set. while previous techniques (e.g., integrated gradient) do not let us test what a model 'knows' in a given layer (i.e. attribution to input conditioned on a layer), they can be used to perform attribution to hidden layers. all methods except attention correctly highlight the last hidden
+
+![](images/3515a9d96f393f6864f81cf39fc19203ed381254fe224648f666ebe763d29d92.jpg)  
+(a) inputs.
+
+![](images/a31b0a2a70c373e68abf3fc681b8da65b2dc842115598564374639fc7741ac70.jpg)  
+(b) hidden states.
+
+state of the [cls] token as important. its importance is due to the top-level classifier using the [cls] hidden state. although for diffmask we show the expectation of keeping states, it assigns much sharper attributions. for instance, on the validation set, it assigns to the last hidden state of the [cls] the biggest attribution  $99\%$  of the times where schulz et al. (2020) only  $71\%$ . raw attention (figure 6a) does not seem to highlight any significant patterns in that example except that start and end of sentence tokens ([cls] and [sep], respectively) receive more attention than the rest. attributions by schulz et al. (2020) and guan et al. (2019) assign slightly higher importance to hidden states corresponding to 'highly' and 'enjoyable', whereas it is hard to see any informative patterns provided by integrated gradient. notice that for diffmask, a near-zero attribution has a very clear interpretation: such a state is not used for prediction since in expectation it is dropped (not gated).
+
+# 3.3 question answering
+
+we turn now to qa where we analyse a fine-tuned bertlarge model on the stanford question answering dataset (squad; rajpurkar et al., 2016).
+
+analysis we start by asking diffmask which tokens does the model keep? we do a similar analysis as for sentiment classification of pos tags over the entire validation set. we summarize the
+
+![](images/418b8bf21019079ce0617eef9c6ab06efc83a99fc99ecb261cb5387e637dbba8.jpg)  
+(a) attention.
+
+![](images/c2632406b06f525f5b83323af1cba00a08c19814977daddd7a3fd9af3409ff32.jpg)  
+(b) sundararajan et al. (2017).
+
+![](images/f96ba10f62b878ee3d59156e98af094cf4ea1eb2eac048c8566b6963b1ec48f7.jpg)  
+(c) schulz et al. (2020).
+
+![](images/f1a17d788eaac4f8a3a8386db4f5a1d9c7a8687fd5e40abb90ccf8704e5041a5.jpg)  
+(d) guan et al. (2019).
+
+![](images/a51aff04db40753efd0ced9980fa1ce7273a9c8fc0ab2405f6e841b92b6b0385.jpg)  
+figure 5: sentiment classification: average number of layers that predict to keep input tokens (a) or hidden states (b) aggregating by part-of-speech tags (pos) and [cls], [sep] tokens on validation set.  
+(e) diffmask on input.  
+figure 6: sentiment classification: comparison between attribution method for hidden layers w.r.t. the predicted label. all plots are normalized per-layer by the largest attribution. attention heatmap is obtained max pooling over heads and averaging across positions.
+
+![](images/e72d86ca92e45987e4e14ba38ff16e8750b175cc4367fc7950e8129dbffa5bb7.jpg)  
+(f) diffmask on hidden.
+
+results in figure 14 in appendix d.2. it turns out that conjunctions and adpositions are dropped by the embedding and first layer, respectively, on average. on the contrary, proper nouns and punctuation are usually predicted to be dropped only after the 14th layer. we argue that due to the pre-training objective, bert could infer well missing parts of the input, especially if they are trivial to infer (e.g., as often the case for prepositions). on the contrary, nouns and proper nouns are important as they count for  $84\%$  of the answers on squad. for example, in figure 8a, we can see that it takes 13-16 layers for the model to 'realize' that 'santa clara marriott' is not relevant to the question and discard it.
+
+unlike in sentiment classification, separator tokens as well as punctuation assume a central role as inputs (i.e., punctuation is considered the most important pos tag as for both questions and passages is usually dropped after the 17th layer). punctuation serves to demarcate sentence boundaries, useful for qa but not for sentiment classification.
+
+tokens from questions are generally masked by higher layers than tokens from passages as we show in figure 7a, which suggests that they are more important. we highlight that even in higher
+
+![](images/4f1a91deaedbfa429f852dea1d9681bf2de6fa941b164ddc46e51522b5ee585e.jpg)  
+(a) input.
+
+![](images/3626dd49f25cd47d95f7e1151d7145c6da2a6714d1444e99729c3ded8900c1a3.jpg)  
+(b) hidden states.
+
+layers when diffmask masks  $>95\%$  of the tokens, the original model prediction is almost always kept  $>90\%$ . noticeably, when the original bert makes wrong predictions, the tokens annotated as the ground truth answer are kept  $\sim 60\%$  of the time. this may suggest that when this happens the model still considers other options (e.g., valid options such as the ground truth) as plausible, thus diffmask detects them as important.
+
+now, we inspect hidden states attributions to answer where is the information stored? in figure 7b we can see a similar trend as for masking input, i.e., question's hidden states are kept more on average and deeper in the computation. states on layers 2-3 are dropped less than from the embedding and first layer. this is consistent with findings of voita et al. (2019a) which show that frequent tokens, such as determiners, accumulate contextual information. however, they are not important as inputs as we show in an example in figure 8b.
+
+the hidden states corresponding to separator tokens are always kept across all layers except the last one across the validation set. notice that, this token is also used as a delimiter between the question and the passage, and hence indicates where questions as well as passages end.
+
+the level of hidden states pruning is quite incremental (after layer 3) and gets strong, after layer 9 more than  $50\%$  of them can be masked out. a steep increase in superfluous states 13-14 (visible on both parts of figure 7) may indicate that some states, at that point in computation, contain enough information needed for the classification while all the others can indeed be removed without affecting the model prediction. our observation that higher layers are more predictive is in line with findings of kovaleva et al. (2019). they pointed out that the final layers of bert change most and are more task-specific. again, the fact that states correspond
+
+![](images/aada8221f8726da23d2176066a5917e55b231e532c848d49045711c0e667d2f2.jpg)  
+figure 7: qa: average expectation of keeping input (a) and hidden states (b) from different layers.  
+(a) gating the input.  
+figure 8: qa: attribution the inputs (a) and hidden states (b). the correct answers is highlighted in bold.
+
+![](images/bdd94066b4ab53828a4770ca9dc39b281351760eb5715afb250bfbd00203f281.jpg)  
+(b) gating hidden states.
+
+ing to the ground truth answer are still active on top layers when the model makes a wrong prediction indicates that the model is still considering different span options across top layers as well.
+
+comparison to other methods as we do not have access to the ground-truth, we start by contrasting diffmask qualitatively to other attribution methods on a few examples. we highlight some common pitfalls that afflict other methods (such as the hindsight bias) and how diffmask overcomes those. this helps demonstrate our method's faithfulness to the original model.
+
+figure 2 shows input attributions by different methods on an example from the validation set. erasure (figure 2d), as expected, does not provide useful insights, it essentially singles out the answer discarding everything else including the question. this cannot be faithful and is a simple consequence of erasure's hindsight bias: when only the span that contains the answer is presented as input, the model predicts that very span as the answer, but this does not imply that the model ignores everything else when presented with the complete document as input. the methods of schulz et al. (2020) and guan et al. (2019) optimize attributions on single examples and thus also converge to assigning high importance mostly to words that support the current prediction and that indicate the question type. for this experiment we used per-sample bottleneck
+
+attrbution from schulz et al. (2020). the authors also proposed a readout bottleneck where they train a second neural network to predict the mask. but differently from our formulation, they condition on subsequent layers and thus attributions are prone to the hindsight bias.
+
+integrated gradient does not seem to highlight any discernible pattern, which we speculate is mainly because a zero baseline is not suitable for word embeddings. choosing a more adequate baseline is not straightforward and remains an important open issue (sturmfels et al., 2020). note that, diff-mask without amortization (figure 2f) resembles erasure (as shown in § 3.2 for sst).
+
+differently from all other methods, our diff-mask probes the network to understand what it 'knows' about the input-output mapping in different layers. in figure 2e we show the expectation of keeping input tokens conditioned on any one of the layers in the model to make such predictions (see figure 8a for a per-layer visualization). our input attributions highlight that the model, in expectation across layers, wants to keep words in the question, the predicate 'practice' in both sentences as well as all potential candidate answers (i.e., named entities). but eventually, the most important spans are in the question and the answer itself.
+
+# 4 related work
+
+while we motivated our approach through its relation to erasure, an alternative way of looking at our approach is considering it as a perturbation-based method. this recently introduced class of attribution methods (ying et al., 2019; guan et al., 2019; schulz et al., 2020; taghanaki et al., 2019), instead of erasing input, injects noise. besides back-propagation and attention-based methods discussed in the introduction, another class of interpretation methods (murdoch and szlam, 2017; singh et al., 2019; jin et al., 2020) builds on prior work in cooperative game theory (e.g., shapley value of shapley, 1953). these methods are not trivial to apply to a new model, as they are architecture-specific. their hierarchical versions (e.g., singh et al., 2019; jin et al., 2020) also make a strong assumption about the structure of interaction (e.g., forming a tree) which may affect their faithfulness. also chen et al. (2018) share some similarities to our work as they also do amortization but use the gumbel softmax trick (maddison et al., 2017; jang et al., 2017) to approximate minimal subset selec
+
+tion. they assume that the subset contains exactly  $k$  elements where  $k$  is a hyperparameter. moreover, their explainer is a separate model predicting input subsets, rather than a 'probe' on top of the model's hidden layers, and hence cannot be used to reveal how decisions are formed across layers.
+
+a large body of literature analyzed bert and transformed-based models. for example, tenney et al. (2019) and van aken et al. (2019) probed bert layers for a range of linguistic tasks, while hao et al. (2019) analyzed the optimization surface. rogers et al. (2020) provides a comprehensive overview of recent bert analysis papers.
+
+there is a stream of work on learning interpretable models by means of extracting latent rationales (lei et al., 2016; bastings et al., 2019). some of the techniques underlying diffmask are related to that line of work. they employ stochastic masks to learn an interpretable model, which they train by minimizing a downstream loss subject to constraints on  $l_{0}$ , whereas we employ stochastic masks to interpret an existing model, and for that, we minimize  $l_{0}$  subject to constraints on that model's output distribution. in our very recent work schlichtkrull et al. (2020), we also employ stochastic masks and  $l_{0}$  regularization for analyzing graph neural networks. we learn which edges are relevant in multi-hop question answering and graph-based semantic role labeling (marcheggiani and titov, 2017; de cao et al., 2019).
+
+# 5 conclusion
+
+we have introduced a new post hoc interpretation method which learns to completely remove subsets of inputs or hidden states through masking. we circumvent an intractable search by learning an end-to-end differentiable prediction model. to overcome the hindsight bias problem, we probe the model's hidden states at different depths and amortize predictions over the training set. faithfulness is validated in a controlled experiment pointing more clearly to some flaws of other attribution methods. we used our method to study bert-based models on sentiment classification and question answering. diffmask sheds light on what different layers 'know' about the input and where information about the prediction is stored in different layers.
+
+# acknowledgements
+
+the authors want to thank christos baziotis, elena voita, dieuwke hupkes, and naomi saphra for helpful discussions. this project is supported by sap innovation center network, erc starting grant broadsem (678254), the dutch organization for scientific research (nwo) vidi 639.022.518, and the european union's horizon 2020 research and innovation programme under grant agreement no 825299 (gourmet).
+
+# references
+
+yossi adi, einat kermany, yonatan belinkov, ofer lavi, and yoav goldberg. 2017. fine-grained analysis of sentence embeddings using auxiliary prediction tasks. international conference on learning representations.  
+betty van aken, benjamin winter, alexander löser, and felix a gers. 2019. how does bert answer questions? a layer-wise analysis of transformer representations. in proceedings of the 28th acm international conference on information and knowledge management, pages 1823-1832.  
+sebastian bach, alexander binder, gregoire montavon, frederick klauschen, klaus-robert müller, and wojciech samek. 2015. on pixel-wise explanations for non-linear classifier decisions by layer-wise relevance propagation. plos one, 10(7).  
+david baehrens, timon schroeter, stefan harmeling, motoaki kawanabe, katja hansen, and klausrobert mäzller. 2010. how to explain individual classification decisions. journal of machine learning research, 11(jun):1803-1831.  
+jasmijn bastings, wilker aziz, and ivan titov. 2019. interpretable neural predictions with differentiable binary variables. in proceedings of the 57th annual meeting of the association for computational linguistics, pages 2963-2977, florence, italy. association for computational linguistics.  
+yonatan belinkov and james glass. 2019. analysis methods in neural language processing: a survey. transactions of the association for computational linguistics, 7:49-72.  
+stephen boyd, stephen p boyd, and lieven vandenberghe. 2004. convex optimization. cambridge university press.  
+oana-maria camburu, tim rocktäschel, thomas lukasiewicz, and phil blunsom. 2018. e-snli: natural language inference with natural language explanations. in advances in neural information processing systems (neurips), pages 9539-9549.  
+jianbo chen, le song, martin wainwright, and michael jordan. 2018. learning to explain: an
+
+information-theoretic perspective on model interpretation. in international conference on machine learning, volume 80 of proceedings of machine learning research, pages 883-892, stockholm, sweden. pmlr.  
+kyunghyun cho, bart van merrienboer, caglar gulcehre, dzmitry bahdanau, fethi bougares, holger schwenk, and yoshua bengio. 2014. learning phrase representations using rnn encoder-decoder for statistical machine translation. in proceedings of the 2014 conference on empirical methods in natural language processing (emnlp), pages 1724-1734, doha, qatar. association for computational linguistics.  
+nicola de cao, wilker aziz, and ivan titov. 2019. question answering by reasoning across documents with graph convolutional networks. in proceedings of the 2019 conference of the north american chapter of the association for computational linguistics: human language technologies, volume 1 (long and short papers), pages 2306-2317, minneapolis, minnesota. association for computational linguistics.  
+jacob devlin, ming-wei chang, kenton lee, and kristina toutanova. 2019. bert: pre-training of deep bidirectional transformers for language understanding. in proceedings of the 2019 conference of the north american chapter of the association for computational linguistics: human language technologies, volume 1 (long and short papers), pages 4171-4186, minneapolis, minnesota. association for computational linguistics.  
+jay deyoung, sarthak jain, nazneen fatema rajani, eric lehman, caiming xiong, richard socher, and byron c. wallace. 2020. eraser: a benchmark to evaluate rationalized nlp models. in proceedings of the 58th annual meeting of the association for computational linguistics, pages 4443-4458, online. association for computational linguistics.  
+shi feng, eric wallace, alvin grissom ii, mohit iyyer, pedro rodriguez, and jordan boyd-graber. 2018. pathologies of neural models make interpretations difficult. in proceedings of the 2018 conference on empirical methods in natural language processing, pages 3719–3728, brussels, belgium. association for computational linguistics.  
+yoav goldberg. 2017. neural network methods for natural language processing. synthesis lectures on human language technologies, 10(1):1-309.  
+chaoyu guan, xiting wang, quanshi zhang, runjin chen, di he, and xing xie. 2019. towards a deep and unified understanding of deep neural models in nlp. in international conference on machine learning, volume 97 of proceedings of machine learning research, pages 2454-2463, long beach, california, usa. pmlr.  
+suchin gururangan, swabha swayamdipta, omer levy, roy schwartz, samuel bowman, and noah a.
+
+smith. 2018. annotation artifacts in natural language inference data. in proceedings of the 2018 conference of the north american chapter of the association for computational linguistics: human language technologies, volume 2 (short papers), pages 107-112, new orleans, louisiana. association for computational linguistics.  
+yaru hao, li dong, furu wei, and ke xu. 2019. visualizing and understanding the effectiveness of bert. in proceedings of the 2019 conference on empirical methods in natural language processing and the 9th international joint conference on natural language processing (emnlp-ijcnlp), pages 4143-4152, hong kong, china. association for computational linguistics.  
+kenneth holstein, jennifer wortman vaughan, hal daume, miro dudik, and hanna wallach. 2019. improving fairness in machine learning systems: what do industry practitioners need? in proceedings of the 2019 chi conference on human factors in computing systems, chi '19, page 1-16, new york, ny, usa. association for computing machinery.  
+alon jacovi and yoav goldberg. 2020. towards faithfully interpretable nlp systems: how should we define and evaluate faithfulness? in proceedings of the 58th annual meeting of the association for computational linguistics, pages 4198-4205, online. association for computational linguistics.  
+sarthak jain and byron c. wallace. 2019. attention is not explanation. in proceedings of the 2019 conference of the north american chapter of the association for computational linguistics: human language technologies, volume 1 (long and short papers), pages 3543-3556, minneapolis, minnesota. association for computational linguistics.  
+eric jang, shixiang gu, and ben poole. 2017. categorical reparameterization with gumbel-softmax. international conference on learning representations.  
+xisen jin, junyi du, zhongyu wei, xiangyang xue, and xiang ren. 2020. towards hierarchical importance attribution: explaining compositional semantics for neural sequence models. international conference on learning representations.  
+divyansh kaushik and zachary c. lipton. 2018. how much reading does reading comprehension require? a critical investigation of popular benchmarks. in proceedings of the 2018 conference on empirical methods in natural language processing, pages 5010-5015, brussels, belgium. association for computational linguistics.  
+been kim. 2015. interactive and interpretable machine learning models for human machine collaboration. ph.d. thesis, massachusetts institute of technology.
+
+diederik p kingma and jimmy ba. 2015. adam: a method for stochastic optimization. international conference on learning representations.  
+diederik p kingma and max welling. 2014. autoencoding variational bayes. international conference on learning representations.  
+olga kovaleva, alexey romanov, anna rogers, and anna rumshisky. 2019. revealing the dark secrets of bert. in proceedings of the 2019 conference on empirical methods in natural language processing and the 9th international joint conference on natural language processing (emnlp-ijcnlp), pages 4365-4374, hong kong, china. association for computational linguistics.  
+tao lei, regina barzilay, and tommi jaakkola. 2016. rationalizing neural predictions. in proceedings of the 2016 conference on empirical methods in natural language processing, pages 107-117, austin, texas. association for computational linguistics.  
+jiwei li, will monroe, and dan jurafsky. 2016. understanding neural networks through representation erasure. arxiv:1612.08220.  
+christos louizos, max welling, and diederik p. kingma. 2018. learning sparse neural networks through  $l_{0}$  regularization. in international conference on learning representations.  
+chris j maddison, andriy mnih, and yee whye teh. 2017. the concrete distribution: a continuous relaxation of discrete random variables. international conference on learning representations.  
+diego marcheggiani and ivan titov. 2017. encoding sentences with graph convolutional networks for semantic role labeling. in proceedings of the 2017 conference on empirical methods in natural language processing, pages 1507-1516, copenhagen, denmark. association for computational linguistics.  
+paul michel, omer levy, and graham neubig. 2019. are sixteen heads really better than one? in h. wallach, h. larochelle, a. beygelzimer, f. d'alché buc, e. fox, and r. garnett, editors, advances in neural information processing systems 32, pages 14014-14024. curran associates, inc.  
+w james murdoch and arthur szlam. 2017. automatic rule extraction from long short term memory networks. international conference on learning representations.  
+weili nie, yang zhang, and ankit patel. 2018. a theoretical explanation for perplexing behaviors of backpropagation-based visualizations. in international conference on machine learning, volume 80 of proceedings of machine learning research, pages 3809-3818, stockholm, sweden. pmlr.
+
+pranav rajpurkar, jian zhang, konstantin lopyrev, and percy liang. 2016. squad: 100,000+ questions for machine comprehension of text. in proceedings of the 2016 conference on empirical methods in natural language processing, pages 2383-2392, austin, texas. association for computational linguistics.  
+danilo jimenez rezende, shakir mohamed, and daan wierstra. 2014. stochastic backpropagation and approximate inference in deep generative models. in international conference on machine learning, volume 32 of proceedings of machine learning research, pages 1278-1286, beijing, china. pmlr.  
+marco ribeiro, sameer singh, and carlos guestrin. 2016. "why should i trust you?": explaining the predictions of any classifier. in proceedings of the 2016 conference of the north american chapter of the association for computational linguistics: demonstrations, pages 97-101, san diego, california. association for computational linguistics.  
+tim rocktäschel, edward grefenstette, karl moritz hermann, tomáš kočisky, and phil blunsom. 2016. reasoning about entailment with neural attention. international conference on learning representations (iclr).  
+anna rogers, olga kovaleva, and anna rumshisky. 2020. a primer in bertology: what we know about how bert works. arxiv:2002.12327.  
+michael sejr schlichtkrull, nicola de cao, and ivan titov. 2020. interpreting graph neural networks for nlp with differentiable edge masking. arxiv:2010.00577.  
+karl schulz, leon sixt, federico tombari, and tim landgraf. 2020. restricting the flow: information bottlenecks for attribution. in international conference on learning representations.  
+sofia serrano and noah a. smith. 2019. is attention interpretable? in proceedings of the 57th annual meeting of the association for computational linguistics, pages 2931-2951, florence, italy. association for computational linguistics.  
+lloyd s shapley. 1953. a value for  $n$ -person games, volume 2, pages 307-317. princeton university press, princeton.  
+avanti shrikumar, peyton greenside, and anshul kundaje. 2017. learning important features through propagating activation differences. in international conference on machine learning, volume 70 of proceedings of machine learning research, pages 3145-3153, international convention centre, sydney, australia. pmlr.  
+karen simonyan, andrea vedaldi, and andrew zisserman. 2014. deep inside convolutional networks: visualising image classification models and saliency maps. workshop at international conference on learning representations.
+
+chandan singh, w. james murdoch, and bin yu. 2019. hierarchical interpretations for neural network predictions. in international conference on learning representations.  
+leon sixt, maximilian granz, and tim landgraf. 2020. when explanations lie: why many modified bp attributions fail. international conference on machine learning.  
+richard socher, alex perelygin, jean wu, jason chuang, christopher d. manning, andrew ng, and christopher potts. 2013. recursive deep models for semantic compositionality over a sentiment treebank. in proceedings of the 2013 conference on empirical methods in natural language processing, pages 1631-1642, seattle, washington, usa. association for computational linguistics.  
+pascal sturmfels, scott lundberg, and su-in lee. 2020. visualizing the impact of feature attribution baselines. distill. https://distill.pub/2020/attribute-baselines.  
+tony sun, andrew gaut, shirlyn tang, yuxin huang, mai elsherief, jieyu zhao, diba mirza, elizabeth belding, kai-wei chang, and william yang wang. 2019. mitigating gender bias in natural language processing: literature review. in proceedings of the 57th annual meeting of the association for computational linguistics, pages 1630–1640, florence, italy. association for computational linguistics.  
+mukund sundararajan, ankur taly, and qiqi yan. 2017. axiomatic attribution for deep networks. in international conference on machine learning, volume 70 of proceedings of machine learning research, pages 3319-3328, international convention centre, sydney, australia. pmlr.  
+saeid asgari taghanaki, mohammad havaei, tess berthier, francis dutil, lisa di jorio, ghassan hamarneh, and yoshua bengio. 2019. infomask: masked variational latent representation to localize chest disease. in medical image computing and computer assisted intervention - miccai 2019, pages 739-747, cham. springer international publishing.  
+ian tenney, patrick xia, berlin chen, alex wang, adam poliak, r thomas mccoy, najoung kim, benjamin van durme, sam bowman, dipanjan das, and ellie pavlick. 2019. what do you learn from context? probing for sentence structure in contextualized word representations. in international conference on learning representations.  
+tijmen tieleman and geoffrey hinton. 2012. lecture 6.5—rmsprop: divide the gradient by a running average of its recent magnitude. coursera: neural networks for machine learning, 4(2):26-31.  
+shikhar vashishth, shyam upadhyay, gaurav singh tomar, and manaal faruqui. 2019. attention interpretability across nlp tasks. arxiv:1909.11218.
+
+elena voita, rico sennrich, and ivan titov. 2019a. the bottom-up evolution of representations in the transformer: a study with machine translation and language modeling objectives. in proceedings of the 2019 conference on empirical methods in natural language processing and the 9th international joint conference on natural language processing (emnlp-ijcnlp), pages 4396-4406, hong kong, china. association for computational linguistics.  
+elena voita, david talbot, fedor moiseev, rico senrich, and ivan titov. 2019b. analyzing multi-head self-attention: specialized heads do the heavy lifting, the rest can be pruned. in proceedings of the 57th annual meeting of the association for computational linguistics, pages 5797-5808, florence, italy. association for computational linguistics.  
+ronald j. williams. 1992. simple statistical gradient-following algorithms for connectionist reinforcement learning. machine learning, 8(3):229-256.  
+thomas wolf, l debut, v sanh, j chaumont, c delangue, a moi, p cistac, t rault, r louf, m funtowicz, et al. 2019. huggingface's transformers: state-of-the-art natural language processing. arxiv:1910.03771.  
+zhitao ying, dylan bourgeois, jiaxuan you, marinka zitnik, and jure leskovec. 2019. gnnexplainer: generating explanations for graph neural networks. in h. wallach, h. larochelle, a. beygelzimer, f. d'alché buc, e. fox, and r. garnett, editors, advances in neural information processing systems 32, pages 9244-9255. curran associates, inc.  
+michael zhang, james lucas, jimmy ba, and geoffrey e hinton. 2019. lookahead optimizer: k steps forward, 1 step back. in h. wallach, h. larochelle, a. beygelzimer, f. d'alché buc, e. fox, and r. garnett, editors, advances in neural information processing systems 32, pages 9597-9608. curran associates, inc.  
+luisa m zintgraf, taco s cohen, tameem adel, and max welling. 2017. visualizing deep neural network decisions: prediction difference analysis. international conference on learning representations.
+
+# a probe parameterization
+
+we parameterized the probe functions with a single layer mlp. note that the architecture of this probe is chosen to be simple but different model choices are also possible and will not affect our general framework. when masking input tokens, 'votes' are computed as  $v_{i}^{(\ell)} = g_{\phi}^{(\ell)}(h_{i}^{(\ell)})$  where
+
+$$
+\gamma_ {i} ^ {(\ell)} = \xi \cdot \tanh  \left(\mathrm {n n} ^ {(\ell)} \left([ x _ {i}; h _ {i} ^ {(\ell)} ]\right)\right) + b ^ {(\ell)}, \tag {4}
+$$
+
+$$
+v _ {i} ^ {(\ell)} \sim \mathrm {h a r d c o n c r e t e} (v _ {i} ^ {(\ell)}; \tau , \gamma_ {i} ^ {(\ell)}, l, r), \qquad (5)
+$$
+
+where  $\xi = 10, \tau = 0.2, l = -0.2, r = 1.0$  are fixed hyperparameters. see appendix b for details about the hard concrete distribution including its parameterization. nn are feed-forward neural networks with architecture  $[h/4, \tanh, 1]$  where  $h$  is the bert hidden size,  $bs$  are learnable biases. we use the same functional form to compute  $z^{(\ell)}$  (masking hidden states) but  $x_{i}$  omitted from the input of the feed-forward nn. for the input probe the output of the last projection (but not the bias) is constrained to be  $\in (-\xi, \xi)$  for numerical stability. we initialized the bias of the last ffnn layer to 5 to start with high probability of keeping states (fundamental for good convergence as the initialized diffmask has not learned what to mask yet).
+
+# b the hard concrete distribution
+
+the hard concrete distribution, assigns density to continuous outcomes in the open interval  $(0,1)$  and non-zero mass to exactly 0 and exactly 1. a particularly appealing property of this distribution is that sampling can be done via a differentiable reparameterization (rezende et al., 2014; kingma and welling, 2014). in this way, the  $\mathcal{l}_0$  loss in equation 1 becomes an expectation
+
+$$
+\mathcal {l} _ {0} (\phi , b | x) = \sum_ {i = 1} ^ {n} \mathbb {e} _ {p _ {\phi} (z _ {i} | x)} [ z _ {i} \neq 0 ]. \tag {6}
+$$
+
+whose gradient can be estimated via monte carlo sampling without the need for reinforce and without introducing biases. we did modify the original hard concrete, though only so slightly, in a way that it gives support to samples in the half-open interval [0, 1), that is, with non-zero mass only at 0. that is because we need only distinguish
+
+![](images/697b772eb1bdb6164af8450dcbf9e93a86dc73f583b5b8ba7a179794ae50102c.jpg)  
+(a)
+
+![](images/ba5361af62f138b331619f7778d2937c7067459f23c00e414a6198ab8a7077f5.jpg)  
+(b)  
+figure 9: binary concrete distributions: (a) a concrete  $p_c$  and its stretched version  $p_{sc}$ ; (b) a rectified and stretched (hard) concrete  $p_{hc}$ .
+
+0 from non-zero, and the value 1 is not particularly important. $^{8}$
+
+the distribution a stretched and rectified binary concrete (also known as hard concrete) distribution is obtained applying an affine transformation to the binary concrete distribution (maddison et al., 2017; jang et al., 2017) and rectifying its samples in the interval  $[0, 1]$  (see figure 9). a binary concrete is defined over the open interval  $(0, 1)$  ( $p_c$  in figure 9a) and it is parameterised by a location parameter  $\gamma \in \mathbb{r}$  and temperature parameter  $\tau \in \mathbb{r}_{>0}$ . the location acts as a logit and it controls the probability mass skewing the distribution towards 0 in case of negative location and towards 1 in case of positive location. the temperature parameter controls the concentration of the distribution. the binary concrete is then stretched with an affine transformation extending its support to  $(l, r)$  with  $l \leq 0$  and  $r \geq 1$  ( $p_{sc}$  in figure 9a). finally, we obtain a hard concrete distribution rectifying samples in the interval  $[0, 1]$ . this corresponds to collapsing the probability mass over the interval  $(l, 0]$  to 0, and the mass over the interval  $[1, r)$  to 1 ( $p_{hc}$  in figure 9b). this induces a distribution over the close interval  $[0, 1]$  with non-zero mass at 0 and 1. samples are obtained using
+
+$$
+\begin{array}{l} s = \sigma \left(\left(\log u - \log (1 - u) + \gamma\right) / \tau\right), \\ z = \min  \left(1, \max  \left(0, s \cdot (l - r) + r\right)\right), \\ \end{array}
+$$
+
+where  $\sigma$  is the sigmoid function  $\sigma(x) = (1 + e^{-x})^{-1}$  and  $u \sim \mathcal{u}(0,1)$ . we point to the appendix b of louizos et al. (2018) for more information about the density of the resulting distribution and its cumulative density function.
+
+latent rationales there is a stream of work on learning interpretable models by means of extracting latent rationales (lei et al., 2016; bastings et al., 2019). some of the techniques underlying diffmask are related to that line of work, but overall we approach very different problems. lei et al. (2016) use reinforce to minimize a downstream loss computed on masked inputs, where the masks are binary and latent. they employ  $l_{0}$  regularization to solve the task while conditioning only on small subsets of the input regarded as a rationale for the prediction. to the same end, bastings et al. (2019) minimize downstream loss subject to constraints on expected  $l_{0}$  using a variant of the sparse relaxation of louizos et al. (2018). in sum, they employ stochastic masks to learn an interpretable model which they learn by minimizing a downstream loss subject to constraints on  $l_{0}$ , we employ stochastic masks to interpret an existing model and for that we minimize  $l_{0}$  subject to constraints on that model's downstream performance.
+
+# c hyperparameters
+
+# c.1 toy task
+
+data we generate sequences of varying length (up to 10 digits long) sampling each element independently: with  $50\%$  probability, we draw uniformly  $n$  or  $m$  and, with  $50\%$  probability, we draw uniformly from the remaining digits. we generate 10k data-points, keeping  $10\%$  of them for validation. the space of input sequences is  $>10^{10}$ . thus, a model that solves the task cannot simply memorize the training set.
+
+model the precise model formulation is the following: given a query  $q = \langle n, m \rangle$  and an input  $x = \langle x_1, \ldots, x_t \rangle$ , they are embedded as
+
+$$
+n ^ {\prime} = \mathrm {e m b} _ {q} (n),
+$$
+
+$$
+m ^ {\prime} = \operatorname {e m b} _ {q} (m), \tag {8}
+$$
+
+$$
+x _ {i} ^ {\prime} = \operatorname {e m b} _ {x} (x _ {i}) \quad \forall i \in 1 \dots t,
+$$
+
+where  $\mathrm{emb}_q$  and  $\mathrm{emb}_x$  are embedding layers of dimensionality 64. the prediction is computed as
+
+$$
+h _ {i} ^ {(1)} = \operatorname {f f n n} \left(\left[ n ^ {\prime}; m ^ {\prime}; x _ {i} ^ {\prime} \right]\right) \quad \forall i \in 1 \dots t,
+$$
+
+$$
+h _ {0} ^ {(2)} = \left[ 0 \dots 0 \right] ^ {\top}, \tag {9}
+$$
+
+$$
+h _ {i} ^ {(2)} = \mathrm {g r u} (h _ {i} ^ {(1)}, h _ {i - 1} ^ {(2)}) \qquad \forall i \in 1 \ldots t,
+$$
+
+$$
+y = w ^ {\top} h _ {t} ^ {(2)} + b,
+$$
+
+where  $[\cdot ;\cdot ]$  denotes concatenation, ffnn is a feed-forward neural network with architecture
+
+<table><tr><td>model</td><td>value</td></tr><tr><td>type</td><td>bertbase(uncased)</td></tr><tr><td>layers</td><td>12</td></tr><tr><td>hidden units</td><td>768</td></tr><tr><td>pre-trained masking</td><td>standard</td></tr><tr><td>optimizer</td><td>adam*</td></tr><tr><td>learning rate</td><td>3·10-5</td></tr><tr><td>train epochs</td><td>50</td></tr><tr><td>batch size</td><td>64</td></tr><tr><td>diffmask</td><td>value</td></tr><tr><td>optimizer</td><td>lookahead rmsprop**</td></tr><tr><td>learning rate φ,b</td><td>3·10-4</td></tr><tr><td>learning rate λ</td><td>1·10-1</td></tr><tr><td>train epochs</td><td>100</td></tr><tr><td>batch size</td><td>64</td></tr><tr><td>constrain</td><td>dkl[y||hat] &lt; 0.5</td></tr></table>
+
+table 3: hyperparameters for the sentiment classification experiment. optimizers: * kingma and ba (2015), ** tieleman and hinton (2012); zhang et al. (2019).
+
+$[64 \times 3, \tanh, 2]$ , gru is a gated recurrent network (cho et al., 2014) with hidden size of 64, and  $w \in \mathbb{r}^{64}$ ,  $b \in \mathbb{r}$  are the weight and bias parameter of the final classifier respectively.
+
+attribution methods integrated gradient attribution (sundararajan et al., 2017) is computed with 500 steps. attribution of schulz et al. (2020) is computed at token level with  $\beta = 10 / k$  where  $k$  is the token embedding size. we optimized using the rmsprop (tieleman and hinton, 2012) with learning rate  $10^{-1}$  for 500 steps. attribution of guan et al. (2019) is computed at token level with  $\lambda = 10^{-4}$  using rmsprop with learning rate  $10^{-1}$  for 500 steps. our diffmask is optimized for 100 epochs using lookahead rmsprop (tieleman and hinton, 2012; zhang et al., 2019) with learning rate  $10^{-2}$  for  $\phi, b$  and  $10^{-1}$  for  $\alpha$ . for these attribution methods we used our own re-implementation.
+
+# c.2 sentiment classification
+
+data we used the stanford sentiment treebank (sst; socher et al., 2013) available here<sup>9</sup>. we pre-processed the data as in bastings et al. (2019). training and validation sets contain 8544 and 1101 sentences respectively.
+
+<table><tr><td>model</td><td>value</td></tr><tr><td>type</td><td>bertlarge (uncased)</td></tr><tr><td>layers</td><td>24</td></tr><tr><td>hidden units</td><td>1024</td></tr><tr><td>pre-trained masking</td><td>whole-word</td></tr><tr><td>optimizer</td><td>adam*</td></tr><tr><td>learning rate</td><td>3·10-5</td></tr><tr><td>train epochs</td><td>2</td></tr><tr><td>batch size</td><td>24</td></tr><tr><td>diffmask</td><td>value</td></tr><tr><td>optimizer</td><td>lookahead rmsprop**</td></tr><tr><td>learning rate φ, b</td><td>3·10-4</td></tr><tr><td>learning rate λ</td><td>1·10-1</td></tr><tr><td>epochs (inputs)</td><td>1 (per layer)</td></tr><tr><td>epochs (hidden)</td><td>4</td></tr><tr><td>batch size</td><td>8</td></tr><tr><td>constrain</td><td>dkl[y||y] &lt; 1</td></tr></table>
+
+table 4: hyperparameters for the question answering experiment. optimizers: * kingma and ba (2015), ** tieleman and hinton (2012); zhang et al. (2019).
+
+model for the sentiment classification experiment we downloaded $^{10}$  a pre-trained model from the huggingface implementation $^{11}$  of wolf et al. (2019), and we fined-tuned on the sst dataset. we report hyperparameters used for training the model and our diffmask in table 3.
+
+# c.3 question answering
+
+data we used the stanford question answering dataset (squad v1.1; rajpurkar et al., 2016) available here<sup>12</sup>. pre-processing excluded qa pairs with more than 384 bpe tokens to avoid memory issues. after this we end up having 86706 training instances and 10387 validation instances.
+
+model for the question answering experiment we downloaded  $^{10}$  an already fine-tuned model from the huggingface implementation  $^{11}$  of wolf et al. (2019) we report hyperparameters used by them for training the original model and the ones used for our diffmask in table 4.
+
+![](images/b454f554e80921d1fc3cb36481d6fcbed359958e206e0c81fa318ff51a5ac340.jpg)  
+figure 10: diffmask for hidden states: states up to layer  $\ell$  from a model (top) are fed to a classifier  $g$  that predicts a mask  $z^{(\ell)}$ . we use this to mask the  $\ell$ th hidden state and re-compute the forward pass from that point on (bottom). the classifier  $g$  is trained to mask the hidden state as much as possible without changing the output (minimizing a divergence  $\mathrm{d}_{\star}$ ).
+
+![](images/dfb897f597450476341233bb00d2901c802da6ace66479adaa66781f2ef067b9.jpg)  
+figure 11: hidden state values for the two-neuron toy task. clusters of whether the input digit is equal to the first or second position in the query ( $= n$  or  $= m$  respectively) or not at all ( $\neq n, m$ ) are completely linear separable.
+
+# d additional plots and results
+
+in figure 10 we show an overview of the variant of diffmask to analyze the hidden states of a model (see figure 1 to compare the two versions).
+
+# d.1 toy task
+
+in figure 11 we show the distribution of hidden states in the toy task where we highlight whether they belong to a state corresponding to  $n, m$  or neither of them.
+
+# d.2 sentiment classification
+
+in figure 13 we show an additional comparison example between attribution method for hidden layers w.r.t the predicted label.
+
+# d.2.1 ablation
+
+as argued in the introduction and shown on the toy task, many popular methods (e.g., erasure and its approximations) are over-aggressive in discarding
+
+![](images/30f74f3a4a197894333825ed0cbdc78da241785fa1e2a23bcb24df35013ef21e.jpg)  
+(a) masking hidden states with amortization.
+
+![](images/39cd1aaeb243338fe69903a5f6d9bd1ae7af25fa771ec368e32aaec207c41766.jpg)  
+(b) masking hidden states without amortization.
+
+![](images/e7348512266f8c2d0f7fd5600a8fc3314e1be415a7bcb2b51cb592b1fc953452.jpg)  
+(c) masking hidden states without amortization and without baseline.
+
+inputs and hidden units. amortization is a fundamental component of diffmask and is aimed at addressing this issue. in figure 12 we show how our method behaves when ablating amortization and thus optimizing on a single example instead. noticeable, our method converges to masking out all hidden states at any layer (figure 12b). this happens as it learns an ad hoc baseline just for that example. when we ablate both amortization and baseline learning (figure 12c), the method struggles to uncover any meaningful patterns. this highlights how both core components of our method are needed in combination with each other.
+
+# d.3 question answering
+
+in figure 14 we report statistics on the average number of layers that predict to keep input tokens aggregating by pos tag. we report additional two examples of expectation predicted by diffmask in figure 15.
+
+![](images/2d519b9fb5faafca4d5a00e1eedd805b612ea6d3b2cdbf92e782e113e7575fac.jpg)  
+(a) attention.
+
+![](images/62d71ec37d5392a7a6825be9ab7369131de7bffb9231ce96cdff39e233777016.jpg)  
+(b) sundararajan et al. (2017).
+
+![](images/fb45736f8614664bf7623329758d5c247ba234444702f7427b4324d6d7d340fe.jpg)  
+figure 12: sentiment classification: ablation study on amortization and baseline.
+
+![](images/91cb372f61b53df4cf1b67595063a9aab201dd7cf31c64dec931a7be4595b9cf.jpg)  
+(d) guan et al. (2019).
+
+![](images/c6c81fc6dffbeaa58e0952e0a53e3f568ffcecf02b3135c9fd188318b3e5df6e.jpg)  
+(c) schulz et al. (2020).  
+(e)diffmask.  
+figure 13: sentiment classification: comparison between attribution method for hidden layers w.r.t. the predicted label. all plots are normalized per-layer by the largest attribution. attention heatmap is obtained max pooling over heads and averaging across positions.
+
+![](images/857ac3f3cfcaf51b2e0e7fdd0b6eb0f795b0155ce761854073d76b6bc455e2d0.jpg)  
+(f) diffmask on input.
+
+![](images/dd43724f355a3fe731652c3ee342d6a7320f8bca918ea2fd8e63b82f3cca03cc.jpg)  
+(a) question inputs.
+
+![](images/d89ba7c9b3b513c32b9957ca1887ad5bc84b5ae40007c8b24c4a3707ec980c40.jpg)  
+(b) question hidden states.
+
+![](images/b5f4c148835f85b3868b1255cade6d3b0665b8c16ea274b2b1ac24c0d3de3203.jpg)  
+(c) context inputs.
+
+![](images/ad669ed297658a401cc28cd56ded8d5893cd03e9f65dbff877b904d175f54dfd.jpg)  
+(d) context hidden states.
+
+![](images/9bc4314b59782ca11235b22f355f5cec18854e7140d3ffe32e131f16539f1ba0.jpg)  
+(e) all inputs.  
+figure 14: question answering: average number of layers that predict to keep input tokens (a), (c) and (e) or hidden states (b), (d) and (f) aggregating by part-of-speech tag (pos) on validation set.
+
+![](images/c1c45ccb5eee7a94285d5358f6fe32018fb995df267f09ed2de4d7b77179079f.jpg)  
+(f) all hidden states.  
+figure 15: expectation predicted by diffmask to keep the inputs in (a) (c) and hidden states in (b) (d) on two different qa pairs. the correct answers is highlighted in bold.
+
+![](images/c5915b0aee45d206800def7b91a652bf7f039a7d2a65da44b445bb88dceb64ad.jpg)  
+(a) gating the input.
+
+![](images/1adec82b0c5f8b53fa9c600f4c017b99556784b0032a4a5c8c703e75746220d3.jpg)  
+(b) gating hidden states.
+
+![](images/ff1a737259c1bfc0854395b40cd5c8a56f8b451cb62cc1bdd827e34e9db2122f.jpg)  
+(c) gating the input.
+
+![](images/700ea331d89e1faea365aab9048f97858b2dab22e9f71df5f2e77eb80b64a34f.jpg)  
+(d) gating hidden states.

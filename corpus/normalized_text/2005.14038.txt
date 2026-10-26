@@ -1,0 +1,501 @@
+# hetpipe: enabling large dnn training on (whimpy) heterogeneous gpu clusters through integration of pipelined model parallelism and data parallelism
+
+jay h. park<sup>1</sup>, gyeongchan yun<sup>1</sup>, chang m. yi<sup>1</sup>, nguyen t. nguyen<sup>1</sup>, seungmin lee<sup>1</sup>, jaesik choi<sup>2</sup>, sam h. noh<sup>1</sup>, and young-ri choi<sup>1</sup>
+
+1 unist 2 kaist
+
+# abstract
+
+deep neural network (dnn) models have continuously been growing in size in order to improve the accuracy and quality of the models. moreover, for training of large dnn models, the use of heterogeneous gpus is inevitable due to the short release cycle of new gpu architectures. in this paper, we investigate how to enable training of large dnn models on a heterogeneous gpu cluster that possibly includes whimpy gpus that, as a standalone, could not be used for training. we present a dnn training system, hetpipe (heterogeneous pipeline), that integrates pipelined model parallelism (pmp) with data parallelism (dp). in hetpipe, a group of multiple gpus, called a virtual worker, processes minibatches in a pipelined manner, and multiple such virtual workers employ data parallelism for higher performance. we also propose a novel parameter synchronization model, which we refer to as wave synchronous parallel (wsp) to accommodate both pmp and dp for virtual workers, and provide convergence proof of wsp. our experimental results on a given heterogeneous setting show that with hetpipe, dnn models converge up to  $49\%$  faster compared to the state-of-the-art dp technique.
+
+# 1 introduction
+
+we have, in our facilities, four systems each with a different set of gpus. each, at the time of purchase, was (close to) state-of-the-art affordable with what budget we could muster. with technology advancing in such rapid pace, these systems have become outdated. furthermore, the world is requiring us to run larger and larger deep neural networks (dnns) models. what we have is a bunch of (now) old technologies, individually unable to run these large models and funds depleted, unable to purchase the high-priced state-of-the-art systems. our boss is asking what happened to those machines bought in the past years, why those cannot be used, unaware that this war is about purchasing power. except for those exceptionals (you know who you are), this is a typical scenario we are faced with.
+
+deep neural networks have been popularly used to solve various problems such as image classification [14, 26], speech recognition [15], topic modeling [3], and text processing [8]. the size of dnn models (i.e., the number of parameters) have continuously been increasing in order to improve the accuracy and quality of models and to deal with complex features of data [17, 42, 48, 49]. the size of input data and batches used
+
+table 1: heterogeneous gpus  
+
+<table><tr><td></td><td>architecture</td><td>cuda core</td><td>boost clock (mhz)</td><td>memory size (gb)</td><td>memory bw (gb/sec)</td></tr><tr><td>titan v</td><td>volta</td><td>5120</td><td>1455</td><td>12</td><td>653</td></tr><tr><td>titan rtx</td><td>turing</td><td>4608</td><td>1770</td><td>24</td><td>672</td></tr><tr><td>geforce rtx 2060</td><td>turing</td><td>1920</td><td>1680</td><td>6</td><td>336</td></tr><tr><td>quadro p4000</td><td>pascal</td><td>1792</td><td>1480</td><td>8</td><td>243</td></tr></table>
+
+for training have also increased to achieve higher accuracy and throughput [17, 23].
+
+for training large dnn models, data parallelism [4, 28, 29, 45], which employs multiple workers using parameter servers or allreduce communication, and model parallelism [10,25,27], which divides the network layers of a dnn model into multiple partitions and assigns each partition to a different gpu, have commonly been leveraged. furthermore, to mitigate the critical issue of low gpu utilization of naive model parallelism, pipelined model parallelism, where minibatches are continuously fed to the gpus one after the other and processed in a pipelined manner, has recently been proposed [17, 34].
+
+for training dnn models, the use of gpu clusters is now commonplace. in such an environment, the use of heterogeneous gpus is inevitable due to the short release cycle of new gpu architectures [21]. moreover, several types of gpus targeted for high-end servers, workstations, and desktops are being released for purchase [35-38]. table 1 shows the hardware specifications for four different types of gpus that we have purchased in our institution in the short span of the last three years, with each type determined by the year of purchase and the expenses available at the time. due to their cost-effectiveness, less expensive gpus targeted for desktops and workstations, rather than high-end servers are also commonly used for machine learning training, especially for small and medium size clusters [12, 19, 44, 50, 51, 53]. due to the same reason, spot instances with different types of gpus that are offered by cloud service providers are being used [2, 21, 33].
+
+there are benefits to enabling dnn training with heterogeneous resources. first, it allows for large model training with lower-class gpus. while unable to train individually due to their limited resources, aggregated together, they may be used for training. these gpus, which likely would have been retired, become usable, possibly used to create (virtual) workers that show similar performance as high-class gpus. second, low-class gpus can be used to improve the perfor
+
+mance of even high-class gpus by incrementally adding on the resources of the (old) lower class systems to the (new) high-class systems. we call a group of aggregated gpus that could satisfy the resource constraint and be used for training a virtual worker. internally, such a virtual worker could leverage pipelined model parallelism (pmp) to process a minibatch, while externally, a number of virtual workers could leverage data parallelism (dp) for higher performance.
+
+in this paper, we explore the integration of pmp and dp to maximize the parallelism of dnn model training. in particular, we investigate a dnn model training system, which employs both pmp and dp, for a heterogeneous gpu cluster that possibly includes whimpy gpus that, as a standalone, could not be used for training large models. there are numerous technical challenges that need to be overcome to realize a truly ideal solution of pmp and dp based dnn training systems for heterogeneous gpu clusters: how are the heterogeneous gpus to be divided and allocated into a virtual worker? how do we reduce virtual worker stragglers when we consider dp? how do we partition the model to maximize the performance of pmp using heterogeneous gpus? how are the weights synchronized in this setting? that is, what version of parameters is used for a next minibatch while previous minibatches are still executing in a pipelined manner within each virtual worker? how do multiple virtual workers synchronize their parameters? can we guarantee convergence?
+
+while dp [4, 28, 29, 45], pmp [17, 34], and heterogeneity [21, 22, 30] for training have been considered separately, to the best of our knowledge, this is the first paper that tackles these issues together in attempting to answer some of the aforementioned questions. in this work, we design a dnn training system, hetpipe (heterogeneous pipeline), that integrates pmp of a virtual worker, which is composed of multiple (possibly whimpy) heterogeneous gpus, with dp of virtual workers using parameter servers to enable and also speed up training of large models. hetpipe can aggregate heterogeneous resources from multiple gpus to form a virtual worker such that the performance of each virtual worker is similar to each other, reducing the straggler problem. for hetpipe, we propose a novel parameter synchronization model, which we refer to as wave synchronous parallel (wsp). wsp is adapted from the stale synchronous parallel (ssp) model [16] to accommodate both pmp and dp for virtual workers composed of heterogeneous gpus. we also prove the convergence of wsp. note that while hetpipe would work in a homogeneous gpu cluster, with the rapid turnaround of newer gpu architectures, it is more likely that one will end up with a cluster of heterogeneous gpus. this is the environment that we target.
+
+we implement hetpipe by modifying tensorflow, a commonly used machine learning training system. we evaluate the performance of hetpipe for two dnn models using a heterogeneous gpu cluster composed of four different types of gpus. our experimental results demonstrate that the performance of hetpipe is better than that of the state-of-the-art dp
+
+via horovod [45] that uses allreduce communication [40]. compared to horovod, the convergence of vgg-19 with a large parameter set to a desired accuracy becomes  $49\%$  faster, and that of resnet-152 which is too big to be loaded in four whimpy gpus in our cluster becomes  $39\%$  faster by using all the gpus (including whimpy ones).
+
+strategies to leverage pmp have been explored in previous studies [6, 17, 24, 34]. compared to these, our study makes forward strides in three aspects. first, we generalize pmp of a virtual worker to be used together with dp of virtual workers, increasing the parallelism of dnn model training. consequently, this results in speeding up training. second, we consider a heterogeneous gpu cluster, which allows the use of gpus, which otherwise, could not be used for training. finally, we present a parameter synchronization model that guarantees convergence, of which we provide a proof. we provide a more in-depth comparative discussion on these studies in section 2.3.
+
+# 2 background
+
+# 2.1 dnn training
+
+the goal of training of a dnn model composed of multiple layers is to find the parameters (or weights)  $w$  of the model that minimizes the sum of a loss function for the training dataset that consists of training samples and their labels. in a popularly used training method, stochastic gradient descent (sgd), it computes the weight updates, i.e., gradients on a subset of training samples, called a minibatch, and updates weights  $w$ .
+
+the training process consists of a forward pass and then a backward pass. in the forward pass, the model first predicts the label for each of the samples in a minibatch. each layer computes activations for the next layer using the given input data and the current parameters. finally, the last layer of the model computes loss based on the predicted and actual labels. in the backward pass, the loss is backpropagated over all the layers of the model where each layer computes gradients using the gradients computed by the upper layer and activations previously computed in the forward pass.
+
+# 2.2 data parallelism
+
+data parallelism (dp) utilizes multiple workers to speed up training of a dnn model. it divides the training dataset into subsets and assigns each worker a different subset. each worker has a replica of the dnn model and processes each minibatch in the subset, thereby computing the weight updates. therefore, if a dnn model cannot be loaded into the memory of a single gpu, dp cannot be used.
+
+among the multiple workers, the parameters are synchronized using parameter servers [28] or allreduce communications [29, 45]. for bulk synchronous parallel (bsp) [1, 32], each worker must wait for all other workers to finish the current minibatch  $p$  before it starts to process the next minibatch  $p + 1$  so that it can use an updated version of the weights for
+
+minibatch  $p + 1$ . for asynchronous parallel (asp) [1, 43], each worker need not wait for other workers to finish minibatch  $p$ , possibly using a stale version of the weights. with bsp, which is possible for both the parameter servers and allreduce communications, the system may suffer from high synchronization overhead, especially in a heterogeneous gpu cluster where each worker with a different gpu provides different training performance [30]. on the other hand, while asp, which is possible for the parameter servers, has no synchronization overhead, it is known that asp does not ensure convergence [43, 52].
+
+a method that takes the middle ground between bsp and asp is stale synchronous parallel (ssp) [16]. with ssp, each worker is allowed to proceed the training of minibatches using a stale version of the weights that may not reflect the most recent updates computed by other workers. thus, workers need not synchronize with other workers whenever it finishes the processing of a minibatch. as such, parameter staleness can occur. however, this staleness is bounded as defined by the user and referred to as the staleness threshold. as ssp is beneficial when worker performance is varied, it has been explored especially in the context of heterogeneous systems [21].
+
+in ssp, each worker periodically pushes the weight updates to the parameter server. this synchronization interval is called a clock. thus, each worker increases its local clock by one for every iteration, which is the training period of a minibatch. for a given staleness threshold  $s$  where  $s \geq 0$ , each worker with clock  $c$  is allowed to use a stale version of the weights, which includes all the updates from iteration 0 to  $c - s - 1$  and, possibly, more recent updates past iteration  $c - s - 1$ . that is, a worker can continue training of the next minibatch with parameters whose updates may be missing from up to the  $s$  most recent minibatches.
+
+# 2.3 model parallelism and pipeline execution
+
+model parallelism (mp) is typically exploited for large dnn models that are too large to be loaded into memory of a single gpu. in particular, a dnn model composed of multiple layers is divided into  $k$  partitions and each partition is assigned to a different gpu. each gpu executes both the forward and backward passes for the layers of the assigned partition. note that it is important to execute the forward and backward passes of a partition on the same gpu as the activation result computed for the minibatch during the forward pass needs to be kept in the gpu memory until the backward pass of the same minibatch for efficient convergence, as similarly discussed by narayanan and others [34]. otherwise, considerable extra overhead will incur for managing the activation through either recomputation or memory management.
+
+in the basic form of mp,  $k$  gpus, individually, act as one virtual worker to process a minibatch as follows: for each minibatch, execution of the forward pass starts from  $\mathrm{gpu}_1$  up to  $\mathrm{gpu}_k$ . when each  $\mathrm{gpu}_i$ , where  $1 \leq i < k$ , completes the forward pass of the assigned partition, it sends the computed
+
+table 2: comparison of hetpipe with gpipe and pipedream  
+
+<table><tr><td></td><td>gpipe</td><td>pipedream</td><td>hetpipe</td></tr><tr><td>heterogeneous cluster support</td><td>no</td><td>no</td><td>yes</td></tr><tr><td>target large model training</td><td>yes</td><td>no</td><td>yes</td></tr><tr><td>number of (virtual) workers</td><td>1</td><td>1</td><td>n</td></tr><tr><td>data parallelism</td><td>extensible</td><td>partition</td><td>virtual workers</td></tr><tr><td>proof of convergence</td><td>analytical</td><td>empirical</td><td>analytical</td></tr></table>
+
+activations of only the last layer in its partition to  $\mathrm{gpu}_{i+1}$ . once  $\mathrm{gpu}_k$  finishes the forward pass of its partition, the backward pass of the minibatch is executed from  $\mathrm{gpu}_k$  down to  $\mathrm{gpu}_1$ . when each  $\mathrm{gpu}_{i'}$ , where  $1 < i' \leq k$ , finishes the backward pass, it sends the computed local gradient of only the first layer in its assigned partition to  $\mathrm{gpu}_{i'-1}$ . this basic form of mp results in low gpu utilization as only one gpu is actively executing either the forward or backward pass. nonetheless, mp allows execution of large dnn models that are too large for a single gpu.
+
+to improve utilization of the gpus in a virtual worker, minibatches can be processed in a pipelined manner. the subsequent minibatches are fed into the first gpu in mp (i.e.,  $\mathrm{gpu}_1$ ) one by one once the gpu completes the processing of the previous minibatch. this allows for multiple gpus to simultaneously execute either the forward or backward pass of their assigned layers for different minibatches. this is referred to as pipelined model parallelism (pmp).
+
+this pmp strategy has been investigated in previous studies [17, 34]. pipedream exploits pmp of a single virtual worker to avoid the parameter communication overhead of dp [34]. considering only homogeneous gpus, when pipedream partitions a model into stages to maximize pipeline performance, it does not take into account the memory requirement of each stage. thus, pipedream processes a limited number of minibatches, which is large enough to saturate the pipeline, to reduce memory overhead. pipedream also provides a form of dp, but it considers dp within a virtual worker to speed up the execution of lagging layers. no proof of single pipeline convergence is provided in pipedream.
+
+gpipe is a scheme that leverages pmp of a single virtual worker to support large dnn models, also in a homogeneous gpu cluster [17]. in gpipe, a minibatch is divided into multiple microbatches that are injected into the pipeline. using the same weights, gpipe executes the forward passes for all the microbatches, and then executes the backward passes for them. when the backward pass of the last minibatch is done, it updates the weights all together for the minibatch. gpipe incurs frequent pipeline flushes, possibly resulting in low gpu utilization [34]. in gpipe, dp of multiple virtual workers can be done using existing synchronization schemes like bsp as a virtual worker processes one minibatch at a time. gpipe saves on gpu memory by recomputing the activations again in the backward pass instead of keeping the activations computed in the forward pass in memory. we do not use this optimization though there are no fundamental reasons forbidding it.
+
+![](images/b8923d4e1571f23ec2b1552fe7e980309c918f532ae8bbd71c3d9003ed268712.jpg)  
+figure 1: pipeline execution of minibatches where  $m_{p,k}$  indicates the execution of a minibatch  $p$  in partition  $k$ , which is executed in  $\mathrm{gpu}_k$  and the yellow and green colors indicate the forward and backward passes, respectively.
+
+a comparison of hetpipe with previous studies is given in table 2.
+
+# 3 system overview
+
+the system that we propose focuses on training a large dnn model in a heterogeneous gpu cluster composed of various types of gpus that have different computation capability and memory capacity. except for the exceptional few who always have the luxury to be provided with the most advanced systems, most dnn practitioners will inevitably find themselves in this type of environment as systems evolve and the demand for larger dnn models continues. in such settings, for some types of gpus in the cluster, the dnn model of interest may be too large to be loaded into the memory of a single gpu. the system that we propose in this paper leverages both pipelined model parallelism (pmp) and data parallelism (dp) to enable training of such large dnn models and, in the process, enhance performance as well as the utilization of the heterogeneous gpu resources of the cluster.
+
+figure 2 shows the architecture of the proposed cluster system composed of  $h$  nodes. each node comprises a homogeneous set of gpus, but the gpus (and memory capacity) of the nodes themselves can be heterogeneous. two key novelties exist in this architecture. first, dp is supported through a notion of a virtual worker (vw), which consists of  $k$ , possibly heterogeneous, gpus, and encapsulates the notion of a worker in typical dnn systems. that is, a virtual worker is used to train the dnn model. in figure 2, note that there are  $n$  virtual workers with 4 gpus each, that is,  $k = 4$ , and that the gpus comprising the virtual worker may be different for each virtual worker. while in this paper we consider  $k$  to be constant for each virtual worker, our design does not restrain it to be so; this is simply a choice we make for simplicity. the key aspect here is that a virtual worker allows dp by aggregating gpus possibly even when individual gpus may be resource limited.
+
+the second novelty is that each virtual worker processes each minibatch based on model parallelism, in a pipelined manner, to fully utilize the gpu resources, as shown in figure 1, to accommodate large dnn models. while pmp has been proposed before (which we compare in section 2.3), to the best of our knowledge, we are the first to present pmp in a heterogeneous setting. we refer to our system as hetpipe
+
+![](images/b2a14309a8d8fe3db916c9b062ff6aafb89de346874f2dd268dd157b2cbdcc3c.jpg)  
+figure 2: system architecture (vw: virtual worker)
+
+as it is heterogeneous, in gpus, across and, possibly, within virtual workers and makes use of pipelining in virtual workers for resource efficiency.
+
+to train dnn models based on pipelined model parallelism in virtual workers, the resource allocator first assigns  $k$  gpus to each virtual worker based on a resource allocation policy (which will be discussed in section 8.1). note that for allocating the heterogeneous gpus to the virtual workers, the resource allocation policy must consider several factors such as the performance of individual gpus as well as the communication overhead caused by sending activations and gradients within a virtual worker, and synchronizing the weights among the virtual workers and the parameter server. then, for the given dnn model and allocated  $k$  gpus, the model partitioner divides the model into  $k$  partitions for the virtual worker such that the performance of the pipeline executed in the virtual worker can be maximized.
+
+as any typical dp, multiple virtual workers must periodically synchronize the global parameters via parameter servers or allreduce communication; in hetpipe, parameter servers are used to maintain the global weights. each virtual worker has a local copy of the global weights and periodically synchronizes the weights with the parameter server. evidently, when managing the weights within a virtual worker and across virtual workers, two types of staleness, local staleness and global staleness, need to be permitted to improve the performance of dnn training. local staleness refers to staleness within a virtual worker. as each virtual worker processes
+
+minibatches in a pipelined manner, there are multiple minibatches that are being processed in parallel. thus, staleness is inevitable as weights seen by a minibatch may not reflect the updates of all of its previous minibatches.
+
+global staleness, on the other hand, is similar to the staleness notion introduced by ho et al. [16]. that is, the system needs to reduce communication overhead between the parameter server and (virtual) workers, and, in our case, also mitigate the synchronization overhead caused by possibly heterogeneous virtual workers. therefore, similarly to ssp [16], each virtual worker should be allowed to proceed training without querying the global weights for every minibatch, unless its local copy is so old such that there are too many missing recent updates made by other virtual workers. note that such staleness condition is set by the user [16].
+
+for our system, we propose the wave synchronous parallel (wsp) model to synchronize the weights. a wave is a sequence of minibatches that are processed concurrently in a virtual worker. let the number of minibatches in a wave be  $n_{m}$ . within a wave, processing of the  $i$ -th minibatch is allowed to proceed without waiting for the preceding minibatches  $i'$  to be completed, where  $1 < i \leq n_{m}$  and  $1 \leq i' < i$ . as the virtual worker does not enforce the updates even from the first minibatch in a wave to be reflected in the weights used by the last minibatch, the local staleness threshold in wsp is  $n_{m} - 1$ . moreover, each virtual worker only pushes the aggregated updates from all the minibatches in a wave, instead of for every minibatch, to the parameter server. this results in considerable reduction in communication overhead.
+
+as it is important that the results generated through our proposed system configuration are correct [16, 21, 54], we show the convergence of our methodology in section 6.
+
+note that hetpipe uses parameter servers, which may incur synchronization and communication overhead. however, hetpipe mitigates such overhead by permitting global staleness among virtual workers and executing the pipeline in each virtual worker such that it continues to process minibatches that have already been injected while waiting for the parameter update. we believe hetpipe can be further optimized by taking decentralized approaches, but leave this for future work.
+
+# 4 pipelined model parallelism within a vw
+
+number of minibatches in the pipeline: in our system, each virtual worker processes up to  $n_{m}$  minibatches concurrently in a pipeline manner so that the executions of the minibatches can overlap. given a dnn model and  $k$  gpus, the maximum number of minibatches executed concurrently in the virtual worker,  $max_{m}$ , is basically determined by the memory requirement for training the model. for a model that requires a huge amount of memory for output activations and weights,  $max_{m}$  may be less than  $k$ . note that in such cases, the utilization of each gpu is unlikely to be high.
+
+$n_{m}$ , the actual number of minibatches in the pipeline will be  $n_{m} \leq max_{m}$  and basically determined by considering the
+
+throughput of the pipeline. note that  $n_{m}$  must be the same in every virtual worker, and thus,  $n_{m}$  is set to the minimum  $max_{m}$  among all the virtual workers.  $n_{m}$  will affect the local staleness that we discuss later in this section.
+
+model partitioning: to train a dnn model, a set of  $k$  gpus is allocated to a virtual worker by a resource allocation policy, which we discuss in section 8.1. for now, let us assume that  $k$ , the number of possibly heterogeneous gpus, and  $n_{m}$  are given. then, a partitioning algorithm is employed to divide multiple layers of the model into  $k$  partitions, assigning them to the  $k$  different gpus. the goal of the partitioning algorithm is to maximize the performance of the pipeline, while satisfying the memory requirement of each partition to process  $n_{m}$  minibatches.
+
+in particular, in this study, for memory, we consider the fact that the actual memory requirement will vary depending on the stage of the pipeline that the gpu is used for. for example, contrast  $\mathrm{gpu}_4$  and  $\mathrm{gpu}_1$  in figure 1.  $\mathrm{gpu}_4$ , the gpu that handles the last stage of the pipeline, handles only one minibatch at a time and is immediately done with the minibatch as exemplified by the yellow (forward pass) and green (backward pass)  $\mathbf{m}_{i,4}$  pairs for  $i = 1,2,\ldots$ , that are side-by-side. in contrast, for  $\mathrm{gpu}_1$ , the yellow and green  $\mathbf{m}_{i,1}$  pairs are far apart, meaning that the forward pass  $\mathbf{m}_{i,1}$  needs to hold up memory until the backward pass  $\mathbf{m}_{i,1}$  is finished with its execution. thus, with  $\mathrm{gpu}_1$ , the memory requirement is high as it needs to hold on to the results of the forward pass for all stages of the pipeline. this variance in memory requirement is considered in partitioning the layers.
+
+execution time must also be considered when partitioning the layers. to do so, we calculate the execution time of a partition to be the sum of the computation time of all the layers in the partition and the communication time needed for receiving the activations (in the forward pass) and local gradients (in the backward pass). our partitioning algorithm attempts to minimize the maximum execution time of the partitions within the bounds of satisfying the memory requirement.
+
+partition scheduling: once the partition is set, the partitions need to be scheduled for each of the gpus. each  $\mathrm{gpu}_q$  responsible for partition  $q$  may have multiple forward pass and backward pass tasks to schedule at a time. each gpu schedules a task by enforcing the following conditions:
+
+1. a forward pass task for a minibatch  $p$  will be executed only after a forward pass task for every minibatch  $p'$  is done where  $1 \leq p' < p$ .  
+2. similarly, a backward pass task for a minibatch  $p$  will be executed only after a backward pass task for every minibatch  $p'$  is done where  $1 \leq p' < p$ .  
+3. among multiple forward and backward pass tasks, a fifo scheduling policy is used.
+
+note that in the last partition, for a minibatch, processing a forward pass immediately followed by a backward pass is executed as a single task.
+
+considering staleness: given the description of pipelining, the question of staleness of weights used needs to be considered. that is, as a minibatch is scheduled, it may be that the layers are not using the most up-to-date weights. for example, in figure 1, when the forward pass  $\mathbf{m}_{2,1}$ , the second minibatch, begins to be processed, it must use stale weights as the first minibatch has not completed and hence, the changes in the weights due to the first minibatch have not yet been appropriately reflected, which is in contrast with typical processing where minibatches are processed one at a time. we now discuss how this staleness issue is considered.
+
+let local staleness be the maximum number of missing updates from the most recent minibatches that is allowed for a minibatch to proceed in a virtual worker. as training with  $n_{m}$  minibatches can proceed in parallel in a virtual worker, the local staleness threshold,  $s_{\text{local}}$ , is determined as  $n_{m} - 1$ , where  $1 \leq n_{m} \leq max_{m}$ . if  $n_{m} = 1$ , the behavior is exactly the same as naive model parallelism. larger  $n_{m}$  improves the performance (i.e., throughput) of the pipeline as a larger number of concurrent minibatches are executed, but local staleness increases, possibly affecting the convergence of training. in a real setting, typically,  $n_{m}$  will not be large enough to affect convergence as it will be bounded by the total amount of gpu memory of a virtual worker.
+
+such local staleness also exists in pipedream [34]. as pipedream basically employs weight stashing that uses the latest version of weights available on each partition to execute the forward pass of a minibatch, a different version of weights is used across partitions for the same minibatch. unfortunately, pipedream only shows empirical evidence of convergence when weight stashing is used. note that pipedream also discusses vertical sync, which is similar to hetpipe, but it excludes vertical sync in its evaluations [34].
+
+now let  $w_{p}$  be the weights used by minibatch  $p$ . then, initially, we can assume that  $w_{0}$ , the initial version of weights, is given to the virtual worker. then, the first  $(s_{local} + 1)$  minibatches are processed in a pipelined manner with  $w_{0} = w_{1} = \dots = w_{s_{local}} = w_{s_{local} + 1}$ .
+
+to accommodate staleness in our system, when processing of minibatch  $p$  completes, the virtual worker updates the local version of the weights,  $w_{local}$  as  $w_{local} = w_{local} + u_p$ , where  $u_p$  is the updates computed by processing minibatch  $p$ . when the virtual worker starts to process a new minibatch, it makes use of the latest value of  $w_{local}$  without waiting for the other minibatches to update their weights. for example, once the virtual worker is done for minibatch 1 and updates  $w_{local}$  with  $u_1$ , it will start to process minibatch  $s_{local} + 2$  by using the updated weights without waiting for minibatches 2 up to  $s_{local} + 1$  to be completed. similarly, when the virtual worker is done with minibatch  $s_{local} + 1$  and updates  $w_{local}$  with  $u_{s_{local} + 1}$ , it will start to process minibatch  $2 \times (s_{local} + 1)$  without waiting for the previous most recent  $s_{local}$  minibatches to be completed. therefore, except for the initial minibatches 1 to  $s_{local} + 1$ , for minibatch  $p$  the virtual worker will use the version of the
+
+weights that reflects (at least) all the local updates from minibatches 1 to  $p - (s_{local} + 1)$ . note that for every minibatch  $p$ ,  $w_{p}$  must be kept in gpu memory until the backward pass for  $p$  is executed.
+
+note that staleness in ssp is caused by the different processing speed of minibatches among multiple workers. thus, in ssp, staleness is used as a means to reduce the synchronization and communication overhead. however, local staleness in hetpipe is caused inherently as minibatches are processed in a pipelined manner within a virtual worker.
+
+# 5 data parallelism with multiple vws
+
+in this section, we discuss data parallelism (dp) with virtual workers. the first and foremost observation of dp being supported with virtual workers is that the virtual workers may be composed of (whimpy) heterogeneous gpus. while it is well known that dp helps expedite dnn execution, dp, in typical systems, is not possible if individual gpus, that is, workers, do not have sufficient resources to handle the dnn model, in particular, large dnns. by allowing a virtual worker to be composed of multiple gpus that are lacking in resources, our system allows dp even with whimpy gpus. the other key observation in properly supporting dp with virtual workers is that each virtual worker now retains local staleness as discussed in section 4. making sure that, despite such individual staleness, we understand and show that the results obtained from dp among virtual workers (globally) converges is an important issue that must be addressed. the rest of the section elaborates on this matter.
+
+workings of wsp: as stated in the system overview, hetpipe uses parameter servers. we assume that such synchronization occurs in clock units, a notion taken from ssp [16]. precisely, a clock unit is defined as the progress of completing one wave. recall from section 3 (and figure 1) that a wave is a sequence of  $s_{local} + 1$  minibatches concurrently executed such that a virtual worker is allowed to process a later minibatch in a wave without updates from an earlier minibatch in the same wave.
+
+similarly to ssp, each virtual worker maintains a local clock  $c_{\text{local}}$ , while the parameter server maintains a global clock  $c_{\text{global}}$ , which holds the minimum  $c_{\text{local}}$  value of all the virtual workers. initially, the local clocks and the global clock are 0. at the end of every clock  $c$ , each virtual worker completes the execution of all the minibatches in wave  $c$ . at this point, the virtual worker computes the aggregated updates from minibatch  $c \times (s_{\text{local}} + 1) + 1$  to minibatch  $(c + 1) \times (s_{\text{local}} + 1)$  and pushes the updates  $\tilde{\mathbf{u}}$  to the parameter server. we see that, similar to in ssp [16],  $\tilde{\mathbf{u}}$  is synchronized with a clock value  $c$ . for example, as shown in figure 1 where  $s_{\text{local}} = 3$ , at the end of clock 0, the virtual worker pushes the aggregated updates of wave 0, and at the end of clock 1, the aggregated updates of wave 1, which is composed of minibatches from 5 to 8, and so on. it is important to note that in wsp, the virtual worker pushes  $\tilde{\mathbf{u}}$  to the parameter server for
+
+every wave, instead of pushing  $\tilde{\mathbf{u}}$  for every minibatch, which will significantly reduce the communication overhead.
+
+when the parameter server receives the updates  $\tilde{\mathbf{u}}$  from the virtual worker, the parameter server updates the global version of the weights as  $w_{global} = w_{global} + \tilde{\mathbf{u}}$ . note that the parameter server updates its  $c_{global}$  to  $c + 1$  only after every virtual worker has pushed the aggregated updates of wave  $c$ .
+
+in wsp, each virtual worker is allowed to proceed training without retrieving the global weights for every wave. thus, the virtual worker may use a weight version that, from a global standpoint, may be stale, as the most recent updates received by the parameter servers may not be reflected in its local version of the weights. we discuss how global staleness among the virtual workers is bounded.
+
+global staleness bound: let clock distance be the maximum difference between the values of  $c_{local}$  of any two virtual workers in the system. that is, the clock distance is the difference in  $c_{local}$  between the fastest and slowest virtual workers. in wsp, the maximum clock distance must be at most  $d$ , where  $d$  is a threshold set by the user. therefore, a virtual worker with local clock  $c$ , where  $c \geq d + 1$ , must use a version of the weights that includes all the (aggregated) updates from wave 0 up to  $c - d - 1$  or beyond. that is, using weights that exclude any updates from waves between 0 up to  $c - d - 1$  is not permitted. thus, a virtual worker can proceed training of the next minibatch without updates from up to  $d$  most recent waves. when a virtual worker pulls the global weights at the end of clock  $c$  to maintain this distance, it may need to wait for other virtual workers to push their updates upon completion of wave  $c - d$ . note, however, that while a virtual worker waits for other virtual workers to possibly catch up at the end of clock  $c$ , local processing is allowed to proceed with  $s_{local}$  minibatches of wave  $c + 1$  as the minibatches are executed in a pipelined manner. take, for example, the case when  $d = 0$  in figure 1. as the virtual worker completes minibatch 4, it computes the aggregated updates  $\tilde{\mathbf{u}}$  for wave 0 (composed of minibatches 1 to 4) and pushes  $\tilde{\mathbf{u}}$  to the parameter server. this virtual worker now waits for the other virtual workers to complete wave 0 before proceeding with minibatch 8. however, note that as shown in the figure, this virtual worker has already started to process minibatches 5, 6 and 7, which belong to wave 1. similarly, once it completes minibatch 8, it pushes the aggregated updates  $\tilde{\mathbf{u}}$  for wave 1 (composed of minibatches 5 to 8) to the parameter server; in the meantime, it has already started processing minibatches 9, 10, and 11, which belong to wave 2.
+
+note that this processing of local minibatches in the virtual worker does not violate the local staleness bound. note also that when  $d = 0$ , each virtual worker must wait for each other at the end of every clock to synchronize the weights for every wave, which is bsp-like behavior with pipelined execution in each virtual worker.
+
+now let us define the global staleness bound,  $s_{\text{global}}$ , to be the maximum number of missing updates from the most
+
+recent minibatches, globally computed by all the other virtual workers in the system, that is allowed for a minibatch to proceed in a virtual worker. we want to identify  $s_{global}$  based on our discussion so far. this will allow each virtual worker to determine whether it can proceed with its current minibatch.
+
+initially, all virtual workers start processing the first  $(d + 1)$  waves without querying the global weights from the parameter server. furthermore, they can start to process up to  $s_{local}$  minibatches of the next wave before receiving the global weights that include the recent updates as discussed above. therefore, for those initial minibatches, the virtual worker uses  $w_0$  or a weight version that may include some recent local updates.
+
+for any minibatch  $p$  thereafter, that is, where  $p > (d + 1) \times (s_{local} + 1) + s_{local}$ ,  $p$  must use a weight version that reflects, at the very least, all the global updates from all the other virtual workers from minibatch 1 to minibatch  $p - (s_{global} + 1)$ , where  $s_{global} = (d + 1) \times (s_{local} + 1) + s_{local} - 1$ . the first term of this equation is due to the fact that a virtual worker is allowed to proceed with the next  $(d + 1)$  waves (i.e.,  $(d + 1) \times (s_{local} + 1)$  minibatches), and the second term is due to the additional  $s_{local}$  minibatches that can be started because of pipelined execution. continuing with the example above, where  $d = 0$  and  $s_{local} = 3$ , the virtual worker proceeds the training of minibatch 11 without the global and/or local updates from wave 1 (minibatches 5 to 8) or the two local updates from minibatches 9 and 10. however, it must have a version of the weights that includes all the global updates from minibatches 1 to 4.
+
+# 6 convergence analysis
+
+in this section, we discuss the convergence property of the wsp model. let  $n$  be the number of virtual workers and  $u_{n,p}$  be the update of worker  $n$  at minibatch execution  $p$ . given  $s_g = s_{global}, s_l = s_{local} + 1$  for abbreviations and following the analysis of [16], the noisy weight parameter  $\tilde{w}_{n,p}$  (which is a defined term for a way of updating the weights in our proof), for worker  $n$  at minibatch execution  $p$ , is decomposed into
+
+$$
+\begin{array}{l} \tilde {w} _ {n, p} = w _ {0} + \left[ \sum_ {n ^ {\prime} = 1} ^ {n} \sum_ {p ^ {\prime} = 1} ^ {p - s _ {g} - 1} u _ {n ^ {\prime}, p ^ {\prime}} \right] + \left[ \sum_ {p ^ {\prime} \in \mathcal {c} _ {n, p}} u _ {n, p ^ {\prime}} \right] \\ + \left[ \sum_ {\left(n ^ {\prime}, p ^ {\prime}\right) \in \mathcal {e} _ {n, p}} u _ {n ^ {\prime}, p ^ {\prime}} \right]. \tag {1} \\ \end{array}
+$$
+
+here  $w_0$  refers to the initial parameter. the noisy weight has three terms which respectively include
+
+1. updates of all workers (guaranteed to be included) to process minibatch execution  $p$ ,  
+2.  $\mathcal{c}_{n,p} \subseteq [p - s_g, p - 1]$ : the index set of latest updates of the querying worker  $n$  in the range of current global staleness bound, and
+
+3.  $\mathcal{e}_{n,p} \subseteq ([1,n] \setminus \{n\}) \times [p - s_g, p + s_g + s_l]$ : the index set of extra updates of other workers in the range of current global staleness bound. when the execution  $p$  is not at synchronization point,  $\mathcal{e}_{n,p} = \emptyset$ .
+
+we define  $\{u_t\}$  as the sequence of updates of each virtual worker after processing each minibatch and  $w_{t} = w_{0} + \sum_{t^{\prime} = 0}^{t - s_{l}n}u_{t^{\prime}}$  as the reference sequence of weights, where
+
+$$
+u _ {t} := u _ {t \bmod n, \lfloor t / n \rfloor + t \bmod s _ {l}}, \tag {2}
+$$
+
+in which we loop over the workers ( $t \bmod n$ ) and over each update after a minibatch execution inside a worker ( $\lfloor t / n \rfloor + t \bmod s_l$ ). (here  $s_ln (= s_l \times n)$  is the number of total minibatch updates in one wave from all virtual workers.) since a virtual worker uses a version of the weights that reflects all the local updates from minibatch 1 to  $p - s_l$  for worker  $p$ , the reference and noisy sequences at iteration  $t$  are updated up to  $t - s_ln$ . the set  $\mathcal{e}_t$  and the noisy sequence  $\tilde{w}_t$  are defined similarly and the difference between  $w_t$  and  $\tilde{w}_t$  is
+
+$$
+\tilde {w} _ {t} = w _ {t} - \left[ \sum_ {i \in \mathcal {r} _ {t}} u _ {i} \right] + \left[ \sum_ {i \in \mathcal {q} _ {t}} u _ {i} \right] \tag {3}
+$$
+
+where  $\mathcal{r}_t$  is the index set of missing updates in the reference weights but not in noisy weights, and  $\mathcal{q}_t$  is the index set of extra updates in the noisy weights but not in reference weights.
+
+after  $t$  updates, when we represent the target function as  $f(w)\coloneqq \frac{1}{t}\sum_{t = 1}^{t}f_{t}(w)$  , the regret of two functions with  $\tilde{w}_t$  the parameter learned from the noisy update, and  $w^{*}$  , the parameter learned from the synchronized update is  $r[w]\coloneqq \frac{1}{t}\sum_{t = 1}^{t}f_{t}\left(\tilde{w}_{t}\right) - f\left(w^{*}\right)$
+
+thus, when we bound the regret of the two functions, we can bound the error of the noisy updates incurred by the distributed pipeline staleness gradient descent. we first bound the cardinality of  $\mathcal{r}_t$  and  $\mathcal{q}_t$  in the following lemma.
+
+lemma 1. the following two inequalities,  $|\mathcal{r}_t| + |\mathcal{q}_t| \leq (2s_g + s_l)(n - 1)$  and  $\min (\mathcal{r}_t \cup \mathcal{q}_t) \geq \max (1, t - (s_g + s_l)n)$ , hold.
+
+proof. since  $\mathcal{q}_t\subseteq \mathcal{e}_t$  and  $\mathcal{r}_t\subseteq \mathcal{e}_t\backslash \mathcal{q}_t$ $|\mathcal{r}_t| + |\mathcal{q}_t|\leq |\mathcal{e}_t|\leq$ $(2s_{g} + s_{l})(n - 1)$  . the second claim follows from  $\mathcal{e}_t\supseteq \mathcal{r}_t\cup$ $\mathcal{q}_t$
+
+to prove the convergence, we have the following two assumptions and leave the proof to the appendix a, which generally follows qirong et al. [16].
+
+assumption 1. (l-lipschitz components) for all  $t$ , the component function  $f_{t}$  is convex and has bounded subdifferential  $\| \nabla f_t(w)\| \leq l$ , in which  $l > 0$  is a constant.
+
+assumption 2. (bounded distances) for all  $w, w'$ , the distance between them is bounded  $d(w \| w') \leq m$ , in which  $m > 0$  is a constant.
+
+we also denote  $\frac{1}{2} \| w - w' \|^2$  as  $d(w \| w')$ . then, we can bound the regret of the function trained with our noisy distributed, pipeline update as in theorem 1.
+
+theorem 1. suppose  $w^*$  is the minimizer of  $f(w)$ . let  $u_t \coloneqq -\eta_t \nabla f_t(\tilde{w}_t)$  where  $\eta_t = \frac{\sigma}{\sqrt{t}}$  with  $\sigma = \frac{m}{l \sqrt{(2s_g + s_l)n}}$ , in which  $m, l$  are the constants defined in the assumptions. then the regret is bounded as  $r[w] \leq 4ml \sqrt{\frac{(2s_g + s_l)n}{t}}$ .
+
+our theoretical results are similar with existing work on non pipelined version of staleness update [16, 21]. however, we reflect the new characteristics of distributed pipeline staleness update in lemma 1, and thus in theorem 1.
+
+# 7 partitioning algorithm
+
+recall that the goal of our partitioning algorithm is to minimize the maximum execution time of the partitions within the bounds of satisfying the memory requirement. to obtain a performance model to predict the execution time of each layer of a model in a heterogeneous gpu, we first profile the dnn model on each of the different types of gpus in a cluster, where we measure the computation time of each layer of the model. for gpu memory usage, we measure the usage of each layer (by using the logging feature of tensorflow) on only one gpu type (as it is roughly the same for all gpu types). to compute the memory requirement for a given partition, we take into account the total memory usage to store the data to process the layers as well as the maximum number of minibatches concurrently assigned to the partition.
+
+for communication time between layers in the model, we first derive the amount of input data for each layer in the forward and backward pass from the model graph. for the given data size, we predict intra-node communication based on the pci-e bandwidth, then multiply it by a scaling-down constant (which is similarly done in paleo [41]), since in practice, it is not possible to utilize the peak bandwidth. the scaling-down constant is derived by running a synthetic model that sends various sizes of data from one gpu to another gpu in the same node. for inter-node communication (via infiniband), we use linear regression to estimate the communication time for the given data size. to build a prediction model, we collect 27 samples by training two dnn models, used in our experiments, with arbitrary partitions. note that in this work, the heterogeneity of network performance such as slow network links is not considered (as in [30]). however, for such cases, we can extend our partitioning algorithm to consider different network performance between two nodes when estimating the communication time. also, a model that estimates the memory requirement for each stage more accurately will be helpful in partitioning a dnn model in a more balanced manner.
+
+to find the best partitions of a dnn model, we make use of cplex, which is an optimizer for solving linear programming problems [18]. memory requirements for each partition on the pipeline to support  $n_{m}$  concurrent minibatches are provided as constraints to the optimizer.
+
+# 8 experimental results
+
+# 8.1 methodology
+
+heterogeneous gpu cluster: in our experiments, we use four nodes with two intel xeon octa-core e5-2620 v4 processors (2.10 ghz) connected via infiniband (56 gbps). each node has 64 gb memory and 4 homogeneous gpus. each node is configured with a different type of gpu as shown in table 1. thus, the total number of gpus in our cluster is 16. each gpu is equipped with pcie-3×16 (15.75 gb/s). ubuntu 16.04 lts with linux kernel version 4.4 is used. we implement hetpipe based on the wsp model by modifying tensorflow 1.12 version with cuda 10.0 and cudnn 7.4.
+
+dnn models and datasets our main performance metric is throughput (images/second) of training a dnn model. we use resnet-152 [14], and vgg-19 [46] with imagenet [11]. for each dnn model, batch size of 32 is used.
+
+resource allocation for virtual workers: given any heterogeneous gpu cluster, there can be many ways of allocating the resources to the multiple virtual workers. for our experiments, we consider allocation policies within the bounds of our platform. thus, given the 16 gpus, hetpipe employs four virtual workers, each of which is configured with four gpus, along the following three allocation policies.
+
+- node partition (np): this policy assigns a node per virtual worker. thus, each virtual worker is composed of homogeneous gpus. consequently, as the nodes are heterogeneous, partitioning of layers for a dnn model is different for each virtual worker. np results in minimum communication overhead within each virtual worker as communication between gpus occurs within the same node via pci-e, rather than across multiple nodes where communication is via infiniband. on the other hand, as the performance of each virtual worker varies, a straggler may degrade performance with dp.  
+- equal distribution (ed): this policy evenly distributes gpus from each node to every virtual worker. thus, every virtual worker is assigned four different gpus, but every virtual worker has the exact same resources. thus, model partitioning is the same, and thus, performance will be the same across the virtual workers, which mitigates the straggler problem. however, ed results in high communication overhead within each virtual worker.  
+- hybrid distribution (hd): this policy is a hybrid of np and ed. for our cluster, a combination of two gpu types are allocated to each virtual worker such that their performances in terms of aggregated computation capability and amount of gpu memory are similar to each other. this choice is made to mitigate the straggler problem while reducing the communication overhead within each virtual worker. as, in terms of computation power,  $v > r > g > q$  and, in terms of the amount of the gpu memory,  $r > v > q > g$ , two virtual workers are allocated vvqq, while the other two are allocated rrgg, where  $v, r,$
+
+table 3: resource allocation for the three policies considered  
+
+<table><tr><td></td><td>node partition</td><td>equal distribution</td><td>hybrid distribution</td></tr><tr><td>vw1</td><td>vvvv</td><td>vrgq</td><td>vvqq</td></tr><tr><td>vw2</td><td>rrrr</td><td>vrgq</td><td>vvqq</td></tr><tr><td>vw3</td><td>gggg</td><td>vrgq</td><td>rrgg</td></tr><tr><td>vw4</td><td>qqqq</td><td>vrgq</td><td>rrgg</td></tr></table>
+
+g and  $\mathbb{q}$  refers to titan v, titan rtx, geforce rtx 2060, and quadro p4000, respectively.
+
+table 3 shows the resource allocation of each virtual worker for the three resource allocation policies.
+
+parameter placement: in our experiments, for dp, we locate the parameter servers, each of which only handles a portion of the model parameters, over all the nodes. for the default placement policy, which can be used with all three of our resource allocation policies, we place layers of the model in round-robin fashion over all the parameter servers as in tensorflow [47]. for ed, however, a different policy is possible as the same partition of the model is assigned to a gpu on the same node for every virtual worker. therefore, we can place the layers of a partition on the parameter server running on the same node, incurring no actual network traffic across the nodes for parameter synchronization. we refer to this as the local placement policy, which will be denoted as 'local'. for all results reported hereafter, unless denoted 'local', all policies use the 'default' policy.
+
+# 8.2 performance of a single virtual worker
+
+we first investigate the performance of the 7 different individual virtual workers that are possible according to the allocation schemes in table 3. figure 3 shows the throughput over various values of  $n_{m}$ , which is the number of minibatches executed concurrently, in the virtual worker normalized to that of when  $n_{m} = 1$  and the maximum average gpu utilization among the four partitions for resnet-152 and vgg-19. the numbers shown (in the box) along with the allocation policy are the absolute throughput (images/sec) when  $n_{m} = 1$ . note that some results for larger  $n_{m}$  are not shown. this is because the gpu memory cannot accommodate such situations and hence, cannot be run.
+
+from the results, we can see that as  $n_{m}$  increases, normalized throughput of a virtual worker as well as the maximum gpu utilization generally increases. however, depending on the resource allocation scheme (which results in different partitions of a model) as well as the dnn model, the effect of having larger  $n_{m}$  varies. when a virtual worker is configured with homogeneous gpus, the average gpu utilization of each partition is similar to each other. however, when it is configured with heterogeneous gpus, there is a tendency that the gpu utilization of the first or last partition is higher than those of the other partitions. for this configuration, different computation capabilities and memory capacity of the gpus are considered when partitioning a model. as it is possible
+
+![](images/dc1a0e034229872ce7633ea47e58a7a2a48b3aec08b248f3599a8614c0f2bde8.jpg)  
+(a) resnet-152
+
+![](images/c0d4f780a267522af901b947d22056c48b23b1e926a6f0760d1d06438ee94dd8.jpg)  
+(b) vgg-19
+
+![](images/a16931dad7ad7c992f5d4b593a5807059d4affcfbe72043d0701237fe199bd3f.jpg)  
+figure 3: normalized throughput and the maximum average gpu utilization among partitions in a single virtual worker for various resource allocation policies as  $n_{m}$  is varied. the number in parenthesis is absolute throughput (images/sec) when  $n_{m} = 1$  for each policy.  
+(a) resnet-152  
+figure 4: performance with the three allocation policies when  $\mathrm{d} = 0$  (the number on bar represents  $n_{m}$ )
+
+![](images/33cee2bdd004c7cb5c88e164b6f76030c9087ce71bb4f8de2ca9332ae3bc32b1.jpg)  
+(b) vgg-19
+
+that only a small number of layers are assigned to some gpus, the overall gpu utilization may turn out to be low.
+
+# 8.3 performance of multiple virtual workers
+
+figure 4 shows the throughput of training each model with the three resource allocation policies, where "horovod" indicates the state-of-the-art dp via horovod that uses allreduce communication. in these experiments, for each resource allocation policy,  $n_{m}$  is set such that performance is maximized while every virtual worker uses the same value of  $n_{m}$  as this is the assumption behind hetpipe. for resnet-152, the whole model is too large to be loaded into a single gpu with g type, and thus, horovod uses only 12 gpus.
+
+the results in figure 4 show that the performance of dnn training is strongly affected by how heterogeneous gpus are allocated to virtual workers. from the results, we can make the following observations:
+
+- for vgg-19 whose parameter size is 548mb, the performance of horovod, which reduces communication overhead for parameter synchronization, is better than those of np, ed, and hd. however, for resnet-152 whose parameter size is 230mb, ed and hd, which utilize virtual workers with similar performance, show similar performance to horovod (with 12 gpus).  
+- with np, training performance of resnet-152 and vgg-19 is low as  $n_{m}$  is bounded by the virtual worker with the smallest gpu memory.  
+- with the local placement policy, intra-communication occurs between each gpu and the parameter server, significantly reducing communication overhead across the
+
+table 4: performance improvement of adding whimpy gpus (the number in parenthesis presents the total number of concurrent minibatches in hetpipe)  
+
+<table><tr><td>model</td><td>method</td><td>4 gpus 4[v]</td><td>8 gpus 4[vr]</td><td>12 gpus 4[vrq]</td><td>16 gpus 4[vrqg]</td></tr><tr><td rowspan="2">vgg-19</td><td>horovod</td><td>164</td><td>205</td><td>265</td><td>339</td></tr><tr><td>hetpipe</td><td>300(5)</td><td>530(16)</td><td>572(20)</td><td>606(20)</td></tr><tr><td rowspan="2">resnet-152</td><td>horovod</td><td>233</td><td>353</td><td>415</td><td>x</td></tr><tr><td>hetpipe</td><td>256(5)</td><td>516(20)</td><td>538(24)</td><td>580(28)</td></tr></table>
+
+nodes, especially for vgg-19, the model with a large parameter set. for vgg-19, the amount of data transferred across the nodes with ed-local (i.e., 103mb) is much smaller than that with horovod (i.e., 515mb). thus, the performance of ed-local (which also mitigates the straggler problem) is 1.8 times higher than horovod. for resnet-152, the amount of data transferred with ed-local (i.e., 298mb) is larger than that with horovod (i.e., 211mb) because the sizes of output activations to be sent between partitions are large, even though the parameter size is relatively small. however, the throughput of ed-local is still  $40\%$  higher than horovod. this is because hetpipe allows each virtual worker to process a large number of minibatches concurrently.
+
+next, we investigate how the throughput is improved when whimpy gpus are additionally used for training. table 4 shows the throughput of vgg-19 and resnet-152 when dp via horovod and hetpipe with ed-local are used over different sets of heterogeneous gpus. for these experiments, hetpipe is configured to use four virtual workers, except for v4 where a single virtual worker is used. in the table, the number and type of gpus used for each experiment are also given. from the results, we can see that the performance of both horovod and hetpipe increases when additional whimpy gpus are used for training. with additional gpus, hetpipe can increase the total number of concurrent minibatches processed, having up to 2.3 times speedup.
+
+this scenario can be thought of as an answer to when new, higher end nodes are purchased, but one does not know what to do with existing nodes. for example, one can imagine node
+
+![](images/a758373489b3daacceb63d4dbadd6d50d973891d06868d1c874cfb39de88cf04.jpg)  
+figure 5: resnet-152 top-1 accuracy
+
+v to be the most recent purchase, with earlier systems r, q, and g. the results show that making use of the earlier whimpy systems allows for faster training of larger models.
+
+# 8.4 convergence
+
+our hetpipe based on the wsp model is guaranteed to converge as proven in section 6. in this section, we analyze the convergence performance of hetpipe with ed-local using resnet-152 and vgg-19. for our experiments, the desired target accuracy of resnet-152 and vgg-19 is  $74\%$  and  $67\%$ , respectively.
+
+figure 5 shows the top-1 accuracy of resnet-152 with horovod (12 gpus), hetpipe (12 gpus), and hetpipe (16 gpus), where  $d$  is set to 0 for hetpipe. for the experiments with 12 gpus, the 4 g type gpus are not used. when the same set of gpus are used, convergence with hetpipe is  $35\%$  faster than that of horovod by reducing the straggler problem in a heterogeneous environment and exploiting both pmp and dp. furthermore, by adding four more whimpy g gpus, hetpipe improves training performance even more, converging faster than horovod by  $39\%$ .
+
+figure 6 shows the top-1 accuracy of vgg-19 with horovod and hetpipe as we vary  $d$  to 0, 4, and 32. for the experiments, all 16 gpus are used. the figure shows that convergence with the bsp-like configuration (i.e.,  $d = 0$ ) of hetpipe is roughly  $29\%$  faster than that with horovod. as we increase  $d$  to 4, the straggler effect is mitigated and the communication overhead due to parameter synchronization is reduced. thus, convergence is faster by  $28\%$  and  $49\%$  compared to  $d = 0$  and horovod, respectively. in this experiment with ed-local (where the training speed of each virtual worker is similar), when  $d$  becomes very large (i.e., 32), the throughput remains similar but the convergence performance becomes degraded by  $4.7\%$ , compared to  $d = 4$ . this is because it is unlikely that the clock distance between the fastest and slowest virtual workers becomes large as 32, but higher global staleness can degrade the convergence performance (similarly discussed in [16]). note that though not shown, using larger  $d$  has a greater effect for hetpipe with np, ed and hd resource allocation, and the different resource allocations only affect the set of heterogeneous gpus used for each virtual worker and do not affect the convergence behavior.
+
+we also analyze the synchronization overhead as  $d$  is varied. we find that as  $d$  increases, the waiting time of a virtual worker to receive the updated global weight decreases. in our experiments, the average waiting time with  $d = 4$  is found
+
+![](images/a88b80150ae289550255ed900b3257795d40bd3c77b3a14a41e42106abaed74c.jpg)  
+figure 6: vgg-19 top-1 accuracy
+
+to be  $62\%$  of that with  $d = 0$ . furthermore, the actual idle time is only  $18\%$  of the waiting time as the virtual worker can continue to proceed in the pipeline while waiting.
+
+# 9 related work
+
+pipelining has been leveraged to improve the performance of machine learning systems [5, 6, 17, 29, 34]. a pipelining scheme is employed to handle expensive backpropagation [6]. pipe-sgd pipelines the processing of a minibatch to hide communication time in allreduce based systems [29]. a weight prediction technique is proposed to address the staleness issue in pipelined model parallelism [5]. detailed comparisons of hetpipe with pipedream [34] and gpipe [17] are provided in section 2.3. note that the feature of overlapping computation and communication, presented in pipedream [34], will also improve the performance of our system. pipedream employs the one-forward-one-backward scheduling algorithm for pipeline execution where the minimum number of minibatches that is large enough to saturate the pipeline are admitted. sophisticated schedulers that consider various factors such as heterogeneous configurations, the number of partitions, and the number of concurrent minibatches within a virtual worker, can potentially improve the performance of hetpipe. techniques to optimize learning rates have been studied [13], which can also be applied to hetpipe to help converge faster.
+
+decentralized training systems that consider heterogeneous environments have also been studied [30, 31]. however, these techniques do not consider integration of dp with pmp, which allows support for large models that do not fit into single gpu memory. in ad-psgd, once a mini-batch is processed, a worker updates the parameters by averaging them with only one neighbor which is randomly selected [30]. this is done asynchronously, allowing faster workers to continue. in theory, the convergence rate of ad-psgd is the same as sgd. in principle, the contribution of ad-psgd is orthogonal with the contributions of hetpipe in that we can extend our hetpipe further by adapting the idea of asynchronous decentralized update in ad-psgd when there is a bottleneck in the parameter server. when it comes to the experimental evaluations, the performance of ad-psgd is evaluated for dnn models whose sizes are 1mb, 60mb, and 100mb, which are smaller than the models we consider in hetpipe. for a decentralized training system, hop [31] considers the bounded staleness and backup workers, and uses cifar-10 for performance
+
+evaluation on a cnn model.
+
+there have been earlier efforts to employ dp and/or mp for model training. project adam uses both dp and mp to train machine learning models on cpus [7]. pal et al. combine dp and mp in a similar way as our system, but do not consider pipelining nor heterogeneous gpus [39]. strads leverages mp to address the issues of uneven convergence of parameters and parameter dependencies [24]. flexflow considers utilizing parallelism in various dimensions such as sample, operator, attribute and parameters to maximize parallelization performance [20]. bounded staleness has been explored where jiang et al. present heterogeneity-aware parameter synchronization algorithms that are based on the ssp model [21], while cui et al. analyze the effects of bounded staleness [9].
+
+# 10 conclusion
+
+in this paper, we presented a dnn training system, hetpipe, that integrates pipelined model parallelism with data parallelism. leveraging multiple virtual workers, each of which consists of multiple, possibly whimpy, heterogeneous gpus, hetpipe makes it possible to efficiently train large dnn models. we proved that hetpipe converges and presented results showing the fast convergence of dnn models with hetpipe.
+
+# references
+
+[1] martin abadi, paul barham, jianmin chen, zhifeng chen, andy davis, jeffrey dean, matthieu devin, sanjay ghemawat, geoffrey irving, michael isard, manjunath kudlur, josh levenberg, rajat monga, sherry moore, derek g. murray, benoit steiner, paul tucker, vijay vasudevan, pete warden, martin wicke, yuan yu, and xiaoqiang zheng. tensorflow: a system for large-scale machine learning. in proceedings of the symposium on operating systems design and implementation (osdi), 2016.  
+[2] amazon. amazon ec2 pricing. https://aws.amazon.com/ec2/pricing/.  
+[3] david m blei, andrew y ng, and michael i jordan. latent dirichlet allocation. journal of machine learning research, 2003.  
+[4] léon bottou. large-scale machine learning with stochastic gradient descent. in proceedings of comp-stat, 2010.  
+[5] chi-chung chen, chia-lin yang, and hsiang-yun cheng. efficient and robust parallel dnn training through model parallelism on multi-gpu platform. arxiv preprint arxiv:1809.02839, 2018.
+
+[6] xie chen, adam eversole, gang li, dong yu, and frank seide. pipelined back-propagation for context-dependent deep neural networks. in proceedings of the annual conference of the international speech communication association, 2012.  
+[7] trishul chilimbi, yutaka suzue, johnson apacible, and karthik kalyanaraman. project adam: building an efficient and scalable deep learning training system. in proceedings of the symposium on operating systems design and implementation (osdi), 2014.  
+[8] ronan collobert and jason weston. a unified architecture for natural language processing: deep neural networks with multitask learning. in proceedings of the international conference on machine learning (icml), 2008.  
+[9] henggang cui, james cipar, qirong ho, jin kyu kim, seunghak lee, abhimanu kumar, jinliang wei, wei dai, gregory r ganger, phillip b gibbons, garth a gibson, and eric p xing. exploiting bounded staleness to speed up big data analytics. in proceedings of the usenix annual technical conference (atc), 2014.  
+[10] jeffrey dean, greg corrado, rajat monga, kai chen, matthieu devin, quoc v le, mark mao, marc'aurelio ranzato, andrew senior, paul tucker, ke yang, and andrew y. ng. large scale distributed deep networks. in proceedings of the advances in neural information processing systems (nips), 2012.  
+[11] jia deng, wei dong, richard socher, li-jia li, kai li, and li fei-fei. imagenet: a large-scale hierarchical image database. in proceedings of the conference on computer vision and pattern recognition (cvpr), 2009.  
+[12] anna veronika dorogush, vasily ershov, and andrey gulin. catboost: gradient boosting with categorical features support. in proceedings of the advances in neural information processing systems (nips), 2018.  
+[13] priya goyal, piotr dollar, ross girshick, pieter noordhuis, lukasz wesolowski, aapo kyrola, andrew tullyoch, yangqing jia, and kaiming he. accurate, large minibatch sgd: training imagenet in 1 hour. arxiv preprint arxiv:1706.02677, 2017.  
+[14] kaiming he, xiangyu zhang, shaoqing ren, and jian sun. deep residual learning for image recognition. in proceedings of the conference on computer vision and pattern recognition (cvpr), 2016.  
+[15] geoffrey hinton, li deng, dong yu, george dahl, abdel-rahman mohamed, navdeep jaitly, andrew senior, vincent vanhoucke, patrick nguyen, tara sainath,
+
+and brian kingsbury. deep neural networks for acoustic modeling in speech recognition. ieee signal processing magazine, 2012.  
+[16] qirong ho, james cipar, henggang cui, seunghak lee, jin kyu kim, phillip b gibbons, garth a gibson, greg ganger, and eric p xing. more effective distributed ml via a stale synchronous parallel parameter server. in proceedings of the advances in neural information processing systems (nips), 2013.  
+[17] yanping huang, yonglong cheng, dehao chen, hyoukjoong lee, jiquan ngiam, quoc v le, and zhifeng chen. gpipe: efficient training of giant neural networks using pipeline parallelism. in proceedings of the advances in neural information processing systems (nips), 2019.  
+[18] ibm. cplex-optimizer. https://www.ibm.com/analytics/cplex-optimizer/.  
+[19] anand jayarajan, jinliang wei, garth gibson, alexandra fedorova, and gennady pekhimenko. priority-based parameter propagation for distributed dnn training. in proceedings of the conference on systems and machine learning (sysml), 2019.  
+[20] zhihao jia, matei zaharia, and alex aiken. beyond data and model parallelism for deep neural networks. in proceedings of the conference on systems and machine learning (sysml), 2019.  
+[21] jiawei jiang, bin cui, ce zhang, and lele yu. heterogeneity-aware distributed parameter servers. in proceedings of the international conference on management of data (sigmod), 2017.  
+[22] wenbin jiang, geyan ye, laurence t yang, jian zhu, yang ma, xia xie, and hai jin. a novel stochastic gradient descent algorithm based on grouping over heterogeneous cluster systems for distributed deep learning. in proceedings of the ieee/acm international symposium on cluster computing and the grid (ccgrid), 2019.  
+[23] tian jin and seokin hong. split-cnn: splitting window-based operations in convolutional neural networks for memory system optimization. in proceedings of the international conference on architectural support for programming languages and operating systems (asplos), 2019.  
+[24] jin kyu kim, qirong ho, seunghak lee, xun zheng, wei dai, garth a gibson, and eric p xing. strads: a distributed framework for scheduled model parallel machine learning. in proceedings of the european conference on computer systems (eurosys), 2016.
+
+[25] alex krizhevsky. one weird trick for parallelizing convolutional neural networks. arxiv preprint arxiv:1404.5997, 2014.  
+[26] alex krizhevsky, ilya sutskever, and geoffrey e. hinton. imagenet classification with deep convolutional neural networks. in proceedings of the advances in neural information processing systems (nips), 2012.  
+[27] seunghak lee, jin kyu kim, xun zheng, qirong ho, garth a gibson, and eric p xing. on model parallelization and scheduling strategies for distributed machine learning. in proceedings of the advances in neural information processing systems (nips), 2014.  
+[28] mu li, david g andersen, jun woo park, alexander j smola, amr ahmed, vanja josifovski, james long, eugene j shekita, and bor-ying su. scaling distributed machine learning with the parameter server. in proceedings of the symposium on operating systems design and implementation (osdi), 2014.  
+[29] youjie li, mingchao yu, songze li, salman avestimehr, nam sung kim, and alexander schwing. pipe-sgd: a decentralized pipelined sgd framework for distributed deep net training. in proceedings of the advances in neural information processing systems (nips), 2018.  
+[30] xiangru lian, wei zhang, ce zhang, and ji liu. asynchronous decentralized parallel stochastic gradient descent. in proceedings of the international conference on machine learning (icml), 2018.  
+[31] qinyi luo, jinkun lin, youwei zhuo, and xuehai qian. hop: heterogeneity-aware decentralized training. in proceedings of the international conference on architectural support for programming languages and operating systems (asplos), 2019.  
+[32] xiangrui meng, joseph bradley, burak yavuz, evan sparks, shivaram venkataraman, davies liu, jeremy freeman, db tsai, manish amde, sean owen, doris xin, reynold xin, michael j. franklin, reza zadeh, matei zahria, and ameet talwalkar. mllib: machine learning in apache spark. the journal of machine learning research, 2016.  
+[33] microsoft. microsoft azure pricing. https://azure.microsoft.com/en-us/pricing/.  
+[34] deepak narayanan, aaron harlap, amar phanishayee, vivek seshadri, nikhil r. devanur, gregory r. ganger, phillip b. gibbons, and matei zaharia. pipedream: generalized pipeline parallelism for dnn training. in proceedings of the acm symposium on operating systems principles (sosp), 2019.
+
+[35] nvidia. geforce rtx 2060. https://www.nvidia.com/en-us/geforce/graphics-cards/rtx-2060/.  
+[36] nvidia. quadro p4000. https://www.nvidia.com/en-us/design-visualization/quadro-desktop-gpus/.  
+[37] nvidia. titan rtx. https://www.nvidia.com/en-us/titan/titan-rtx/.  
+[38] nvidia. titan v. https://www.nvidia.com/en-us/titan/titan-v/.  
+[39] saptadeep pal, eiman ebrahimi, arslan zulfiqar, yaosheng fu, victor zhang, szymon migacz, david nellans, and puneet gupta. optimizing multi-gpu parallelization strategies for deep learning training. ieee micro, 2019.  
+[40] pitch patarasuk and xin yuan. bandwidth optimal allreduce algorithms for clusters of workstations. journal of parallel and distributed computing, 2009.  
+[41] hang qi, evan r sparks, and ameet talwalkar. paleo: a performance model for deep neural networks. in proceedings of the conference on international conference on learning representations (iclr), 2017.  
+[42] esteban real, alok aggarwal, yanping huang, and quoc v le. regularized evolution for image classifier architecture search. in proceedings of the conference on association for the advancement of artificial intelligence (aaai), 2019.  
+[43] benjamin recht, christopher re, stephen wright, and feng niu. hogwild!: a lock-free approach to parallelizing stochastic gradient descent. in proceedings of the advances in neural information processing systems (nips), 2011.  
+[44] muhammad saqib, sultan daud khan, nabin sharma, and michael blumenstein. a study on detecting drones using deep convolutional neural networks. in ieee international conference on advanced video and signal based surveillance (avss), 2017.  
+[45] alexander sergeev and mike del balso. horovod: fast and easy distributed deep learning in tensorflow. arxiv preprint arxiv:1802.05799, 2018.  
+[46] karen simonyan and andrew zisserman. very deep convolutional networks for large-scale image recognition. arxiv preprint arxiv:1409.1556, 2014.  
+[47] tensorflow. tf.train.replica_device setter. https://www.tensorflow.org/api_docs/python/ tf/compat/v1/train/replica_device setter/.
+
+[48] ashish vaswani, noam shazeer, niki parmar, jakob uszkoreit, llion jones, aidan n gomez, lukasz kaiser, and illia polosukhin. attention is all you need. in proceedings of the advances in neural information processing systems (nips), 2017.  
+[49] minjie wang, chien-chin huang, and jinyang li. supporting very large models using automatic dataflow graph partitioning. in proceedings of the european conference on computer systems (eurosys), 2019.  
+[50] tian wang, yang chen, mengyi zhang, jie chen, and hichem snoussi. internal transfer learning for improving performance in human action recognition for small datasets. ieee access, 2017.  
+[51] fengli yu, jing sun, annan li, jun cheng, cheng wan, and jiang liu. image quality classification for dr screening using deep learning. in annual international conference of the ieee engineering in medicine and biology society (embc), 2017.  
+[52] shen-yi zhao and wu-jun li. fast asynchronous parallel stochastic gradient descent: a lock-free approach with convergence guarantee. in proceedings of the conference on association for the advancement of artificial intelligence (aaai), 2016.  
+[53] hongyu zhu, mohamed akrout, bojian zheng, andrew pelegris, anand jayarajan, amar phanishayee, bianca schroeder, and gennady pekhimenko. benchmarking and analyzing deep neural network training. in ieee international symposium on workload characterization (iiswc), 2018.  
+[54] martin zinkevich, john langford, and alex j smola. slow learners are fast. in proceedings of the advances in neural information processing systems (nips), 2009.
+
+# a appendix
+
+the analysis follows qirong ho et al. [16], except the addition of global staleness  $s_g = s_{global}$  and local staleness  $s_l = s_{local} + 1$ . theorem 1. suppose  $w^*$  is the minimizer of convex function  $f(w)$ . let  $u_t \coloneqq -\eta_t \nabla f_t(\tilde{w}_t)$  where  $\eta_t = \frac{\sigma}{\sqrt{t}}$  with  $\sigma = \frac{m}{l \sqrt{(2s_g + s_l)n}}$ , in which  $m, l$  are the constants defined in the assumptions. we assume that the components  $f_t$  are also convex. then after  $t$  iterations, the regret is bounded as
+
+$$
+r [ w ] \leq 4 m l \sqrt {\frac {(2 s _ {g} + s _ {l}) n}{t}},
+$$
+
+with
+
+$$
+f (w) := \frac {1}{t} \sum_ {t = 1} ^ {t} f _ {t} (w), \quad \text {a n d} \quad r [ w ] := \frac {1}{t} \sum_ {t = 1} ^ {t} f _ {t} (\tilde {w} _ {t}) - f \left(w ^ {*}\right).
+$$
+
+proof. since  $f_{t}$  are convex
+
+$$
+t \cdot r [ w ] \leq \sum_ {t = 1} ^ {t} \left\langle \nabla f _ {t} \left(\tilde {w} _ {t}\right), \tilde {w} _ {t} - w ^ {*} \right\rangle = \sum_ {t = 1} ^ {t} \left\langle \tilde {g} _ {t}, \tilde {w} _ {t} - w ^ {*} \right\rangle , \tag {4}
+$$
+
+where  $\tilde{g}_t\coloneqq \nabla f_t(\tilde{w}_t)$ . if  $t\cdot r[w]\leq \mathcal{o}(\sqrt{t})$ , we will have  $\mathbb{e}_t\{f_t(\tilde{w}_t) - f_t(w^*)\} \to 0$  and thus convergence. first, we need this lemma. note that this is not lemma 1 in the paper:
+
+lemma 2. with  $\tilde{w}_t = w_t - \left[\sum_{i\in \mathcal{r}_t}u_i\right] + \left[\sum_{i\in \mathcal{q}_t}u_i\right]$ , for all  $w^{*}\in \mathbb{r}^{n}$  and  $t > 0$ , we have
+
+$$
+\left\langle \tilde {w} _ {t} - w ^ {*}, \tilde {g} _ {t} \right\rangle = \frac {\eta_ {t}}{2} \| \tilde {g} _ {t} \| ^ {2} + \frac {d \left(w ^ {*} \| w _ {t + 1}\right) - d \left(w ^ {*} \| w _ {t}\right)}{\eta_ {t}} + \left[ \sum_ {i \in \mathcal {r} _ {t}} \eta_ {i} \left\langle \tilde {g} _ {i}, \tilde {g} _ {t} \right\rangle - \sum_ {i \in \mathcal {q} _ {i}} \eta_ {i} \left\langle \tilde {g} _ {i}, \tilde {g} _ {t} \right\rangle \right], \tag {5}
+$$
+
+with  $d(w\| w^{\prime}) = \frac{1}{2}\| w - w^{\prime}\|^{2}$
+
+proof. we have
+
+$$
+d \left(w ^ {*} \| w _ {t + 1}\right) - d \left(w ^ {*} \| w _ {t}\right) = \frac {1}{2} \eta_ {t} ^ {2} \| \tilde {g} _ {t} \| ^ {2} - \eta_ {t} \left\langle \tilde {w} _ {t} - w ^ {*}, \tilde {g} _ {t} \right\rangle - \eta_ {t} \left\langle w _ {t} - \tilde {w} _ {t}, \tilde {g} _ {t} \right\rangle , \tag {6}
+$$
+
+with the last term is
+
+$$
+\left\langle w _ {t} - \tilde {w} _ {t}, \tilde {g} _ {t} \right\rangle = - \sum_ {i \in \mathcal {r} _ {t}} \eta_ {i} \left\langle \tilde {g} _ {i}, \tilde {g} _ {t} \right\rangle + \sum_ {i \in \mathcal {q} _ {t}} \eta_ {i} \left\langle \tilde {g} _ {i}, \tilde {g} _ {t} \right\rangle . \tag {7}
+$$
+
+therefore,
+
+$$
+\left\langle \tilde {w} _ {t} - w ^ {*}, \tilde {g} _ {t} \right\rangle = \frac {\eta_ {t}}{2} \| \tilde {g} _ {t} \| ^ {2} + \frac {d \left(w ^ {*} \| w _ {t + 1}\right) - d \left(w ^ {*} \| w _ {t}\right)}{\eta_ {t}} + \left[ \sum_ {i \in \mathcal {r} _ {t}} \eta_ {i} \left\langle \tilde {g} _ {i}, \tilde {g} _ {t} \right\rangle - \sum_ {i \in \mathcal {q} _ {t}} \eta_ {i} \left\langle \tilde {g} _ {i}, \tilde {g} _ {t} \right\rangle \right]. \tag {8}
+$$
+
+we use the above lemma to find the upper bound of each term in the regret  $r[w]$ :
+
+$$
+\begin{array}{l} \sum_ {t = 1} ^ {t} \frac {\eta_ {t}}{2} \| \tilde {g} _ {t} \| ^ {2} \leq \sum_ {t = 1} ^ {t} \frac {\eta_ {t}}{2} l ^ {2} \quad (l - \text {l i p s c h i t z a s s u m p t i o n}) \\ = \frac {1}{2} \sum_ {t = 1} ^ {t} \frac {\sigma}{\sqrt {t}} l ^ {2} \leq \sigma l ^ {2} \sqrt {t} \quad \left(\text {s i n c e} \sum_ {k = a} ^ {b} \frac {1}{2 \sqrt {k}} \leq \sqrt {b - a + 1}\right), \\ \end{array}
+$$
+
+and
+
+$$
+\begin{array}{l} \sum_ {t = 1} ^ {t} \frac {d \left(w ^ {*} \| w _ {t + 1}\right) - d \left(w ^ {*} \| w _ {t}\right)}{\eta_ {t}} \\ = \frac {d \left(w ^ {*} \| w _ {1}\right)}{\eta_ {1}} - \frac {d \left(x ^ {*} \| w _ {t + 1}\right)}{\eta_ {t}} + \sum_ {t = 2} ^ {t} \left[ d \left(w ^ {*} \| w _ {t}\right) \left(\frac {1}{\eta_ {t}} - \frac {1}{\eta_ {t - 1}}\right) \right] \\ \leq \frac {m ^ {2}}{\sigma} + 0 + \frac {m ^ {2}}{\sigma} \sum_ {t = 2} ^ {t} \left[ \sqrt {t} - \sqrt {t - 1} \right] \quad (\text {b o u n d e d d i s t a n c e s a s s u m p t i o n}) \\ = \frac {m ^ {2}}{\sigma} \sqrt {t}, \tag {9} \\ \end{array}
+$$
+
+and
+
+$$
+\begin{array}{l} \sum_ {t = 1} ^ {t} \left[ \sum_ {i \in \mathcal {r} _ {t}} \eta_ {i} \langle \tilde {g} _ {i}, \tilde {g} _ {t} \rangle - \sum_ {i \in \mathcal {q} _ {t}} \eta_ {i} \langle \tilde {g} _ {i}, \tilde {g} _ {t} \rangle \right] \\ \leq \sum_ {t = 1} ^ {t} \left(\left| \mathcal {r} _ {t} \right| + \left| \mathcal {q} _ {t} \right|\right) \eta_ {\max  (1, t - (s _ {g} + s _ {l}) n)} l ^ {2} \\ \end{array}
+$$
+
+(from paper's lemma:  $\min (\mathcal{r}_t\cup \mathcal{q}_t)\geq \max (1,t - (s_g + s_l)n))$
+
+$$
+= l ^ {2} \left[ \sum_ {t = 1} ^ {\left(s _ {g} + s _ {l}\right) n} \left(\left| \mathcal {r} _ {t} \right| + \left| \mathcal {q} _ {t} \right|\right) \eta_ {1} + \sum_ {t = \left(s _ {g} + s _ {l}\right) n + 1} ^ {t} \left(\left| \mathcal {r} _ {t} \right| + \left| \mathcal {q} _ {t} \right|\right) \eta_ {t - \left(s _ {g} + s _ {l}\right) n} \right]
+$$
+
+split the sum and use decreasing sequence property of  $\{\eta_t\}$
+
+$$
+\begin{array}{l} = l ^ {2} \left[ \sum_ {t = 1} ^ {(s _ {g} + s _ {l}) n} \left(| \mathcal {r} _ {t} | + | \mathcal {q} _ {t} |\right) \sigma + \sum_ {t = (s _ {g} + s _ {l}) n + 1} ^ {t} \left(| \mathcal {r} _ {t} | + | \mathcal {q} _ {t} |\right) \frac {\sigma}{\sqrt {t - (s _ {g} + s _ {l}) n}} \right] \\ \leq \sigma l ^ {2} \left(2 s _ {g} + s _ {l}\right) (n - 1) \left[ \left(s _ {g} + s _ {l}\right) n + \sum_ {t = \left(s _ {g} + s _ {l}\right) n + 1} ^ {t} \frac {1}{\sqrt {t - \left(s _ {g} + s _ {l}\right) n}} \right] \\ \end{array}
+$$
+
+(from paper's lemma:  $|\mathcal{r}_t| + |\mathcal{q}_t| \leq (2s_g + s_l)(n - 1)$ )
+
+$$
+\begin{array}{l} \leq \sigma l ^ {2} (2 s _ {g} + s _ {l}) n \left[ (s _ {g} + s _ {l}) n + 2 \sqrt {t - (s _ {g} + s _ {l}) n} \right] \quad \left(\text {s i n c e} \sum_ {k = a} ^ {b} \frac {1}{2 \sqrt {k}} \leq \sqrt {b - a + 1}\right) \\ \leq \sigma l ^ {2} \left(2 s _ {g} + s _ {l}\right) \left(s _ {g} + s _ {l}\right) n ^ {2} + 2 \sigma l ^ {2} \left(2 s _ {g} + s _ {l}\right) n \sqrt {t} \tag {10} \\ \end{array}
+$$
+
+therefore,
+
+$$
+t \cdot r [ w ] \leq \sigma l ^ {2} \sqrt {t} + \frac {m ^ {2}}{\sigma} \sqrt {t} + \sigma l ^ {2} \left(2 s _ {g} + s _ {l}\right) \left(s _ {g} + s _ {l}\right) n ^ {2} + 2 \sigma l ^ {2} \left(2 s _ {g} + s _ {l}\right) n \sqrt {t} \tag {11}
+$$
+
+let the initial  $\sigma = \frac{m}{l\sqrt{(2s_g + s_l)n}}$ , then
+
+$$
+\begin{array}{l} t \cdot r [ w ] \leq \frac {m l \sqrt {t}}{\sqrt {(2 s _ {g} + s _ {l}) n}} + m l \sqrt {(2 s _ {g} + s _ {l}) n t} + m l (s _ {g} + f s _ {l}) n \sqrt {(2 s _ {g} + s _ {l}) n} + 2 m l \sqrt {(2 s _ {g} + s _ {l}) n t} \\ = m l \sqrt {\left(2 s _ {g} + s _ {l}\right) n t} \left[ \frac {1}{\left(2 s _ {g} + s _ {l}\right) n} + 1 + \frac {\left(s _ {g} + s _ {l}\right) n}{\sqrt {t}} + 2 \right]. \tag {12} \\ \end{array}
+$$
+
+we have  $\frac{1}{(2s_g + s_l)n} +\frac{(s_g + s_l)n}{\sqrt{t}}\leq 1$  when  $t$  is large enough. therefore we get
+
+$$
+t \cdot r [ w ] \leq 4 m l \sqrt {\left(2 s _ {g} + s _ {l}\right) n t},
+$$
+
+or
+
+$$
+r [ w ] \leq 4 m l \sqrt {\frac {(2 s _ {g} + s _ {l}) n}{t}} \tag {13}
+$$
+
+□

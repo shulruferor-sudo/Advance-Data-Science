@@ -1,0 +1,384 @@
+# scaling graph neural networks with approximate pagerank
+
+aleksandar bojchevski*
+
+johannes gasteiger*
+
+a.bojchevski@in.tum.de
+
+j.gasteiger@in.tum.de
+
+technical university of munich
+
+bryan perozzi
+
+amol kapoor
+
+martin blais
+
+benedek rozemberczki
+
+michal lukasik
+
+bperozzi@acm.org
+
+google research
+
+stephan gunnemann
+
+guennemann@in.tum.de
+
+technical university of munich
+
+# abstract
+
+graph neural networks (gnns) have emerged as a powerful approach for solving many network mining tasks. however, learning on large graphs remains a challenge - many recently proposed scalable gnn approaches rely on an expensive message-passing procedure to propagate information through the graph. we present the pprgo model which utilizes an efficient approximation of information diffusion in gnns resulting in significant speed gains while maintaining state-of-the-art prediction performance. in addition to being faster, pprgo is inherently scalable, and can be trivially parallelized for large datasets like those found in industry settings.
+
+we demonstrate that pprgo outperforms baselines in both distributed and single-machine training environments on a number of commonly used academic graphs. to better analyze the scalability of large-scale graph learning methods, we introduce a novel benchmark graph with 12.4 million nodes, 173 million edges, and 2.8 million node features. we show that training pprgo from scratch and predicting labels for all nodes in this graph takes under 2 minutes on a single machine, far outpacing other baselines on the same graph. we discuss the practical application of pprgo to solve large-scale node classification problems at google.<sup>1</sup>
+
+# ccs concepts
+
+computing methodologies  $\rightarrow$  machine learning.
+
+# keywords
+
+graph neural networks; personalized pagerank; scalability
+
+# acm reference format:
+
+aleksandar bojchevski, johannes gasteiger, bryan perozzi, amol kapoor, martin blais, benedek rozemberczki, michal lukasik, and stephan gunnemann. 2020. scaling graph neural networks with approximate pagerank. in proceedings of the 26th acm sigkdd conference on knowledge discovery and data mining (kdd '20), august 23-27, 2020, virtual event, ca, usa. acm, new york, ny, usa, 10 pages. https://doi.org/10.1145/3394486.3403296
+
+permission to make digital or hard copies of part or all of this work for personal or classroom use is granted without fee provided that copies are not made or distributed for profit or commercial advantage and that copies bear this notice and the full citation on the first page. copyrights for third-party components of this work must be honored. for all other uses, contact the owner/author(s).
+
+kdd '20, august 23-27, 2020, virtual event, ca, usa
+
+© 2020 copyright held by the owner/author(s).
+
+acm isbn 978-1-4503-7998-4/20/08.
+
+https://doi.org/10.1145/3394486.3403296
+
+# 1 introduction
+
+graph neural networks (gnns) excel on a wide variety of network mining tasks from semi-supervised node classification and link prediction [32, 25, 44, 55] to community detection and graph classification [22, 36, 14, 40]. the success of gnns on academic datasets has generated significant interest in scaling these methods to larger graphs for use in real-world problems [13, 12, 25, 20, 54, 27, 41, 15]. unfortunately, there are few large graph baseline datasets available; apart from a handful of exceptions [54, 15], the scalability of most gnn methods has been demonstrated on graphs with fewer than 250k nodes. moreover, the majority of existing work focuses on improving scalability on a single machine. many interesting network mining problems involve graphs with billions of nodes and edges that require distributed computation across many machines. as a result, we believe most of the current literature does not accurately reflect the major challenges of large scale gnn computing.
+
+the main scalability bottleneck of most gnns stems from the recursive message-passing procedure that propagates information through the graph. computing the hidden representation for a given node requires joining information from its neighbors, and the neighbors in turn have to consider their own neighbors, and so on. this process leads to an expensive neighborhood expansion, growing exponentially with each additional layer.
+
+in many proposed gnn pipelines, the exponential growth of neighborhood size corresponds to an exponential io overhead. a common strategy for scaling gnns is to sample the graph structure during training, e.g. sample a fixed number of nodes from the  $k$ -hop neighborhood of a given node to generate its prediction [25, 54]. the key differences between many scalable techniques lies in the design of the sampling scheme. for example, chen et al. [13] directly sample the receptive field for each layer using importance sampling, while chen et al. [12] use the historical activations of the nodes as a control variate. huang et al. [27] propose an adaptive sampling strategy with a trainable sampler per layer, and chiang et al. [15] sample a block of nodes corresponding to a dense subgraph identified by the clustering algorithm metis [30]. because these approaches still rely on a multi-hop message passing procedure, there is an extremely steep trade-off between runtime and accuracy. unfortunately, for many of the proposed methods sampling does not directly reduce the number of nodes that need to be retrieved, since e.g. we have first have to compute the importance scores [13].
+
+recent work shows that personalized pagerank [28] can be used to directly incorporate multi-hop neighborhood information of a node without explicit message-passing [21]. intuitively, propagation based on personalized pagerank corresponds to infinitely many
+
+neighborhood aggregation layers where the node influence decays exponentially with each layer. however, as proposed, gasteiger et al. [21]'s approach does not easily scale to large graphs since it performs an expensive variant of power iteration during training.
+
+in this work, we present pprgo, a gnn model that scales to large graphs in both single and multi-machine (distributed) environments by using an adapted propagation scheme based on approximate personalized pagerank. our approach removes the need for performing expensive power iteration during each training step by utilizing the (strong) localization properties [23, 35] of personalized pagerank vectors for real-world graphs. these vectors can be readily approximated with sparse vectors and efficiently pre-computed in a distributed manner [4]. using the sparse pre-computed approximations we can maintain the influence of relevant nodes located multiple hops away without prohibitive message-passing or power iteration costs. we make the following contributions:
+
+- we introduce the pprgo model based on approximate personalized pagerank. on a graph of over 12 million nodes, pprgo runs in under 2 minutes on a single machine, including pre-processing, training and inference time.  
+- we show that pprgo scales better than message-passing gnns, especially with distributed training in a real-world setting.  
+- we introduce the mag-scholar dataset (12.4m nodes, 173m edges, 2.8m node features), a version of the microsoft academic graph that we augment with "ground-truth" node labels. the dataset is orders of magnitude larger than many commonly used benchmark graphs.  
+- most previous work exclusively focuses on training time. we also show a significantly reduced inference time and furthermore propose sparse inference to achieve an additional 2x speed-up.
+
+# 2 background
+
+# 2.1 gnns and message-passing
+
+many proposed gnn models can be analyzed using the message-passing framework proposed by gilmer et al. [22] or other similar frameworks [5, 50, 11]. typically, the computation is carried out in two phases: (i) messages are propagated along the neighbors; and (ii) the messages are aggregated to obtain the updated representations. at each layer, transformation of the input (e.g. linear projection plus a non-linearity) is coupled with aggregation/propagation among the neighbors (e.g. averaging). increasing the number of layers is desirable since: (i) it allows the model to incorporate information from more distant neighbors; and (ii) it enables hierarchical feature extraction and thus the learning of richer node representations.
+
+however, this has both computational and modelling consequences. first, the recursive neighborhood expansion at each layer implies an exponential increase in the overall number of nodes we need to aggregate to produce the output at the final layer which is computationally prohibitive for large graphs. second, it has been shown [33, 52] that naively stacking multiple layers may suffer from over-smoothing that can reduce predictive performance.
+
+to tackle both of these challenges gasteiger et al. [21] suggest decoupling the feature transformation from the propagation. in their ppnp model, predictions are first generated (e.g. with a neural
+
+network) for each node utilizing only that node's own features, and then propagated using an adaptation of personalized pagerank. specifically, ppnp is defined as:
+
+$$
+z = \operatorname {s o f t m a x} \left(\pi^ {\text {s y m}} h\right), \quad h _ {i;} = f _ {\theta} \left(x _ {i}\right) \tag {1}
+$$
+
+where  $\pi^{\mathrm{sym}} = \alpha (i_n - (1 - \alpha)\tilde{a})^{-1}$  is a symmetric propagation matrix,  $\tilde{a} = d^{-1 / 2}ad^{-1 / 2}$  is the normalized adjacency matrix with added self-loops,  $\alpha$  is a teleport (restart) probability,  $h$  is a matrix where each row is a vector representation for a specific node, and  $z$  is a matrix where each row is a prediction vector for each node, after propagation. the local per-node representations  $h_{i,:}$  are generated by a neural network  $f_{\theta}$  that processes the features  $x_{i}$  of every node  $i$  independently. the responsibility for learning good representations is delegated to  $f_{\theta}$ , while  $\pi^{\mathrm{sym}}$  ensures that the representations are smoothly changing w.r.t. the graph.
+
+because directly calculating the dense propagation matrix  $\pi^{\mathrm{sym}}$  in eq. 1 is inefficient, the authors propose a variant of power iteration to compute the final predictions instead. unfortunately, even a moderate number of power iteration evaluations (e.g. gasteiger et al. [21] used  $k = 10$  to achieve a good approximation) is prohibitively expensive for large graphs since they need to be computed during each gradient-update step. moreover, despite the fact that  $\tilde{a}$  is sparse, graphs beyond a certain size cannot be stored in memory.
+
+# 2.2 personalized pagerank and localization
+
+since it is more amenable to efficient approximation we analyze the personalized pagerank matrix  $\pi^{\mathrm{ppr}} = \alpha (i_n - (1 - \alpha)d^{-1}a)^{-1}$ . each row  $\pi (i)\coloneqq \pi_{i:}^{\mathrm{ppr}}$  is equal to the personalized (seeded) pagerank vector of node  $i$ . pagerank and its many variants [37, 28, 47] have been extensively studied in the literature. here we are interested in efficient and scalable algorithms for computing (an approximation) of personalized pagerank. luckily, given the broad applicability of pagerank, many such algorithms have been developed [18, 4, 3, 23, 34, 45, 46, 48, 19].
+
+random walk sampling [18] is one such approximation technique. while simple to implement, in order to guarantee at most  $\epsilon$  absolute error with probability of  $1 - 1/n$  we need  $o\left(\frac{\log n}{\epsilon^2}\right)$  random walks. forward search [4, 23] and backward search [3] can be viewed as deterministic variants of the random walk sampling method. given a starting configuration, the pagerank scores are updated by traversing the out-links (respect., in-links) of the nodes.
+
+for this work we adapt the approach by andersen et al. [4] since it offers a good balance of scalability, approximation guarantees, and ease of distributed implementation. they show that  $\pi(i)$  can be weakly approximated with a low number of non-zero entries using a scalable algorithm that applies a series of push operations which can be executed in a distributed manner.
+
+when the graph is strongly connected  $\pi(i)$  is non-zero for all nodes. nevertheless, we can obtain a good approximation by truncating small elements to zero since most of the probability mass in the personalized pagerank vectors  $\pi(i)$  is localized on a small number of nodes [35, 23, 4]. thus, we can approximate  $\pi(i)$  with a sparse vector and in turn approximate  $\pi^{\mathrm{ppr}}$  with a sparse matrix.
+
+once we obtain an approximation  $\pi^{(\epsilon)}$  of  $\pi^{\mathrm{ppr}}$  we can either use it directly to propagate information, or we can renormalize it via  $d^{1/2}\pi^{(\epsilon)}d^{-1/2}$  to obtain an approximation of the matrix  $\pi^{\mathrm{sym}}$ .
+
+# 2.3 related work
+
+scalability. gnns were first proposed in gori et al. [24] and in scarselli et al. [42] and have since emerged as a powerful approach for solving many network mining tasks [8, 16, 32, 22, 44, 42, 1, 2]. most gnns do not scale to large graphs since they typically need to perform a recursive neighborhood expansion to compute the hidden representations of a given node. while several approaches have been proposed to improve the efficiency of graph neural networks [13, 12, 25, 20, 54, 27, 41, 49, 15], the scalability of gnns to massive (web-scale) graphs is still under-studied. as we discussed in § 1 the most prevalent approach to scalability is to sample a subset of the graph, e.g. based on different importance scores for the nodes [25, 54, 20, 41, 15]. beyond sampling, gao et al. [20] collect the representations from a node's neighborhood into a matrix, sort independently along each column/feature, and use the  $k$  largest entries as input to a 1-dimensional cnn. these techniques all focus on single-machine environments with limited (gpu) memory.
+
+buchnik et al. [9] propose feature propagation which can be viewed as a simplified linearized gnn. they perform graph-based smoothing as a preprocessing step (before learning) to obtain diffused node features which are then used to train a logistic regression classifier to predict the node labels. wu et al. [49] propose an equivalent simple graph convolution (sgc) model and diffuse the features by multiplication with the k-th power of the normalized adjacency matrix. however, node features are often high dimensional, which can make the preprocessing step computationally expensive. more importantly, while node features are typically sparse, the obtained diffused features become denser, which significantly reduces the efficiency of the subsequent learning step. both of these approaches are a special case of the ppnp model [21] which experimentally shows higher classification performance [21, 17].
+
+approximating pagerank. recent approaches combine basic techniques to create algorithms with enhanced guarantees [34, 45, 46]. for example wei et al. [48] propose the topppr algorithm combining the strengths of random walks and forward/backward search simultaneously. they can compute the top  $k$  entries of a personalized pagerank vector up to a given precision using a filter-and-refine paradigm. another family of approaches [19] are based on the idea of maintaining upper and lower bounds on the pagerank scores which are then used for early termination with certain guarantees. for our purpose the basic techniques are sufficient.
+
+# 3 the pprgo model
+
+the design of our model is motivated by: (i) the insights from § 2.1, namely that we can decouple the feature transformation from the information propagation, and (ii) the insights from § 2.2, namely that we can approximate  $\pi^{\mathrm{ppr}}$  with a sparse matrix. analogous to eq. 1 we define the final predictions of our model (see fig. 1):
+
+$$
+z = \operatorname {s o f t m a x} \left(\pi^ {(\epsilon)} h\right), \quad h _ {i,:} = f _ {\theta} \left(x _ {i}\right) \tag {2}
+$$
+
+where  $\pi^{(\epsilon)}$  is a sparse approximation of  $\pi^{\mathrm{ppr}}$ . to obtain each row of  $\pi^{(\epsilon)}$  we adapt the push-flow algorithm described in andersen et al. [4]. we additionally truncate  $\pi^{(\epsilon)}$  to contain only the top  $k$  largest entries for each row. that is, for each node  $i$  we only
+
+![](images/499a1eb5a9b1f60a7342469a40d07a3d5cc6589ebc1e9b850204a1a6362f3108.jpg)
+
+![](images/8d072a99bde4e793133d413e88d706fff13cd042b278375d232fb40fbdbceaa8.jpg)  
+figure 1: an illustration of pprgo. for each node  $i$  we pre-compute an approximation of its personalized pagerank vector  $\pi^{(\epsilon)}(i)$ . the approximation is computed efficiently and in parallel using a distributed batch data processing pipeline. the final prediction  $z_{i}$  is then generated as a weighted average of the local (per-node) representations  $h_{j:} = f_{\theta}(x_{j})$  for the top  $k$  nodes ordered by largest personalized pagerank score  $\pi(i)_j$ . to train the model  $f_{\theta}(\cdot)$  that maps node attributes  $x_{i}$  to local representations  $h_{i}$ , we only need the personalized pagerank vectors of the training nodes and attributes of the their respective top  $k$  neighbors. the model is trained in a distributed manner on multiple batches of data in parallel.
+
+consider the set of nodes with top  $k$  largest scores according to  $\pi (i)$ . combined, the predictions for a given node  $i$  are:
+
+$$
+\boldsymbol {z} _ {i} = \operatorname {s o f t m a x} \left(\sum_ {j \in \mathcal {n} ^ {k} (i)} \boldsymbol {\pi} ^ {(\epsilon)} (i) _ {j} \boldsymbol {h} _ {j}\right) \tag {3}
+$$
+
+where  $\mathcal{n}^k (i)$  enumerates the indices of the top  $k$  largest non-zero entries in  $\pi^{(\epsilon)}(i)$ . eq. 3 highlights that we only have to consider a small number of other nodes to compute the final prediction for a given node. furthermore, this definition allows us to explicitly trade-off scalability and performance by increasing/decreasing the number of neighbors  $k$  we take into account. we can achieve a similar trade-off by changing the threshold  $\epsilon$  which effectively controls the norm of the residual. we show the pseudo-code for computing  $\pi^{(\epsilon)}$  in algorithm 1. for further details see § a.4.
+
+algorithm 1 approximate personalized pagerank  $(g,\alpha ,t,\epsilon)$  [4]  
+inputs: graph  $g$ , teleport prob.  $\alpha$ , target node  $t$ , max. residual  $\epsilon$   
+1: initialize the (sparse) estimate-vector  $\pi^{(\epsilon)} = 0$  and the (sparse) residual-vector  $\boldsymbol{r} = \alpha \cdot \boldsymbol{e}_t$  (i.e.  $\boldsymbol{e}_t = 1$ ,  $\boldsymbol{e}_v = 0, v \neq t$ )  
+2: while  $\exists v \text{ s.t. } r_v > \alpha \cdot \epsilon \cdot d_v$  do #  $d_v$  is the out-degree  
+3:  $\pi_v^{(\epsilon)} += r_v$   
+4:  $r_v = 0$   
+5:  $m = (1 - \alpha) \cdot r_v / d_v$   
+6: for  $u \in \mathcal{n}_g^{\mathrm{out}}(v)$  do #  $v$ 's outgoing neighbors  
+7:  $r_u += m$   
+8: end for  
+9: end while  
+10: return  $\pi^{(\epsilon)}$
+
+in contrast to the ppnp model, a big advantage of pprgo is that we can pre-compute the sparse matrix  $\pi^{(\epsilon)}$  before we start training. pre-computation allows pprgo to calculate the training and inference predictions in  $o(k)$  time, where  $k \ll n$ , and  $n$  is number of nodes. better still, for training we only require the rows of  $\pi^{(\epsilon)}$  corresponding to the training nodes and the representations  $f_{\theta}(x_i)$  of their top-k neighbors. furthermore, our model lends itself nicely to batched computation. for example, for a batch of nodes of size  $b$  we have to load in memory the features of at most  $b \cdot k$  nodes. in practice, this number is smaller than  $b \cdot k$  since the nodes that appear in  $\mathcal{n}^k(i)$  often overlap for the different nodes in the batch. we discuss the applicability and limitations of pprgo in § a.5.
+
+# 3.1 effective neighborhood,  $\alpha$  and  $k$
+
+from the definition of personalized pagerank we can conclude that the hyper-parameter  $\alpha$  controls the amount of information we are incorporating from the neighborhood of a node. namely, for values of  $\alpha$  close to 1 the random walks return (teleport) to the node  $i$  more often and we are therefore placing more importance on the immediate neighborhood of the node. as the value of  $\alpha$  decreases to 0 we instead give more and more importance to the extended (multi-hop) neighborhood of the node. intuitively, the importance of the  $k$ -hop neighborhood is proportional to  $(1 - \alpha)^{k}$ . note that the importance that each node assigns to itself (i.e. the value of  $\pi(i)_i$ ) is typically higher than the importance it assigns to the rest of the nodes. in conjunction with  $\alpha$ , we can modify the number of  $k$  largest entries we consider to increase or decrease the size of the effective neighborhood. this stands in stark contrast to message-passing frameworks, where incorporating information from the extended neighborhood requires additional layers, thereby significantly increasing the computational complexity.
+
+# 4 scalability
+
+here we discuss the properties of pprgo which make it suitable for large-scale classification problems occurring in industry.
+
+# 4.1 node classification in the real world
+
+the web is an incredibly rich data source and many different large graphs (potentially with hundreds of billions of nodes and edges) can be derived from it. many web graphs have interesting node classification problems that can be addressed via semi-supervised learning.
+
+their applications occur across all media types and power many different google products [29, 39, 38]. in web-scale datasets, the node sets are large, the graphs commonly have power-law degrees, the datasets change frequently, and labels can quickly become stale. therefore, having a model that trains as fast as possible is desirable to reduce the latency. arguably even more important is having a model for which inference is as fast as possible, since inference is typically performed much more frequently than training in real-world settings. a low enough inference time may even open the door to using the model for online tasks, an impactful domain of problems where these models have limited penetration. our proposed model, pprgo, ameliorates many of the difficulties associated with scaling these learning systems. we have successfully tested it on internal graphs with billions of nodes and edges.
+
+# 4.2 distributed training
+
+in contrast to most previously proposed methods [54, 25, 49] we utilize distributed computing techniques which significantly reduce the overall runtime of our method. our model is trained in two stages. first, we pre-compute the approximated personalized pagerank vectors using the distributed version of algorithm 1 (see § a.4). second, we train the model parameters with stochastic gradient descent. both stages are implemented in a distributed fashion.
+
+for the first stage we use an efficient batch data processing pipeline [10] similar to mapreduce. since we can compute the pagerank vectors for every node in parallel our implementation easily scales to graphs with billions of nodes. moreover, we can a priori determine the number of iterations we need for achieving a desired approximation accuracy [23, 4] which in turn means we can reliably estimate the runtime beforehand.
+
+we implement pprgo in tensorflow and optimize the parameters with asynchronous distributed stochastic gradient descent. we store the model parameters on a parameter server (or several parameter servers depending on the model size) and multiple workers process the data in parallel. we use asynchronous training to avoid the communication overhead between many workers. each worker fetches the most up-to-date parameters and computes the gradients for a mini-batch of data independently of the other workers.
+
+# 4.3 efficient inference
+
+as discussed in § 3 we only need to compute the approximate personalized pagerank vectors for the nodes in the training/validation set in order to train the model. in the semi-supervised classification setting these typically comprise only a small subset of all nodes (a few 100s or 1000s). however, during inference we still need to compute the ppr vector for every test node (see eq. 3). specifically, to predict the class label for  $m < n$  test nodes we have to compute  $z = \text{softmax}(\pi h)$  where  $\pi$  is a  $m \times n$  matrix such that each row contains the personalized pagerank vector for a given test node, and  $h$  is a  $n \times c$  matrix of logits. even though the computation of each of these  $m$  ppr vectors can be trivially parallelized, when  $m$  is extremely large the overall runtime can still be considerable. however, during inference we only use the ppr vectors a single time. in this case it is more efficient to circumvent this calculation and fall back to power iteration, i.e.
+
+$$
+q ^ {(0)} = h, \quad q ^ {(p + 1)} = (1 - \alpha) d ^ {- 1} a q ^ {(p)} + \alpha h. \tag {4}
+$$
+
+we furthermore found that, as opposed to training, during inference only very few (i.e. 1-3) steps of power iteration are necessary until accuracy improvements level off (see § 5.5). hence we only need very few sparse matrix-matrix multiplications for inference, which can be implemented very efficiently.
+
+since this truncated power iteration is very fast to compute, the neural network  $f_{\theta}$  quickly becomes the limiting factor for inference time, especially if it is computationally expensive (e.g. a deep resnet architecture [26] or recurrent neural network (rnn)). with pprgo, we can leverage the graph's homophily to reduce the number of nodes that need to be analyzed. since nearby nodes are likely to be similar we only need to calculate predictions  $h$  for a small, randomly chosen fraction of nodes. setting the remaining entries to zero we can smooth out these sparse labels over the rest via eq. 4.
+
+in the very sparse case, using homophily to limit the number of needed predictions can be viewed as a label propagation problem with labels given by logits  $h$ . in the context of label propagation, the power iteration in eq. 4 is a common algorithm known as "label propagation with return probability". this algorithm is known to perform well; we find that we can almost match the performance of full prediction with only a small fraction (e.g.  $10\%$  or  $1\%$ ) of logits (see § 5.5). overall, this approach allows us to reduce the runtime even below a model that ignores the graph and instead considers each node independently, without sacrificing accuracy.
+
+# 5 experiments
+
+setup. we focus on semi-supervised node classification on attributed graphs and demonstrate the strengths and scalability of pprgo in both distributed and single-machine environments. to best align with real use cases we only use  $20 \cdot$  number of classes uniformly sampled (non-stratified) training nodes. we fix the value of the teleport parameter to a common  $\alpha = 0.25$  for all experiments except the unusually dense reddit dataset, where  $\alpha = 0.5$ . for details regarding training, hyperparameters, and metrics see § a.3 in the appendix. we answer the following research questions:
+
+- what kind of trade-offs between scalability and accuracy can we achieve with pprgo? (§ 5.2)  
+- how effectively can we leverage distributed training? (§ 5.3)  
+- how much resources (memory, compute) does pprgo need compared to other scalable gnns? (§ 5.4)  
+- how efficient is the proposed sparse inference scheme? (§ 5.5)
+
+# 5.1 large-scale datasets
+
+the majority of previous approaches are evaluated on a small set of publicly available benchmark datasets [13, 12, 25, 20, 27, 41, 49, 2]. the size of these datasets is relatively small, with the reddit graph (233k nodes, 11.6m edges, 602 node features) [25] typically being the largest graph used for evaluation. $^{4}$  chiang et al. [15] recently introduced the amazon2m graph (2.5m nodes, 61m edges, 100 node features) which is large in terms of number of nodes, but tiny in terms of node feature size. $^{5}$
+
+mag-scholar. to facilitate the development of scalable gnns we create a new benchmark dataset based on the microsoft academic graph (mag) [43]. nodes represent papers, edges denote citations, and node features correspond to a bag-of-words representation of paper abstracts. we augmented the graph with "ground-truth" node labels corresponding to the papers' field of study.
+
+we extract the node labels semi-automatically by mapping the publishing venues (conferences and journals) to a field of study using metadata on the top venues from google scholar. we create two sets of labels for the same graph. coarse-grained labels correspond to the following 8 coarse-grained fields of study: biology, engineering, humanities, medicine, physics, sociology, business, and other. we refer to this graph as mag-scholar-c. fine-grained labels correspond to 253 fine-grained fields of study such as: architecture, epidemiology, geology, ethics, anthropology, linguistics, etc. the fine-grained labels make the classification problem more difficult. we refer to this graph as mag-scholar-f.
+
+the resulting mag-scholar graph is a few orders of magnitude larger than the commonly used benchmark graphs (12.4m nodes, 173m edges, 2.8m node features). the graphs and the code to generate them will be made publicly available. see § a.2 for a detailed description of the graph construction and node labelling process.
+
+# 5.2 scalability vs. accuracy trade-off
+
+the approximation parameter  $\epsilon$  and the number of top- $k$  nodes are important hyper-parameters that modulate scalability and accuracy (see eq. 3). we note that  $\alpha$  and  $k$  play similar roles, so we choose to analyze  $k$  for a fixed  $\alpha$ . to examine their effect on the performance of pprgo we train our model on the mag-scholar-c graph for different values of  $k$  and  $\epsilon$ . we repeat the experiment five times and report the mean performance. we investigate two cases: a sparsely labeled scenario similar to industry settings (160 nodes), and an "academic" setting with many more labeled nodes (105415 nodes).
+
+as expected, we can see in fig. 2 that the performance consistently increases if we either use a more accurate approximation of the pagerank vectors (smaller  $\epsilon$ ) or a larger number of top-k neighbors. this also shows that we can smoothly trade-off performance for scalability since models with higher value of  $k$  and lower value of  $\epsilon$  are computationally more expensive. for example, in the academic setting (fig. 2b) a model with  $\epsilon = 0.1$ ,  $k = 2$  had an overall (preprocessing + training + inference) runtime of 6 minutes, while a model with  $\epsilon = 0.001$ ,  $k = 256$  had an overall runtime of 12 minutes. since many nodes are labeled (1%) the difference between the highest accuracy (top right corner) and lowest accuracy (bottom left corner) is under 2% and the model is not sensitive to the hyperparameters. in the sparsely labeled setting (fig. 2a) the choice of hyperparameters is more important and depends on the desired trade-off level (slowest overall runtime was <2 minutes).
+
+interestingly, we can see on fig. 2 that for any value of  $\epsilon$  the performance starts to plateau at around top-  $k = 32$ . the reason for this behavior becomes more clear by examining fig. 3. here, for each node  $i$  we calculate the sum of the top-  $k$  largest scores in  $\pi^{(\epsilon)}(i)$  and we plot the average across all nodes. we see that by looking at a very few nodes - e.g. 32 out of 12.4 million - we are able to capture the majority of the pagerank scores on average (recall that  $\sum_{j}\pi^{(\epsilon)}(i)_{j}\leq 1$ ). therefore, the curves in both fig. 2 and
+
+![](images/ff04912948d8cfdd6a7f2f81559b27d58896a227e714ee5f587888b8db016e54.jpg)  
+(a) sparsely labeled setting (160 nodes,  $0.0015\%$ )
+
+![](images/1baa6465d82394207956f34082edac45cd22f82368fbd5baf1bd00baa63fdb25.jpg)  
+(b) setting with a large number of labeled nodes (105415 nodes, 1%)
+
+![](images/881094f55e5c0f2d6391f037e9356208a63d92795efb944c5820ce6072bd0297.jpg)  
+figure 2: mean accuracy  $(\%)$  over 5 runs on mag-scholar-c as we vary the number of neighbors and the approx. parameter  $\epsilon$ .  
+figure 3: for each node in mag-scholar-c we calculate the sum of the top- $k$  largest scores in  $\pi^{(\epsilon)}(i)$  and we plot the average across all nodes for different values of  $\epsilon$ . the dashed line indicates  $k = n$ , i.e. the entire sum of  $\pi^{(\epsilon)}(i)$  averaged across nodes. the  $95\%$  confidence intervals around the mean (estimated with bootstrapping) are too small to be visible.
+
+# 5.3 distributed training
+
+in this section we aim to compare the performance of one-hop propagation using personalized pagerank and traditional multihop message passing propagation in a real distributed environment at google. to make sure that the differences we observe are only due to the used model and not other factors, we implement simple 2-hop and 3-hop gnn models [32], which are also trained in a distributed manner using the same infrastructure as pprgo. specifically, we make sure that both the multi-hop models and pprgo consider the same number of neighbors, e.g. if pprgo uses  $k = 64$  then the 2-hop model uses information from  $8 \times 8 = 64$  nodes from its first and second hop respectively. to select these neighborhoods we use a weighted sampling scheme similar to previous work [54]. additionally, we implement a distributed version of fastgcn [13] to evaluate the effect of different sampling schemes.
+
+our first observation is that there is no significant difference in terms of predictive performance between the different models
+
+(around  $61\%$  accuracy). however, there is a significant difference in terms of runtime. on fig. 4 we show the speedup in terms of number of gradient-update steps per second on the mag-scholar-f graph as we increase the number of worker machines used for distributed training. specifically, we show the relative speedup compared to the baseline method - 2-hop gcn on a single worker. we see that pprgo is considerably faster than the baseline (note that both axes are on a log-scale). pprgo also requires fewer steps in total to converge. moreover, the speedup gap between the 2 hop model and pprgo increases with the number of workers. crucially, since we have to fetch all neighbors to calculate their importance scores and since the runtime in the distributed setting is dominated by io we see that fastgcn does not offer any significant scalability advantage over the baseline gnn 2-hop model. in § a.1 we additionally analyze parallel efficiency, i.e. how well the different models utilize the additional workers.
+
+pprgo is able to process all top- $k$  neighbors at once, compared to the multi-hop models which have to recursively update the hidden representations. therefore, while increasing the number of top- $k$  neighbors makes all model computationally more expensive, we expect the runtime of pprgo to increase the least. to validate this claim, we analyze the relative speed (number of gradient updates
+
+![](images/ed91b37386ab1190570cc5f3460c80f2bd33328037c8a12d0fed26c9299e0d35.jpg)  
+fig. 3 plateau around the same value of  $k$ . these figures validate our approach of approximating the dense (but localized) personalized pagerank vectors with their respective sparse top- $k$  versions.  
+figure 4: relative speed in terms of number of gradient-update steps per second on the mag-scholar-f graph compared to the baseline method (gnn 2-hop, single worker). both axes are on a log scale. pprgo is consistently the fastest method and can best utilize additional workers.
+
+table 1: breakdown of the runtime, memory, and predictive performance on a single machine for different models on the reddit dataset. we use 820 (20 · #classes) nodes for training. we see that pprgo has a total runtime of less than 20 s and is two orders of magnitude faster than sgc and cluster-gcn. pprgo also requires less memory overall.  
+
+<table><tr><td></td><td colspan="6">runtime (s)</td><td colspan="2">memory (gb)</td><td>accuracy (%)</td></tr><tr><td></td><td>preprocessing</td><td colspan="2">training</td><td colspan="2">inference</td><td>overall</td><td>ram</td><td>gpu</td><td></td></tr><tr><td></td><td></td><td>per epoch</td><td>overall</td><td>forward</td><td>propagation</td><td></td><td></td><td></td><td></td></tr><tr><td>cluster-gcn</td><td>1175(25)</td><td>4.77(12)</td><td>953(24)</td><td>-</td><td>-</td><td>186(21)</td><td>2310(40)</td><td>20.97(15)</td><td>0.071(6)</td></tr><tr><td>sgc</td><td>313(9)</td><td>0.0026(2)</td><td>0.53(3)</td><td>-</td><td>-</td><td>7470(150)</td><td>7780(150)</td><td>10.12(3)</td><td>0.027</td></tr><tr><td>pprgo (1 pi step)</td><td>2.26(4)</td><td>0.0233(5)</td><td>4.67(10)</td><td>0.341(9)</td><td>5.85(3)</td><td>6.19(4)</td><td>13.10(7)</td><td>5.560(19)</td><td>0.073</td></tr><tr><td>pprgo (2 pi steps)</td><td>2.22(12)</td><td>0.021(3)</td><td>4.1(7)</td><td>0.43(8)</td><td>10.1(14)</td><td>10.5(15)</td><td>16.8(17)</td><td>5.42(18)</td><td>0.073</td></tr></table>
+
+![](images/5d9ba6c2c312afce663f1cf26d57f6c3502e5e8154333f7977211553b8715bad.jpg)  
+figure 5: relative speed comparison (num. gradient updates per second) between pprgo and multi-hop models for different values of  $k$  on mag-scholar-f. distributed training.
+
+per second) compared to the slowest method at different values of  $k$ . the results in fig. 5 exactly match our intuition, and indeed the curve of pprgo has the smallest slope as we increase  $k$ , while the relative speed of the 2- and 3-hop gnns deteriorate faster. fastgcn again matches gnn 2-hop, like it does in fig. 4 (not shown here).
+
+# 5.4 runtime and memory on a single machine
+
+setup. to highlight the benefits of pprgo we compare the runtime, memory, and predictive performance with sgc [49] and cluster-gcn [15], two strong baselines that represent the current state-of-the-art scalable gnns. since sgc and cluster-gcn report significant speedup over fastgcn [13] and vrgcn [12] we omit these models from our comparison.
+
+we run the experiments on nvidia 1080ti gpus and on intel cpus (5 cores), using cuda and tensorflow. we run each experiment on five different random splits and report mean values and standard deviation. for sgc we use the second power of the graph laplacian as suggested by the authors (i.e. we effectively have a 2-hop model). for pprgo we set  $\epsilon = 10^{-4}$  and  $k = 32$  following the discussion in § 5.2. we compute the overall runtime including the preprocessing time, the time to train the models, and the time to perform inference for all test nodes. this is in contrast to previous work which rarely report preprocessing time and almost never report inference time. for training, we report both the overall training time, as well as the time per epoch.
+
+preprocessing time. for each model, during preprocessing we perform the computation only for the training nodes. for sgc,
+
+the preprocessing step involves computing the diffused features using the second power of the graph laplacian. we significantly optimized preprocessing for cluster-gcn, resulting in node cluster computation with metis [30] becoming its main bottleneck. for pprgo, the preprocessing step involves computing the approximate personalized pagerank vectors using algorithm 1 and selecting the top  $k$  neighbors.
+
+inference time. for sgc, during inference we have to compute the diffused features for the test nodes (again using the second power of the graph laplacian). following the implementation by the original authors of cluster-gcn, we do not cluster the test nodes, but rather perform "standard" message-passing inference on the full graph. for pprgo, as discussed in § 4.3, we run power iteration rather than computing the approximate ppr vectors for the test nodes. two iteration steps were already sufficient to obtain good accuracy. we analyze the inference step in more detail in § 5.5.
+
+the results when training a model on the reddit dataset (233k nodes, 11.6m edges, 602 node features) are summarized in table 1. both sgc and cluster-gcn are several orders of magnitude slower than pprgo. interestingly, sgc is significantly slower w.r.t. inference time (since we have to compute the diffused features for all test nodes) while cluster-gcn is significantly slower w.r.t. preprocessing and training time. the overall runtime of cluster-gcn (2310 s) and sgc (7470 s) is in stark contrast to our proposed approach: under 20 s. moreover, we see that the amount of memory used by pprgo is 4 times smaller compared to cluster-gcn and 2 times smaller compared to sgc. given that cluster-gcn and sgc achieve significantly worse accuracy, the benefits of our proposed approach in terms of scalability are apparent.
+
+we extend the above analysis to several other datasets. we chose two comparatively small academic graphs that are commonly used as benchmark datasets - cora-full [6] (18.7k nodes, 62.4k edges, 8.7k node features) and pubmed [53] (19.7k nodes, 44.3k edges, 0.5k node features) - as well as our newly introduced mag-scholar-c dataset (10.5m nodes, 133m edges, 2.8m node features). in addition to the two scalable baselines, we also evaluate how pprgo compares to the appnp model [21] which we build upon. the results are summarized in table 2. we can see that the performance of most models is comparable in terms of accuracy. in most cases our proposed model pprgo has the smallest overall runtime and it always uses the least amount of memory. pprgo's comparatively long runtime on cora-full can be explained by its training set size: the training set is so large that pprgo accesses more neighbors per batch than there are nodes in this graph, not leveraging the
+
+table 2: single machine runtime (s), memory (gb), and accuracy (%) for different models and datasets using 20 - #classes training nodes. pprgo shows comparable accuracy and scales much better to large datasets than its competitors.  
+
+<table><tr><td rowspan="2"></td><td colspan="3">cora-full</td><td colspan="3">pubmed</td><td colspan="3">reddit</td><td colspan="3">mag-scholar-c</td></tr><tr><td>time</td><td>mem.</td><td>acc.</td><td>time</td><td>mem.</td><td>acc.</td><td>time</td><td>mem.</td><td>acc.</td><td>time</td><td>mem.</td><td>acc.</td></tr><tr><td>cluster-gcn</td><td>84(4)</td><td>2.435(18)</td><td>58.0(7)</td><td>54.3(27)</td><td>1.90(3)</td><td>74.7(30)</td><td>2310(50)</td><td>21.04(15)</td><td>17.1(8)</td><td>&gt;24h</td><td>-</td><td>-</td></tr><tr><td>sgc</td><td>92(3)</td><td>3.95(3)</td><td>58.0(8)</td><td>5.3(3)</td><td>2.172(4)</td><td>75.7(23)</td><td>7780(140)</td><td>10.15(3)</td><td>12.1(1)</td><td>&gt;24h</td><td>-</td><td>-</td></tr><tr><td>appnp</td><td>10.7(5)</td><td>2.150(19)</td><td>62.8(11)</td><td>6.5(4)</td><td>1.977(4)</td><td>76.9(26)</td><td>-</td><td>oom</td><td>-</td><td>-</td><td>oom</td><td>-</td></tr><tr><td>pprgo (ε = 10-4,k=32)</td><td>25(3)</td><td>1.73(3)</td><td>61.0(7)</td><td>3.8(9)</td><td>1.626(25)</td><td>75.2(33)</td><td>16.8(17)</td><td>5.49(18)</td><td>26.6(18)</td><td>98.6(17)</td><td>24.51(4)</td><td>69.3(31)</td></tr><tr><td>pprgo (ε = 10-2,k=32)</td><td>6.6(5)</td><td>1.644(13)</td><td>58.1(6)</td><td>2.9(5)</td><td>1.623(17)</td><td>73.7(39)</td><td>16.3(17)</td><td>5.61(6)</td><td>26.2(18)</td><td>89(5)</td><td>24.49(5)</td><td>63.4(29)</td></tr></table>
+
+duplicate information. this can only happen with small graphs, for which runtime is not an issue. we see that the appnp model runs out of memory for even the moderately sized reddit graph, highlighting the necessity of our approach.
+
+more importantly, on the largest graph mag-scholar-c, we successfully trained pprgo from scratch and obtained the predictions for all test nodes in under 2 minutes, while cluster-gcn and sgc were not able to finish in over 24 hours, with cluster-gcn still stuck in preprocessing.
+
+# 5.5 efficient inference
+
+inference time is crucial for real-world applications since a machine learning model needs to be trained only once, while inference is run continuously when the model is put into production. we found that pprgo can achieve an accuracy of  $68.7\%$  with a single power iteration step, i.e. without even calculating the ppr vectors. at this point, the neural network  $f_{\theta}$  and not the propagation becomes the limiting factor. however, as described in § 4.3, we can reduce the neural network cost by only computing logits for a small, random subset of nodes. fig. 6 shows that the accuracy only reduces by around 0.6 percentage points when reducing the number of inferred nodes by a factor of 10. we can therefore trade in a small amount of accuracy to significantly reduce inference time, in this case by  $50\%$ . with this approximation, pprgo has a shorter inference time than the forward pass of a simple neural network executed on each node independently. furthermore, note that we use a rather simple feed-forward neural network in our experiments. this reduction will become even more dramatic in cases that leverage more computationally expensive neural networks for  $f_{\theta}$ . fig. 7 shows that when reducing the fraction of inferred nodes, the corresponding accuracy drops off earlier if we perform fewer power iteration steps  $p$ . therefore, we need to increase the number of power iteration steps when we calculate fewer logits. this furthermore shows that subsampling logits would not be possible with methods that use locally sampled subgraphs (e.g. fastgcn). note that we do not use this additional improvement in table 1 and 2.
+
+# 6 conclusion
+
+we propose a gnn for semi-supervised node classification that scales easily to graphs with millions of nodes. in comparison to previous work our model does not rely on expensive message-passing, making it well suited for use in large-scale distributed environments. we can trade scalability and performance via a few intuitive hyperparameters. to stimulate the development of scalable gnns we present mag-scholar - a new large-scale graph (12.4m nodes, 173m
+
+![](images/94f613725e309cc3025284fb779e764a5d0851763d2788ca50e624f3d4887e9f.jpg)  
+figure 6: accuracy and corresponding inference time (nn inference (dark blue) + propagation (light blue)) on mag-scholar-c w.r.t. the fraction of nodes for which local logits  $h$  are inferred by the nn. pprgo performs very well even if the nn is evaluated on very few nodes. we need more power iteration steps  $p$  if we do fewer forward passes (see fig. 7), increasing the propagation time. note the logarithmic scale.
+
+![](images/506ebd62144e14b385bf830631e8f74cdd70a3321407c9c71cb9409722900af3.jpg)  
+figure 7: accuracy on mag-scholar-c w.r.t. the fraction of nodes for which local logits  $h$  are inferred and number of power iteration steps  $p$ . the fewer logits we calculate, the more power iteration steps we need for stabilizing the prediction. note the logarithmic scale.
+
+edges, and 2.8m node features) with coarse/fine-grained "ground-truth" node labels. on this web-scale dataset pprgo achieves high performance in under 2 minutes (preprocessing + training + inference time) on a single machine. beyond the single machine scenario, we demonstrate the scalability of pprgo in a distributed setting and show that it is more efficient compared to multi-hop models.
+
+# 7 acknowledgements
+
+we would like to thank chandan yeshwanth for his assistance with conducting the experiments. this research was supported by the deutsche forschungsgemeinschaft (dfg) through the emmy noether grant gu 1409/2-1 and the tum international graduate school of science and engineering (igsse), gsc 81.
+
+# references
+
+[1] s. abu-el-haija, a. kapoor, b. perozzi, and j. lee. 2018. n-gcn: multi-scale graph convolution for semi-supervised node classification. arxiv preprint arxiv:1802.08888.  
+[2] s. abu-el-haija et al. 2019. mixhop: higher-order graph convolutional architectures via sparsified neighborhood mixing. icml, 21-29.  
+[3] r. andersen, c. borgs, j. t. chayes, j. e. hopcroft, v. s. mirroki, and s.-h. teng. 2008. local computation of pagerank contributions. *internet mathematics*, 5, 23-45.  
+[4] r. andersen, f. chung, and k. lang. 2006. local graph partitioning using pagerank vectors. focs, 475-486.  
+[5] p. w. battaglia et al. 2018. relational inductive biases, deep learning, and graph networks. arxiv preprint arxiv:1806.01261.  
+[6] a. bojchevski and s. gunnemann. 2018. deep gaussian embedding of graphs: unsupervised inductive learning via ranking.  
+[7] p. boldi, v. lonati, m. santini, and s. vigna. 2006. graph fibrations, graph isomorphism, and pagerank. rairo theor. informatics appl., 40, 2, 227-253.  
+[8] j. bruna, w. zaremba, a. szlam, and y. lecun. 2013. spectral networks and locally connected networks on graphs. arxiv preprint arxiv:1312.6203.  
+[9] e. buchnik and e. cohen. 2018. bootstrapped graph diffusions: exposing the power of nonlinearity. sigmetrics, 8-10.  
+[10] c. chambers, a. raniwala, f. perry, s. adams, r. r. henry, r. bradshaw, and n. weizenbaum. 2010. flumejava: easy, efficient data-parallel pipelines. acm sigplan notices, 45, 6, 363-375.  
+[11] i. chami, s. abu-el-haija, b. perozzi, c. ré, and k. murphy. 2020. machine learning on graphs: a model and comprehensive taxonomy. arxiv preprint arxiv:2005.03675.  
+[12] j. chen, j. zhu, and l. song. 2018. stochastic training of graph convolutional networks with variance reduction. icml, 941-949.  
+[13] j. chen, t. ma, and c. xiao. 2018. fastgen: fast learning with graph convolutional networks via importance sampling. arxiv preprint arxiv:1801.10247.  
+[14] z. chen, l. li, and j. bruna. 2018. supervised community detection with line graph neural networks.  
+[15] w. chiang, x. liu, s. si, y. li, s. bengio, and c. hsieh. 2019. cluster-gcn: an efficient algorithm for training deep and large graph convolutional networks. kdd. acm, 257-266.  
+[16] m. defferrard, x. bresson, and p. vandergheynst. 2016. convolutional neural networks on graphs with fast localized spectral filtering. advances in neural information processing systems, 3844-3852.  
+[17] m. fey and j. e. lenssen. 2019. fast graph representation learning with pytorch geometric. corr, abs/1903.02428. arxiv: 1903.02428.  
+[18] d. fogaras and b. rácz. 2004. towards scaling fully personalized pagerank. waw.  
+[19] y. fujiwara, m. nakatsuji, h. shiokawa, t. mishima, and m. onizuka. 2013. fast and exact top-k algorithm for pagerank. aaai.  
+[20] h. gao, z. wang, and s. ji. 2018. large-scale learnable graph convolutional networks. kdd, 1416-1424.  
+[21] j. gasteiger, a. bojchevski, and s. gunnemann. 2019. predict then propagate: graph neural networks meet personalized pagerank. *iclr*.  
+[22] j. gilmer, s. s. schoenholz, p. f. riley, o. vinyals, and g. e. dahl. 2017. neural message passing for quantum chemistry. arxiv preprint arxiv:1704.01212.  
+[23] d. f. gleich, k. kloster, and h. nassar. 2015. localization in seeded pagerank. arxiv preprint arxiv:1509.00016.  
+[24] m. gori, g. monfardini, and f. scarselli. 2005. a new model for learning in graph domains. *ijcnn*, 729-734.  
+[25] w. hamilton, z. ying, and j. leskovec. 2017. inductive representation learning on large graphs. advances in neural information processing systems, 1024-1034.  
+[26] k. he, x. zhang, s. ren, and j. sun. 2016. deep residual learning for image recognition. cvpr, 770-778.  
+[27] w. huang, t. zhang, y. rong, and j. huang, 2018. adaptive sampling towards fast graph representation learning. advances in neural information processing systems, 4563-4572.  
+[28] g. jeh and j. widom. 2003. scaling personalized web search. www.  
+[29] a. kannan et al. 2016. smart reply: automated response suggestion for email. kdd, 955-964.  
+[30] g. karypis and v. kumar. 1998. a fast and high quality multilevel scheme for partitioning irregular graphs. siam journal on scientific computing, 20, 1.
+
+[31] d. p. kingma and j. ba. 2014. adam: a method for stochastic optimization. arxiv preprint arxiv:1412.6980.  
+[32] t. n. kipf and m. welling. 2016. semi-supervised classification with graph convolutional networks. arxiv preprint arxiv:1609.02907.  
+[33] q. li, z. han, and x.-m. wu. 2018. deeper insights into graph convolutional networks for semi-supervised learning. arxiv preprint arxiv:1801.07606.  
+[34] p. lofgren, s. banerjee, and a. goel. 2016. personalized pagerank estimation and search: a bidirectional approach. wsdm.  
+[35] h. nassar, k. kloster, and d. f. gleich. 2015. strong localization in personalized pagerank vectors. international workshop on algorithms and models for the web-graph. springer, 190–202.  
+[36] m. niepert, m. ahmed, and k. kutzkov. 2016. learning convolutional neural networks for graphs. icml, 2014-2023.  
+[37] l. page, s. brin, r. motwani, and t. winograd. 1998. the pagerank citation ranking: bringing order to the web.  
+[38] b. perozzi, m. schueppert, j. saalweachter, and m. thakur. 2016. when recommendation goes wrong: anomalous link discovery in recommendation networks. kdd, 569-578.  
+[39] s. ravi. 2016. graph-powered machine learning at google. https://ai.googleblog.com/2016/10/graph-powered-machine-learning-at-google.html. (2016).  
+[40] r. al-rfou, d. zelle, and b. perozzi. 2019. ddgk: learning graph representations for deep divergence graph kernels. www, 37-48.  
+[41] r. sato, m. yamada, and h. kashima. 2019. constant time graph neural networks. arxiv preprint arxiv:1901.07868.  
+[42] f. scarselli, m. gori, a. c. tsoi, m. hagenbuchner, and g. monfardini. 2009. the graph neural network model. ieee transactions on neural networks, 20, 1.  
+[43] a. sinha, z. shen, y. song, h. ma, d. eide, b.-j. p. hsu, and k. wang. 2015. an overview of microsoft academic service (mas) and applications. www 2015.  
+[44] p. velickovic, g. cucurull, a. casanova, a. romero, p. lio, and y. bengio. 2017. graph attention networks. arxiv preprint arxiv:1710.10903, 1, 2.  
+[45] s. wang, y. tang, x. xiao, y. yang, and z. li. 2016. hubppr: effective indexing for approximate personalized pagerank. pvldb, 10, 205-216.  
+[46] s. wang, r. yang, x. xiao, z. wei, and y. yang. 2017. fora: simple and effective approximate single-source personalized pagerank. kdd.  
+[47] x. wang, a. shakery, and t. tao. 2005. dirichlet pagerank. sigir.  
+[48] z. wei, x. he, x. xiao, s. wang, s. shang, and j.-r. wen. 2018. toppkr: topk personalized pagerank queries with precision guarantees on large graphs. sigmod.  
+[49] f. wu, t. zhang, a. h. d. souza jr, c. fifty, t. yu, and k. q. weinberger. 2019. simplifying graph convolutional networks. arxiv preprint arxiv:1902.07153.  
+[50] z. wu, s. pan, f. chen, g. long, c. zhang, and p. s. yu. 2019. a comprehensive survey on graph neural networks. arxiv preprint arxiv:1901.00596.  
+[51] k. xu, w. hu, j. leskovec, and s. jegelka. 2018. how powerful are graph neural networks? arxiv preprint arxiv:1810.00826.  
+[52] k. xu, c. li, y. tian, t. sonobe, k.-i. kawarabayashi, and s. jegelka. 2018. representation learning on graphs with jumping knowledge networks. arxiv preprint arxiv:1806.03536.  
+[53] j. yang and j. leskovec. 2015. defining and evaluating network communities based on ground-truth. knowledge and information systems, 42, 1, 181-213.  
+[54] r. ying, r. he, k. chen, p. eksombatchai, w. l. hamilton, and j. leskovec. 2018. graph convolutional neural networks for web-scale recommender systems. arxiv preprint arxiv:1806.01973.  
+[55] m. zhang and y. chen. 2018. link prediction based on graph neural networks. arxiv preprint arxiv:1802.09691.
+
+# a appendix
+
+# a.1 parallel efficiency
+
+![](images/74c88068599c6b9766809d440fb181517db10ab5f791c3b81d8257c927a0dd51.jpg)  
+figure 8: parallel efficiency w.r.t. the number of distributed workers on mag-scholar-f for different models.
+
+to further investigate the performance of different models in the distributed training setting we also evaluate parallel efficiency. intuitively, this efficiency measures how well we can utilize additional workers. let  $m_t$  be the number of steps per second using  $t$  workers, then the parallel efficiency of a model is defined as  $\frac{m_t}{m_1 \cdot t}$ . in fig. 8 we see that pprgo achieves the best parallel efficiency.
+
+# a.2 mag-scholar graph construction
+
+first, we obtain the "raw" data from the microsoft academic graph (mag) [43] repository, specifically we downloaded a snapshot of the data on 01.25.2019. we construct a graph where each node is a paper and the edges indicate citations/references between the papers. the node features are a bag-of-words representation of the paper's abstract. we preprocess the feature matrix by keeping only those words that appear in at least 5 abstracts. we preprocess the graph by keeping only the nodes that belong to the largest connected component. the resulting mag-scholar-f graph has 12.40393 million nodes, 2.78424 million features, and 173.050172 million edges. the mag-scholar-c graph has 10.54156 million nodes, 2.78424 million features, and 132.817644 million edges. to obtain the fields of study for each paper, we first create a mapping between a venue (i.e. conference or journal) and its respective field of study. specifically, we consider the top-20 venues in each field of study according to google scholar<sup>6</sup>. we manually match the same venues that have different tittles (e.g. because of abbreviations) in the mag data compared to the google scholar data. these venues are categorized in 8 different coarse-grained categories (e.g. engineering<sup>7</sup>) and 253 different fine-grained categories (e.g. biophysics)<sup>8</sup> and we use them to define coarse/fine-grained "ground-truth" labels for the nodes.
+
+# a.3 experimental details
+
+we keep all pprgo hyperparameters constant across all datasets, except the value of the teleport parameter  $\alpha = 0.25$ , which we set to  $\alpha = 0.5$  for reddit. the feed-forward neural network has two layers,
+
+i.e. a single hidden layer of size 32. we use a dropout of 0.1 and set the weight decay to  $10^{-4}$ . we train for 200 epochs using a learning rate of 0.005 and the adam optimizer [31] with a batch size of 512. to achieve a consistent setup across all models and datasets we always use the same number of epochs, use no early stopping and only evaluate validation accuracy after training. for the validation set we randomly sample 10 times the number of training nodes.
+
+we standardize the graphs as a preprocessing step, i.e. we choose only the subset of nodes belonging to the largest connected component and make the graph undirected and unweighted. we do not include dataset loading time in the overall runtime since it is the same for all models.
+
+# a.4 further implementational details
+
+the pseudo code in algorithm 1 shows how we compute the approximate personalized pagerank based on [4]. for single-machine experiments we implement the algorithm as described in python using numba for acceleration (not parallelized). in the distributed setting instead of carrying out push-flow iterations until convergence, we perform a fixed number of iterations (i.e. we replace the while with a for loop), and drop nodes whose residual score is below a specified threshold in each iteration. additionally, we truncate nodes with a very large degree ( $\geq 10000$ ) by randomly sampling their neighbors. the above modifications proved to be just as effective as andersen et al. [4]'s method while being significantly faster in terms of runtime.
+
+# a.5 applicability and limitations
+
+when using pprgo for your own purposes you should first be aware that this model assumes a homophilic graph, which is mostly, but not always the case. furthermore, it cannot perform arbitrary message passing schemes like gnns do, since we essentially compress the message passing into a single step. it therefore has less theoretical expressiveness than gnns [7, 51], even if it practically shows the same or better accuracy. however, note that pprgo allows arbitrary realizations of  $f_{\theta}$  and can therefore be used with more complex data and models such as images and cnns, audio and lstms, or text and transformers.

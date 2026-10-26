@@ -1,0 +1,449 @@
+# best-first beam search
+
+clara meister* tim vieira ryan cotterell*,
+
+\*eth zürich ‡ johns hopkins university \*university of cambridge
+
+clara.meister@inf.ethz.ch tim.vieira@gmail.com
+
+ryan.cotterell@inf.ethz.ch
+
+# abstract
+
+decoding for many nlp tasks requires an effective heuristic algorithm for approximating exact search since the problem of searching the full output space is often intractable, or impractical in many settings. the default algorithm for this job is beam search—a pruned version of breadth-first search. quite surprisingly, beam search often returns better results than exact inference due to beneficial search bias for nlp tasks. in this work, we show that the standard implementation of beam search can be made up to  $10\mathrm{x}$  faster in practice. our method assumes that the scoring function is monotonic in the sequence length, which allows us to safely prune hypotheses that cannot be in the final set of hypotheses early on. we devise effective monotonic approximations to popular nonmonotic scoring functions, including length normalization and mutual information decoding. lastly, we propose a memory-reduced variant of best-first beam search, which has a similar beneficial search bias in terms of downstream performance, but runs in a fraction of the time.
+
+# 1 introduction
+
+beam search is a common heuristic algorithm for decoding structured predictors, e.g., neural machine translation models and transition-based parsers. due to the widespread adoption of recurrent neural networks and other non-markov models, traditional dynamic programming solutions, such as the viterbi algorithm (viterbi, 1967), are prohibitively inefficient; this makes beam search a common component of many state-of-the-art nlp systems. despite offering no formal guarantee of finding the highest-scoring hypothesis under the model, beam search yields impressive performance on a variety of tasks—unexpectedly providing a beneficial search bias over exact search for many tasks (stahlberg and byrne, 2019).
+
+within nlp, most research on beam search has focused on altering the log-probability scoring function to return improved results, e.g., higher bleu scores (wu et al., 2016; murray and chiang, 2018; shu and nakayama, 2018; yang et al., 2018) or a more diverse set of outputs (vijayakumar et al., 2016). however, little work has been done to speed up beam search itself. filling this gap, this paper focuses on reformulating beam search in order to make it faster. we propose best-first beam search, a prioritized version of traditional beam search which is up to an order of magnitude faster in practice while still returning the same set of results. we additionally discuss an even faster heuristic version of our algorithm which further limits the number of candidate solutions, leading to a smaller memory footprint while still finding good solutions.
+
+concretely, we offer a novel interpretation of beam search as an agenda-based algorithm where traditional beam search is recovered by employing a length-based prioritization scheme. we prove that a specific best-first prioritization scheme, as in classic  $\mathbf{a}^*$  search (hart et al., 1968), allows for the elimination of paths that will necessarily fall off the beam; for many scoring functions, including standard log-probability scoring, we can still guarantee the same  $k$  hypotheses as traditional beam search are returned. indeed, our algorithm returns beam search's top hypothesis the first time it encounters a complete hypothesis, allowing the program to stop early. further, we discuss the application of best-first beam search to several popular scoring functions in the literature (he et al., 2016; li et al., 2016); this demonstrates that we have a general framework for adapting a variety of rescoring methods and alternate objectives to work with our algorithm.
+
+empirically, we compare best-first beam search to ordinary beam search on two nlp sequence-to-sequence tasks: neural machine translation (nmt) and abstractive summarization (as). on
+
+nmt, we find that our algorithm achieves roughly a  $30\%$  speed-up over traditional beam search with increased gains for larger beams (e.g.,  $\approx 10x$  for a beam of 500). we find similar results hold for as. finally, we show that our memory-reduced version, which limits the number of active hypotheses, leads to additional speed-ups over best-first beam search across beam sizes while maintaining similar bleu scores. our code is available online at https://github.com/rycolab/bfbs
+
+# 2 sequence transduction
+
+a core operation in structured prediction models is the determination of the highest-scoring output for a given input under a learned scoring model.
+
+$$
+\mathbf {y} ^ {\star} \stackrel {\text {d e f}} {=} \underset {\mathbf {y} \in \mathcal {y} (\mathbf {x})} {\operatorname {a r g m a x}} \operatorname {s c o r e} (\mathbf {x}, \mathbf {y}) \tag {1}
+$$
+
+where  $\mathbf{x}$  is an input and  $\mathcal{v}(\mathbf{x})$  is a set of well-formed outputs for the input. an important example of (1) is maximum a posteriori (map),
+
+$$
+\mathbf {y} ^ {\text {m a p}} \stackrel {{\text {d e f}}} {{=}} \underset {\mathbf {y} \in \mathcal {y} (\mathbf {x})} {\operatorname {a r g m a x}} p (\mathbf {y} \mid \mathbf {x}). \tag {2}
+$$
+
+our work focuses on sequence-to-sequence transduction: predicting an output sequence given an input sequence. one such task is machine translation, wherein a source-language sentence is mapped ("transduced") to a target-language sentence. while our exposition focuses on sequence-to-sequence prediction, our algorithms are directly applicable to any sequential structured prediction model, such as transition-based parsers (nivre et al., 2008) and sequence taggers (mccallum et al., 2000; lafferty et al., 2001).
+
+notation. let  $\mathbf{x} = \langle x_1, \ldots, x_{n_{\mathbf{x}}} \rangle$  be an input sequence of length  $n_{\mathbf{x}}$  and, likewise, let  $\mathbf{y} = \langle y_1, \ldots, y_{n_{\mathbf{y}}} \rangle$  be an output sequence of length  $n_{\mathbf{y}}$ . each  $y_t$  is an element of  $\mathcal{v}$ , the set of output tokens. finally, let  $\mathcal{v}(\mathbf{x})$  be the set of all valid output sequences (i.e., complete hypotheses). for the task of language generation, which we focus on experimentally, this set is defined as
+
+$$
+\mathcal {y} (\mathbf {x}) \stackrel {\text {d e f}} {=} \left\{\mathrm {b o s} \circ \mathbf {v} \circ \mathrm {e o s} \mid \mathbf {v} \in \mathcal {v} ^ {<   n _ {\max }} \right\} \tag {3}
+$$
+
+where  $\circ$  is string concatenation and  $\mathcal{v}^{<n_{max}(\mathbf{x})}$  is the set of all subsets of  $\mathcal{v}^{\star}$  of size  $< n_{max}(\mathbf{x})$ . in words, every valid sequence begins and ends with
+
+distinguished tokens (bos and eos, respectively). furthermore, each sequence has at most length  $n_{max}(\mathbf{x})$  which is typically dependent on  $\mathbf{x}$  a restriction we impose to ensure termination. some applications may require a stronger coupling between  $\mathcal{v}(\mathbf{x})$  and  $\mathbf{x}$  (e.g.,  $|\mathbf{x}| = |\mathbf{y}|$ ). we drop the dependence of  $\mathcal{v}$  and  $n_{max}$  on  $\mathbf{x}$  when it is clear from context.
+
+scoring. we consider a general additively decomposable scoring model of the form
+
+$$
+\operatorname {s c o r e} (\mathbf {x}, \mathbf {y}) = \sum_ {t = 1} ^ {n _ {\mathbf {y}}} \operatorname {s c o r e} (\mathbf {x}, \mathbf {y} _ {<   t} \circ y _ {t}) \tag {4}
+$$
+
+this framework covers a variety of modeling methodologies including probabilistic transducers (both globally and locally normalized) and nonprobabilistic models such as maximum-margin techniques (taskar et al., 2004). most importantly, (4) covers map decoding (2) of neural sequence-to-sequence models à la sutskever et al. (2014):<sup>2</sup>
+
+$$
+\operatorname {s c o r e} _ {s 2 s} (\mathbf {x}, \mathbf {y} _ {<   t} \circ y _ {t}) = \log p (y _ {t} \mid \mathbf {y} _ {<   t}, \mathbf {x}) \tag {5}
+$$
+
+we note that (5) is the scoring function used for decoding many language generation models.
+
+beam search. the worst-case running time of exactly computing (1) is exponential in  $n_{max}$ ; namely,  $\mathcal{o}(|\mathcal{v}|^{n_{max}})$ .<sup>3</sup> beam search is a commonly used approximation to (1) in nmt and language generation tasks. it is used in many (if not most) state-of-the-art nlp systems (wu et al., 2016; serban et al., 2017; edunov et al., 2018; yang et al., 2019). beam search may be understood as a pruned version of the classic path-search algorithm, breadth-first search (bfs), where the breadth is narrowed to the beam size  $k$ . pseudocode is given in alg. 1.
+
+although, beam search does not solve (1) exactly, it is a surprisingly useful approximation for nlp models. in many settings, beam search outperforms exact methods in terms of downstream evaluation (koehn and knowles, 2017; stahlberg and
+
+algorithm 1 standard beam search  
+input: x: source sentence  
+k: maximum beam size  
+ $n_{max}$ : maximum hypothesis length  
+score( $\cdot$ ,  $\cdot$ ): scoring function  
+1:  $b_0 \gets \{\langle 0, \mathrm{bos} \rangle\}$   
+2: for  $t \in \{1, \dots, n_{max}\}$ :  
+3:  $b \gets \emptyset$   
+4: for  $\langle s, \mathbf{y} \rangle \in b_{t-1}$ :  
+5: if  $\mathbf{y}.\mathrm{last}(.) = \mathrm{eos}$ :  
+6:  $b.\mathrm{add}(\langle s, \mathbf{y} \rangle)$   
+7: continue  
+8: for  $y \in \mathcal{v}$ :  
+9:  $s \gets \mathrm{score}(\mathbf{x}, \mathbf{y} \circ y)$   
+10:  $b.\mathrm{add}(\langle s, \mathbf{y} \circ y \rangle)$   
+11:  $b_t \gets b.\mathrm{top}(k)$   
+12: return  $b_{n_{max}}$ .max()
+
+byrne, 2019). for the remainder of this paper, we will pivot our attention away from exact solutions to (1) to exact solutions to the beam search output.
+
+definition 2.1.  $k$ -optimal hypothesis. we say that a hypothesis is  $k$ -optimal if it is the top hypothesis returned by beam search with beam size  $k$ .
+
+# 3 a* beam search
+
+we develop a meta-algorithm that is parameterized by several choice points. our general search algorithm for decoding (alg. 2) takes an arbitrary prioritization function, stopping criterion, and search heuristic. with certain values of these attributes, we recover many common search algorithms: greedy search, beam search, best-first search (dijkstra, 1959), and  $\mathbf{a}^*$  search (hart et al., 1968). we propose an alternate prioritization function for beam search that allows for faster decoding while still returning the same  $k$ -optimal set of hypotheses.
+
+algorithm 2 general decoding scheme.4,5 highlighted sections are choice points in the algorithm for which values determine the search strategy. see § 3.1 for detailed explanation.
+
+input: x: source sentence  $n_{max}$  : maximum hypothesis length score  $(\cdot ,\cdot)$  : scoring function  $\vartriangleright$  comparator 1 stop(): stopping criterion 2 k: maximum beam size 3 h  $(\cdot ,\cdot)$  : heuristic function 4   
+1:  $\mathcal{q}\gets$  priority_queue()   
+2: q.push(0,bos)   
+3: pops  $\leftarrow$  counter()   
+4: while not stop(q) and not q.empty():   
+5:  $\langle s_h,\mathbf{y}\rangle \leftarrow \mathcal{q}.\mathrm{pop()}$    
+6: if pops[|y]  $\geqslant$  k or |y|> nmax:   
+7: continue   
+8: pops[|y]  $\leftarrow$  pops[|y] + 1   
+9: if y.last() = eos :   
+10: q.push(  $\langle sh,\mathbf{y}\circ \mathrm{eos}\rangle$    
+11: else:   
+12: for  $y\in \mathcal{v}$  ..   
+13:  $s\gets$  score(x,y o y)   
+14:  $s_h\gets s + h(\mathbf{x},\mathbf{y}\circ y)$    
+15: q.push(  $\langle sh,\mathbf{y}\circ y\rangle$    
+16: return q.pop() if not q.empty() else null
+
+# 3.1 choice points of alg. 2
+
+here we review the components of our meta algorithm (the highlighted sections in alg. 2) that can be varied to recover different search strategies:
+
+①  $\ominus : \mathbf{y} \times \mathbf{y} \rightarrow \{\text{true}, \text{false}\}$ . a priority queue  $q$  maintains the set of active hypotheses. elements in this set are ordered according to a generic comparator  $\ominus$ . when its peek() (or pop()) methods are called, the first element ordered by  $\ominus$  is returned (or returned and removed).  
+$②$  stop(·) : collection(y) → {true, false}. the algorithm terminates according to configurable stopping criterion based on the current set of elements in  $q$ .  
+$③$ $k\in \mathbb{n}_{>0}$  .only  $k$  paths of a given length are considered. if the algorithm has already encountered  $k$  paths of a given length, subsequent paths of that length are not
+
+evaluated. if we take  $k = \infty$ , we recover unpruned search algorithms.
+
+$④$ $h(\cdot ,\cdot):\mathbf{x}\times \mathbf{y}\to \mathbb{r}.$  a heuristic function  $h(\mathbf{x},\mathbf{y})$  can be used during search to change the priority in which paths are evaluated. we note that with pruning, a heuristic may change the value of the  $k$  -optimal hypothesis (see  $\s 4.1)$
+
+recovering beam search. to recover beam search from alg. 2, we use the choice points from tab. 1. explicitly, the comparator prioritizes hypotheses from earlier time steps first, but breaks ties with the hypotheses' scores under the model. we note that while the standard algorithm for beam search does not prioritize by score within a time step, variations of the algorithm use this strategy so they can employ early-stopping strategies (klein et al., 2017; huang et al., 2017). beam search terminates once either all hypotheses end in eos or the queue is empty (i.e., when the  $k$  beams have been extended  $n_{\text{max}}$  time steps but none end in eos). in the second case, no complete hypothesis is found. finally, choosing the heuristic  $h(\mathbf{x}, \mathbf{y}) = 0$  makes the algorithm a case of standard best-first search.
+
+note that, while standard beam search returns a set, alg. 2 only returns the  $k$ -optimal hypothesis. this behavior is sufficient for the majority of use cases for beam search. however, if the full set of  $k$  hypotheses is desired, the stopping criterion can be changed to evaluate true only when  $k$  hypotheses are complete. under the other beam search settings, this would provably return the same set as beam search (see  $\s 4.1$ ).
+
+recovering  $\mathbf{a}^*$ . to recover the traditional  $\mathbf{a}^*$  search algorithm, we use the comparator that prioritizes hypotheses with a higher score first; ties are broken by hypothesis length. the algorithm terminates when the first item of  $\mathcal{q}$  contains an eos. if we take  $k = \infty$ , best-first beam search recovers  $\mathbf{a}^*$ . any admissible heuristic may be used for  $h(\mathbf{x},\mathbf{y})$ .
+
+definition 3.1. admissible heuristic. a heuristic  $h$  is admissible if it never overestimates the future cost—or underestimates the future reward—of continuing down a path.
+
+# 3.2 best-first beam search
+
+in its original form,  $\mathbf{a}^*$  search may traverse the entire  $\mathcal{o}(|\mathcal{v}|^{n_{max}})$  graph, which as discussed earlier, is intractable for many decoding problems.
+
+while standard beam search addresses this problem by limiting the search space, it still has computational inefficiencies—namely, we must analyze  $k$  hypotheses of a given length (i.e., time step), regardless of how poor their scores may already be, before considering longer hypotheses. however, prioritization by length is not strictly necessary for finding a  $k$ -optimal hypothesis. as is done in  $\mathbf{a}^*$ , we can use score as the prioritization scheme and still guarantee optimality—or  $k$ -optimality-of the paths returned by the algorithm.
+
+we define  $\mathbf{a}^*$  beam search as the  $\mathbf{a}^*$  algorithm where breadth is limited to size  $k$ . further, we define best-first beam search as the case of  $\mathbf{a}^*$  beam search when no heuristic is used (see tab. 1 for algorithm settings). this formulation has two large advantages over standard beam search: (1) we gain the ability to remove paths from the queue that are guaranteed to fall off the beam and (2) we can terminate the algorithm the first time a complete hypothesis is encountered. we can therefore reduce the computation required for decoding while still returning the same set of results.
+
+the mathematical property that makes this short-circuiting of computation possible is the monotonicity of the scoring function. note that not all scoring functions are monotonic, but many important ones are, including log-probability (5). we discuss effective approximations for popular non-monotonic scoring functions in § 5.
+
+definition 3.2. monotonicity. a scoring function score  $(\cdot, \cdot)$  is monotonic in  $t$  if for all  $\mathbf{x}$ ,  $\mathbf{y}_{< t} = \langle y_1 \ldots y_{t-1} \rangle$ ,  $y_t \in \mathcal{v}$ ,  $1 \leqslant t \leqslant n_{\max}$
+
+$$
+\operatorname {s c o r e} (\mathbf {x}, \mathbf {y} _ {<   t}) \geqslant \operatorname {s c o r e} (\mathbf {x}, \mathbf {y} _ {<   t} \circ y _ {t})
+$$
+
+clearly, (5) is a monotonic scoring function in  $t$  because  $\mathrm{score}_{s2s} \leqslant 0$ , that is, the score of a partial hypothesis  $\mathbf{y}_{<t}$  can only decrease if we extend it by another symbol  $y_{t}$ . this implies we can order our search according to  $\mathrm{score}(\mathbf{x}, \mathbf{y}_{<t})$  without fear of overlooking a hypothesis whose score would increase over time. furthermore, once  $k$  hypotheses of a given length  $t$  have been evaluated, we no longer need to consider any hypothesis where  $|\mathbf{y}| < t$  since such hypotheses would necessarily fall off the beam. we can therefore remove such hypotheses from the queue and avoid wasting computational power on their evaluation. we prove this formally in § 4.1.
+
+another implication of the monotonicity property of score is that we may terminate best-first
+
+<table><tr><td></td><td>beam search</td><td>best-first beam search</td><td>a* beam search</td></tr><tr><td>①</td><td>(sh,y) ⊕ (sh&#x27;, y&#x27;) ⇌ |y| &lt; |y&#x27;| or (|y| = |y&#x27;| and sh ≥ sh&#x27;)</td><td>(sh,y) ⊕ (sh&#x27;, y&#x27;) ⇌ sh &gt; sh&#x27; or (sh = sh&#x27; and |y| &lt; |y&#x27;|)</td><td>(sh,y) ⊕ (sh&#x27;, y&#x27;) ⇌ sh &gt; sh&#x27; or (sh = sh&#x27; and |y| &lt; |y&#x27;|)</td></tr><tr><td>②</td><td>stop(q) ⇌ y.last() = eos ∨ ∀y ∈ q</td><td>stop(q) ⇌ qpeek().last() = eos</td><td>stop(q) ⇌ qpeek().last() = eos</td></tr><tr><td>③</td><td>k = beam size</td><td>k = beam size</td><td>k = beam size</td></tr><tr><td>④</td><td>0</td><td>0</td><td>any admissible heuristic</td></tr><tr><td></td><td>breadth-first search</td><td>best-first search</td><td>a* search</td></tr><tr><td>①</td><td>(sh,y) ⊕ (sh&#x27;, y&#x27;) ⇌ |y| &lt; |y&#x27;| or (|y| = |y&#x27;| and sh ≥ sh&#x27;)</td><td>(sh,y) ⊕ (sh&#x27;, y&#x27;) ⇌ sh &gt; sh&#x27; or (sh = sh&#x27; and |y| &lt; |y&#x27;|)</td><td>(sh,y) ⊕ (sh&#x27;, y&#x27;) ⇌ sh &gt; sh&#x27; or (sh = sh&#x27; and |y| &lt; |y&#x27;|)</td></tr><tr><td>(2)</td><td>stop(q) ⇌ y.last() = eos ∨ ∀y ∈ q</td><td>stop(q) ⇌ qpeek().last() = eos</td><td>stop(q) ⇌ qpeek().last() = eos</td></tr><tr><td>③</td><td>k = ∞</td><td>k = ∞</td><td>k = ∞</td></tr><tr><td>④</td><td>0</td><td>0</td><td>any admissible heuristic</td></tr></table>
+
+table 1: values at choice points for various search algorithms. note that any admissible heuristic may be used for variants of a* search.
+
+beam search once a hypothesis containing eos is encountered (i.e., the end state is found). if the full set of  $k$  complete hypotheses is desired, then we simply continue until  $k$  hypotheses have reached eos. we prove the  $k$ -optimality of these hypotheses under best-first beam search in § 4.1.
+
+# 3.3 implementation details
+
+standard beam search forms a separate set of active hypotheses for each time step, i.e., each  $b_{t}$  is its own set. once  $b_{t}$  has been narrowed down to the top  $k$ , the previous  $b_{< t}$  can be forgotten. however in best-first beam search, since hypotheses are not evaluated in order of time step, we may need to keep  $b_{t}$  from several time steps at any given point.
+
+a naive implementation of best-first beam search is to keep a single priority queue with all the active hypotheses ordered by current score. however, each push to the queue would then require  $\mathcal{o}(\log (n_{\max}k|\mathcal{v}|))$  time. we can reduce this runtime by instead keeping a priority queue of beams, where the priority queue is ordered by the highest-scoring hypothesis from each beam. further, each beam can be represented by a min-max queue (atkinson et al., 1986); this allows us to limit the size of  $b_{t}$  to  $k$ : we can check in  $\mathcal{o}(1)$  time if a hypothesis is in the top- $k$  before adding it to  $b_{t}$ .
+
+a potential inefficiency, which we avoid, comes from updating  $b_{t + 1}$ , which we must do when evaluating a hypothesis from  $b_{t}$ . since all beams are stored in a queue, there is no guarantee of the location in the queue of  $b_{t + 1}$ . to avoid  $\mathcal{o}(n_{max})$  lookup, we can keep a pointer to each beam, indexed by  $t$  making the lookup  $\mathcal{o}(1)$ . however, we
+
+acquire a  $\mathcal{o}(\log n_{max})$  term to update the queue of beams as  $b_{t + 1}$  may change priority.
+
+memory-reduced best-first beam search. a major drawback of the  $\mathbf{a}^*$  algorithm is its memory usage, which in the worst-case is  $\mathcal{o}(b^{d})$  for breadth width  $b$  and maximum depth  $d$ . in the  $\mathbf{a}^*$  formulation of beam search, where the breadth width is limited to the beam size, this amounts to worst-case  $\mathcal{o}(k \cdot n_{max})$  memory usage, where standard beam search has  $\mathcal{o}(k)$  memory usage. while in many settings the multiplicative factor may be insignificant, for neural sequence models it can be prohibitive; this is due to the large amount of memory required to store each hypothesis (e.g., prior hidden states needed to compute subsequent scores for scoring functions parameterized by neural networks).
+
+we propose a variant of best-first beam search that limits memory usage, i.e., the queue capacity. specifically, if we reach the chosen queue capacity, we remove the worst scoring active hypothesis from the earliest active time step. this can easily be done in  $\mathcal{o}(1)$  time given our pointer to each beam.
+
+# 4 algorithm analysis
+
+# 4.1 correctness
+
+we show the equivalence of the top hypothesis $^6$  returned by beam search and best-first beam search when  $\mathrm{score}(\cdot, \cdot)$  is monotonically decreasing in  $t$ , length-based prioritization is used and the beam
+
+size  $k$  is the same for both algorithms. without loss of generality, we hold  $\mathbf{x}$  constant in all the following proofs.
+
+note that we take the terms pop and push from queue terminology. specifically, "popping a hypothesis" refers to making it past line 7 of alg. 2, where a hypothesis  $\mathbf{y}$  is expanded by  $y_{t} \in \mathcal{v}$ . in path search terminology, this would be equivalent to visiting a node and adding the edges from that node as potential paths to explore. lastly, we refer to the priority queue used by beam search and best-first beam search as  $q_{\mathrm{bs}}$  and  $q_{\mathrm{a}}*$ , respectively.
+
+lemma 4.1. best-first beam search evaluates all hypotheses of a given length  $t$  in order of their score.
+
+proof. we prove the lemma by induction. the lemma holds trivially for the base case of hypotheses of length 0 because the only hypothesis of length 0 is  $\langle \mathrm{bos} \rangle$ .
+
+now, by the inductive hypothesis, suppose lemma 4.1 holds for all hypotheses of length  $< t$ . we will show it must also hold for hypotheses of length  $t$ . consider two competing hypotheses:  $\mathbf{y} = \mathbf{y}_{< t} \circ y_t$  and  $\mathbf{y}' = \mathbf{y}_{< t}' \circ y_t'$ . note that  $|\mathbf{y}_{< t}| = |\mathbf{y}_{< t}'| = t - 1$ . suppose  $\mathrm{score}(\mathbf{x}, \mathbf{y}') < \mathrm{score}(\mathbf{x}, \mathbf{y})$ .
+
+case 1:  $\mathrm{score}(\mathbf{x},\mathbf{y}_{< t}^{\prime}) < \mathrm{score}(\mathbf{x},\mathbf{y}_{< t})$ . then by induction,  $\mathbf{y}_{< t}$  popped first and  $\mathbf{y}$  is pushed to  $\mathcal{q}$  before  $\mathbf{y}^{\prime}$ . since  $\mathrm{score}(\mathbf{x},\mathbf{y}^{\prime}) < \mathrm{score}(\mathbf{x},\mathbf{y})$ ,  $\mathbf{y}$  will be popped before  $\mathbf{y}^{\prime}$ .
+
+case 2:  $\mathrm{score}(\mathbf{x},\mathbf{y}_{< t}) < \mathrm{score}(\mathbf{x},\mathbf{y}_{< t}')$ . then by induction,  $\mathbf{y}_{< t}'$  is popped first and  $\mathbf{y}'$  is added to  $\mathcal{q}$  before  $\mathbf{y}$ . but, since  $\mathrm{score}(\mathbf{x},\mathbf{y}') < \mathrm{score}(\mathbf{x},\mathbf{y}) \leqslant \mathrm{score}(\mathbf{x},\mathbf{y}_{< t})$  by monotonicity, then  $\mathbf{y}_{< t}$  will be popped before  $\mathbf{y}'$ . consequently,  $\mathbf{y}$  will be pushed to  $\mathcal{q}$  before  $\mathbf{y}'$  is evaluated. by the rules of the priority queue  $\mathbf{y}$  will be evaluated before  $\mathbf{y}'$ .
+
+case 3:  $\mathrm{score}(\mathbf{x},\mathbf{y}^{\prime}) = \mathrm{score}(\mathbf{x},\mathbf{y})$  . the lemma holds if either  $\mathbf{y}$  or  $\mathbf{y}'$  is popped first.
+
+by the principle of induction, lemma 4.1 holds for all  $t\in \mathbb{n}_{>0}$
+
+lemma 4.2. the first hypothesis that best-first beam search pops that ends in eos is  $k$ -optimal.
+
+proof. let  $\mathbf{y}$  be the first hypothesis popped by best-first beam search ending in eos. by rules of the priority queue, no other active hypothesis has a higher score than  $\mathbf{y}$ . additionally, by monotonicity of the scoring function, no other hypothesis can
+
+subsequently have score greater than  $\mathbf{y}$  . therefore  $\mathbf{y}$  must be k-optimal.
+
+lemma 4.3. if best-first beam search pops a hypothesis, then beam search necessarily pops that same hypothesis.
+
+proof. we prove the lemma by induction on hypothesis length. the base case holds trivially: for hypotheses of length 0, both best-first beam search and beam search must pop the  $\langle \mathrm{bos} \rangle$  as it is the only item in the queue after initialization.
+
+by the inductive hypothesis, suppose lemma 4.3 holds for hypotheses of length  $< t$ . suppose best-first beam search pops a hypothesis  $\mathbf{y} = \mathbf{y}_{< t} \circ y_t$  of length  $t$ .
+
+case 1: best-first beam search pops  $k$  hypotheses of length  $t - 1$  before popping  $\mathbf{y}$ , which is of length  $t$ . the sets of hypotheses of length  $t - 1$  that each algorithm pops are necessarily the same by the inductive hypothesis and the fact that they have the same cardinality. if best-first beam search pops  $\mathbf{y}$ , which is of length  $t$ , then it must be in the top-  $k$  highest-scoring hypotheses of length  $t$  in  $\mathcal{q}_{\mathrm{a}}^*$  by the rules of the priority queue. consequently, it must be in the top-  $k$  in  $\mathcal{q}_{\mathrm{bs}}$ .
+
+case 2: best-first beam search has popped fewer than  $k$  hypotheses of length  $t - 1$  before popping  $\mathbf{y}$ . then, all remaining hypotheses of length  $t - 1$  in  $\mathcal{q}_{\mathrm{a}}*$  must have score  $(\mathbf{x},\mathbf{y}_{< t}^{\prime}) < \mathrm{score}(\mathbf{x},\mathbf{y})$  by the rules of the priority queue. by the monotonicity of the score function, all extensions of those  $\mathbf{y}_{< t}^{\prime}$  will also have score  $(\mathbf{x},\mathbf{y}_{< t}^{\prime}\circ y_{t}^{\prime}) < \mathrm{score}(\mathbf{x},\mathbf{y})$ . because none of  $\mathbf{y}_{< t}^{\prime}\circ y_{t}^{\prime}$  has greater score than  $\mathbf{y}$ ,  $\mathbf{y}$  must be in  $b_{t}$ .
+
+corollary 4.3.1. best-first beam search will never pop more hypotheses than beam search.
+
+theorem 4.4. once best-first beam search has popped  $k$  hypotheses of length  $t$ , hypotheses from time steps  $< t$  do not need to be popped.
+
+proof. this follows from lemma 4.1. if  $k$  hypotheses of length  $t$  have been popped, then these must be the top-  $k$  hypotheses from time step  $t$ . therefore no hypothesis from time step  $< t$  that is still in  $\mathcal{q}_{\mathrm{a}}*$  would be in the top-  $k$  at time step  $t$ .
+
+theorem 4.5. let  $\mathcal{h}_{\mathrm{bs}}$  and  $\mathcal{h}_{\mathrm{a}}$  be the set of  $k$  hypotheses returned by beam search and best-first beam search, respectively.  $\mathcal{h}_{\mathrm{bs}} = \mathcal{h}_{\mathrm{a}}$ .
+
+proof. since  $|\mathcal{h}_{\mathrm{bs}}| = |\mathcal{h}_{\mathrm{a}}| = k$ , we only need to show  $\mathbf{y} \in \mathcal{h}_{\mathrm{bs}} \longrightarrow \mathbf{y} \in \mathcal{h}_{\mathrm{a}}$ .
+
+suppose, by way of contradiction, there exists a hypothesis  $\mathbf{y} \in \mathcal{h}_{\mathrm{bs}}$  such that  $\mathbf{y} \notin \mathcal{h}_{\mathrm{a}}$ . if  $\mathbf{y} \notin \mathcal{h}_{\mathrm{a}}$  then we must not pop the prefix  $\mathbf{y}_{<t}$  (where  $\mathbf{y} = \mathbf{y}_{<t} \circ \mathbf{y}_{t:|\mathbf{y}|}$ ) for some time step  $t < |\mathbf{y}|$ .
+
+case 1: at some time step  $t + j$  ( $j \geqslant 0$ ), we pop  $k$  partial hypotheses  $\{\mathbf{y}_{\leqslant t + j}^{(1)}, \ldots, \mathbf{y}_{\leqslant t + j}^{(k)}\}$  where  $\mathbf{y}_{\leqslant t + j} \notin \{\mathbf{y}_{\leqslant t + j}^{(1)}, \ldots, \mathbf{y}_{\leqslant t + j}^{(k)}\}$ . by lemma 4.1, it must be that  $\text{score}(\mathbf{x}, \mathbf{y}_{\leqslant t + j}^{(i)}) > \text{score}(\mathbf{x}, \mathbf{y}_{\leqslant t + j}) \forall i \in \mathbb{1}, \ldots, k$ . this implies that for beam search,  $\mathbf{y}_{\leqslant t + j}$  would not be in the top- $k$  paths at time step  $t + j$  since by lemma 4.3, paths  $\{\mathbf{y}_{\leqslant t + j}^{(1)}, \ldots, \mathbf{y}_{\leqslant t + j}^{(k)}\}$  would also be evaluated by beam search. therefore  $\mathbf{y}$  cannot be in  $\mathcal{h}_{\mathrm{bs}}$ , which is a contradiction.
+
+case 2: for no time step  $t + j$  ( $j \geqslant 0$ ) do we pop  $k$  paths. this can only happen if the algorithm stops early, i.e. we have found  $k$  complete hypotheses  $\mathbf{y}^{(1)}, \ldots, \mathbf{y}^{(k)}$ . if this is the case, then by rules of the priority queue, each  $\mathbf{y}^{(1)}, \ldots, \mathbf{y}^{(k)}$  must have score greater than  $\mathrm{score}(\mathbf{x}, \mathbf{y}_{<t})$ . by monotonicity of the score function,  $\mathrm{score}(\mathbf{x}, \mathbf{y}^{(i)}) > \mathrm{score}(\mathbf{x}, \mathbf{y})$ . this implies  $\mathbf{y}$  cannot be in  $\mathcal{h}_{\mathrm{bs}}$ , which is a contradiction.
+
+non-monotonic scoring functions. non-monotonic scoring functions (definition 3.2) break the assumptions of § 4.1, in which case best-first beam search is not guaranteed to return a  $k$ -optimal hypothesis. however, when the scoring function is boundable from above, we can alter the original stopping criterion (② in alg. 2) such that  $k$ -optimality is again guaranteed.
+
+given our assumed restriction on the search space—namely,  $|\mathbf{y}^{\star}\in \mathcal{y}(\mathbf{x})|\leqslant n_{max}(\mathbf{x})$ —we can upper-bound the maximal score of any hypothesis under the scoring function in use. formally, for any function score we have:
+
+$$
+\begin{array}{l} \operatorname {s t o p} (\mathcal {q}) \iff \\ \operatorname {s c o r e} (\mathbf {x}, \hat {\mathbf {y}}) \geqslant \operatorname {s c o r e} (\mathbf {x}, \mathbf {y} ^ {\prime}) + \mathcal {u} (\mathbf {x}, \mathbf {y} ^ {\prime}) \\ \forall \mathbf {y} ^ {\prime} \in \mathcal {q} \tag {6} \\ \end{array}
+$$
+
+where  $\hat{\mathbf{y}}$  is the best complete hypothesis found so far and  $\mathcal{u}(\mathbf{x},\mathbf{y}^{\prime})$  is the score function-dependent upper bound on how much the score of  $\mathbf{y}^{\prime}$  can increase as  $\mathbf{y}^{\prime}$  is expanded further. in this situation, best-first beam search only terminates once no other hypothesis in  $\mathcal{q}$  can have a score greater than the best finished hypothesis. we note that huang et al. (2017) use a similar scheme for optimal
+
+stopping with bounded length normalization. we discuss examples of non-monotonic scoring functions in  $\s 5$ .
+
+a note on heuristics. our analysis shows the equivalence of beam search and best-first beam search, i.e., when  $h(\mathbf{x}, \mathbf{y}) = 0$ . the analysis does not hold for arbitrary admissible heuristics. a poor heuristic, e.g., one that grossly overestimates the future score of continuing down one path, may cause other items to be pruned from best-first beam search that otherwise would have remained on the beam in standard beam search.
+
+# 4.2 runtime
+
+theorem 4.6. the runtime of best-first beam search is  $\mathcal{o}(n_{\max}k(|\mathcal{v}| \log(k) + \log(n_{\max})))$
+
+proof. we pop at most  $n_{\text{max}} \cdot k$  items. each pop requires us to push  $|\mathcal{v}|$  items. each push requires  $\log(k)$  time when the priority queue is implemented with a min-max heap (atkinson et al., 1986) and incrementally pruned so that it has no more than  $k$  items. after pushing those  $|\mathcal{v}|$  items, we have to perform a percolation in the priority queue of priority queues which requers  $\log(n_{\text{max}})$  time. this yields  $\mathcal{o}(n_{\text{max}}k(|\mathcal{v}| \log(k) + \log(n_{\text{max}})))$  time.
+
+theorem 4.7. the runtime of standard beam search is  $\mathcal{o}(n_{\max}k|\mathcal{v}|\log (k))$
+
+proof. the proof is the same as theorem 4.6, but we can forgo the percolation step in the queue of queues because standard beam search proceeds in order of hypothesis length. this yields  $\mathcal{o}(n_{\max}k|\mathcal{v}|\log (k))$
+
+while the theoretical bound of best-first beam search has an additional log factor compared to standard beam search, we find this to be negligible in practice. rather, we find number of calls to score, the scoring function under our model (e.g., a neural network), is often the bottleneck operation when decoding neural networks (see § 6 for empirical evidence). in terms of this metric, the beam search algorithm makes  $\mathcal{o}(kn_{max})$  calls to score, as score is called once for each active hypothesis in  $b$  and  $b$  may evolve for  $n_{max}$  rounds. the worst-case number of calls to score will be the same as for beam search, which follows from lemma 4.3.
+
+# 5 scoring functions
+
+even before the findings of stahlberg and byrne (2019), it was well known that the best-scoring hypothesis with respect to the traditional likelihood objective can be far from ideal in practice (wu et al., 2016; murray and chiang, 2018; yang et al., 2018). for language generation tasks specifically, the results returned by neural models using the standard scoring function are often short and default to high-frequency words (vinyals and le, 2015; shen et al., 2016).
+
+to alleviate such problems, methods that revise hypothesis scores to incorporate preferences for longer, less repetitive, or more diverse options have been introduced and are often used in practice. while most such techniques change the scoring function such that it is no longer monotonic, we can still guarantee the  $k$ -optimality of the returned hypothesis for (upper) bounded scoring functions using the methods discussed in  $\s 4.1$ . in the remainder of this section, we present alternate scoring schemes adapted to work with best-first beam search. additionally, we present several heuristics which, while breaking the  $k$ -optimality guarantee, provide another set of decoding strategies worth exploring.
+
+length normalization. length normalization is a widely-used hypothesis scoring method that aims to counteract the propensity for shorter sequences to have higher scores under neural models; this is done by normalizing scores by hypothesis length (see murray and chiang (2018) for more detail).
+
+for early stopping in beam search with length normalization, huang et al. (2017) propose bounding the additive length reward as the minimum of a pre-determined optimal sequence length ratio  $r$  and the final sequence length  $n_{\mathbf{y}}$ :
+
+$$
+\begin{array}{l} \operatorname {s c o r e} _ {\mathrm {l n}} (\mathbf {x}, \mathbf {y}) = \operatorname {s c o r e} (\mathbf {x}, \mathbf {y}) \tag {7} \\ + \beta \cdot \min  \left\{r | \mathbf {x} |, n _ {\mathbf {y}} \right\} \\ \end{array}
+$$
+
+where  $\beta$  is the scaling parameter for the reward. we note, however, that the same can be done with the maximum sequence length  $n_{max}$  such that the traditional length reward used by he et al. (2016) is recovered:
+
+$$
+\begin{array}{l} \operatorname {s c o r e} _ {\mathrm {l n}} (\mathbf {x}, \mathbf {y}) = \operatorname {s c o r e} (\mathbf {x}, \mathbf {y}) + \beta \min  \left\{n _ {\max }, n _ {\mathbf {y}} \right\} \\ = \operatorname {s c o r e} (\mathbf {x}, \mathbf {y}) + \beta n _ {\mathbf {y}} \tag {8} \\ \end{array}
+$$
+
+we formally propose two methods for length normalization. we use the scoring functions in (7)
+
+or (8) with either: (1) the following heuristic:
+
+$$
+h (\mathbf {x}, \mathbf {y}) = \left\{ \begin{array}{l l} 0 & \text {f o r y . l a s t () = e o s} \\ \beta \max  \left\{b - | \mathbf {y} |, 0 \right\} & \text {f o r y . l a s t () \neq e o s} \end{array} \right. \tag {9}
+$$
+
+where  $b$  can be  $r|\mathbf{x}|$  or  $n_{max};^8$  or (2) stopping criterion as in (6) albeit with scoring function  $\mathrm{score}_{\mathrm{ln}}$  and upper-bound function:
+
+$$
+\mathcal {u} (\mathbf {x}, \mathbf {y}) = \beta \max  \{0, b - | \mathbf {y} | \} \tag {10}
+$$
+
+despite their similarities, these two methods are not guaranteed to return the same results. while the second method will return the same  $k$ -optimal hypotheses as beam search, using a heuristic during pruned search means we can no longer guarantee the  $k$ -optimality of the results with respect to the scoring function as the heuristic may push hypotheses off of the beam. we present experimental results for both methods in § 6.
+
+mutual information. maximum mutual information decoding (li et al., 2016) aims to alleviate the inherent preference of neural models for high-frequency tokens when using the log-probability decoding objective. rather than choosing the hypothesis  $\mathbf{y}$  to maximize conditional probability with respect to the input  $\mathbf{x}$ , we instead choose  $\mathbf{y}$  to maximize pointwise mutual information (pmi):
+
+$$
+\operatorname {p m i} (\mathbf {x}; \mathbf {y}) = \log \frac {p (\mathbf {x} , \mathbf {y})}{p (\mathbf {x}) p (\mathbf {y})} \tag {11}
+$$
+
+note that (11) is equivalent to  $\log \frac{p(\mathbf{y}|\mathbf{x})}{p(\mathbf{y})}$ , which can be rewritten as  $\log p(\mathbf{y}|\mathbf{x}) - \log p(\mathbf{y})$  making the objective additive and thus (11) can conform to (4).
+
+from this last form, we can see how mutual information decoding penalizes high-frequency and generic outputs; the negative  $p(\mathbf{y})$  term, as li et al. (2016) point out, acts as an "anti-language model." one unfortunate side effect of this objective is that ungrammatical and nonsensical outputs, which have probabilities close to 0 under a language model like  $p(\mathbf{y})$ , end up with high scores due to the second term in the score function. to address this problem, and to upper-bound the scoring function, we propose lower-bounding the language model term by a hyperparameter  $1 \geqslant \varepsilon > 0$ . we additionally use the strength hyperparameter  $\lambda$  employed by li et al. (2016):
+
+$$
+\begin{array}{l} \operatorname {s c o r e} _ {\mathrm {p m i}} (\mathbf {x}, \mathbf {y}) = \log p (\mathbf {y} \mid \mathbf {x}) \\ - \lambda \log \max  \left\{p (\mathbf {y}), \varepsilon \right\} \tag {12} \\ \end{array}
+$$
+
+<table><tr><td rowspan="2"></td><td colspan="4">iwslt&#x27;14 de-en</td><td colspan="3">mttt fr-en</td><td colspan="3">cnn-dailymail</td></tr><tr><td>k=5(35.6)</td><td>k=10(35.4)</td><td>k=100(34.7)</td><td>k=500(7.9)</td><td>k=10(33.0)</td><td>k=100(9.9)</td><td>k=500(1.2)</td><td>k=5(31.5)</td><td>k=10(30.9)</td><td>k=100(29.1)</td></tr><tr><td>bf beam search</td><td>93 (24%)</td><td>169 (36%)</td><td>1275 (79%)</td><td>1168 (736%)</td><td>184 (16%)</td><td>867 (138%)</td><td>885 (836%)</td><td>200 (33%)</td><td>305 (43%)</td><td>2960 (92%)</td></tr><tr><td>beam search (es)</td><td>107 (7%)</td><td>210 (9%)</td><td>2047 (12%)</td><td>7685 (27%)</td><td>196 (9%)</td><td>1310 (58%)</td><td>4182 (98%)</td><td>224 (19%)</td><td>357 (22%)</td><td>3942 (59%)</td></tr><tr><td>beam search</td><td>115</td><td>229</td><td>2286</td><td>9770</td><td>214</td><td>2066</td><td>8281</td><td>266</td><td>435</td><td>5673</td></tr></table>
+
+table 2: average number of calls (rounded to nearest whole digit) to score, the sequence transduction model, per generated sequence when using different decoding algorithms. green percentages are performance improvements over standard beam search. beam search (es) refers to the opennmt early-stopping method (klein et al., 2017). all methods provably return the same solution and thus, evaluation metrics (in dark blue) for a given beam size are identical.
+
+similarly to our methods for length normalization, we can use the scoring function in (12) either with the heuristic:
+
+$$
+h (\mathbf {x}, \mathbf {y}) = \left\{ \begin{array}{l l} 0 & \text {f o r y . l a s t () = e o s} \\ - \lambda \log \varepsilon \left(n _ {\max } - | \mathbf {y} |\right) & \text {f o r y . l a s t () ≠ e o s} \end{array} \right. \tag {13}
+$$
+
+or with stopping criterion as in (6) albeit with  $\mathrm{score}_{\mathrm{pmi}}$  and upper-bound function:
+
+$$
+\mathcal {u} (\mathbf {x}, \mathbf {y}) = - \lambda \log \varepsilon \left(n _ {\text {m a x}} - | \mathbf {y} |\right) \tag {14}
+$$
+
+since  $-\lambda \log \varepsilon$  is the best possible score at any given time step, clearly we can bound the increase in  $\mathrm{score}_{\mathrm{pmi}}$  by the above function. however, as with our length normalization strategy, we lose the  $k$ -optimality guarantee with the heuristic method for mutual information decoding. we present experimental results for both methods in § 6.
+
+# 6 experiments
+
+we run our algorithm on several language-related tasks that typically use beam search for decoding: neural machine translation (nmt) and abstractive summarization (as). specifically, experiments are performed on iwslt'14 de-en (cettolo et al., 2012), wmt'17 de-en (bojar et al., 2017), mttt fr-en (duh, 2018), and cnn-dailymail (hermann et al., 2015) using both transformers (vaswani et al., 2017) and convolutional sequence-to-sequence models (gehring et al., 2017).
+
+for reproducibility, we use the data preprocessing scripts provided by faireq (ott et al., 2019) and follow their methods for training sequence transduction models. hyperparameter are set in accordance with previous works. specifically, on iwslt'14 and mttt tasks, we follow the recommended transformer settings for iwslt'14 in faireq, which are based on
+
+![](images/c0cd64e2b1992929e972a9bb347f7dc47b1b8276ee071ad094dae2482a613fd8.jpg)  
+figure 1: number of calls to scoring function score vs. total sequence generation time. each point is a decoded sequence. colors represent different model architectures and shapes signify the decoding algorithm used (beam sizes 3 and 10 are included for each). there is no notable difference in the overhead (time-wise) of best-first beam search and beam search.
+
+vaswani et al. (2017) and gehring et al. (2017). hyperparameters for models trained on the wmt task are set following version 3 of the tensor2tensor toolkit (vaswani et al., 2018). we use byte-pair encoding (bpe; sennrich et al. 2016) for all languages. vocabulary sizes for wmt and iwslt'14 are set from recommendations for the respective tasks in fairseq; for the mttt tasks, vocabulary sizes are tuned on models trained with standard label-smoothing regularization. similarly, the cnn/dailymail dataset is pre-processed and uses bpe following the same steps as (lewis et al., 2019); model hyperparameters are likewise copied. details are available on fairseq's website. $^{10}$
+
+we use bleu (papineni et al., 2002) (evaluated using sacrebleu (post, 2018)) for mt metrics and rouge-l (lin, 2004) for abstractive summarization metrics. we build our decoding framework in sgnmt.
+
+# 6.1 running time
+
+in tab. 2, we report values as the average number of calls to the scoring function per input; we do not use wall-clock time as this is heavily dependent on hardware. see fig. 1 for empirical justification of the correlation between calls to the scoring function and runtime on the hardware our experiments were run on. for reference, in our experiments, the scoring function took on average  $>99\%$  of the total computation time, even with larger beam sizes, when overhead of the search algorithm is most significant.
+
+we find that best-first (bf) beam search leads to significant speed-ups over both traditional beam search and beam search with early stopping, with a performance increase $^{12}$  of  $\approx 8x$  for a beam size of 500. we likewise find that best-first beam search offers speed-ups over early stopping methods that are not guaranteed to return the same results as standard beam search (see tab. 3).
+
+# 6.2 length normalization
+
+we experiment with both forms of length normalization presented in § 5 and provide results in tab. 4. we find that both methods, i.e., changing the stopping criterion and using a heuristic during search, provide improvements over baseline bleu scores albeit with different hyperparameter settings; increases are similar to improvements reported by murray and chiang (2018). notably, using a heuristic causes a large percentage of search errors with respect to standard beam search using the same scoring function. however, the difference in results appears to be beneficial in terms of bleu.
+
+# 6.3 mutual information
+
+we train a language model on the iwslt dataset and use it to calculate  $p(\mathbf{y})$  from (12) as marginalizing over  $\mathbf{y}$  is intractable (see li et al. (2016) for further justification). we run experiments using both of the methods discussed in § 5 and present results in tab. 5. we find that both methods provide results of equivalent bleu score compared with
+
+<table><tr><td colspan="5">iwslt&#x27;14 de-en</td></tr><tr><td>k</td><td>method</td><td>search error</td><td>bleu</td><td># calls</td></tr><tr><td rowspan="3">10</td><td>shrinking</td><td>0%</td><td>35.4</td><td>229 (0%)</td></tr><tr><td>early</td><td>0%</td><td>35.4</td><td>225 (2%)</td></tr><tr><td>bf bs</td><td>-</td><td>35.4</td><td>169 (36%)</td></tr><tr><td rowspan="3">100</td><td>shrinking</td><td>31.7%</td><td>13.2</td><td>2278 (0%)</td></tr><tr><td>early</td><td>31.7%</td><td>13.2</td><td>1738 (31%)</td></tr><tr><td>bf bs</td><td>-</td><td>34.7</td><td>1275 (79%)</td></tr><tr><td colspan="5">wmt&#x27;17 de-en</td></tr><tr><td rowspan="3">10</td><td>shrinking</td><td>0%</td><td>28.6</td><td>260 (0%)</td></tr><tr><td>early</td><td>0%</td><td>28.6</td><td>252 (3%)</td></tr><tr><td>bf bs</td><td>-</td><td>28.6</td><td>230 (12%)</td></tr><tr><td rowspan="3">100</td><td>shrinking</td><td>1.7%</td><td>26.4</td><td>2587 (0%)</td></tr><tr><td>early</td><td>1.7%</td><td>26.4</td><td>2402 (8%)</td></tr><tr><td>bf bs</td><td>-</td><td>26.9</td><td>2046 (26%)</td></tr></table>
+
+table 3: bleu, search error, and average number of calls to score for different stopping criterion. "shrinking" refers to the shrinking beam method of bahdanau et al. (2015) and "early" refers to the stopping criterion of huang et al. (2017). note that neither method is guaranteed to return the same result as standard beam search. search error and performance increases are with respect to standard beam search.
+
+the baseline output, i.e., results obtained with the unbounded pmi objective and beam search. again, despite the high search error rate demonstrated by the heuristic method, evaluation metrics are still comparable.
+
+# 6.4 memory usage
+
+we conduct a set of experiments where we limit total queue capacity to  $k \cdot \gamma$  for  $\gamma \in \{1, \dots, n_{\text{max}}\}$ , as described in § 3.3, and report the bleu score of the resulting set of hypotheses.
+
+as shown in tab. 6, we find that restricting the queue capacity does not harm output quality and additionally, leads to even greater runtime performance increase. for example, runtime for decoding of iwslt'14 with a beam size of 10 can be improved by  $>3x$  while returning results with better evaluation metrics. we find that improvements are even more pronounced for larger beam sizes. across beam widths and tasks, we find that search error (with respect to standard beam search) is quite low for  $\gamma = 5$ . additionally, for smaller  $\gamma$ , the change in bleu score demonstrates that search error in this context does not necessarily hurt the
+
+<table><tr><td colspan="7">iwslt&#x27;14 de-en</td></tr><tr><td></td><td>k</td><td>β</td><td>b</td><td># calls</td><td>search error</td><td>bleu</td></tr><tr><td rowspan="2">heuristic</td><td>5</td><td>0.8</td><td>|x|</td><td>115 (0%)</td><td>40.6%</td><td>33.9 +0.3</td></tr><tr><td>10</td><td>1.2</td><td>|x|</td><td>229 (0%)</td><td>54.7%</td><td>33.8 +0.5</td></tr><tr><td>stopping</td><td>5</td><td>0.5</td><td>\(n_{max}\)</td><td>73 (58%)</td><td>-</td><td>33.7 +0.1</td></tr><tr><td>criterion</td><td>10</td><td>0.5</td><td>\(n_{max}\)</td><td>130 (76%)</td><td>-</td><td>33.7 +0.4</td></tr><tr><td colspan="7">mttt fr-en</td></tr><tr><td rowspan="2">heuristic</td><td>5</td><td>0.8</td><td>.7|x|</td><td>100 (8%)</td><td>16.2%</td><td>33.5 +0.2</td></tr><tr><td>10</td><td>1.0</td><td>.7|x|</td><td>196 (9%)</td><td>25.2%</td><td>33.6 +0.6</td></tr><tr><td>stopping</td><td>5</td><td>1.0</td><td>\(n_{max}\)</td><td>65 (66%)</td><td>-</td><td>34.1 +0.8</td></tr><tr><td>criterion</td><td>10</td><td>1.2</td><td>\(n_{max}\)</td><td>88 (143%)</td><td>-</td><td>34.1 +1.1</td></tr></table>
+
+table 4: bleu search error, and average number of calls to score for output obtained with length normalization scoring function on the iwslt'14 de-en and mttt fr-en test sets. increase in bleu is over baseline with no length normalization. search error and performance increases are with respect to standard beam search decoding using the same scoring function.  
+
+<table><tr><td></td><td>k</td><td>ε</td><td>β</td><td># calls</td><td>search error</td><td>bleu</td></tr><tr><td rowspan="2">baseline</td><td>5</td><td>-</td><td>.05</td><td>115</td><td>-</td><td>33.2</td></tr><tr><td>10</td><td>-</td><td>.05</td><td>229</td><td>-</td><td>33.0</td></tr><tr><td rowspan="2">heuristic</td><td>5</td><td>.02</td><td>.05</td><td>129(0%)</td><td>42.7%</td><td>33.2</td></tr><tr><td>10</td><td>.02</td><td>.05</td><td>256(0%)</td><td>42.7%</td><td>33.0</td></tr><tr><td>stopping</td><td>5</td><td>3e-4</td><td>.05</td><td>114(1%)</td><td>29.2%</td><td>33.2</td></tr><tr><td>criterion</td><td>10</td><td>5e-5</td><td>.05</td><td>224(2%)</td><td>26.6%</td><td>33.0</td></tr></table>
+
+quality of results.
+
+# 7 related work
+
+our work is most similar to that of zhou and hansen (2005), who propose beam stack search. however, they are focused on exact inference and still evaluate hypotheses in breadth-first order. additionally, their algorithm requires  $\mathcal{o}(n_{\max}k)$  memory; while best-first beam search has the same requirements, we introduce effective methods for reducing them, namely memory-reduced best-first beam search.
+
+huang et al. (2017) propose and prove the optimality of an early-stopping criterion for beam search. the authors find in practice though that
+
+table 5: bleu scores with mutual information scoring function on iwslt'14 de-en. baseline is pmi decoding with unbounded  $p(\mathbf{y})$ , i.e.,  $\varepsilon = 0$ . search error is with respect to beam search decoding of baseline with same  $\beta$ .  
+
+<table><tr><td colspan="5">iwslt&#x27;14 de-en</td></tr><tr><td>k</td><td>γ</td><td>search error</td><td>bleu</td><td># calls</td></tr><tr><td rowspan="3">5</td><td>2</td><td>22.7%</td><td>35.7 +0.1</td><td>43.8 (163%)</td></tr><tr><td>5</td><td>4.4 %</td><td>35.8 +0.2</td><td>79.8 (44%)</td></tr><tr><td>\(n_{max}\)</td><td>-</td><td>35.6</td><td>93.0 (24%)</td></tr><tr><td rowspan="3">10</td><td>2</td><td>22.6%</td><td>35.7 +0.3</td><td>48.4 (374%)</td></tr><tr><td>5</td><td>4.5%</td><td>35.6 +0.2</td><td>126.9 (81%)</td></tr><tr><td>\(n_{max}\)</td><td>-</td><td>35.4</td><td>169.0 (36%)</td></tr><tr><td colspan="5">wmt&#x27;17 de-en</td></tr><tr><td rowspan="3">5</td><td>2</td><td>29.0%</td><td>29.7 +0.2</td><td>77.5 (75%)</td></tr><tr><td>5</td><td>1.2%</td><td>29.5 +0.0</td><td>115.8 (12%)</td></tr><tr><td>\(n_{max}\)</td><td>-</td><td>29.5</td><td>118.8 (10%)</td></tr><tr><td rowspan="3">10</td><td>2</td><td>36.6%</td><td>29.5 +0.2</td><td>97.3 (165%)</td></tr><tr><td>5</td><td>2.6%</td><td>29.3 +0.0</td><td>230.0 (12%)</td></tr><tr><td>\(n_{max}\)</td><td>-</td><td>29.3</td><td>230.2 (12%)</td></tr></table>
+
+table 6: bleu scores and the number of calls to score on the iwslt'14 de-en validation set and wmt'17 de-en test set with queue size restricted to  $n_{max} \cdot k$ . note that  $\gamma = n_{max}$  is the standard best-first beam search algorithm. performance increases are over standard beam search. search error is with respect to beam search with same beam width.
+
+reduction in computation from their algorithm was generally not significant. we build on this work and introduce additional methods for avoiding unnecessary computation. our method leads to better performance, as shown in tab. 2.
+
+klein and manning (2003) use  $\mathbf{a}^*$  for pcfg parsing; however, they use the un-pruned version for exact search which is not applicable for nmt or as as the memory requirements of the algorithm are far too large for these tasks. subsequently, pauls and klein (2009) provide a method for pruning this search algorithm, albeit using a threshold rather than explicitly limiting the state space. huang et al. (2012) also adapt  $\mathbf{a}^*$  for a  $k$ -best decoding algorithm. while their methods differ notably from ours, they likewise employ pruning techniques that allow for substantial speedups.
+
+stahlberg and byrne (2019) create an exact inference algorithm for decoding and use it to analyze the output of neural nmt models. while they likewise employ the monotonicity of the scoring function to make their method tractable, they do not focus on speed or mimicking the results of standard beam search.
+
+# 8 conclusion
+
+we propose best-first beam search, an algorithm that allows for faster decoding while still guaranteeing  $k$ -optimality. we provide results on several sequence-to-sequence transduction tasks that show the speed-ups our algorithm provides over standard beam search for decoding neural models. we adapt several popular alternate scoring functions to best-first beam search and provide a framework that can be used to adapt other scoring methods such as coverage normalization (wu et al., 2016) or diverse beam search (vijayakumar et al., 2016). we also provide a memory-reduced version of our algorithm, which returns competitive results in a fraction of the time needed for standard beam search.
+
+# references
+
+m. d. atkinson, j. r. sack, n. santoro, and t. strothotte. 1986. min-max heaps and generalized priority queues. commun. acm, 29(10).  
+dzmitry bahdanau, kyunghyun cho, and yoshua bengio. 2015. neural machine translation by jointly learning to align and translate. in proceedings of the international conference on learning representations.  
+ondrej bojar, rajen chatterjee, christian federmann, yvette graham, barry haddow, shujian huang, matthias huck, philipp koehn, qun liu, varvara logacheva, christof monz, matteo negri, matt post, raphael rubino, lucia specia, and marco turchi. 2017. findings of the 2017 conference on machine translation. in proceedings of the conference on machine translation, volume 2: shared task papers, copenhagen, denmark.  
+mauro cettolo, christian girardi, and marcello federico. 2012. *wit<sup>3</sup>: web inventory of transcribed and translated talks. in *proceedings of the conference of the european association for machine translation*.  
+edsger w. dijkstra. 1959. a note on two problems in connexion with graphs. numerische mathematik, 1(1).  
+kevin duh. 2018. the multitarget ted talks task. http://www.cs.jhu.edu/~kevinduh/a/multitarget-tedtalks/.
+
+sergey edunov, myle ott, michael auli, and david grangier. 2018. understanding back-translation at scale. in proceedings of the 2018 conference on empirical methods in natural language processing, pages 489–500, brussels, belgium. association for computational linguistics.  
+jonas gehring, michael auli, david grangier, and yann dauphin. 2017. a convolutional encoder model for neural machine translation. in proceedings of the 55th annual meeting of the association for computational linguistics (volume 1: long papers), pages 123-135, vancouver, canada. association for computational linguistics.  
+peter e. hart, nils j. nilsson, and bertram raphael. 1968. a formal basis for the heuristic determination of minimum cost paths. ieee transactions on systems science and cybernetics, 4(2).  
+wei he, zhongjun he, hua wu, and haifeng wang. 2016. improved neural machine translation with smt features. in proceedings of the aaai conference on artificial intelligence.  
+karl moritz hermann, tomas kocisky, edward grefenstette, lasse espeholt, will kay, mustafa suleyman, and phil blunsom. 2015. teaching machines to read and comprehend. in advances in neural information processing systems.  
+liang huang, kai zhao, and mingbo ma. 2017. when to finish? optimal beam search for neural text generation (modulo beam size). in proceedings of the 2017 conference on empirical methods in natural language processing, pages 2134-2139, copenhagen, denmark. association for computational linguistics.  
+zhiheng huang, yi chang, bo long, jean-francois crespo, anlei dong, sathiya keerthi, and sulin wu. 2012. iterative viterbi a* algorithm for k-best sequential decoding. in proceedings of the 50th annual meeting of the association for computational linguistics (volume 1: long papers), pages 611-619, jeju island, korea. association for computational linguistics.  
+dan klein and christopher d. manning. 2003. a* parsing: fast exact viterbi parse selection. in proceedings of the 2003 human language technology conference of the north american chapter of the association for computational linguistics, pages 119-126.
+
+guillaume klein, yoon kim, yuntian deng, jean senellart, and alexander rush. 2017. opennmt: open-source toolkit for neural machine translation. in proceedings of acl 2017, system demonstrations, pages 67-72, vancouver, canada. association for computational linguistics.  
+philipp koehn and rebecca knowles. 2017. six challenges for neural machine translation. in proceedings of the first workshop on neural machine translation, pages 28-39, vancouver. association for computational linguistics.  
+john d. lafferty, andrew mccallum, and fernando c. n. pereira. 2001. conditional random fields: probabilistic models for segmenting and labeling sequence data. in proceedings of the international conference on machine learning, icml '01, san francisco, ca, usa.  
+mike lewis, yinhan liu, naman goyal, marjan ghazvininejad, abdelrahman mohamed, omer levy, veselin stoyanov, and luke zettle-moyer. 2019. bart: denoising sequence-to-sequence pre-training for natural language generation, translation, and comprehension. in arxiv:1910.13461.  
+jiwei li, michel galley, chris brockett, jianfeng gao, and bill dolan. 2016. a diversity-promoting objective function for neural conversation models. in proceedings of the 2016 conference of the north american chapter of the association for computational linguistics: human language technologies, pages 110-119, san diego, california. association for computational linguistics.  
+chin-yew lin. 2004. rouge: a package for automatic evaluation of summaries. in text summarization branches out, pages 74-81, barcelona, spain. association for computational linguistics.  
+andrew mccallum, dayne freitag, and fernando c. n. pereira. 2000. maximum entropy markov models for information extraction and segmentation. in proceedings of the international conference on machine learning, icml '00, san francisco, ca, usa.  
+kenton murray and david chiang. 2018. correcting length bias in neural machine translation. in
+
+proceedings of the third conference on machine translation: research papers, pages 212-223, belgium, brussels. association for computational linguistics.  
+joakim nivre, igor m. boguslavsky, and leonid l. iomdin. 2008. parsing the syntagrus treebank of russian. in proceedings of the 22nd international conference on computational linguistics (coling 2008), pages 641-648, manchester, uk. coling 2008 organizing committee.  
+myle ott, sergey edunov, alexei baevski, angela fan, sam gross, nathan ng, david grangier, and michael auli. 2019. fairseq: a fast, extensible toolkit for sequence modeling. in proceedings of naacl-hlt: demonstrations.  
+kishore papineni, salim roukos, todd ward, and wei-jing zhu. 2002. bleu: a method for automatic evaluation of machine translation. in proceedings of the annual meeting on association for computational linguistics.  
+adam pauls and dan klein. 2009. hierarchical search for parsing. in proceedings of human language technologies: the 2009 annual conference of the north american chapter of the association for computational linguistics, pages 557-565, boulder, colorado. association for computational linguistics.  
+matt post. 2018. a call for clarity in reporting bleu scores. in proceedings of the conference on machine translation: research papers.  
+rico sennrich, barry haddow, and alexandra birch. 2016. neural machine translation of rare words with subword units. in proceedings of the annual meeting of the association for computational linguistics.  
+iulian serban, tim klinger, gerald tesauro, kartik talamadupula, bowen zhou, yoshua bengio, and aaron courville. 2017. multiresolution recurrent neural networks: an application to dialogue response generation.  
+shiqi shen, yong cheng, zhongjun he, wei he, hua wu, maosong sun, and yang liu. 2016. minimum risk training for neural machine translation. in proceedings of the 54th annual meeting of the association for computational linguistics (volume 1: long papers), pages 1683-
+
+1692, berlin, germany. association for computational linguistics.  
+raphael shu and hideki nakayama. 2018. improving beam search by removing monotonic constraint for neural machine translation. in proceedings of the 56th annual meeting of the association for computational linguistics (volume 2: short papers), pages 339-344, melbourne, australia. association for computational linguistics.  
+felix stahlberg and bill byrne. 2019. on nmt search errors and model errors: cat got your tongue? in proceedings of the conference on empirical methods in natural language processing and the 9th international joint conference on natural language processing (emnlp-ijcnlp), hong kong, china.  
+ilya sutskever, oriol vinyals, and quoc v le. 2014. sequence to sequence learning with neural networks. in advances in neural information processing systems.  
+ben taskar, carlos guestrin, and daphne koller. 2004. max-margin markov networks. in advances in neural information processing systems.  
+ashish vavwani, samy bengio, eugene brevdo, francois chollet, aidan n. gomez, stephan gouws, llion jones, lukasz kaiser, nal kalchbrenner, niki parmar, ryan sepassi, noam shazeer, and jakob uszkoreit. 2018. tensor2tensor for neural machine translation. corr.  
+ashish vaswani, noam shazeer, niki parmar, jakob uszkoreit, llion jones, aidan n gomez, lukasz kaiser, and illia polosukhin. 2017. attention is all you need. in advances in neural information processing systems, volume 30.  
+tim vieira, ryan cotterell, and jason eisner. 2016. speed-accuracy tradeoffs in tagging with variable-order crfs and structured sparsity. in proceedings of the conference on empirical methods in natural language processing.  
+ashwin k. vijayakumar, michael cogswell, ramprasaath r. selvaraju, qing sun, stefan lee, david j. crandall, and dhruv batra. 2016. *diverse beam search: decoding diverse solu-
+
+tions from neural sequence models. corr, abs/1610.02424.  
+oriol vinyals and quoc v. le. 2015. a neural conversational model.  
+andrew viterbi. 1967. error bounds for convolutional codes and an asymptotically optimum decoding algorithm. ieee transactions on information theory, 13(2).  
+yonghui wu, mike schuster, zhifeng chen, quoc v. le, mohammad norouzi, wolfgang macherey, maxim krikun, yuan cao, qin gao, klaus macherey, jeff klingner, apurva shah, melvin johnson, xiaobing liu, lukasz kaiser, stephan gouws, yoshikiyo kato, taku kudo, hideto kazawa, keith stevens, george kurian, nishant patil, wei wang, cliff young, jason smith, jason riesa, alex rudnick, oriol vinyals, gregory s. corrado, macduff hughes, and jeffrey dean. 2016. google's neural machine translation system: bridging the gap between human and machine translation.  
+yilin yang, liang huang, and mingbo ma. 2018. breaking the beam search curse: a study of (re-)scoring methods and stopping criteria for neural machine translation. in proceedings of the 2018 conference on empirical methods in natural language processing, pages 3054-3059, brussels, belgium. association for computational linguistics.  
+zhilin yang, zihang dai, yiming yang, jaime carbonell, russ r salakhutdinov, and quoc v le. 2019. xlnet: generalized autoregressive pretraining for language understanding. in advances in neural information processing systems.  
+rong zhou and eric a. hansen. 2005. beam-stack search: integrating backtracking with beam search. in proceedings of the international conference on international conference on automated planning and scheduling, icaps'05.

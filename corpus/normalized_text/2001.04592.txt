@@ -1,0 +1,572 @@
+# cloudburst: stateful functions-as-a-service
+
+vikram sreekanti, chenggang wu, xiayue charles lin, johann schleier-smith, joseph e. gonzalez, joseph m. hellerstein, alexey tumanov†
+
+u.c. berkeley, †georgia tech
+
+{vikrams, cgwu, charles.lin, jssmith, jegonzal, hellerstein}@berkeley.edu, atumanov3@gatech.edu
+
+# abstract
+
+function-as-a-service (faas) platforms and "serverless" cloud computing are becoming increasingly popular due to ease-of-use and operational simplicity. current faas offerings are targeted at stateless functions that do minimal i/o and communication. we argue that the benefits of serverless computing can be extended to a broader range of applications and algorithms while maintaining the key benefits of existing faas offerings. we present the design and implementation of cloudburst, a stateful faas platform that provides familiar python programming with low-latency mutable state and communication, while maintaining the autoscaling benefits of serverless computing. cloudburst accomplishes this by leveraging anna, an autoscaling key-value store, for state sharing and overlay routing combined with mutable caches co-located with function executors for data locality. performant cache consistency emerges as a key challenge in this architecture. to this end, cloudburst provides a combination of lattice-encapsulated state and new definitions and protocols for distributed session consistency. empirical results on benchmarks and diverse applications show that cloudburst makes stateful functions practical, reducing the state-management overheads of current faas platforms by orders of magnitude while also improving the state of the art in serverless consistency.
+
+# pvldb reference format:
+
+vikram sreekanti, chenggang wu, xiayue charles lin, johann schleier-smith, jose m. faleiro, joseph e. gonzalez, joseph m. hellerstein, alexey tumanov. cloudburst: stateful functions-as-a-service. pvldb, 13(11): 2438-2452, 2020.
+
+doi: https://doi.org/10.14778/3407790.3407836
+
+# 1. introduction
+
+serverless computing has become increasingly popular in recent years, with a focus on autoscaling function-as-a-service (faas) systems. faas platforms allow developers to write functions in standard languages and deploy their code to the cloud with reduced administrative burden. the platform is responsible for transparently autoscaling resources from zero to peak load and back in response to workload shifts. consumption-based pricing ensures that developers' cost is proportional to usage
+
+this work is licensed under the creative commons attribution-noncommercial-noderivatives 4.0 international license. to view a copy of this license, visit http://creativecommons.org/licenses/by-nc-nd/4.0/. for any use beyond those covered by this license, obtain permission by emailing info@vldb.org. copyright is held by the owner/author(s). publication rights licensed to the vldb endowment.
+
+proceedings of the vldb endowment, vol. 13, no. 11
+
+issn 2150-8097.
+
+doi: https://doi.org/10.14778/3407790.3407836
+
+![](images/2963658eb2dd11e628dd9d12f8638593569145b006f49af71231a3bfd8940f4d.jpg)  
+figure 1: median (bar) and 99th percentile (whisker) latency for square(increment(x:int)).cloudburst matches the best distributed python systems and outperforms other faas systems by over an order of magnitude (§6.1).
+
+of their code: there is no need to overprovision to match peak load, and there are no compute costs during idle periods. these benefits have made faas platforms an attractive target for both research [26, 44, 4, 43, 37, 47, 10, 81, 28, 25] and industry applications [7].
+
+the hallmark autoscaling feature of serverless platforms is enabled by an increasingly popular design principle: the disaggregation of storage and compute services [32]. disaggregation allows the compute layer to quickly adapt computational resource allocation to shifting workload requirements, packing functions into vms while reducing data movement. similarly, object or key-value stores can pack multiple users' data storage and access workloads into shared resources with high volume and often at low cost. disaggregation also enables allocation at multiple timescales: long-term storage can be allocated separately from short-term compute leases. together, these advantages enable efficient autoscaling. user code consumes expensive compute resources as needed and accrues only storage costs during idle periods.
+
+unfortunately, today's faas platforms take disaggregation to an extreme, imposing significant constraints on developers. first, the autoscaling storage services provided by cloud vendors—e.g., aws s3 and dynamodb—are too high-latency to access with any frequency [84, 37]. second, function invocations are isolated from each other: faas systems disable point-to-point network communication between functions. finally, and perhaps most surprisingly, current faas offerings have very slow nested function calls: argument- and result-passing is a form of cross-function communication and exhibits the high latency of current serverless offerings [4]. we return these points in §2.1, but in short, today's popular faas platforms only work well for isolated, stateless functions.
+
+as a workaround, many applications—even some that were explicitly designed for serverless platforms—are forced to step out
+
+side the bounds of the serverless paradigm altogether. for example, the excamera serverless video encoding system [26] depends upon a single server machine as a coordinator and task assignment service. similarly, numpywren [74] enables serverless linear algebra but provisions a static redis machine for low-latency access to shared state for coordination. these workarounds might be tenable at small scales, but they architecturally reintroduce the scaling, fault tolerance, and management problems of traditional server deployments.
+
+# 1.1 toward stateful serverless via ldpc
+
+given the simplicity and economic appeal of faas, we are interested in exploring designs that preserve the autoscaling and operational benefits of current offerings, while adding performant, cost-efficient, and consistent shared state and communication. this "stateful" serverless model opens up autoscaling faas to a much broader array of applications and algorithms. we aim to demonstrate that serverless architectures can support stateful applications while maintaining the simplicity and appeal of the serverless programming model.
+
+for example, many low-latency services need to autoscale to handle bursts while dynamically manipulating data based on request parameters. this includes webservers managing user sessions, discussion forums managing threads, ad servers managing ml models, and more. similarly, many parallel and distributed protocols require fine-grained messaging, from quantitative tasks like distributed aggregation [46] to system tasks like membership [20] or leader election [6]. these protocols form the backbone of parallel and distributed systems. as we see in §6, these scenarios are infeasible on today's stateless faas platforms.
+
+to enable stateful serverless computing, we propose a new design principle: logical disaggregation with physical colocation (ldpc). disaggregation is needed to provision, scale, and bill storage and compute independently, but we want to deploy resources to different services in close physical proximity. in particular, a running function's "hot" data should be kept physically nearby for low-latency access. updates should be allowed at any function invocation site, and cross-function communication should work at wire speed.
+
+colocation of compute and data is a well-known method to overcome performance barriers, but it can raise thorny correctness challenges at the compute layer. for locality, each compute node should be able to independently update its copy of the data. however, given that a single composition of multiple functions may run across multiple nodes, we need to preserve a consistent "session" [80] that is distributed across those nodes. distributed session consistency is a challenge we must address in this context.
+
+# 1.2 cloudburst: a stateful faas platform
+
+in this paper, we present a new function-as-a-service platform called cloudburst that removes the shortcomings of commercial systems highlighted above, without sacrificing their benefits. cloudburst is unique in achieving logical disaggregation and physical collocation of computation and state, and in allowing programs written in a traditional language to observe consistent state across function compositions. cloudburst is designed to be an autoscaling functions-as-a-service system—similar to aws lambda or google cloud functions—but with new abstractions that enable performant, stateful programs.
+
+cloudburst achieves this via a combination of an autoscaling key-value store (providing state sharing and overlay routing) and mutable caches co-located with function executors (providing data locality). the system is built on top of anna [85, 86], a low
+
+```python
+1 from cloudburst import *  
+2 cloud = cloudburstclient(cloudburst_addr, my_ip)  
+3 cloud.put('key', 2)  
+4 reference = cloudburstreference('key')  
+5 def sqfun(x): return x * x  
+6 sq = cloud.register(sqfun, name='square')  
+7  
+8 print('result: %d' % (sq(reference))  
+9 > result: 4  
+10  
+11 future = sq(3, store_in_kvs=true)  
+12 print('result: %d' % (future.get()))  
+13 > result: 9
+```
+
+figure 2: a script to create and execute a cloudburst function.
+
+latency autoscaling key-value store designed to achieve a variety of coordination-free consistency levels by using mergeable monotonic lattice data structures [75, 17]. for performant consistency, cloudburst takes advantage of anna's design by transparently encapsulating opaque user state in lattices so that anna can consistently merge concurrent updates. in addition, we present novel protocols that ensure consistency guarantees (repeatable read and causal consistency) across function invocations that run on separate nodes. we evaluate cloudburst via microbenchmarks as well as two application scenarios using third-party code, demonstrating benefits in performance, predictable latency, and consistency. in sum, this paper's contributions include:
+
+1. the design and implementation of an autoscaling serverless architecture that combines logical disaggregation with physical co-location of compute and storage (ldpc) ( $\s 4$ ).  
+2. identification of distributed session consistency concerns and new protocols to achieve two distinct distributed session consistency guarantees—repeatable read and causal consistency—for compositions of functions (§5).  
+3. the ability for programs written in traditional languages to enjoy coordination-free storage consistency for their native data types via lattice capsules that wrap program state with metadata that enables automatic conflict apis supported by anna (§5.2).  
+4. an evaluation of cloudburst's performance and consistency on workloads involving state manipulation, fine-grained communication and dynamic autoscaling (§6).
+
+# 2. motivation and background
+
+although serverless infrastructure has gained traction recently, there remains significant room for improvement in performance and state management. in this section, we discuss common pain points in building applications on today's serverless infrastructure (§2.1) and explain cloudburst's design goals (§2.2).
+
+# 2.1 deploying serverless functions today
+
+current faas offerings are poorly suited to managing shared state, making it difficult to build applications, particularly latency-sensitive ones. there are three kinds of shared state management that we focus on in this paper: function composition, direct communication, and shared mutable storage.
+
+function composition. for developers to embrace serverless as a general programming and runtime environment, it is necessary that function composition work as expected. pure functions share state by passing arguments and return values to each other. figure 1 (discussed in §6.1), shows the performance of a simple composition of side-effect-free arithmetic functions. aws lambda
+
+imposes a latency overhead of up to  $20\mathrm{ms}$  for a single function invocation, and this overhead compounds when composing functions. aws step functions, which automatically chains together sequences of operations, imposes an even higher penalty. since the overheads compound linearly, the overhead of a call stack as shallow as 5 functions saturates tolerable limits for an interactive service ( $\sim100\mathrm{ms}$ ). functional programming patterns for state sharing are not an option in current faas platforms.
+
+direct communication. faas offerings disable inbound network connections, requiring functions to communicate through high-latency storage services like s3 or dynamodb. while point-to-point communication may seem tricky in a system with dynamic membership, distributed hashtags (dhts) or lightweight key-value stores (kvss) can provide a lower-latency solution than deep storage for routing messages between migratory function instances [67, 78, 72, 71]. current faas vendors do not offer autoscaling, low-latency dhts or kvss. instead, as discussed in §1, faas applications resort to server-based solutions for lower-latency storage, like hosted redis and memcached.
+
+low-latency access to shared mutable state. recent studies [84, 37] have shown that latencies and costs of shared autoscaling storage for faas are orders of magnitude worse than underlying infrastructure like shared memory, networking, or server-based shared storage. worse, the available systems offer weak data consistency guarantees. for example, aws s3 offers no guarantees across multiple clients (isolation) or for inserts and deletes from a single client (atomicity). this kind of weak consistency can produce very confusing behavior. for example, simple expressions like  $f(x, g(x))$  may produce non-deterministic results:  $f$  and  $g$  are different "clients", so there is no guarantee about the versions of  $x$  read by  $f$  and  $g$ .
+
+# 2.2 towards stateful serverless
+
+logical disaggregation with physical colocation. as a principle, ldpc leaves significant latitude for designing mechanisms and policy that co-locate compute and data while preserving correctness. we observe that many of the performance bottlenecks described above can be addressed by an architecture with distributed storage and local caching. a low-latency autoscaling kvs can serve as both global storage and a dht-like overlay network. to provide better data locality to functions, a kvs cache can be deployed on every machine that hosts function invocations. cloudburst's design includes consistent mutable caches in the compute tier (§4).
+
+consistency. distributed mutable caches introduce the risk of cache inconsistencies, which can cause significant developer confusion. we could implement strong consistency across caches (e.g., linearizability) via quorum consensus (e.g., paxos [51]). this offers appealing semantics but has well-known issues with latency and availability [14, 15]. in general, consensus protocols are a poor fit for the internals of a dynamic autoscaling framework: consensus requires fixed membership, and membership ("view") change involves high-latency agreement protocols (e.g., [12]). instead, applications desiring strong consistency can employ a slow-changing consensus service adjacent to the serverless infrastructure.
+
+coordination-free approaches to consistency are a better fit to the elastic membership of a serverless platform. bailis, et al.[8] categorized consistency guarantees that can be achieved without coordination. we chose the anna kvs [85] as cloudburst's storage engine because it supports all these guarantees. like cvrdts [75], anna uses lattice data types for coordination-free
+
+consistency. that is, anna values offer a merge operator that is insensitive to batching, ordering and repetition of requests—merge is associative, commutative and idempotent. anna uses lattice composition [17] to implement consistency; anna's lattices are simple and composable as in bloom [17]; we refer readers to [85] for more details. anna also provides autoscaling at the storage layer, responding to workload changes by selectively replicating frequently-accessed data, growing and shrinking the cluster, and moving data between storage tiers (memory and disk) for cost savings [86].
+
+however, anna only supports consistency for individual clients, each with a fixed ip-port pair. in cloudburst, a request like  $f(x,g(x))$  may involve function invocations on separate physical machines and requires consistency across functions—we term this distributed session consistency. in §5, we provide protocols for various consistency levels.
+
+programmability. we want to provide consistency without imposing undue burden on programmers, but anna can only store values that conform to its lattice-based type system. to address this, cloudburst introduces lattice capsules (§5.2), which transparently wrap opaque program state in lattices chosen to support cloudburst's consistency protocols. users gain the benefits of anna's conflict resolution and cloudburst's distributed session consistency without having to modify their programs.
+
+we continue with cloudburst's programmer interface. we return to cloudburst's design in §4 and consistency mechanisms in §5.
+
+# 3. programming interface
+
+cloudburst accepts programs written in vanilla python<sup>1</sup>. an example client script to execute a function is shown in figure 2. cloudburst functions act like regular python functions but trigger remote computation in the cloud. results by default are sent directly back to the client (line 8), in which case the client blocks synchronously. alternately, results can be stored in the kvs, and the response key is wrapped in a cloudburstfuture object, which retrieves the result when requested (line 11-12).
+
+function arguments are either regular python objects (line 11) or kvs references (lines 3-4). kvs references are transparently retrieved by cloudburst at runtime and deserialization before invoking the function. to improve performance, the runtime attempts to execute a function call with kvs references on a machine that might have the data cached. we explain how this is accomplished in §4.3. functions can also dynamically retrieve data at runtime using the cloudburst communication api described below.
+
+to enable stateful functions, cloudburst allows programmers to put and get python objects via the anna kvs api. object serialization and encapsulation for consistency (§5.2) is handled transparently by the runtime. in the common case, put and get are fast due to the presence of caches at the function executors.
+
+for repeated execution, cloudburst allows users to register arbitrary compositions of functions. we model function compositions as dags in the style of systems like apache spark [88], dryad [42], apache airflow [2], and tensorflow [1]. this model is also similar in spirit to cloud services like aws step functions that automatically chain together functions in existing serverless systems.
+
+each function in the dag must be registered with the system (line 4) prior to use in a dag. users specify each function in the dag and how they are composed—results are automatically
+
+table 1: the cloudburst object api. users can interact with the key value store and send and receive messages.  
+
+<table><tr><td>api name</td><td>functionality</td></tr><tr><td>get(key)</td><td>retrieve a key from the kvs.</td></tr><tr><td>put(key, value)</td><td>insert or update a key in the kvs.</td></tr><tr><td>delete(key)</td><td>delete a key from the kvs.</td></tr><tr><td>send(recv, msg)</td><td>send a message to another executor.</td></tr><tr><td>recv()</td><td>receive outstanding messages for this function.</td></tr><tr><td>get_id()</td><td>get this function&#x27;s unique id</td></tr></table>
+
+passed from one dag function to the next by the cloudburst runtime. the result of a function with no successor is either stored in the kvs or returned directly to the user, as above. cloudburst's resource management system (§4.4) is responsible for scaling the number of replicas of each function up and down.
+
+cloudburst system api. cloudburst provides developers an interface to system services—table 1 provides an overview. the api enables kvs interactions via get and put, and it enables message passing between function invocations. each function invocation is assigned a unique id, and functions can advertise this id to well-known keys in the kvs. these unique ids are translated into physical addresses and used to support direct messaging.
+
+note that this process is a generalization of the process that is used for function composition, where results of one function are passed directly to the next function. we expose these as separate mechanisms because we aimed to simplify the common case (function composition) by removing the hassle of communicating unique ids and explicitly sharing results.
+
+in practice this works as follows. first, one function writes its unique id to a pre-agreed upon key in storage. the second function waits for that key to be populated and then retrieves the first thread's id by reading that key. once the second function has the first function's id, it uses the send api to send a message. when send is invoked, the executor thread uses a deterministic mapping to convert from the thread's unique id to an ip-port pair. the executor thread opens a tcp connection to that ip-port pair and sends a direct message. if a tcp connection cannot be established, the message is written to a key in anna that serves as the receiving thread's "inbox". when recv is invoked by a function, the executor returns any messages that were queued on its local tcp port. on a recv call, if there are no messages on the local tcp port, the executor will read its inbox in storage to see if there are any messages stored there. the inbox is also periodically read and cached locally to ensure that messages are delivered correctly.
+
+# 4. architecture
+
+cloudburst implements the principle of logical disaggregation with physical colocation (ldpc). to achieve disaggregation, the cloudburst runtime autoscales independently of the anna kvs. colocation is enabled by mutable caches placed in the cloudburst runtime for low latency access to kvs objects.
+
+figure 3 provides an overview of the cloudburst architecture. there are four key components: function executors, caches, function schedulers, and a resource management system. user requests are received by a scheduler, which routes them to function executors. each scheduler operates independently, and the system relies on a standard stateless cloud load balancer (aws elastic load balancer). function executors run in individual processes that are packed into vms along with a local cache per vm. the cache on each vm intermediates between the local executors and the remote kvs. all cloudburst components are run in individual
+
+![](images/0338cc04dc4cfc02b79566814ee020d43331a70750135b2af4a343bb38b05042.jpg)  
+figure 3: an overview of the cloudburst architecture.
+
+docker [21] containers. cloudburst uses kubernetes [49] simply to start containers and redeploy them on failure. cloudburst system metadata, as well as persistent application state, is stored in anna which provides autoscaling and fault tolerance.
+
+# 4.1 function executors
+
+each cloudburst executor is an independent, long-running python process. schedulers (§4.3) route function invocation requests to executors. before each invocation, the executor retrieves and deserialization the requested function and transparently resolves all kvs reference function arguments in parallel. dag execution requests span multiple function invocations, and after each dag function invocation, the runtime triggers downstream dag functions. to improve performance for repeated execution (§3), each dag function is deserialization and cached at one or more executors. each executor also publishes local metrics to the kvs, including the executor's cached functions, stats on its recent cpu utilization, and the execution latencies for finished requests. we explain in the following sections how this metadata is used.
+
+# 4.2 caches
+
+to ensure that frequently-used data is locally available, every function execution vm has a local cache, which executors contact via ipc. executors interface with the cache, not directly with anna; the cache issues requests to the kvs as needed. when a cache receives an update from an executor, it updates the data locally, acknowledges the request, and asynchronously sends the result to the kvs to be merged. if a cache receives a request for data that it does not have, it asynchronously retrieves it from the kvs.
+
+cloudburst must ensure the freshness of data in caches. a naive (but correct) scheme is for the cloudburst caches to poll the kvs for updates, or for the cache to blindly evict data after a timeout. in a typical workload where reads dominate writes, this generates unnecessary load on the kvs. instead, each cache periodically publishes a snapshot of its cached keys to the kvs. we modified anna to accept these cached keysets and incrementally construct an index that maps each key to the caches that store it; anna uses this index to periodically propagate key updates to caches. lattice encapsulation enables anna to correctly merge conflicting key updates ( $\s 5.2$ ). the index itself is partitioned across storage nodes following the same scheme anna uses to partition the key space, so anna takes the index overhead into consideration when making autoscaling decisions.
+
+# 4.3 function schedulers
+
+a key goal of cloudburst's architecture is to enable low latency function scheduling. however, policy design is not a main goal of this paper; cloudburst's scheduling mechanisms allow pluggable policies to be explored in future work. in this section, we describe cloudburst's scheduling mechanisms, illustrating their use with
+
+policy heuristics that enable us to demonstrate benefits from data locality and load balancing.
+
+scheduling mechanisms. schedulers handle requests to register or invoke functions. new functions are registered by storing them in anna and updating a shared kvs list of registered functions. for new dags, the scheduler verifies that each function in the dag exists before picking an executor on which to cache it.
+
+for single function execution requests, the scheduler picks an executor and forwards the request to it. dag requests require more work: the scheduler creates a schedule by picking an executor for each dag function—which is guaranteed to have the function stored locally—and broadcasts this schedule to all participating executors. the scheduler then triggers the first function(s) in the dag and, if the user wants the result stored in the kvs, returns a cloudburstfuture.
+
+dag topologies are the scheduler's only persistent metadata and are stored in the kvs. each scheduler tracks how many calls it receives per dag and per function and stores these statistics in the kvs. finally, each scheduler constructs a local index that tracks the set of keys stored by each cache; this is used for the scheduling policy described next.
+
+scheduling policy. our scheduling policy makes heuristic decisions using metadata reported by executors, including cached key sets and executor load. we prioritize data locality when scheduling both single functions and dags. if the function's arguments have kvs references, the scheduler inspects its local cached key index and picks the executor with the most data cached locally—to take advantage of locality, the user must specify kvs references (§3). otherwise, the scheduler picks an executor at random.
+
+hot data and functions are replicated across many executor nodes via backpressure. the few nodes initially caching hot keys will quickly be saturated with requests and report high utilization (above  $70\%$ ). the scheduler tracks this utilization and avoids overloaded nodes, picking new nodes instead. the new nodes will then fetch and cache the hot data, effectively increasing the replication factor and hence the number of options the scheduler has for the next request containing a hot key.
+
+# 4.4 monitoring and resource management
+
+an autoscaling system must track system load and performance metrics to make effective decisions. cloudburst uses anna as a substrate for metric collection. each thread independently tracks an extensible set of metrics (described above) and publishes them to the kvs. the monitoring system asynchronously aggregates these metrics from storage and uses them for its policy engine.
+
+for each dag, the monitoring system compares the incoming request rate to the number of requests serviced by executors. if the incoming request rate is significantly higher than the request completion rate of the system, the monitoring engine will increase the resources allocated to that dag function by pinning the function onto more executors. if the overall cpu utilization of the executors exceeds a threshold  $(70\%)$ , then the monitoring system will add nodes to the system. similarly, if executor utilization drops below a threshold  $(20\%)$ , we deallocate resources accordingly. we rely on kubernetes to manage our clusters and efficiently scale the cluster. this simple approach exercises our monitoring mechanisms and provides adequate behavior (see §6.1.4).
+
+when a new node is allocated, it reads the relevant data and metadata (e.g., functions, dag metadata) from the kvs. this allows anna to serve as the source of truth for system metadata and removes concerns about efficiently scaling the system.
+
+the heuristics that we described here are based on the existing dynamics of the system (e.g., node spin up time). we discuss po
+
+tential advanced auto-scaling mechanisms and policies as a part of future work (§8), which might draw more heavily on understanding how workloads interact with our infrastructure.
+
+# 4.5 fault tolerance
+
+at the storage layer, cloudburst relies on anna's replication scheme for  $k$ -fault tolerance. for the compute tier, we adopt the standard approach to fault tolerance taken by many faas platforms. if a machine fails while executing a function, the whole dag is re-executed after a configurable timeout. the programmer is responsible for handling side-effects generated by failed programs if they are not idempotent. in the case of an explicit program error, the error is returned to the client. this approach should be familiar to users of aws lambda and other faas platforms, which provides the same guarantees. more advanced guarantees are a subject for future work (§8).
+
+# 5. cache consistency
+
+as discussed in section 3, cloudburst developers can register compositions of functions as a dag. this also serves as the scope of consistency for the programmer, sometimes called a "session" [80]. the reads and writes in a session together experience the chosen definition of consistency, even across function boundaries. the simplest way to achieve this is to run the entire dag in a single thread and let the kvs provide the desired consistency level. however, to allow for autoscaling and flexible scheduling, cloudburst may choose to run functions within a dag on different executors—in the extreme case, each function could run on a separate executor. this introduces the challenge of distributed session consistency: because a dag may run across many machines, the executors involved in a single dag must provide consistency across different physical machines.
+
+in the rest of this section, we describe distributed session consistency in cloudburst. we begin by explaining two different guarantees (§5.1), describe how we encapsulate user-level python objects to interface with anna's consistency mechanisms (§5.2), and present protocols for the guarantees (§5.3).
+
+# 5.1 consistency guarantees
+
+a wide variety of coordination-free consistency and isolation guarantees have been identified in the literature. we focus on two guarantees here; variants are presented in §6.2 to illustrate protocol costs. in our discussion, we will denote keys with lowercase letters like  $k$ ;  $k_v$  is a version  $v$  of key  $k$ .
+
+we begin with repeatable read (rr) consistency. rr is adapted from the transactions literature [11], hence it assumes sequences of functions-i.e., linear dags. given a read-only expression  $f(x, g(x))$ , rr guarantees that both  $f$  and  $g$  read the same version  $x_v$ . more generally:
+
+repeatable read invariant: in a linear dag, when any function reads a key  $k$ , either it sees the most recent update to  $k$  within the dag, or in the absence of preceding updates it sees the first version  $k_v$  read by any function in the dag $^2$ .
+
+the second guarantee we explore is causal consistency, one of the strongest coordination-free consistency models [54, 56, 8]. in a nutshell, causal consistency requires reads and writes to respect lamport's "happens-before" relation [50]. one key version  $k_{i}$  influences another version  $l_{j}$  if a read of  $k_{i}$  happens before a write of  $l_{j}$ ; we denote this as  $k_{i} \rightarrow l_{j}$ . within a cloudburst dag, this
+
+means that if a function reads  $l_{j}$ , subsequent functions must not see versions of  $k$  that happened before  $k_{i}$ : they can only see  $k_{i}$ , versions concurrent with  $k_{i}$ , or versions newer than  $k_{i}$ . note that causal consistency does not impose restrictions on key versions read by concurrent functions within a dag. for example, if function  $f$  calls two functions,  $g$  and  $h$  (executed in parallel), and both  $g$  and  $h$  read key  $k$ , the versions of  $k$  read by  $g$  and  $h$  may diverge. prior work introduces a variety of causal building blocks that we extend. systems like anna [85] track causal histories of individual objects but do not track ordering between objects. bolt-on causal consistency [9] developed techniques to achieve multi-key causal snapshots at a single physical location. cloudburst must support multi-key causal consistency that spans multiple physical sites.
+
+causal consistency invariant: consider a function  $f$  in dag  $g$  that reads a version  $k_v$  of key  $k$ . let  $v$  denote the set of key versions read previously by  $f$  or by any of  $f$ 's ancestors in  $g$ . denote the dependency set for  $f$  at this point as  $d = \{d_i | d_i \to l_j \in v\}$ . the version  $k_v$  that is read by  $f$  must satisfy the invariant  $k_v \nrightarrow k_i \in d$ . that is,  $k_v$  is concurrent to or newer than any version of  $k$  in the dependency set  $d$ .
+
+# 5.2 lattice encapsulation
+
+portable shared state is a key tenet of cloudburst's design (§3), and we rely on anna's lattices to resolve conflicts from concurrent updates. typically, python objects are not lattices, so cloudburst transparently encapsulates python objects in lattices.
+
+by default, cloudburst encapsulates each bare program value into an anna last writer wins (lww) lattice—a composition of an anna-provided global timestamp and the value. the global timestamp is generated by each node in a coordination-free fashion by concatenating the local system clock and the node's unique id. anna merges two lww versions by keeping the value with the higher timestamp. this allows cloudburst to achieve eventual consistency: all replicas will agree on the lww value that corresponds to the highest timestamp for the key [82]. it also provides timestamps for the rr protocol below.
+
+in causal consistency mode, cloudburst encapsulates each key  $k$  in a causal lattice—the composition of an anna-provided vector clock [68] that identifies  $k$ 's version, a dependency set that tracks key versions that  $k$  depends on, and the value. each vector clock consists of a set of  $\langle id, clock \rangle$  pairs where the  $id$  is the unique id of the function executor thread that updated  $k$ , and the  $clock$  is a monotonically-growing logical clock. upon merge, anna keeps the causal consistency lattice whose vector clock dominates. vector clock  $vc_1$  dominates  $vc_2$  if it is at least equal in all entries and greater in at least one; otherwise,  $vc_1$  and  $vc_2$  are concurrent. if two vector clocks are concurrent, anna merges the keys by: (1) creating a new vector clock with the pairwise maximum of each entry in the two keys' vector clock; and (2) merging the dependency sets and values via set union. in most cases, an object has only one version. however, to de-encapsulate a causally-wrapped object with multiple concurrent versions, cloudburst presents the user program with one version chosen via an arbitrary but deterministic tie-breaking scheme. regardless of which version is returned, the user program sees a causally consistent history; the cache layer retains the concurrent versions for the consistency protocol described below. applications can also choose to retrieve all concurrent versions and resolve updates manually.
+
+# 5.3 distributed session protocols
+
+distributed session repeatable read. to achieve repeatable read, the cloudburst cache on each node creates "snapshot" versions of each locally cached object upon first read, and the cache
+
+algorithm 1 repeatable read  
+input:  $k,r$    
+1: //  $k$  is the requested key;  $r$  is the set of keys previously read by the dag   
+2: if  $k\in r$  then   
+3: cache_version  $\equiv$  cache.get_metadata  $(k)$    
+4: if cache_version  $\equiv =$  null v cache_version!  $=$ $r[k].$  version then   
+5: return cache_fetch_from_upstream  $(k)$    
+6: else   
+7: return cache.get  $(k)$    
+8: else   
+9: return cache.get_or_fetch  $(k)$
+
+![](images/320e98bbc819bb9749ca39033882e74fadd114af147162cf342b397da0c3ac41.jpg)  
+figure 4: an illustration of a scenario in which two functions executing on separate machines might unwittingly read causally inconsistent data.
+
+stores them for the lifetime of the dag. when invoking a downstream function in the dag, we propagate a list of cache addresses and version timestamps for all snapshoted keys seen so far.
+
+in order to maintain repeatable read consistency, the downstream executor needs to read the same versions of variables as read by the upstream executor. algorithm 1 shows pseudocode for the process that downstream executors follow to ensure this. when such an executor in a dag receives a read request for key  $k$ , it includes the prior version snapshot metadata in its request to the cache ( $r$  in algorithm 1). if  $k$  has been previously read and the exact version is not stored locally, the cache queries the upstream cache that stores the correct version (line 5 in algorithm 1). if the exact version is stored locally (line 7), we return it directly to the user. finally, if the key has not been read thus far, we return any available version to the client (line 9). if the upstream cache fails, we restart the dag from scratch. finally, the last executor in the dag (the "sink") notifies all upstream caches of dag completion, allowing version snapshots to be evicted.
+
+distributed session causal consistency. to support causal consistency in cloudburst, we use causal lattice encapsulation and augment the cloudburst cache to be a causally consistent store, implementing the bolt-on causal consistency protocol [9]. the protocol ensures that each cache always holds a "causal cut": for every pair of versions  $a_i, b_j$  in the cache,  $\exists a_k : a_i \to a_k, a_k \to b_j$ . storing a causal cut ensures that key versions read by functions executed on one node (accessing a single causal cut) satisfy the causal consistency invariant discussed in section 5.1.
+
+however, maintaining a causal cut within each individual cache is not sufficient to achieve distributed session causal consistency. consider a dag with two functions  $f(k)$  and  $g(l)$ , which are executed in sequence on different machines—figure 4 illustrates the following situation. assume  $f$  reads  $k_v$  and there is a dependency  $l_u \rightarrow k_v$ . if the causal-cut cache of the node executing  $g$  is un-
+
+algorithm 2 causal consistency  
+input:  $k,r$  dependencies   
+1: //  $k$  is the requested key;  $r$  is the set of keys previously read by the dag; dependencies is the set of causal dependencies of keys in  $r$    
+2: if  $k\in r$  then   
+3: cache_version  $\equiv$  cache.get_metadata  $(k)$    
+4: // valid returns true if  $k\geq$  cache_version   
+5: if validcache_version,  $r[k]$  )then   
+6: return cache.get  $(k)$    
+7: else   
+8: return cache.fetch_from_upstream  $(k)$    
+9: if  $k\in$  dependencies then   
+10: cache_version  $\equiv$  cache.get_metadata  $(k)$    
+11: if valid(cache_version,dependencies[k]) then   
+12: return cache.get  $(k)$    
+13: else   
+14: return cache.fetch_from_upstream  $(k)$
+
+aware of the constraint on valid versions of  $l$ ,  $g$  could read an old version  $l_w : l_w \to l_u$ , thereby violating causality. the following protocol solves this challenge: in addition to shipping read-set metadata (as in rr), each executor ships the set of causal dependencies (pairs of keys and their associated vector clocks) of the read set to downstream executors. caches upstream store version snapshots of these causal dependencies.
+
+for each key  $k$  requested, the downstream cache first checks whether the locally-cached key's vector clock is causally concurrent with or dominates that of the version snapshot stored at the upstream cache (lines 2-3 of algorithm 2). if so, the cache returns the local version (line 5); otherwise, it queries the upstream cache for the correct version snapshot (line 7). we perform the same check if the key being requested is in the set of dependencies shipped from the upstream cache—if we have a valid version locally, we return it, and otherwise, we fetch a snapshot from the upstream cache (lines 8-13 of algorithm 2). this protocol guarantees that key versions read by functions executed across different nodes (i.e., different causal cuts) follow the causal consistency invariant, guaranteeing distributed session causal consistency.
+
+# 6. evaluation
+
+we now present a detailed evaluation of cloudburst. we first study the individual mechanisms implemented in cloudburst (§6.1), demonstrating orders of magnitude improvement in latency relative to existing serverless infrastructure for a variety of tasks. next we study the overheads introduced by cloudburst's consistency mechanisms (§6.2), and finally we implement and evaluate two real-world applications on cloudburst: machine learning prediction serving and a twitter clone (§6.3).
+
+all experiments were run in the us-east-1a aws availability zone. schedulers were run on aws c5.1arge ec2 vms (2 vcpus, 4gb ram), and function executors were run on c5.2xlarge ec2 vms (8 vcpus, 16gb ram); 2 vcpus comprise one physical core. function execution vms used 3 cores for python execution and 1 for the cache. clients were run on separate machines in the same az. all redis experiments were run using aws elasticcache, using a cluster with two shards and three replicas per shard.
+
+# 6.1 mechanisms in cloudburst
+
+in this section, we evaluate the primary individual mechanisms that cloudburst enables—namely, low-latency function composi
+
+tion (§6.1.1), local cache data accesses (§6.1.2), direct communication (§6.1.3), and responsive autoscaling (§6.1.4).
+
+# 6.1.1 function composition
+
+to begin, we compare cloudburst's function composition overheads with other serverless systems, as well as a non-serverless baseline. we chose functions with minimal computation to isolate each system's overhead. the pipeline was composed of two functions: square(increment(x:int)). figure 1 shows median and 99th percentile measured latencies across 1,000 requests run in serial from a single client.
+
+first, we compare cloudburst and lambda using a "stateless" application, where we invoke one function—both bars are labelled stateless in figure 1. cloudburst stored results in anna, as discussed in section 3. we ran cloudburst with one function executor (3 worker threads). we find that cloudburst is about  $5 \times$  faster than lambda for this simple baseline.
+
+for a composition of two functions—the simplest form of statefulness we support—we find that cloudburst's latency is roughly the same as with a single function and significantly faster than all other systems measured. we first compared against sand [4], a new serverless platform that achieves low-latency function composition by using a hierarchical message bus. we could not deploy sand ourselves because the source code is unavailable, so we used the authors' hosted offering [73]. as a result, we could not replicate the setup we used for the other experiments, where the client runs in the same datacenter as the service. to compensate for this discrepancy, we accounted for the added client-server latency by measuring the latency for an empty http request to the sand service. we subtracted this number from the end-to-end latency for a request to our two-function pipeline running sand to estimate the in-datacenter request time for the system. in this setting, sand is about an order of magnitude slower than cloudburst both at median and at the 99th percentile.
+
+to further validate cloudburst, we compared against dask, a "serverful" open-source distributed python execution framework. we deployed dask on aws using the same instances used for cloudburst and found that performance was comparable to cloudburst's. given dask's relative maturity, this gives us confidence that the overheads in cloudburst are reasonable.
+
+we compared against four aws implementations, three of which used aws lambda. lambda (direct) returns results directly to the user, while lambda (s3) and lambda (dynamo) store results in the corresponding storage service. all lambda implementations pass arguments using the user-facing lambda api. the fastest implementation was lambda (direct) as it avoided high-latency storage, while dynamodb added a 15ms latency penalty and s3 added 40ms. we also compared against aws step functions, which constructs a dag of operations similar to cloudburst's and returns results directly to the user in a synchronous api call. the step functions implementation was  $10 \times$  slower than lambda and  $82 \times$  slower than cloudburst.
+
+takeaway: cloudburst's function composition matches state-of-the-art python runtime latency and outperforms commercial serverless infrastructure by 1-3 orders of magnitude.
+
+# 6.1.2 data locality
+
+next, we study the performance benefit of cloudburst's caching techniques. we chose a representative task, with large input data but light computation: our function returns the sum of all elements across 10 input arrays. we implemented two versions on aws lambda, which retrieved inputs from aws elasticache (using redis) and aws s3 respectively. elasticache is not an au
+
+![](images/2cdfd93435ae0c1ac88063e282ceccf8cb7dcafe3a042d52c6e356cbab3b36c9.jpg)  
+figure 5: median and 99th percentile latency to calculate the sum 10 arrays, comparing cloudburst with caching and without and aws lambda over redis and aws s3. we vary array lengths from 1,000 to 1,000,000 by multiples of 10 to demonstrate the effects of increasing data retrieval costs.
+
+toscaling system, but we include it in our evaluation because it offers best-case latencies for data retrieval for aws lambda. we compare two implementations in cloudburst. one version, cloudburst (hot) passes the same array in to every function execution, guaranteeing that every retrieval after the first is a cache hit. this achieves optimal latency, as every request after the first avoids fetching data over the network. the second, cloudburst (cold), creates a new set of inputs for each request; every retrieval is a cache miss, and this scenario measures worst-case latencies of fetching data from anna. all measurements are reported across 12 clients issuing 3,000 requests each. we run cloudburst with 7 function execution nodes.
+
+the cloudburst (hot) bars in figure 5 show that system's performance is consistent across the first two data sizes for cache hits, rises slightly for 8mb of data, and degrades significantly for the largest array size as computation costs begin to dominate. cloudburst performs best at 8mb, improving over cloudburst (cold)'s median latency by about  $10\times$ , over lambda on redis' by  $25\times$ , and over lambda on s3's by  $79\times$ .
+
+while lambda on s3 is the slowest configuration for smaller inputs, it is more competitive at 80mb. here, lambda on redis' latencies rise significantly. cloudburst (cold)'s median latency is the second fastest, but its 99th percentile latency is comparable with s3's and redis'. this validates the common wisdom that s3 is efficient for high bandwidth tasks but imposes a high latency penalty for smaller data objects. however, at this size, cloudburst (hot)'s median latency is still  $9\times$  faster than cloudburst (cold) and  $24\times$  faster than s3's.
+
+takeaway: while performance gains vary across configurations and data sizes, avoiding network roundtrips to storage services enables cloudburst to improve performance by 1-2 orders of magnitude.
+
+# 6.1.3 low-latency communication
+
+another key feature in cloudburst is low-latency communication, which allows developers to leverage distributed systems protocols that are infeasibly slow in other serverless platforms [37].
+
+as an illustration, we consider distributed aggregation, the simplest form of distributed statistics. our scenario is to periodically average a floating-point performance metric across the set of functions that are running at any given time. kempe et al. [46] developed a simple gossip-based protocol for approximate aggregation that uses random message passing among the current participants in the protocol. the algorithm is designed to provide correct answers even as the membership changes. we implemented the algorithm in 60 lines of python and ran it over cloudburst with 4 executors (12 threads). we compute 1,000 rounds of aggregation
+
+![](images/2f4a103c085c700d4b5816b8627c7a3ddd9c3f72ffd1e50666f663494aee0a70.jpg)  
+figure 6: median and 99th percentile latencies for distributed aggregation. the cloudburst implementation uses a distributed, gossip-based aggregation technique, and the lambda implementations share state via the respective key-value stores. cloudburst outperforms communication through storage, even for a low-latency kvs.
+
+with 10 actors each in sequence and measure the time until the result converges to within  $5\%$  error.
+
+the gossip algorithm involves repeated small messages, making it highly inefficient on stateless platforms like aws lambda. since aws lambda disables direct messaging, the gossip algorithm would be extremely slow if implemented via reads/writes from slow storage. instead, we compare against a more natural approach for centralized storage: each lambda function publishes its metrics to a kvs, and a predetermined leader gathers the published information and returns it to the client. we refer to this algorithm as the "gather" algorithm. note that this algorithm, unlike [46], requires the population to be fixed in advance, and is therefore not a good fit to an autoscaling setting. but it requires less communication, so we use it as a workaround to enable the systems that forbid direct communication to compete. we implement the centralized gather protocol on lambda over redis for similar reasons as in § 6.1.2—although serverful, redis offers best-case performance for lambda. we also implement this algorithm over cloudburst and anna for reference.
+
+figure 6 shows our results. cloudburst's gossip-based protocol is  $3 \times$  faster than the gather protocol using lambda and dynamodb. although we expected gather on serverful redis to outperform cloudburst's gossip algorithm, our measurements show that gossip on cloudburst is actually about  $10\%$  faster than the gather algorithm on redis at median and  $40\%$  faster at the 99th percentile. finally, gather on cloudburst is  $22 \times$  faster than gather on redis and  $53 \times$  faster than gather on dynamodb. there are two reasons for these discrepancies. first, lambda has very high function invocation costs (see §6.1.1). second, redis is single-mastered and forces serialized writes, creating a queuing delay for writes.
+
+takeaway: cloudburst's low latency communication mechanisms enable developers to build fast distributed algorithms with fine-grained communication. these algorithms can have notable performance benefits over workarounds involving even relatively fast shared storage.
+
+# 6.1.4 autoscaling
+
+finally, we validate cloudburst's ability to detect and respond to workload changes. the goal of any serverless system is to smoothly scale program execution in response to changes in request rate. as described in § 4.4, cloudburst uses a heuristic policy that accounts for incoming request rates, request execution times, and executor load. we simulate a relatively computationally intensive workload with a function that sleeps for  $50\mathrm{ms}$ . the function reads in two keys drawn from a zipfian distribution with coefficient of 1.0 from 1 million 8-byte keys stored in anna, and it writes to a third key drawn from the same distribution.
+
+![](images/ccbd602657d694c897803574244866f89e36f14272c8a9513d2428a887a7f9bf.jpg)  
+figure 7: cloudburst's responsiveness to load changes. we start with 180 executor threads, issue requests from 60 clients, and measure throughput. cloudburst quickly detects load spikes and allocate more resources. plateaus in the figure are the wait times for ec2 instance startup.
+
+the system starts with 60 executors (180 threads) and one replica of the function deployed—the remaining threads are all idle. figure 7 shows our results. at time 0, 400 client threads simultaneously begin issuing requests. the jagged curve measures system throughput (requests per second), and the dotted line tracks the number of threads allocated to the function. over the first 20 seconds, cloudburst takes advantage of the idle resources in the system, and throughput reaches around 3,300 requests per second. at this point, the management system detects that all nodes are saturated and adds 20 ec2 instances, which takes about 2.5 minutes; this is seen in the plateau that lasts until time 2.67. as soon as resources become available, they are allocated to our task, and throughput rises to 4.4k requests a second.
+
+this process repeats itself twice more, with the throughput rising to 5.6k and 6.7k requests per second with each increase in resources. after 10 minutes, the clients stop issuing requests, and by time 10.33, the system has drained itself of all outstanding requests. the management system detects the sudden drop in request rate and, within 20 seconds, reduces the number of threads allocated to the sleep function from 360 to 2. within 5 minutes, the number of ec2 instances drops from a max of 120 back to the original 60. our current implementation is bottlenecked by the latency of spinning up ec2 instances; we discuss that limitation and potential improvements in section 8.
+
+we also measured the per-key storage overhead of the index in anna that maps each key to the caches it is stored in. we observe small overheads even for the largest deployment (120 function execution nodes). for keys in our working set, the median index overhead is 24 bytes and the 99th percentile overhead is 1.3kb, corresponding to keys being cached at  $1.6\%$  and  $93\%$  of the function nodes, respectively. even if all keys had the maximum overhead, the total index size would be around 1 gb for 1 million keys.
+
+takeaway: cloudburst's mechanisms for autoscaling enable policies that can quickly detect and react to workload changes. we are mostly limited by the high cost of spinning up new ec2 instances. the policies and cost of spinning up instances can be improved in future without changing cloudursts architecture.
+
+# 6.2 consistency models
+
+in this section, we evaluate the overheads of cloudburst's consistency models. for comparison, we also implement and measure weaker consistency models to understand the costs involved in distributed session causal consistency. in particular, we evaluated single-key causality and multi-key causality, which are both weaker forms of causal consistency than the distributed session causality supported by cloudburst. single-key causality tracks causal order of updates to individual keys (omitting
+
+![](images/7acd8bc2c3550e9b68a9896ec7523f3a78faa4a90abbf80aa2132e2111ad02ec.jpg)  
+figure 8: median and 99th percentile latencies for cloudburst's consistency models, normalized by the depth of the dag. we measure last-writer wins (lww), distributed session repeatable read (dsrr), single-key causality (sk), multi-key causality (mk), and distributed session causal consistency (dsc). median latency is uniform across modes, but stronger consistency levels have higher tail latencies due to increased data and metadata overheads.
+
+the overhead of dependency sets). multi-key causality is an implementation of bolt-on causal consistency [9], avoiding the overhead of distributed session consistency.
+
+we populate anna with 1 million keys, each with a payload of 8 bytes, and we generate 250 random dags which are 2 to 5 functions long, with an average length of 3. we isolate the latency overheads of each consistency mode by avoiding expensive computation and use small data to highlight any metadata overheads. each function takes two string arguments, performs a simple string manipulation, and outputs another string. function arguments are either kvs references—which are drawn from the set of 1 million keys with a zipfian coefficient of 1.0—or the result of a previous function execution in the dag. the sink function of the dag writes its result to the kvs into a key chosen randomly from the set of keys read by the dag. we use 8 concurrent benchmark threads, each sequentially issuing 500 requests to cloudburst. we ran cloudburst with 5 executor nodes (15 threads).
+
+# 6.2.1 latency comparison
+
+figure 8 shows the latency of each dag execution under five consistency models normalized by the longest path in the dag. median latency is nearly uniform across all modes, but performance differs significantly at the 99th percentile.
+
+last-writer wins has the lowest overhead, as it only stores the 8-byte timestamp associated with each key and requires no remote version fetches. the 99th percentile latency of distributed session repeatable read is  $1.8 \times$  higher than last-writer wins'. this is because repeated reference to a key across functions requires an exact version match; even if the key is cached locally, a version mismatch will force a remote fetch.
+
+single-key causality does not involve metadata passing or data retrieval, but each key maintains a vector clock that tracks the causal ordering of updates performed across clients. since the size of the vector clock grows linearly with the number of clients that modified the key, hot keys tend to have larger vector clocks, leading to higher retrieval latency at the tail. multi-key causality forces each key to track its dependencies in addition to maintaining the vector clock, adding to its worst-case latency. we observe that the median per-key causal metadata (vector clock and dependency set) storage overhead is 624 bytes and the 99th percentile overhead is 7.1kb. techniques such as vector clock compression [59] and dependency garbage collection [54] can be used to reduce the metadata overhead, which we plan to explore in future work.
+
+table 2: the number of inconsistencies observed across 4,000 dag executions under cloudburst's consistency levels relative to what is observed under lww. the causal levels are increasingly strict, so the numbers accrue incrementally left to right. dsrr anomalies are independent.  
+
+<table><tr><td colspan="5">inconsistencies observed</td></tr><tr><td rowspan="2">lww</td><td colspan="3">causal</td><td rowspan="2">dsrr</td></tr><tr><td>sk</td><td>mk</td><td>dsc</td></tr><tr><td>0</td><td>904</td><td>939</td><td>1043</td><td>46</td></tr></table>
+
+distributed session causal consistency incurs the cost of passing causal metadata along the dag as well as retrieving version snapshots to satisfy causality. in the worst case, a 5-function dag performs 4 extra network round-trips for version snapshots. this leads to a  $1.7 \times$  slowdown in 99th percentile latency over single- and multi-key causality and a  $9 \times$  slowdown over last-writer wins.
+
+takeaway: although cloudburst's non-trivial consistency models increase tail latencies, median latencies are over an order of magnitude faster than dynamodb and s3 for similar tasks, while providing stronger consistency.
+
+# 6.2.2 inconsistencies
+
+stronger consistency models introduce overheads but also prevent anomalies that would arise in weaker models. table 2 shows the number of anomalies observed over the course of 4000 dag executions run in lww mode, tracking anomalies for other levels.
+
+the causal consistency levels have increasingly strict criteria; anomaly counts accrue with the level. we observe 904 single-key (sk) causal inconsistencies when the system operates in lww mode. with single-key causality, two concurrent updates to the same must both be preserved and returned to the client. lww simply picks the largest timestamp and drops the other update, leading to a majority of observed anomalies. multi-key (mk) causality flagged 35 additional inconsistencies corresponding to single-cache read sets that were not causal cuts. distributed session causal consistency (dsc) flagged 104 more inconsistencies where the causal cut property was violated across caches. rerepeatable read (dsrr) flagged 46 anomalies.
+
+takeaway: a large number of anomalies arose naturally in our experiments and the cloudburst consistency model was able to detect and prevent these anomalies.
+
+# 6.3 case studies
+
+in this section, we discuss the implementation of two real-world applications on top of cloudburst. we first consider low-latency prediction serving for machine learning models and compare cloudburst to a purpose-built cloud offering, aws sagemaker. we then implement a twitter clone called retwis, which takes advantage of our consistency mechanisms, and we report both the effort involved in porting the application to cloudburst as well as some initial evaluation metrics.
+
+# 6.3.1 prediction serving
+
+ml model prediction is a computationally intensive task that can benefit from elastic scaling and efficient sparse access to large amounts of state. for example, the prediction serving infrastructure at facebook [34] needs to access per-user state with each query and respond in real time, with strict latency constraints. furthermore, many prediction pipelines combine multiple stages
+
+![](images/49a889dead8a45202352da3bda849c28ab50f83a59a4d9ca21acb222d27482ae.jpg)  
+figure 9: cloudburst compared to native python, aws sage-maker, and aws lambda for serving a prediction pipeline.
+
+![](images/19aa1331b49222c07a3602744723ace27f8425617db31b3325eb3c5632711cd3.jpg)  
+figure 10: a measure of the cloudburst's ability to scale a simple prediction serving pipeline. the blue whiskers represent 95th percentile latencies, and the black represent the 99th percentile.
+
+![](images/27915777fbd785e1d49cc927ea4ae93d66c287197aed8aa8c674b92003a251d9.jpg)
+
+of computation—e.g., clean the input, join it with reference data, execute one or more models, and combine the results [18, 52].
+
+we implemented a basic prediction serving pipeline on cloudburst and compare against a fully-managed, purpose-built prediction serving framework (aws sagemaker) as well as aws lambda. we also compare against a single python process to measure serialization and communication overheads. lambda does not support gpus, so all experiments are run on cpus.
+
+we use the mobilenet [41] image classification model implemented in tensorflow [1] and construct a three-stage pipeline: resize an input image, execute the model, and combine features to render a prediction. qualitatively, porting this pipeline to cloudburst was easier than porting it to other systems. the native python implementation was 23 lines of code (loc). cloudburst required adding 4 loc to retrieve the model from anna. aws sagemaker required adding serialization logic (10 loc) and a python web-server to invoke each function (30 loc). finally, aws lambda required significant changes: managing serialization (10 loc) and manually compressing python dependencies to fit into lambda's 512mb container limit<sup>3</sup>. the pipeline does not involve concurrent modification to shared state, so we use the default last writer wins for this workload. we run cloudburst with 3 workers, and all experiments used a single client.
+
+figure 9 reports median and 99th percentile latencies. cloudburst is only about 15ms slower than the python baseline at the median (210ms vs. 225ms). aws sagemaker, ostensibly a purpose-built system, is  $1.7 \times$  slower than the native python implementation and  $1.6 \times$  slower than cloudburst. we also measure two aws lambda implementations. one, aws lambda (actual), computes a full result for the pipeline and takes over 1.1 seconds. to better understand lambda's performance, we isolated compute costs by removing all data movement. this result (aws lambda (mock))
+
+![](images/2d49ee867bf76a96e4d441802f5fc0d32f50a4cd0b758779e16f63bb3707a81d.jpg)  
+figure 11: median and 99th percentile latencies for cloud-burst in lww and causal modes and retwis over redis.
+
+![](images/2891c22c8deed6db61a6caffbe478af3cbc4375843561ed623d3e502ef45b336.jpg)  
+figure 12: cloudburst's ability to scale the retwis workload up to 160 worker threads.
+
+is much faster, suggesting that the latency penalty is incurred by the lambda runtime passing results between functions. nonetheless, aws lambda (mock)'s median is still  $44\%$  slower than cloudburst's median latency and only  $9\%$  faster than aws sagemaker.
+
+figure 10 measures throughput and latency for cloudburst as we increase the number of worker threads from 10 to 160 by factors of two. the number of clients for each setting is set to  $\left\lfloor \frac{\text{workers}}{3} \right\rfloor$  because there are three functions executed per client. we see that throughput scales linearly with the number of workers. we see a climb in median and 99th percentile latency from 10 to 20 workers due to increased potential conflicts in the scheduling heuristics. from this point on, we do not a significant change in either median or tail latency until 160 executors. for the largest deployment, only one or two executors need to be slow to significantly raise the 99th percentile latency—to validate this, we also report the 95th percentile latency in figure 10, and we see that there is a minimal increase between 80 and 160 executors.
+
+takeaway: an ml algorithm deployed on cloudburst delivers both smooth scaling and low, predictable latency comparable to native python, out-performing a purpose-built commercial service.
+
+# 6.3.2 retwis
+
+web serving workloads are closely aligned with cloudburst's features. for example, twitter provisions server capacity of up to 10x the typical daily peak in order to accommodate unusual events such as elections, sporting events, or natural disasters [33]. furthermore, causal consistency is a good model for many consumer internet workloads because it matches end-user expectations for information propagation: e.g., google has adopted it as part of a universal model for privacy and access control [64].
+
+to this end, we considered an example web serving workload. retwis [69] is an open source twitter clone built on redis and is often used to evaluate distributed systems [77, 40, 91, 19, 87]. conversational "threads" like those on twitter naturally exercise causal consistency: it is confusing to read the response to a post (e.g., "lambda!") before you have read the post it refers to ("what
+
+comes after kappa?"). we adapted a python retwis implementation called retwis-py [70] to run on cloudburst and compared its performance to a vanilla "serverful" deployment on redis. we ported retwis to our system as a set of six cloudburst functions. the port was simple: we changed 44 lines, most of which were removing references to a global redis variable.
+
+we created a graph of 1000 users, each following 50 other users (zipf=1.5, a realistic skew for online social networks [60]) and pre-populated 5000 tweets, half of which were replies to other tweets. we compare cloudburst in lww mode, cloudburst in causal consistency mode, and retwis over redis; all configurations used 10 executor threads (webservers for retwis), 1 kvs node, and 10 clients. each client issues 5000 requests— $10\%$  posttweet (write) requests and  $90\%$  gettimeline (read) requests.
+
+figure 11 shows our results. median and 99th percentile latencies for lww mode are  $27\%$  and  $2\%$  higher than redis', respectively. this is largely due to different code paths; for retwis over redis, clients communicate directly with web servers, which interact with redis. each cloudburst request interacts with a scheduler, a function executor, a cache, and anna. cloudburst's causal mode adds a modest overhead over lww mode:  $4\%$  higher at the median and  $20\%$  higher at the tail. however, causality prevents anomalies on over  $60\%$  of requests—when a timeline returns a reply without the original tweet—compared to lww mode.
+
+figure 12 measures throughput and latency for cloudburst's causal mode as we increase the number of function executor threads from 10 to 160 by factors of two. for each setting, the number of clients is equal to the number of executors. from 10 threads to 160 threads, median and the 99th percentile latencies increase by about  $60\%$ . this is because increased concurrency means a higher volume of new tweets. with more new posts, each gettimeline request forces the cache to query the kvs for new data with higher probability in order to ensure causality—for 160 threads,  $95\%$  of requests incurred cache misses. nonetheless, these latencies are well within the bounds for interactive web applications [35]. throughput grows nearly linearly as we increase the executor thread count. however, due to the increased latencies, throughput is about  $30\%$  below ideal at the largest scale.
+
+takeaway: it was straightforward to adapt a standard social network application to run on cloudburst. our implementation adds a modest overhead to the serverful redis baseline and scales smoothly as the workload increases.
+
+# 7. related work
+
+architecture. client-side caching and consistency has a long history in the database literature [27] that bears similarity to our ldpc principal. in more recent examples, [13] describes client-side techniques for a database built on s3, and [89] uses caching in a distributed transactional system based on rdma over dedicated memory nodes. this line of work primarily focuses on strong transactional consistency for static or slowly-changing configurations. cloudburst explicitly chooses to pursue coordination-free techniques for serverless computing, for the reasons described in section 2.2. the serverless setting also drives our need to handle consistency when a single transaction moves across multiple caches, which is not seen in prior work.
+
+serverless execution frameworks. in addition to commercial offerings, there are many open-source serverless platforms [38, 63, 62, 48] which provide standard stateless faas guarantees. among research platforms [39, 4, 58], sand [4] is most similar to cloudburst, reducing overheads for low-latency function compositions. cloudburst achieves better latencies ( $\s 6.1.1$ ) and adds shared state and communication abstractions.
+
+recent work has explored faster, more efficient serverless platforms. sock [61] introduces a generalized-zygote provisioning mechanism to cache and clone function initialization; its library loading technique could be integrated with cloudburst. also complementary are low-overhead sandboxing mechanisms released by cloud providers—e.g., gvisor [31] and firecracker [24].
+
+other recent work has demonstrated the ability to build data-centric services on top of commodity serverless infrastructure. starling [65] implements a scalable database query engine on aws lambda. similarly, the pywren project [44] and follow-on work [74] implemented highly parallel map tasks on lambda, with a focus on linear algebra applications. the excamera project [26] enabled highly efficient video encoding on faas. these systems explored what is possible to build on stateless serverless infrastructure by contrast, our work explores the design of a new architecture, which raises new challenges for systems issues in distributed consistency.
+
+perhaps the closest work to ours is the archipelago system [76], which also explores the design of a new serverless infrastructure. they also adopt the model of dags of functions, but their focus is complementary to ours. they are interested in scheduling techniques to achieve latency deadlines on a per-request basis.
+
+serverless io infrastructure. pocket [47] is a serverless storage system that improves the efficiency of analytics (large read oriented workloads). locus [66] provides a high-bandwidth shuffle functionality for serverless analytics. neither of these systems offers a new serverless programming framework, nor do they consider issues of caching for latency or consistent updates.
+
+finally, shredder [92] enables users to push functions into storage. this raises fundamental security concerns like multi-tenant isolation, which are the focus of the research. shredder is currently limited to a single node and does not address autoscaling or other characteristic features of serverless computing.
+
+language-level consistency programming languages also offer solutions to distributed consistency. one option from functional languages is to prevent inconsistencies by making state immutable [16]. a second is to constrain updates to be deterministically mergeable, by requiring users to write associative, commutative, and idempotent code (acid 2.0 [36]), use special-purpose types like crdts [75] or dsls for distributed computing like bloom [17]. as a platform, cloudburst does not prescribe a language or type system, though these approaches could be layered on top of cloudburst.
+
+causal consistency. several existing storage systems provide causal consistency [54, 59, 3, 55, 23, 22, 5, 90]. however, these are fixed-deployment systems that do not meet the autoscaling requirements of a serverless setting. in [59, 3, 5, 22, 23], each data partition relies on a linear clock to version data and uses a fixed-size vector clock to track causal dependencies across keys. the size of these vector clocks is tightly coupled with the system deployment—specifically, the shard and replica counts. correctly adjusting this metadata requires an expensive coordination protocol, which we rejected in cloudburst's design (§ 2.2). [54] and [55] reveal a new version only when all of its dependencies have been retrieved. [90] constructs a causally consistent snapshot across an entire data center. all of these systems are susceptible to "slow-down cascades" [59], where a single straggler node limits write visibility and increases the overhead of write buffering.
+
+in contrast, cloudburst implements causal consistency in the cache layer as in bolt-on causal consistency [9]. each cache creates its own causally consistent snapshot without coordinating with other caches, eliminating the possibility of a slowdown cas
+
+cade. the cache layer also tracks dependencies in individual keys' metadata rather than tracking the vector clocks of fixed, coarse-grained shards. this comes at the cost of increased dependency metadata overhead. various techniques including periodic dependency garbage collection [54], compression [59], and reducing dependencies via explicit causality specification [9] can mitigate this issue, though we do not measure them here.
+
+# 8. conclusion and future work
+
+in this paper we demonstrate the feasibility of general-purpose stateful serverless computing. we enable autoscaling via logical disaggregation of storage and compute and achieve performant state management via physical collocation of caches with compute services. cloudburst demonstrates that disaggregation and colocation are not inherently in conflict. in fact, the ldpc design pattern is key to our solution for stateful serverless computing.
+
+the remaining challenge is to provide performant correctness. cloudburst embraces coordination-free consistency as the appropriate class of guarantees for an autoscaling system. we confront challenges at both the storage and caching layer. we use lattice capsules to allow opaque program state to be merged asynchronously into replicated coordination-free persistent storage. we develop distributed session consistency protocols to ensure that computations spanning multiple caches provide uniform correctness guarantees. together, these techniques provide a strong contract to users for reasoning about state—far stronger than the guarantees offered by cloud storage that backs commercial faas systems. even with these guarantees, we demonstrate performance that rivals and often beats baselines from inelastic server-centric approaches.
+
+the feasibility of stateful serverless computing suggests a variety of potential future work.
+
+isolation and fault tolerance as noted in §5.1, storage consistency guarantees say nothing about concurrent effects between dags, a concern akin to transactional isolation (the "t" in acid). on a related note, the standard fault tolerance model for faas is to restart on failure, ignoring potential problems with non-idempotent functions. something akin to transactional atomicity (the "a" in acid) seems desirable here. it is well-known that serializable transactions require coordination [8], but it is interesting to consider whether sufficient atomicity and isolation are achievable without strong consistency schemes.
+
+auto-scaling mechanism and policy. in this work we present and evaluate a simple auto-scaling heuristic. however, there are opportunities to reduce boot time by warm pooling [83] and more proactively scale computation [29, 45, 79] as a function of variability in the workloads. we believe that cache-based co-placement of computation and data presents promising opportunities for research in elastic auto-scaling of compute and storage.
+
+streaming services cloudburst's internal monitoring service requires components to publish metadata to well-known kvs keys. in essence, the kvs serves a rolling snapshot of an update stream. there is a rich literature on distributed streaming that could offer more, e.g. as surveyed by [30]. the autoscaling environment of faas introduces new challenges, but this area seems ripe for both system internals and user-level streaming abstractions.
+
+security and privacy. as mentioned briefly in §4, cloudburst's current design provides container-level isolation, which is susceptible to well-known attacks [53, 57]. this is unacceptable in multi-tenant cloud environments, where sensitive user data may coincide with other user programs. it is interesting to explore how cloudburst's design would address these concerns.
+
+# 9. references
+
+[1] m. abadi, p. barham, j. chen, z. chen, a. davis, j. dean, m. devin, s. ghemawat, g. irving, m. isard, et al. tensorflow: a system for large-scale machine learning. in 12th {usenix} symposium on operating systems design and implementation (\{osdi\} 16), pages 265-283, 2016.  
+[2] apache airflow. https://airflow.apache.org.  
+[3] d. d. akkoorath, a. z. tomsic, m. bravo, z. li, t. crain, a. bieniusa, n. preguiça, and m. shapiro. cure: strong semantics meets high availability and low latency. in 2016 ieee 36th international conference on distributed computing systems (icdcs), pages 405-414. ieee, 2016.  
+[4] i. e. akkus, r. chen, i. rimac, m. stein, k. satzke, a. beck, p. aditya, and v. hilt. sand: towards high-performance serverless computing. in 2018 usenix annual technical conference (usenix atc 18), pages 923-935, 2018.  
+[5] s. almeida, j. a. leitão, and l. rodrigues. chainreaction: a causal+ consistent datastore based on chain replication. in proceedings of the 8th acm european conference on computer systems, eurosys '13, pages 85-98, new york, ny, usa, 2013. acm.  
+[6] b. awerbuch. optimal distributed algorithms for minimum weight spanning tree, counting, leader election, and related problems. in proceedings of the nineteenth annual acm symposium on theory of computing, pages 230-240. acm, 1987.  
+[7] aws lambda - case studies. https://aws.amazon.com/ lambda/resources/customer-case-studies/.  
+[8] p. bailis, a. davidson, a. fekete, a. ghodsi, j. m. hellerstein, and i. stoica. highly available transactions: virtues and limitations. pvldb, 7(3):181-192, 2013.  
+[9] p. bailis, a. ghodsi, j. m. hellerstein, and i. stoica. bolt-on causal consistency. in proceedings of the 2013 acm sigmod international conference on management of data, sigmod '13, pages 761-772, new york, ny, usa, 2013. acm.  
+[10] i. baldini, p. castro, k. chang, p. cheng, s. fink, v. ishakian, n. mitchell, v. muthusamy, r. rabbah, a. slominski, et al. serverless computing: current trends and open problems. in research advances in cloud computing, pages 1-20. springer, 2017.  
+[11] h. berenson, p. bernstein, j. gray, j. melton, e. o'neil, and p. o'neil. a critique of ansi sql isolation levels. in acm sigmod record, volume 24, pages 1-10. acm, 1995.  
+[12] k. birman and t. joseph. exploiting virtual synchrony in distributed systems. sigops oper. syst. rev., 21(5):123-138, nov. 1987.  
+[13] m. brantner, d. florescu, d. graf, d. kossmann, and t. kraska. building a database on s3. in proceedings of the 2008 acm sigmod international conference on management of data, pages 251-264, 2008.  
+[14] e. brewer. cap twelve years later: how the "rules" have changed. computer, 45(2):23-29, feb 2012.  
+[15] t. d. chandra, r. griesemer, and j. redstone. paxos made live: an engineering perspective. in proceedings of the twenty-sixth annual acm symposium on principles of distributed computing, pages 398-407. acm, 2007.  
+[16] m. coblenz, j. sunshine, j. aldrich, b. myers, s. weber, and f. shull. exploring language support for immutability. in proceedings of the 38th international conference on software engineering, pages 736-747. acm, 2016.  
+[17] n. conway, w. r. marczak, p. alvaro, j. m. hellerstein, and d. maier. logic and lattices for distributed programming. in
+
+proceedings of the third acm symposium on cloud computing, socc '12, pages 1:1-1:14, new york, ny, usa, 2012. acm.  
+[18] d. crankshaw, x. wang, g. zhou, m. j. franklin, j. e. gonzalez, and i. stoica. clipper: a low-latency online prediction serving system. in 14th usenix symposium on networked systems design and implementation (nsdi 17), pages 613-627, boston, ma, 2017. usenix association.  
+[19] n. crooks, y. pu, n. estrada, t. gupta, l. alvisi, and a. clement. tardis: a branch-and-merge approach to weak consistency. in proceedings of the 2016 international conference on management of data, pages 1615–1628. acm, 2016.  
+[20] a. das, i. gupta, and a. motivala. swim: scalable weakly-consistent infection-style process group membership protocol. in proceedings international conference on dependable systems and networks, pages 303-312. ieee, 2002.  
+[21] enterprise application container platform | docker. https://www.docker.com.  
+[22] j. du, s. elnikety, a. roy, and w. zwaenepoel. orbe: scalable causal consistency using dependency matrices and physical clocks. in proceedings of the 4th annual symposium on cloud computing, socc '13, pages 11:1-11:14, new york, ny, usa, 2013. acm.  
+[23] j. du, c. iorgulescu, a. roy, and w. zwaenepoel. gentlerain: cheap and scalable causal consistency with physical clocks. in proceedings of the acm symposium on cloud computing, pages 1-13. acm, 2014.  
+[24] announcing the firecracker open source technology: secure and fast microvm for serverless computing. https://aws.amazon.com/blogs/opensource/ firecracker-open-source-secure-fast-microvm -serverless/.  
+[25] s. fouladi, f. romero, d. iter, q. li, s. chatterjee, c. kozyrakis, m. zaharia, and k. winstein. from laptop to lambda: outsourcing everyday jobs to thousands of transient functional containers. in 2019 usenix annual technical conference (usenix atc 19), pages 475-488, 2019.  
+[26] s. fouladi, r. s. wahby, b. shacklett, k. v. balasubramaniam, w. zeng, r. bhalerao, a. sivaraman, g. porter, and k. winston. encoding, fast and slow: low-latency video processing using thousands of tiny threads. in 14th usenix symposium on networked systems design and implementation (nsdi 17), pages 363-376, boston, ma, 2017. usenix association.  
+[27] m. j. franklin and m. j. carey. client-server caching revisited. technical report, university of wisconsin-madison department of computer sciences, 1992.  
+[28] y. gan, y. zhang, d. cheng, a. shetty, p. rathi, n. katarki, a. bruno, j. hu, b. ritchken, b. jackson, et al. an open-source benchmark suite for microservices and their hardware-software implications for cloud & edge systems. in proceedings of the twenty-fourth international conference on architectural support for programming languages and operating systems, pages 3-18. acm, 2019.  
+[29] a. gandhi, m. harchol-balter, r. raghunathan, and m. a. kozuch. autoscale: dynamic, robust capacity management for multi-tier data centers. acm transactions on computer systems (tocs), 30(4):14, 2012.  
+[30] m. garofalakis, j. gehrke, and r. rastogi. data stream
+
+management: processing high-speed data streams. springer, 2016.  
+[31] open-sourcing gvisor, a sandboxed container runtime. https://cloud.google.com/blog/products/gcp/open-sourcing-gvisor-a-sandboxed-container-runtime.  
+[32] s. han, n. egi, a. panda, s. ratnasamy, g. shi, and s. shenker. network support for resource disaggregation in next-generation datacenters. in proceedings of the twelfth acm workshop on hot topics in networks, page 10. acm, 2013.  
+[33] m. hashemi. the infrastructure behind twitter: scale. https://blog.twitter.com/engineering/en_us/topics/infrastructure/2017/the-infrastructure-behind-twitter-scale.html.  
+[34] k. hazelwood, s. bird, d. brooks, s. chintala, u. diril, d. dzhulgakov, m. fawzy, b. jia, y. jia, a. kalro, j. law, k. lee, j. lu, p. noordhuis, m. smelyanskiy, l. xiong, and x. wang. applied machine learning at facebook: a datacenter infrastructure perspective. in 2018 ieee international symposium on high performance computer architecture (hpca), pages 620-629, feb 2018.  
+[35] y. he, s. elnikety, j. larus, and c. yan. zeta: scheduling interactive services with partial execution. in proceedings of the third acm symposium on cloud computing, pages 1-14, 2012.  
+[36] p. helland and d. campbell. building on quicksand. corr, abs/0909.1788, 2009.  
+[37] j. m. hellerstein, j. m. faleiro, j. gonzalez, j. schleier-smith, v. sreekanti, a. tumanov, and c. wu. serverless computing: one step forward, two steps back. in cidr 2019, 9th biennial conference on innovative data systems research, asilomar, ca, usa, january 13-16, 2019, online proceedings, 2019.  
+[38] s. hendrickson, s. sturdevant, t. harter, v. venkataramani, a. c. arpaci-dusseau, and r. h. arpaci-dusseau. serverless computation with openlambda. in 8th usenix workshop on hot topics in cloud computing (hotcloud 16), denver, co, 2016. usenix association.  
+[39] s. hendrickson, s. sturdevant, t. harter, v. venkataramani, a. c. arpaci-dusseau, and r. h. arpaci-dusseau. serverless computation with openlambda. elastic, 60:80, 2016.  
+[40] b. holt, i. zhang, d. ports, m. oskin, and l. ceze. claret: using data types for highly concurrent distributed transactions. in proceedings of the first workshop on principles and practice of consistency for distributed data, page 4. acm, 2015.  
+[41] a. g. howard, m. zhu, b. chen, d. kalenichenko, w. wang, t. weyand, m. andreetto, and h. adam. mobilenets: efficient convolutional neural networks for mobile vision applications. corr, abs/1704.04861, 2017.  
+[42] m. isard, m. budiu, y. yu, a. birrell, and d. fetterly. dryad: distributed data-parallel programs from sequential building blocks. in proceedings of the 2nd acm sigops/eurosys european conference on computer systems 2007, eurosys '07, pages 59–72, new york, ny, usa, 2007. acm.  
+[43] e. jonas, j. schleier-smith, v. sreekanti, c.-c. tsai, a. khandelwal, q. pu, v. shankar, j. menezes carreira, k. krauth, n. yadwadkar, j. gonzalez, r. a. popa, i. stoica, and d. a. patterson. cloud programming simplified: a berkeley view on serverless computing. technical report ucb/eecs-2019-3, eecs department, university of california, berkeley, feb 2019.
+
+[44] e. jonas, s. venkataraman, i. stoica, and b. recht. occupy the cloud: distributed computing for the  $99\%$ . corr, abs/1702.04024, 2017.  
+[45] v. kalavri, j. liagouris, m. hoffmann, d. dimitrova, m. forshaw, and t. roscoe. three steps is all you need: fast, accurate, automatic scaling decisions for distributed streaming dataflows. in 13th {usenix} symposium on operating systems design and implementation (osdi) 18), pages 783-798, 2018.  
+[46] d. kempe, a. dobra, and j. gehrke. gossip-based computation of aggregate information. in 44th annual ieee symposium on foundations of computer science, 2003. proceedings., pages 482-491. ieee, 2003.  
+[47] a. klimovic, y. wang, p. stuedi, a. trivedi, j. pfefferle, and c. kozyrakis. pocket: elastic ephemeral storage for serverless analytics. in 13th {usenix} symposium on operating systems design and implementation (osdi) 18), pages 427-444, 2018.  
+[48] kubeless. http://kubeless.io.  
+[49] kubernetes: production-grade container orchestration. http://kubernetes.io.  
+[50] l. lamport. time, clocks, and the ordering of events in a distributed system. commun. acm, 21(7):558-565, july 1978.  
+[51] l. lamport et al. paxos made simple. acm sigact news, 32(4):18-25, 2001.  
+[52] y. lee, a. scolari, b.-g. chun, m. d. santambrogio, m. weimer, and m. interlandi. pretzel: opening the black box of machine learning prediction serving systems. in 13th usenix symposium on operating systems design and implementation (osdi 18), pages 611-626, carlsbad, ca, 2018. usenix association.  
+[53] m. lipp, m. schwarz, d. gruss, t. prescher, w. haas, a. fogh, j. horn, s. mangard, p. kocher, d. genkin, y. yarom, and m. hamburg. meltdown: reading kernel memory from user space. in 27th usenix security symposium (usenix security 18), 2018.  
+[54] w. lloyd, m. freedman, m. kaminsky, and d. g. andersen. don't settle for eventual: scalable causal consistency for wide-area storage with cops. in sosp'11 - proceedings of the 23rd acm symposium on operating systems principles, pages 401-416, 10 2011.  
+[55] w. lloyd, m. j. freedman, m. kaminsky, and d. g. andersen. stronger semantics for low-latency geo-replicated storage. in presented as part of the 10th {usenix} symposium on networked systems design and implementation (\{nsdi\} 13), pages 313-328, 2013.  
+[56] p. mahajan, l. alvisi, and m. dahlin. consistency, availability, convergence. technical report tr-11-22, computer science department, university of texas at austin, may 2011.  
+[57] f. manco, c. lupu, f. schmidt, j. mendes, s. kuenzer, s. sati, k. yasukata, c. raiciu, and f. huici. my vm is lighter (and safer) than your container. in proceedings of the 26th symposium on operating systems principles, pages 218-233. acm, 2017.  
+[58] g. mcgrath and p. r. brenner. serverless computing: design, implementation, and performance. in 2017 ieee 37th international conference on distributed computing systems workshops (icdcsw), pages 405-410. ieee, 2017.  
+[59] s. a. mehdi, c. littley, n. crooks, l. alvisi, n. bronson, and w. lloyd. i can't believe it's not causal! scalable causal consistency with no slowdown cascades. in 14th usenix
+
+symposium on networked systems design and implementation (nsdi 17), pages 453-468, boston, ma, mar. 2017. usenix association.  
+[60] a. mislove, m. marcon, k. p. gummadi, p. druschel, and b. bhattacharjee. measurement and analysis of online social networks. in proceedings of the 7th acm sigcomm conference on internet measurement, imc '07, pages 29-42, new york, ny, usa, 2007. acm.  
+[61] e. oakes, l. yang, d. zhou, k. houck, t. harter, a. arpaci-dusseau, and r. arpaci-dusseau. sockc: rapid task provisioning with serverless-optimized containers. in 2018 usenix annual technical conference (usenix atc 18), pages 57-70, boston, ma, 2018. usenix association.  
+[62] home | openfaas - serverless functions made simple. https://www.openfaas.com.  
+[63] apache openwhisk is a serverless, open source cloud platform. https://openwhisk.apache.org.  
+[64] r. pang, r. caceres, m. burrows, z. chen, p. dave, n. germer, a. golynski, k. graney, n. kang, l. kissner, j. l. korn, a. parmar, c. d. richards, and m. wang. zanzibar: google's consistent, global authorization system. in 2019 usenix annual technical conference (usenix atc '19), renton, wa, 2019.  
+[65] m. perron, r. c. fernandez, d. dewitt, and s. madden. starling: a scalable query engine on cloud function services. arxiv preprint arxiv:1911.11727, 2019.  
+[66] q. pu, s. venkataraman, and i. stoica. shuffling, fast and slow: scalable analytics on serverless infrastructure. in 16th {usenix} symposium on networked systems design and implementation (\{nsdi\} 19), pages 193-206, 2019.  
+[67] s. ratnasamy, p. francis, m. handley, r. karp, and s. shenker. a scalable content-addressable network. sigcomm comput. commun. rev., 31(4):161-172, aug. 2001.  
+[68] m. raynal and m. singhal. logical time: capturing causality in distributed systems. computer, 29(2):49-56, feb. 1996.  
+[69] tutorial: design and implementation of a simple twitter clone using php and the redis key-value store | redis. https://redis.io/topics/twitter-clone.  
+[70] pims/retwis-py: retwis clone in python. https://github.com/pims/retwis-py.  
+[71] r. rodruigues, a. gupta, and b. liskov. one-hop lookups for peer-to-peer overlays. in proceedings of the 11th workshop on hot topics in operating systems (hotos'03), 2003.  
+[72] a. rowstron and p. druschel. pastry: scalable, decentralized object location, and routing for large-scale peer-to-peer systems. in ifip/acm international conference on distributed systems platforms and open distributed processing, pages 329-350. springer, 2001.  
+[73] nokia bell labs project sand. https://sandserverless.org.  
+[74] v. shankar, k. krauth, q. pu, e. jonas, s. venkataraman, i. stoica, b. recht, and j. ragan-kelley. numpywren: serverless linear algebra. corr, abs/1810.09679, 2018.  
+[75] m. shapiro, n. preguiça, c. baquero, and m. zawirski. conflict-free replicated data types. in symposium on self-stabilizing systems, pages 386-400. springer, 2011  
+[76] a. singhvi, k. houck, a. balasubramanian, m. d. shaikh, s. venkataraman, and a. akella. archipelago: a scalable low-latency serverless platform. corr, abs/1911.09849, 2019.  
+[77] y. sovran, r. power, m. k. aguilera, and j. li. transactional storage for geo-replicated systems. in proceedings of the
+
+twenty-third acm symposium on operating systems principles, pages 385-400. acm, 2011.  
+[78] i. stoica, r. morris, d. karger, m. f. kaashoek, and h. balakrishnan. chord: a scalable peer-to-peer lookup service for internet applications. acm sigcomm computer communication review, 31(4):149-160, 2001.  
+[79] r. r. y. taft. elastic database systems. phd thesis, massachusetts institute of technology, 2017.  
+[80] d. b. terry, a. j. demers, k. petersen, m. j. spreitzer, m. m. theimer, and b. b. welch. session guarantees for weakly consistent replicated data. in proceedings of 3rd international conference on parallel and distributed information systems, pages 140-149. ieee, 1994.  
+[81] e. van eyk, a. iosup, s. seif, and m. thömmes. the spec cloud group's research vision on faas and serverless architectures. in proceedings of the 2nd international workshop on serverless computing, pages 1-4. acm, 2017.  
+[82] w. vogels. eventually consistent. communications of the acm, 52(1):40-44, 2009.  
+[83] t. a. wagner. acquisition and maintenance of compute capacity, sept. 4 2018. us patent 10067801b1.  
+[84] l. wang, m. li, y. zhang, t. ristenpart, and m. swift. peeking behind the curtains of serverless platforms. in 2018 {usenix} annual technical conference (  $\{\mathrm{usenix}\} \{\mathrm{atc}\}$  18), pages 133-146, 2018.  
+[85] c. wu, j. faleiro, y. lin, and j. hellerstein. anna: a kvs for any scale. ieee transactions on knowledge and data engineering, 2019.  
+[86] c. wu, v. sreekanti, and j. m. hellerstein. autoscaling tiered cloud storage in anna. pvldb, 12(6):624-638, 2019.  
+[87] x. yan, l. yang, h. zhang, x. c. lin, b. wong, k. salem, and t. brecht. wheelbase: low-latency transaction processing for globally-distributed data. in proceedings of the 2018 international conference on management of data, pages 231-243. acm, 2018.  
+[88] m. zaharia, m. chowdhury, t. das, a. dave, j. ma, m. mccauley, m. j. franklin, s. shenker, and i. stoica. resilient distributed datasets: a fault-tolerant abstraction for in-memory cluster computing. in proceedings of the 9th usenix conference on networked systems design and implementation, pages 2-2. usenix association, 2012.  
+[89] e. zamanian, c. binnig, t. kraska, and t. harris. the end of a myth: distributed transactions can scale. arxiv preprint arxiv:1607.00655, 2016.  
+[90] m. zawirski, n. preguiça, s. duarte, a. bieniusa, v. balegas, and m. shapiro. write fast, read in the past: causal consistency for client-side applications. in proceedings of the 16th annual middleware conference, middleware '15, pages 75-87, new york, ny, usa, 2015. acm.  
+[91] i. zhang, n. lebeck, p. fonseca, b. holt, r. cheng, a. norberg, a. krishnamurthy, and h. m. levy. diamond: automating data management and storage for wide-area, reactive applications. in 12th {usenix} symposium on operating systems design and implementation (osdi) 16), pages 723-738, 2016.  
+[92] t. zhang, d. xie, f. li, and r. stutsman. narrowing the gap between serverless and its state with storage functions. in proceedings of the acm symposium on cloud computing, pages 1-12, 2019.

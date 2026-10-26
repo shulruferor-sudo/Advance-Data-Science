@@ -1,0 +1,517 @@
+# turbotransformers: an efficient gpu serving system for transformer models
+
+jiarui fang
+
+pattern recognition center, wechat ai, tencent inc
+
+beijing, china
+
+jiaruifang@tencent.com
+
+chengdu zhao
+
+pattern recognition center, wechat ai, tencent inc
+
+beijing, china
+
+florianzhao@tencent.com
+
+# abstract
+
+the transformer is the most critical algorithm innovation of the nature language processing (nlp) field in recent years. unlike the recurrent neural network (rnn) models, transformers can process on dimensions of sequence lengths in parallel, therefore leading to better accuracy on long sequences. however, efficient deployments of them for online services in data centers equipped with gpus are not easy. first, more computation introduced by transformer structures makes it more challenging to meet the latency and throughput constraints of serving. second, nlp tasks take in sentences of variable length. the variability of input dimensions brings a severe problem to efficient memory management and serving optimization.
+
+this paper designed a transformer serving system called turbotransformers, which consists of a computing runtime and a serving framework to solve the above challenges. three innovative features make it stand out from other similar works. an efficient parallel algorithm is proposed for gpu-based batch reduction operations, like softmax and layernorm, major hot spots besides blas routines. a memory allocation algorithm, which better balances the memory footprint and allocation/free efficiency, is designed for variable-length input situations. a serving framework equipped with a new batch scheduler using dynamic programming achieves the optimal throughput on variable-length requests. the system can achieve the state-of-the-art transformer model serving performance on gpu platforms and can be seamlessly integrated into your pytorch code with a few lines of code.
+
+permission to make digital or hard copies of all or part of this work for personal or classroom use is granted without fee provided that copies are not made or distributed for profit or commercial advantage and that copies bear this notice and the full citation on the first page. copyrights for components of this work owned by others than acm must be honored. abstracting with credit is permitted. to copy otherwise, or republish, to post on servers or to redistribute to lists, requires prior specific permission and/or a fee. request permissions from permissions@acm.org.
+
+ppopp '21, february 27-march 3, 2021, virtual event, republic of korea
+
+© 2021 association for computing machinery.
+
+acm isbn 978-1-4503-8294-6/21/02...$15.00
+
+https://doi.org/10.1145/3437801.3441578
+
+yang yu  
+pattern recognition center, wechat ai, tencent inc  
+beijing, china  
+josephyu@tencent.com
+
+jie zhou  
+pattern recognition center, wechat ai, tencent inc  
+beijing, china  
+withtomzhou@tencent.com
+
+ccs concepts:  $\cdot$  computing methodologies concurrent computing methodologies; natural language generation; parallel algorithms.
+
+keywords: transformers, deep learning runtime, serving system, gpu
+
+# 1 introduction
+
+the recent success of nature language processing (nlp) techniques is enabled largely by the transformer-based deep neural networks (dnns), such as seq2seq [30], bert [7], gpt2 [25], and xlnet [31], albert [14]. with the support of the attention mechanism, the transformer models can capture long-range dependency in long sequences. in data centers, gpu has proven to be the most effective hardware for deploying deep learning (dl) services. the dl service accepts network requests and performs inference computation by performing a feed-forward pass on the model. although there are mature solutions for convolutional neural network (cnn) and rnn services, deploying transformer services with low latency and high throughput on gpu still faces two critical challenges.
+
+despite their success in model accuracy, transformer models are notorious for the massive amount of computation. for the inference of a 40 words sequence, the base bert model requires 6.9 gflops. to translate a 20 words sentence from chinese to english, a typical seq2seq model requires over 20 gflops. in comparison, for the inference of a  $3 \times 224 \times 224$  image, the resnet50 [11], googlenet [29] and alexnet [13] require 3.9, 1.6 and 0.7 gflops, respectively. generally, transformer models lead to more computations than previous dnn models.
+
+besides enhanced computation requirement, transformer models introduced the problem of variable-length input, where intermediate tensor dimensions have to change according to the input sequence length during a serving process. although also facing at variable-length input, rnn-based models, like lstm [12] and gru [4], split the variable-length input into multiple fixed-length inputs and execute them sequentially. unlike models with fixed-length input,
+
+transformer models cannot benefit from pre-optimization of memory space allocated for intermediate tensors with known lengths, resulting in memory optimization challenges. in addition, due to variable-length input, the optimization of the serving framework becomes more complicated. conventional serving frameworks take advantage of batching techniques to increase gpu execution efficiency. extra computations brought by zero-padding of short requests in a batch of variable-length requests often conflict with the performance gains of batching computing.
+
+existing online serving solutions are not able to resolve both the large computation demand and the variable-length input issues, especially the latter one. the deficiencies can be summarized from the three following aspects. first, directly employing a training framework, such as tensorflow [1] or pytorch [23], on inference tasks is not able to fully utilize the hardware resources. inference differs from training in a way that it does not perform backward propagations which require extra memory space for intermediate tensors and eliminate the opportunity for operator fusion. second, currently existing dl inference frameworks such as onnxruntime [19], tensorflow xla [10], tvm [3], tensorrt [22] use techniques designed for fixed-length input workloads and have insufficient capability in dealing with variable-length input. most of these current frameworks need a time-consuming preprocessing step to tune the computation pattern of the model operators according to their pre-determined input dimension. in order to work with transformer models, they usually convert variable-length requests into fixed-length requests through zero paddings, which not only introduces additional computational overhead but also limits the maximum length allowed to the pre-determined value. although onnxruntime [19] recently provides some patches to support computation for variable-length input, the runtime's gpu memory management is not efficient. after it serves a long request or a large batch of requests, a huge amount of memory allocated for intermediate tensors will not be released, introducing waste in terms of the memory footprint. third, none of the existing solutions have investigated serving optimization for variable-length input workloads. the request batching, which is the technique most helpful for performance, adopted in modern serving systems, such as tf-serving [9], clipper [5], nexus [28], are suitable for only fixed-length input.
+
+to solve the challenges of deploying an efficient transformer service, we proposed a serving system called turbotransformers. the system consists of a light-weight computation runtime and a serving framework. the runtime adopts a variable-length-input-friendly design to avoid time-consuming preprocessing specified with dimensions of the intermediate tensor. after loading a pre-trained model, the runtime rewrites the computation graph by fusing non-gemm kernels, and provides efficient cuda implementations for them. before launching an inference, it conducts light-weight memory usage optimizations according to the input sequence length. the
+
+runtime can achieve state-of-the-art speed and a smaller memory footprint compared with existing dl runtimes. moreover, it is easy to use, it can bring end-to-end speedup by adding a few lines of python code. building upon the runtime, the serving framework improves throughput of the service through a variable-length-aware batching technique.
+
+the innovative contributions of the paper are listed as follows.
+
+- we proposed a new parallel algorithm for batch reduction kernels like softmax and layernorm, which pushes the efficiency boundary of these kernels on gpu.  
+- we proposed a sequence-length-aware memory allocation algorithm. unlike other popular allocators for dnn runtimes, our allocator can utilize the computation graph of the dnn model to derive efficient memory reusing strategies for variable dimension intermediate tensors.  
+- we proposed a sequence-length-aware batch scheduler. it utilizes a dynamic programming algorithm to derive a batching scheme to achieve the optimal throughput.
+
+# 2 backgrounds
+
+# 2.1 transformer models
+
+self-attention is the key idea behind the transformer model. it has the ability to attend to different positions of the input sequence to compute a representation of that sequence. a transformer model handles variable-length input using stacks of self-attention layers instead of rnns or cnns. an encoder-decoder model architecture is illustrated in figure 1.
+
+multi-head attention consists of four parts, a set of linear layers that are split into heads, a scaled dot-product attention, a concat, and a final linear layer. each multi-head attention block gets three tensors as inputs; q (query), k (key), v (value). these are put through the linear layers and split up into multiple heads. the scaled dot-product attention computes the dot products of the query with all keys, and applies a softmax function to obtain the weights on the values. the attention output for each head is then concatenated and put through a final linear layer. in addition to multi-head attention, each of the layers in our encoder and decoder contains a fully connected feed-forward network to improve the capacity of the model. it consists of two linear transformations with activations in between.
+
+by introducing parallelism on the sequence length, dimensions of q, k, and v tensors change unpredictably during serving. take a real-time translation system as an example. after a short greeting phrase including a few words as input, a long paragraph of hundreds of words maybe its next input. the variable-length input feature brings difficulties to batching. when the input contains a batch of request, in order to be processed together, the short sequence must be filled with
+
+zeros according to the longest sequence before being sent to the transformer models.
+
+![](images/7e547664c788c6b92317b8a445490d341e2b36fecd851e473b1bb5deda081e5b.jpg)  
+figure 1. the transformer model [30] - an encoder-decoder model architecture and its key components.
+
+figure 1 shows a transformer architecture with both encoder and decoder parts. note that decoder parts are not necessary in transformer-based model, for example the widely-used bert model only contain the encoder parts.
+
+# 2.2 serving systems
+
+leveraging the power of transformer-based models to nlp online applications requires joint efforts in both training and serving stages. training is the process of building a model from offline data, which requires iteratively forward and backward passes. serving, consisting of repeated inferences, is the process of using the model to extract useful features from user online input through a forward pass. although inference does not involve complex backward computation and iterative processing, its performance requirements are more demanding. the serving process must run in real-time with low latency and sometimes should have the capacity of handling orders of magnitude more throughput than the training process. a serving system can be divided into two components, a dl inference runtime, and a serving framework.
+
+training frameworks have been widely used as inference runtimes. for instance, tf-serving [9] is wrapped with tensorflow. considering the poor performance of applying training framework in inference, some works have been dedicated to inference-specific runtimes, such as onnxruntime [19], tenorflow xla [10], tvm [3], and tensorrt [22]. due to time-consuming preprocessing specific to the dimension of inputs, most of these runtimes can not be applied in variable-length input tasks. among them, only the onnxruntime is able to be used in the variable-length input tasks, with dynamic axis
+
+supports after version 1.3. faster transformers [20] is a transformer boost software developed by nvidia. however, it is not a complete runtime because it has no memory manager and has to be used as an operator for tensorflow. the comparison between this work and them are listed in table 1.
+
+table 1. comparison of our runtime and existing gpu dl inference runtimes.  
+
+<table><tr><td>related works</td><td>speed</td><td>preprocess</td><td>variable-len</td><td>usage</td></tr><tr><td>tensorflow-xla [10]</td><td>medium</td><td>yes</td><td>no</td><td>easy</td></tr><tr><td>pytorch [23]</td><td>medium</td><td>no</td><td>yes</td><td>easy</td></tr><tr><td>tensorrt [22]</td><td>fastest</td><td>yes</td><td>no</td><td>hard</td></tr><tr><td>faster transformers [20]</td><td>fast</td><td>yes</td><td>no</td><td>hard</td></tr><tr><td>onnx-routine [19]</td><td>fast</td><td>yes</td><td>yes</td><td>medium</td></tr><tr><td>turbotransformers</td><td>fastest</td><td>no</td><td>yes</td><td>easy</td></tr></table>
+
+the serving framework wraps the runtime into a service exposing grpc/http as endpoints. the advanced functionalities of the serving framework include batching, caching, model version management, and model ensembles. batching boosts throughput substantially by combining multiple inference requests into a batch to increase gpu usability, which is the main focus of this paper. tf-serving enforces a static batch size by concat multiple requests together and has to pad zeros if requests are not enough. clipper [5] proposed an adaptive batching scheme to dynamically find and adapt the maximum batch size. nexus [28] further designed a batch scheduler to serve multiple different models on the same gpu. ebird [6] is a prototype system designed an elastic batch scheduler based on an inference engine supporting multiple batches of the same model running concurrently. all of the above works are targeted at fixed-length input, which does not consider performance harm brought by zero-padding of short requests in a batch of variable-length requests. to avoid the zero-padding problem in rnn, batchmaker [8] breaks the computation graph into a graph of cellulars and dynamically decides the set of cellular should be batched together. it takes advantage of the weight sharing between multiple forward passes of rnn, which is not applicable in transformer models.
+
+# 3 design overview
+
+as shown in the figure 2, there are two ingredients of turbotransformers, an inference runtime and a serving framework. the system accepts network requests and responds the results processed by the transformer models to end users. section 4 will elaborate on the details of the runtime<sup>1</sup>, and section 5 will focus on the serving framework.
+
+# 4 inference runtime
+
+inference runtime focuses on increasing computation efficiency and optimizing memory allocation.
+
+![](images/fd4768eb2781824ee06c6628d8a351caab98d78f75ce24c57e877b44e06216e8.jpg)  
+figure 2. the serving system architecture adopted by turbo-transformers.
+
+# 4.1 computational optimizations
+
+4.1.1 kernel fusion. without backward propagations, there is a lot of room left for inference customized optimizations. when using training frameworks, like tensorflow or pytorch to infer a transformer model on the gpu, a significant amount of time is spent on some non-computational intensive kernels. take pytorch as an example. for the case where batch size and sequence length are both relatively large, pytorch bert brings low efficiency due to the inefficient implementations of non-gemm kernels. for a bert inference on a tesla v100 gpu using input with batch size as 20 and sequence length as 128, only  $61.8\%$  of the time is spent on gemm kernels, and  $38.2\%$  is spent on non-gemm intensive cores, such as layernorm, softmax, add bias, transpose, etc. for the case where batch size and sequence length are relatively small, pytorch leads to poor efficiency due to the launch overhead of the cuda kernels. for a bert model inference on a tesla v100 gpu with batch size as 1 and sequence length as 40, gpu is completely idle  $80.64\%$  of the time.
+
+![](images/d12e5efb39bdd30978511d70524cb327f50706244434a4873bfb215a1a7d89c1.jpg)  
+figure 3. kernel fusion of a transformer encoder. the part in darker color is a multi-head attention. the part in lighter color is a feed forward network.
+
+kernel fusion is able to increase computation efficiency by reducing the number of memory accesses, increasing cache locality, and reducing kernel launch overhead. similar to many popular frameworks, such as tensorflow, and theano [2], our runtime represents the dnn forward propagation by constructing a computation graph, in which nodes are operators and edges are tensors. as is shown in figure 3, the computation graph of a transformer can be reorganized into a more compact graph by fusing all the kernels between two gemm kernels into a single one. the fused non-gemm kernels are non-standard dnn operators, so it is impossible to take advantage of existing dnn operator libraries, such as cudnn [21]. for example, there is no such api to combine matrix addition and transpose operation in a single cuda kernel.
+
+turbotransformers implements all the non-gemm kernels using cuda, which can be categorized into two types. one type of kernel, such as fused activation functions and fused transpose operations, are composed of element-wise operations. there is no dependency between the processing of two different tensor elements, so we can process them in embarrassingly parallel. the second type of kernels, including softmax and fused layernorm, are composed of reduction operations, which is notorious for being hard to parallelized. the latter is the focus of our performance improvement.
+
+4.1.2 gpu-based batch-reduction. both of softmax and layernorm based kernels can be viewed as batch reduction operations. on the lower dimension of a 2d tensor, softmax calculates summation and maximum and layernorm calculates the mean and variance. in other words, they both need to reduce a batch of 1d arrays in parallel. table 2 shows the proportion of time of the two operators in the attention layer. in the table, the execution time of softmax and layernorm is measured using pytorch. attention time is measured using our runtime after replaced softmax and layernorm with pytorch's implementations, respectively. we can observe that they are two big hotspots if not carefully optimized.
+
+table 2. proportion of batch reduction operations in attention layer before and after optimizing.  
+
+<table><tr><td colspan="2">(batch size, seq len)</td><td>(1, 10)</td><td>(1, 100)</td><td>(1, 500)</td><td>(20, 10)</td><td>(20, 100)</td><td>(20, 500)</td></tr><tr><td rowspan="2">softmax/attention</td><td>before</td><td>26.23%</td><td>24.73%</td><td>34.41%</td><td>3.04%</td><td>29.4%</td><td>90.68%</td></tr><tr><td>after</td><td>3.44%</td><td>3.18%</td><td>11.56%</td><td>2.46%</td><td>5.50%</td><td>15.46%</td></tr><tr><td rowspan="2">layernorm/attention</td><td>before</td><td>29.20%</td><td>21.72%</td><td>18.96%</td><td>10.61%</td><td>52.59%</td><td>83.38%</td></tr><tr><td>after</td><td>4.96%</td><td>4.40%</td><td>4.08%</td><td>5.14%</td><td>6.44%</td><td>4.24%</td></tr></table>
+
+realizing the inefficiency of pytorch operators, some effort is spent on optimize gpu batch reduction. according to the programming model of cuda, efficient reduction algorithms need to fully utilize the power of three hardware levels. first, by splitting on the batch dimension, streaming-processors (sms) level parallelism is exploited by the process of the workload on different sms in parallel. second, warp level parallelism is exploited by taking advantage of the
+
+warp-level inter-thread communication mechanism provided by cuda beyond the 9.0 version. third, instruction-level parallelism is exploited by overlapping memory access and computation instructions. a classical implementation adopted in faster transformers [20] is shown in the top part of the figure 4. it is derived from work [16], which proposed a best practice for 1-d array reduction operations on the gpu. reduction workloads of  $n$  rows (inside the dotted line on the top of the figure) are assigned to a thread block, which is scheduled to be executed on an sm. the thread block sequentially performs  $n$  times independent 1-d array reduction, which is finished with two-pass. in the first pass, each warp of the sm conducts a warpreduce operation on 32 aligned elements, and then store reduction results of them inside shared memory. in the second pass, a warp load at most 32 partial results to register and conduct another warpreduce to obtain the final results.
+
+in this paper, we push the efficiency boundary of classical batch reduction algorithms on gpu. note that some space is still left for improvement of warp level and instruction parallelism in the above algorithm. first, due to the accesses of shared memory, synchronizations of warps inside an sm introduce huge overheads. second, if the input array is not 32-aligned, warp divergence resulting from boundary processing also introduces extra overhead. third, warpreduce leads to poor efficiency of instruction issuing. as pointed out by reference [16], there is a dependency between shuffle and add instructions. in the upper right corner of the figure 4, the target register r3 in an shfl down instruction is required immediately as a source register in fadd instruction. the fadd instruction can only be issued until the shfl is completely finished, whose latency is more than 1 cycle.
+
+the above three shortcomings can be overcome by leveraging parallelism between multiple 1-d reduction operations. as shown in the bottom part of figure 4, a new subroutine warpallreducesum_xelem  $(x = 2$  in our figure) is introduced, which combine  $x$  warp as a batch and do their reduction together. first, only one synchronization is required for  $x$  elements reduction in blockreducesum_xelem, therefore, reduces  $(x - 1) / x$  synchronization cost. second,  $x$  independent boundary processing can be merged into a single one, therefore reduce warp divergence. third, the instruction issuing is more efficient because we eliminate instructions dependency. as shown in the figure, the target register of shfl down is required two cycles later by fadd as a source register. another shfl down with no dependency on the previous one can be issued immediately.
+
+especially for the layernorm kernel, turbotransformers further derives a mathematical optimization trick to improve efficiency. layernorm requires the variances of elements of 1-d arrays. there are two equivalent formulas of variance, as shown in the equation 1. the first one used in [20] requires two separate reductions for  $x$  and  $x - e(x)$ , during which one synchronization between. we use the second one
+
+![](images/6a5fb02611a9d45261093def726f446e1bd8f58e0d915d5681bad44ce1a42ef0.jpg)  
+figure 4. parallel batch reduction optimizations on three hardware levels.
+
+![](images/ee2a33d533cfcadbe686cb383260fb7e52ca954706784bca3fb7a2741ee5f542.jpg)
+
+![](images/a4e4d4ccf0ac33db49aae74ff528c899b98273a3eb8a7cb5d37c46f6cb32e760.jpg)  
+figure 5. speedup of batch reduction kernels on tesla v100.
+
+to compute variances. the warpallreducesum_2elem can simultaneously reduce  $x$  and  $x^2$ , which not only increases the efficiency of instruction execution but also reduces half of the number of synchronizations.
+
+$$
+\operatorname {v a r} (x) = e \left(x - e (x)\right) ^ {2} = e \left(x ^ {2}\right) - e ^ {2} (x) \tag {1}
+$$
+
+figure 5 shows the speedups of softmax and layernorm kernels in turbotransformers compared with the other implementations. the baseline of both kernels is used implementations from [20]. for the softmax kernel, we also compare
+
+with the softmax routine cudnnv7.5. in most cases, our optimization strategy has achieved obvious acceleration. due to the batch dimension is larger for softmax, its performance boost is more significant.
+
+# 4.2 memory manager
+
+besides computing optimizations, memory management is also vital to a dnn runtime. it is evaluated by two metrics. the allocation efficiency, which determined by the number of times and the amount of the memory is allocated and released, affects the overall execution speed of the runtime. the memory footprint affects the possible size of the model as well as the maximum batch size of requests. three types of memory are managed by the runtime, i.e., input tensors, intermediate tensors, layer parameters. dimensions of intermediate tensors change frequently during inferences in case of variable-length input. adversely, for fixed-length input, the dimensions of intermediate tensors are determined in advance and allocation scheme never changes during inference processes. therefore, the memory usage and positions of tensors can be pre-optimized and fixed during serving. however, the optimal memory allocation strategy is different in case of the different input lengths. allocator of variable-length input must efficiently deal with unpredictable memory usage requirements.
+
+it is complicated to achieve both a high allocation efficiency and a small memory footprint for variable-length input. to achieve the best memory footprint, the memory of intermediate tensors should be allocated when needed, and released immediately when not required. frequent allocation and release of small memory space on gpu will lead to a worse runtime efficiency. for example, in this case,  $50\%$  of the computing resources idle wait for memory allocation ready on tesla m40 (batch size = 20, sequence length = 128). to achieve the best allocation efficiency, the memory should be allocated in advance and cached for repeated use in the future the inferences without any extra allocation. however, it is challenging to predict maximum memory usage to meet the requirement of a long-term serving process. even if we know it, occupying a vast amount of memory for a long time will lead to extremely poor memory footprints.
+
+although the allocator for fixed-length input has been well studied, the one for variable-length input is still not perfect. for fixed-length input, by taking advantage of the topology of the computation graph, works [24] [15] figure out the optimal memory usage by reusing the same memory space for intermediate tensors that do not coexist. for variable-length input, the existing solutions have to tradeoff allocation efficiency and footprint. pytorch [23] designed a custom caching tensor allocator which incrementally builds up a cache of cuda memory and reassigns it to later allocations. paddlepaddle [17] used a similar method, which is all inspired by the caching device allocator implemented in the nvlab's cub library [26]. experiments have shown that these methods
+
+cannot achieve optimal memory usage, because they do not consider the dnn's computation graph.
+
+we adopted an innovative memory optimization method for variable-dimension intermediate tensors, which evoke a lightweight variable-length-aware memory manager after knowing the length of each inference. to achieve more efficiency and less footprint, the allocator used in turbotransformers combines the idea of memory cache and graph-topology-aware space reuse. first, it organizes memory space in units of the chunks, which is a small block, for example, 2mb of memory. by reusing already allocated chunks, allocation efficiency can remain at a high level during serving. second, it utilizes the computation graph to know the life cycle of each intermediate tensor in advance, and calculate the offset of each tensor within a specific chunk as soon as it recognizes the sequence length of the new arrival request. in this way, tensors with no overlapping life cycle can reuse the same memory space, therefore reduce memory footprint as much as possible.
+
+our sequence-length-aware allocation method is shown as algorithm 1. the input tensor usage record is a list of tuples  $\{first\_ op, last\_ op, size\}$ , where first_op, last_op are indices of the first and last operator that use the tensor. the indices are from the topological sorting of the dnn's computation graph. it first sorts the usage records in non-increasing order based on the size of the tensor. findgapfromchunk is used to determine if there exists a free gap inside a chunk to fit for that tensor. if no such gap is found in all existing chunks, we append a new chunk to the end of the chunk list. the size of the new chunk is the maximal one of default_chunk_size (2mb in our implementation) and the size of tensor times k_scale (1.2 in our implementation). when a chunk is not used in this inference, in our algorithm, its memory is released immediately. alternatively, we can assign each chunk a maximum inference idle times, and release it after it reaches the time limit.
+
+findgapfromchunk of algorithm 1 finds the best gap in a memory chunk. it is equivalent to a special case of the 2d strip packing problem, which is np-hard. we slightly modify the greedy by size for offset calculation algorithm in [24] to solve findgapfromchunk in  $o(n^{2})$  time complexity. the inputs are a target tensor  $t$  and a target chunk chunk. for each record  $x$  in the chunk, the algorithm first checks whether  $x$  and the target tensor  $t$  overlap in usage time (l5-l7), in order to find the smallest gap between them such that current tensor fits into that gap (l8 - l11). if we found such a gap before the end of the chunk, we assign the tensor  $t$  to the gap. otherwise, the function returns invalid. (l15 - l21).
+
+figure 6 shows an example of applying our algorithm on a bert inference application. when the input length changes from 200 to 240, we allocate one more chunk and adjust the offsets.
+
+algorithm 1: sequence-length-aware allocator  
+def findgapfromchunk(t : tensor_id, chunk):  
+    get chunk_size from chunk; smallest_gap  $\leftarrow \infty$ ;  
+prev_offset  $\leftarrow 0$ ; best_offset  $\leftarrow$  nil;  
+foreach record  $x \in$  chunk do  
+max_first_op  $\leftarrow$  max (first_opt, first_op_x);  
+min_last_op  $\leftarrow$  min (last_opt, last_op_x);  
+if max_first_op  $\leq$  min_last_op then  
+gap  $\leftarrow$  offset_x - prev_offset;  
+if gap  $\geq$  sizet and gap < smallest_gap then  
+smallest_gap  $\leftarrow$  gap;  
+best_offset  $\leftarrow$  prev_offset;  
+end  
+prev_offset  $\leftarrow$   
+max(preval_offset, offset_x + sizex);  
+end  
+end  
+if best_offset is nil and  
+chunk_size - prev_offset  $\geq$  sizet then  
+best_offset  $\leftarrow$  prev_offset;  
+end  
+if best_offset is nil then  
+return invalid;  
+end  
+return best_offset  
+end  
+def memallocatetensorusagerecords : a list of tuples  
+(first_op, last_op, size), chunk_list : a chunk has size, mem  
+addr, list of <tensor_id, offset>):  
+sort tensorusagerecords in decreasing order of size;  
+foreach record  $t \in$  tensorusagerecords do  
+is assigned  $\leftarrow$  false;  
+foreach chunk  $\in$  chunk_list do  
+offset  $\leftarrow$  findgapfromchunk(t, chunk);  
+if offset is valid then  
+assigned_chunk_t  $\leftarrow$  chunk_id;  
+assigned_offset_t  $\leftarrow$  offset;  
+is assigned  $\leftarrow$  true;  
+break;  
+end  
+end  
+if is assigned is false then  
+new_chunk_size  $\leftarrow$   
+max(default_chunk_size, t_size×k_scale);  
+assigned_chunk_t  $\leftarrow$  len(chunk_list);  
+assigned_offset_t  $\leftarrow 0$ ;  
+append a new chunk of size new_chunk_size to  
+chunk_list;  
+end
+
+![](images/02d04af20ca4a9b50307c13ab19c68a51cc14f6de6746f21291a69e0bcf5e891.jpg)  
+figure 6. a memory allocation example uses our proposed variable-length-aware allocator.
+
+# 5 serving framework
+
+based on the computation runtime, a serving framework is required to attain enough serving throughput under latency constraints to satisfy a service level objectives (slos). the serving framework of turbotransformers is shown in figure 2. the user's requests first arrive at a message queue (mq) and then are sent to runtime for inference computation after two serving-level optimizations, i.e. caching and batching. for caching, similar to clipper [5], by caching the inference results in a database, the resp cache component in the figure responses the frequent requests without evaluating the model. for batching, the batch scheduler component is responsible for packaging requests that come in a period of time into a batch. in most application scenarios, the input of the user is a single inference request with batch size as 1. it has been known that small batch sizes lead to low gpu hardware utilization. packaging multiple requests into a relatively larger batch and conducting inference on them together can improve hardware utilization. as shown in figure 7, serving requests in batch brings significant speedup, especially for short sequences. the batch schedulers adopted by conventional serving systems, like tf-serving [9] and nexus [28], are designed to packages requests with fixed-length into a batch. currently, serving systems are lack of critical ability to handle variable-length requests.
+
+how to batch variable-length requests to achieve the optimal throughput is tricky. if we package multiple requests of different lengths into a batch, then all requests in the batch will be zero-padded with regards to the maximum length of the request in the batch. zero paddings will introduce a lot of extra computations. an efficient batch scheduler has to
+
+![](images/07573fb0de8834ba57e443460260c2e0e7071e6646d6e67bb17887bf8d6f25b3.jpg)  
+figure 7. batching brings performance gain for the base bert serving on rtx 2060 gpu. the y-axis illustrates the normalized latency of inferring a request of batch size 1.
+
+carefully balance the overheads of padding and the benefits of batching. for example, assume that there are five inference requests to be served, with lengths of 17, 18, 52, 63, and 77, respectively. packing a single batch with 5 instances is less efficient than no batching. the batching scheme achieving the optimal throughput is packing three batches. as shown in figure 8, the response throughput (resp/sec) improved  $35\%$  by the optimal scheduling scheme.
+
+![](images/0ecbd33874efb7152475188b315a15d2959eca44a50f925f53c12c32a1c08c88.jpg)  
+figure 8. an example of batch scheduler for variable-length requests.
+
+for variable-length request serving, we proposed an innovative sequence-length-aware batch scheduler in algorithm 2. the core idea is to use dynamic programming (dp) to solve an optimization problem which maximizes the response throughput as the objective in  $o(n^{2})$  time complexity. the inputs of the algorithm consist of two data structures. the request_list is the list of input requests with variable length. the cached_cost is a dictionary. it uses two keys as indices, namely the sequence length and batch size. its value is the inference cost with the parameter from the corresponding key. the values of cached_cost are collected by a warm-up phase after the service first starts on specific hardware, which utilizes the runtime to run inferences under all possible batch sizes and sequence lengths. they are stored on disk or database (database in figure 2) and reloaded to memory when the serving module is restarted. first, the request_list are sorted in increasing order according to the sequence length. then line 3 initializes an array called states to store intermediate information. specifically, state[i] records the minimum time overhead for processing the sublist request_list[0:i]. the algorithm traverses each request in request_list and uses a
+
+dp algorithm to update the state  $[i]$  at the corresponding position  $i$ . the bellman equation of this dp problem is shown in equation 2.
+
+$$
+\begin{array}{l} \operatorname {s t a t e} [ i ] = \min  _ {0 \leq j \leq i} (\operatorname {c a c h e d \_ c o s t} [ \text {r e q u e s t \_ l i s t} [ i ]. \text {l e n} ] [ i - j + 1 ] \\ \times (i - j + 1) + s t a t e s [ j - 1 ]) \tag {2} \\ \end{array}
+$$
+
+algorithm 2: batch scheduler with dp  
+input: request_list, cached_cost  
+1 sort request_list in increasing order with regards to sequence length;  
+2  $n\gets$  size(request_list);  
+3 create states, start_idx lis as lists of size  $n + 1$   
+4 states[0]  $\leftarrow$  0;  $i\gets 1$   
+5 while  $i\leq n$  do  
+6  $j\gets i - 1$  ; start_idx  $= i - 1$  .  
+7 cur_length  $=$  request_list[i-1].length;  
+8 min_cost  $=$  cached_cost[cur_length][1]  $^+$  states[j];  
+9 while  $j > 0$  do  
+10 tmp_cost  $=$  states[j-1]+ cached_cost[cur_length][i-j+1]*(i-j+1);  
+11 if tmp_cost  $<$  min_cost then  
+12 |min_cost  $=$  tmp_cost; start_idx  $= j - 1$  .  
+13 end  
+14  $j\gets j - 1$  .  
+15 end  
+16 states[i]  $=$  min_cost; start_idx_list[i]  $=$  start_idx;  
+17  $i\gets i + 1$    
+18 end  
+19  $i = n$  .  
+20 while  $i > 0$  do  
+21 end_idx  $\leftarrow$  i; start_idx  $\leftarrow$  start_idx_list[i];  
+22 pack request_list[start_idx : end_idx] into a batch;  
+23  $i =$  start_idx-1;  
+24 end
+
+note that the premise of this algorithm work is that there exists a scheduling strategy for requests in mq that can meet slo on this server. in a multi-server environment, an upper-level load balancer as the one in nexus [28] can ensure that the requests assigned to each server will not be overloaded. there are two options to decide when to evoke the batch scheduler. the first one is a hungry strategy. when the runtime is idle, we immediately start the batch scheduler to batch requests in mq. this strategy is suitable for the situation where request throughput is high and the gpu have to run at full load. the second one is a lazy strategy. similar to delayed batching of clipper, we sets a timeout value and a maximum batch size. once the number of requests in the batch exceeds the maximum batch size, or the timeout is reached, we start the batch scheduler. due to the reordering of requests in algorithm 2, requests that arrive early may be
+
+served late. we check the elapse between the current time and the recorded arrival timestamp of request at the front of the mq, and start the batch scheduler immediately if the elapse plus the estimated execution latency of current requests in batch exceeds half of the latency constraints.
+
+# 6 experimental results
+
+we evaluated the performance of both the runtime and the serving system on a server equipped with an amd ryzen 7 3700x cpu and one rtx 2060 gpu.
+
+# 6.1 usability
+
+our runtime provides c++ and python apis. for the python one, as shown in the following code snippet, adding 3 lines of python code (l3, 12, 13) can bring end-to-end speedup.
+
+```python
+import torch   
+import transformers   
+import turbo_transformers   
+model_id  $=$  "bert-base-uncased"   
+torch_model  $\equiv$  transformers.bertmodel.from_pretrained(model_id)   
+torch_model.eval()   
+input_ids  $\equiv$  torch.tensor( [12166, 10699, 16752, 4454], dtype  $\equiv$  torch.long device  $\equiv$  torchdevice('cuda:0'))   
+torch_model.to(torch_device('cuda:0'))   
+torch_res  $\equiv$  torch_model(input_ids)   
+turbo_model  $\equiv$  turbo_transformers.bertmodel.from_torch(torch_model)   
+turbo_res  $\equiv$  turbo_model(input_ids)
+```
+
+# 6.2 performance of the runtime
+
+the runtime is evaluated on four transformer dnns, including bert [7], albert [14], distilbert [27] and a seq2seq decoder [30], the parameters of which are shown in table 3. the former three dnns consist of transformer encoder structures, and the latter consists of both encoder and decoder structure and is applied in a neural machine translation system. the bert model adopts a base configuration, while the albert model adopts a large configuration.
+
+table 3. evaluated transformer models & parameters  
+
+<table><tr><td>model</td><td>parameters</td></tr><tr><td>bert</td><td>num_layer=12, num_head=12, hidden_size=4096, inter_size=3072</td></tr><tr><td>albert</td><td>num_layer=12, num_head=64, hidden_size=4096, inter_size=16384</td></tr><tr><td>distilbert</td><td>num_layer=6, num_head=12, hidden_size=4096, inter_size=3072</td></tr><tr><td>seq2seq</td><td>num_layer=6, num_head=16, hidden_size=3072,</td></tr><tr><td>decoder</td><td>beam_size=4, max_target_len=500</td></tr></table>
+
+6.2.1 end-to-end speed on variable-length input. the ability to handle variable-length input is evaluated by sequential execution of the runtime using requests of different lengths. for bert and albert, the input requests are randomly generated texts whose lengths are uniformly distributed from
+
+![](images/58ba4b55d61b9b6520f285380c8e64c0a8e545dc6ae1ff0ada9ce1da8b6ce1b0.jpg)
+
+![](images/1bed0f1fb97b60873da6ab00a0348bda216a48a4cb18880904a3d8080432f11e.jpg)
+
+![](images/afd40dd499dd36d2ba3c35f4586fa8dbc209b67dfb53ecdbc47048110a8fbd04.jpg)
+
+![](images/2bc8e0f40855719fed253a5fd265b88fa87fe93d419bac19c305f2855af98248.jpg)  
+figure 9. benchmarking the latency of runtimes using variable length requests.
+
+5 to 500. for decoder, it is a model adopted from a chinese-english translation task, and its inputs are randomly sampled chinese texts whose length ranges from 28 to 137. the performance results are shown in figure 9. note that our generating and sampling processes are completely random, and the random seed is the same for different tests, although the figure displays in order of input length from small to large for the sake of clearness. we compare our runtime with the pytorch (v1.5.0) and onnxruntime-gpu (v1.3.0). turbo is the performance of our proposed runtime implemented by fp32 gemm algorithms. the turbo-tc allows gemm operation to use tensor core [18] if possible. because the tensor core optimization is not allowed in pytorch and onnxruntime, we list it here as an additional reference. however, it introduces minimal and acceptable precision loss to the fp32 version.
+
+turbotransformers' runtime shows significant performance advantages over pytorch on short requests. in the case of bert inference, turbo's speedups to pytorch are ranging from  $0.97\mathrm{x} - 2.44\mathrm{x}$ , on average  $1.25\mathrm{x}$ . in albert inference, turbo's speedups to pytorch are ranging from  $1.04\mathrm{x} - 1.45\mathrm{x}$  on average  $1.17\mathrm{x}$ . in the case of distilbert inference, turbo's
+
+speedups to pytorch are ranging from  $0.85\mathrm{x} - 2.24\mathrm{x}$ , on average  $1.13\mathrm{x}$ . in the case of decoder inference, turbo's speedups to pytorch are ranging from  $1.14\mathrm{x} - 1.20\mathrm{x}$ , on average  $1.16\mathrm{x}$ . the performance improvement is more obvious in test cases of short input sequences. the latency of long input sequences is mainly limited by gemm operations, which are not optimized by our runtime. since the gemm operations are conducted on the tensor core, turbo-tc always leads to much low latency. for the same reason, the decrease in albert's speedup to bert is caused by the larger parameters of the albert model, leading to an increase in the proportion of gemm operations.
+
+turbotransformers exhibits similar performance with onnxruntime. in the case of bert, the speedups of turbo to onnxruntime are ranging from  $0.88\mathrm{x} - 1.05\mathrm{x}$ , on average  $1.01\mathrm{x}$ . in the case of distilbert, the speedups of turbo to onnxruntime are ranging from  $0.83\mathrm{x} - 1.36\mathrm{x}$ , on average  $1.03\mathrm{x}$ .
+
+the time distribution of different bert computation kernels is analyzed in figure 10. we selected two test cases to show the inference hotspots in a long sequence input as 400 and a short sequence input as 20. in the sequence length 20, the gemm kernels account for  $70.31\%$  of overall computation time. the softmax kernel (applymaskandsoftmax) only accounts for  $1.85\%$  of time, and layernorm kernels (addbiaslayernorm + bertoutput/addbiaslayernorm) account for  $2.71\%$  of time. in the sequence length 400, the gemm kernels account for  $82.80\%$  of overall computation time. the softmax accounts for  $4.57\%$ , and layernorm accounts for  $3.64\%$ . the remaining time is spent in element-wise operations, such as activations, biases addition, tensor transposing, and reshaping. our optimization for batch reduction is very successful since they are no longer the main hotspots among the non-gemm kernels.
+
+![](images/2ecf3dc003bd1cf70bc1718e0b1773f802d50974dc2eb208779dcdccf18e30b5.jpg)  
+figure 10. time distribution of different bert computation kernels in the case of long and short sequences.  
+figure 12. amount of device memory allocation/free for intermediate tensors during bert inferences.
+
+# 6.2.2 memory optimization on variable-length requests.
+
+for memory optimization, we first analyze the memory footprint of the intermediate tensors. our proposed model-aware-allocator is compared with three other allocators, including the allocators of pytorch and onnxruntime and an accelerator implemented by greedy by size for offset calculation (gsoc) algorithm proposed in work [24], which has achieved the near-optimal memory footprint for fixed-length input inference. memory footprint results are reported in figure 11 and the memory allocation results are reported in figure 12,
+
+which are evaluated using c++ apis. the memory allocated for intermediate tensors in pytorch and onnxruntime keep increasing during benchmarking. after processing a long sequence request, 460 in this case, the memory usage reaches its peak and no longer drops. the two runtimes incrementally build up a cache of cuda memory and reassign it to later allocations. when there are no available fragments in the cached memory blocks, they allocate a large block of additional memory and never release it until the memory usage reaches an upper limit. in contrast, our allocator and gcos use the information of computation-graph to control memory usage wisely. as shown in the figure, the maximum memory usage of us is  $12.15\mathrm{mb}$ . the memory footprint of turbo is quite close to the gcos method. however, turbo allocates and frees less memory than gcos for each inference.
+
+![](images/6a983c14a3d79ab995d916596bb79b2465a03d9aaf9b0997ee9013d5d720a990.jpg)  
+figure 11. footprint of intermediate tensors during bert inferences.
+
+![](images/90aead85d2560c1c990b1328487c36f89aea6bbea7af29b162452a2b296df2a5.jpg)
+
+we also analyze the overall memory footprint of the runtime. the peak device memory usage is measured by monitoring the nvidia-smi information in every 1 ms. the peak gpu memory used for turbo is 663 mb while the gpu peak memory used by pytorch is 1307 mb and 1653 mb for onnxruntime. since the cuda contexts of a variety of cuda kernels need to take up a large amount of memory space  $^{2}$ , pytorch and onnxruntime require more gpu memory than the dnn model and intermediate tensors actually used, which valid our efforts to implement a lightweight transformer-target inference runtime instead of a training framework or a general inference runtime.
+
+to prove our proposed model-aware allocator's efficiency, we measure the overhead of algorithm 1 to schedule memory offset of each intermediate tensor. since the time complexity
+
+of the algorithm is  $\mathrm{o}(\# \text{tensor}^2)$ , a trick to reduce the number of tensors is that, for the dnn model with repeated structures, we only compute memory addresses once for intermediate tensors in one of those structures and reuse them in the other ones. we measure the cost of algorithm 1 in each inference process using a bert model with input sequence lengths randomly generated from 5 to 500. as shown in fig. 13., the average cost of offset scheduling (cost of algorithm 1) is  $1.8\%$  on average  $(0.07\%-5.77\%)$  of dnn inference latency. the overhead of the algorithm is extremely low and its benefit outweighs its cost.
+
+![](images/2cd0d90492d9270147c278cfb2b95aee7c9b7d55f0e42aa1e3a848546c03bb19.jpg)  
+figure 13. the offset scheduling overhead of model-aware allocator.
+
+6.2.3 end-to-end speed on fixed-length requests. we also compared with another three popular runtimes that only support fixed-length requests. 1) tensorflow-xla is implemented with tensorflow (version 1.13) and preprocessed with xla. 2) faster transformers (v1) is a transformer boost software developed by nvidia, which implements a set of customized fused kernels like us. however, it has no memory management and using the memory allocator of the tensorflow framework. 3) nvidia tensorrt (v5.1.5) is an sdk for high-performance deep learning inference. the above three solutions require a time-consuming pre-tuning process based on the input dimension in advance, so they cannot be applied to handling real-time variable-length requests.
+
+for the sake of fairness, we chose bert as the transformer model to be evaluated on a fixed-length input task, for which every runtime has been specifically optimized for it, and an official example is provided. we select a parameter space consisting of the cartesian product of a set of batch sizes including 1 and 20 and a set of sequence lengths sampled from 10 to 500. the speedups of turbotransformers to the other runtimes are shown in figure 14. compared with pytorch, the speedup of turbo is  $1.23\mathrm{x} - 2.77\mathrm{x}$ , on average  $1.54\mathrm{x}$ . compared with onnnruntime-gpu, the speedup of turbo is  $1.01\mathrm{x} - 1.26\mathrm{x}$ , on average  $1.11\mathrm{x}$ . compared with tensorflow-xla, the speedup of turbo is  $1.03\mathrm{x} - 1.31\mathrm{x}$ , on average  $1.11\mathrm{x}$ . compared with faster transformers, the speedup of turbo is  $0.71\mathrm{x} - 1.32\mathrm{x}$ , on average  $0.91\mathrm{x}$ . compared with tensorrt, the speedup of turbo is  $0.53\mathrm{x} - 0.96\mathrm{x}$ , on average  $0.87\mathrm{x}$ . on average, our runtime is around  $10\%$  faster than xla and onnxruntime and around  $10\%$  slower than faster transformers and tensorrt. tensorrt needs an offline tuning process, during which it can select the optimal parameters for gemm kernels and may
+
+identify the optimal cuda thread block sizes for non-gemm kernels. on the contrary, our runtime does not involve the benefits of these optimizations.
+
+![](images/aeffce0282b635979ad8cc557cdb8b11ccef3d797db8eea477a2c7993896ed23.jpg)  
+figure 14. benchmarking the runtimes for fixed-length input tasks on rtx 2060. the y-axis indicates normalized speedup of turbotransformers.
+
+# 6.3 performance of serving framework
+
+we choose a bert-based service as our target application, which is used to classify a paragraph of text. the input text is first randomly generated with sequence length uniformly distributed between 2-100 and then generated with sequence length uniformly distributed between 5-500. the requests are sent to the serving system with poisson inter-arrival times. we turn off the caching optimization.
+
+there are two strategies to build the cached_cost dictionary in algorithm 2. first, if the parameter space is small, a warmup phase that records the latency of executing with all possible parameters is required after the service started. it takes tens of minutes in our experiments. second, if the parameter space is large, we sample the parameter space and use the interpolation method to estimate a specific case during serving. after you get real data, it can be used to update the dictionary in a lazy evaluation way.
+
+the serving throughput of input sequence length ranging 2-100 is illustrated in figure 15. the figure's x-axis indicates how many requests arrive at the serving system per second, ranging from 20 req/sec to 1500 req/sec. the figure's y-axis represents how many responses can be obtained per second, which is usually called serving throughput. the critical point for service latency to remain stable is that request throughput, and serving throughput are equal. when request throughput is higher than the critical point, the requests will accumulate in the message queue, leading to long delays of latter requests. after a while, its latency will gradually tend to infinity  $(+\infty)$ , and the service system has to drop some requests.
+
+our proposed batch scheduler achieves the best serving throughput. the baseline is shown as pytorch-nobatch, which uses pytorch as the runtime and serve without batching optimization. turbo-nobatch is the service using our proposed runtime to replace pytorch. turbo-naive-batch is implemented with a naive batch scheduler, which packs the requests currently inside the message queue into a single batch.
+
+turbo-dp-batch is our proposed variable-length-aware batch scheduler. the batch scheduler of our system employs the hungry strategy, and the maximum batch size is 20. the serving throughput of pytorch-nobatch is saturated at 99 resp/sec. the serving throughput of turbo-nobatch is saturated at 237 resp/sec (2.39x). turbo-naive-batch improves it to 323 resp/sec (3.26x) and the turbo-dp-batch futher improves it to 402 resp/sec (4.06x).
+
+the latency results on four systems' critical points are shown in table 4. since batching brings higher gpu utilization for short requests, the latency of naive-batch is smaller than nobatch. turbo-dp-batch sorts the requests in mq, the execution of long sequences is delayed, thus increasing their latency. therefore naive-batch brings smaller latency than turbo-dp-batch.
+
+![](images/8c938fe30219728e9836e5072214452a0efe9eb1f6ee60181794d4ada734b841.jpg)  
+figure 15. serving throughput under different request throughput (sequence length 2-100).
+
+table 4. the latency of four serving systems (sequence length 2-100). table item contains the avg (min, max) latency in ms.  
+
+<table><tr><td>request 
+thrift (req/sec)</td><td>pytorch 
+nobatch</td><td>turbo 
+naive-batch</td><td>turbo-dp-batch</td></tr><tr><td rowspan="2">99</td><td>36.52</td><td>7.47</td><td>7.51</td></tr><tr><td>(10.05, 108.72)</td><td>(3.84, 18.59)</td><td>(3.78, 21.58)</td></tr><tr><td rowspan="2">237</td><td>+∞</td><td>16.68</td><td>10.09</td></tr><tr><td></td><td>(3.68, 45.39)</td><td>(3.67, 28.60)</td></tr><tr><td rowspan="2">323</td><td>+∞</td><td>+∞</td><td>12.44</td></tr><tr><td></td><td></td><td>(3.48, 26.70)</td></tr><tr><td rowspan="2">402</td><td>+∞</td><td>+∞</td><td>+∞</td></tr><tr><td></td><td></td><td>24.74</td></tr><tr><td></td><td></td><td></td><td>(4.23, 57.02)</td></tr></table>
+
+when increasing the length difference between the sequences by changing the input sequence range from 2-100 to 5-500, our proposed allocator achieves the best throughput and leads to the lowest latency. the throughput of input sequence length ranging 5-500 is illustrated in figure 16 and the latency results are shown in table 5. in this case, we turn on the tensor core optimization, which brings no accuracy loss and can better satisfy the slo. the serving throughput of pytorch-nobatch is saturated at 60 resp/sec, while turbo-tc-nobatch improves it to 120 resp/sec (2.0x). turbo-tc-dp-batch further improves it to 144 resp/sec (2.4x). due to the additional zero-padding overhead, turbo-tc-naive-batch's throughput is 98 resp/sec, which is even worse than turbo-nobatch. as shown in table 5. under the same request
+
+throughput rate, turbo-dp-batch usually brings the lowest average and maximum service latency. this is because of the reduction of zero-padding cost and shortening the latency of every single request.
+
+![](images/67480e7aa281f60c860d2f3a09ab7e6797c7fcbc1a4221832372fed9f24fff84.jpg)  
+figure 16. serving throughput under different request throughput (sequence length 5-500).
+
+table 5. the latency of four serving systems (sequence length 5-500). table item contains the avg (min, max) latency in ms.  
+
+<table><tr><td>request 
+thrift (req/sec)</td><td>pytorch 
+nobatch</td><td>naivebatch</td><td>turbo 
+nobatch</td><td>turbo-dp-batch</td></tr><tr><td rowspan="2">60</td><td>77.71</td><td>17.80</td><td>8.05</td><td>8.05</td></tr><tr><td>(10.61, 158.06)</td><td>(3.06, 121.96)</td><td>(2.76, 20.53)</td><td>(2.70, 27.42)</td></tr><tr><td rowspan="2">98</td><td>+∞</td><td>16.68</td><td>24.88</td><td>13.79</td></tr><tr><td></td><td>(2.96, 65.09)</td><td>(3.0, 65.09)</td><td>(2.94, 45.09)</td></tr><tr><td rowspan="2">120</td><td>+∞</td><td>+∞</td><td>32.91</td><td>23.18</td></tr><tr><td></td><td></td><td>(3.14, 127.61)</td><td>(2.72, 81.83)</td></tr><tr><td rowspan="2">144</td><td>+∞</td><td>+∞</td><td>+∞</td><td>38.51</td></tr><tr><td></td><td></td><td></td><td>(4.44, 106.65)</td></tr></table>
+
+# 7 conclusion
+
+turbotransformers improves latency and throughput for deploying transformer-based dl services in gpu datacenter. it solves two critical problems introduced by the transformer models, which are unprecedented computation pressure and variable-length input. for these purposes, it proposed three innovations in computing, memory and serving levels, including a new parallel batch reduction algorithm for softmax and layernorm kernels, a sequence-length-aware memory allocator as well as a sequence-length-aware batch scheduler. the runtime achieves better speed than pytorch and similar speed as onnxruntime in the variable-length request tests but maintains a smaller memory footprint. it also achieves comparable speed than tensorflow-xla, tensorrt, and fastertransformers in the fixed-length request tests. while conventional batching is inefficient for variable-length request, the serving framework achieves higher throughput using the proposed batch scheduler.
+
+# 8 acknowledgements
+
+we would like to thanks yin li (uc davis), shengqi chen, wentao han (tsinghua univ.) for their proofreading.
+
+# references
+
+[1] martin abadi, paul barham, jianmin chen, zhifeng chen, andy davis, jeffrey dean, matthieu devin, sanjay ghemawat, geoffrey irving, michael isard, et al. 2016. tensorflow: a system for large-scale machine learning. in 12th usenix symposium on operating systems design and implementation (osdi16). 265-283.  
+[2] james bergstra, olivier breuleux, frédéric bastien, pascal lamblin, razvan pascanu, guillaume desjardins, joseph turian, david warde-farley, and yoshua bengio. 2010. theano: a cpu and gpu math expression compiler. in proceedings of the python for scientific computing conference (scipy), vol. 4. austin, tx, 1-7.  
+[3] tianqi chen, thierry moreau, ziheng jiang, lianmin zheng, eddie yan, haichen shen, meghan cowan, leyuan wang, yuwei hu, luis ceze, et al. 2018. tvm: an automated end-to-end optimizing compiler for deep learning. in 13th usenix symposium on operating systems design and implementation (osdi 18). 578-594.  
+[4] kyunghyun cho, bart van merrienboer, dzmitry bahdanau, and yoshua bengio. 2014. on the properties of neural machine translation: encoder-decoder approaches. arxiv preprint arxiv:1409.1259 (2014).  
+[5] daniel crankshaw, xin wang, guilio zhou, michael j franklin, joseph e gonzalez, and ion stoica. 2017. clipper: a low-latency online prediction serving system. in 14th usenix symposium on networked systems design and implementation (nsdi 17). 613-627.  
+[6] weihao cui, mengze wei, quan chen, xiaoxin tang, jingwen leng, li li, and mingyi guo. 2019. ebird: elastic batch for improving responsiveness and throughput of deep learning services. in 2019 ieee 37th international conference on computer design (iccd). ieee, 497-505.  
+[7] jacob devlin, ming-wei chang, kenton lee, and kristina toutanova. 2018. bert: pre-training of deep bidirectional transformers for language understanding. arxiv preprint arxiv:1810.04805 (2018).  
+[8] pin gao, lingfan yu, yongwei wu, and jinyang li. 2018. low latency rnn inference with cellular batching. in proceedings of the thirteenth eurosys conference. 1-15.  
+[9] google. 2020. tensorflow serving. https://github.com/tensorflow/serving. [online; accessed july-2020].  
+[10] google. 2020. xla: optimizing compiler for machine learning. https://www.tensorflow.org/xla. [online; accessed july-2020].  
+[11] kaiming he, xiangyu zhang, shaoqing ren, and jian sun. 2016. deep residual learning for image recognition. in proceedings of the ieee conference on computer vision and pattern recognition. 770-778.  
+[12] sepp hochreiter and jürgen schmidhuber. 1997. long short-term memory. neural computation 9, 8 (1997), 1735-1780.  
+[13] alex krizhevsky, ilya sutskever, and geoffrey e hinton. 2012. imagenet classification with deep convolutional neural networks. in advances in neural information processing systems. 1097-1105.  
+[14] zhenzhong lan, mingda chen, sebastian goodman, kevin gimpel, piyush sharma, and radu soricut. 2019. albert: a lite bert for self-supervised learning of language representations. arxiv preprint arxiv:1909.11942 (2019).  
+[15] juhyun lee, nikolay chirkov, ekaterina ignasheva, yury pisarchyk, megan shieh, fabio riccardi, raman sarokin, andrei kulik, and matthias grundmann. 2019. on-device neural net inference with mobile gpus. arxiv preprint arxiv:1907.01989 (2019).  
+[16] yuan lin and v grover. 2019. using cuda warp-level primitives. retrieved from https://devblogs.nvidia.com/using-cuda-warp-level-primitives/. accessed (2019).  
+[17] yanjun ma, dianhai yu, tian wu, and haifeng wang. 2019. paddlepaddle: an open-source deep learning platform from industrial practice. frontiers of data and computing 1, 1 (2019), 105-115.  
+[18] stefano markidis, steven wei der chien, erwin laure, ivy bo peng, and jeffrey s vetter. 2018. nvidia tensor core programmability, performance & precision. in 2018 ieee international parallel and distributed processing symposium workshops (ipdpsw). ieee, 522-531.
+
+[19] microsoft. 2020. onnx runtime is a cross-platform inherencing and training accelerator compatible with many popular ml/dnn framework. https://github.com/microsoft/onnxruntime. [online; accessed july-2020].  
+[20] nvidia. 2019. fastertransformer v1, a highly optimized bert equivalent transformer layer for inference. https://github.com/nvidia/deeplearningexamples/tree/master/fastertransformer. [online; accessed april-2020].  
+[21] nvidia. 2020. cudnn. https://developer.nvidia.com/cudnn. [online; accessed august-2020].  
+[22] nvidia. 2020. nvidia tensorrt. https://developer.nvidia.com/tensortrt. [online; accessed july-2020].  
+[23] adam paszke, sam gross, francisco massa, adam lerer, james bradbury, gregory chanan, trevor killeen, zeming lin, natalia gimelshein, luca antiga, et al. 2019. pytorch: an imperative style, high-performance deep learning library. in advances in neural information processing systems. 8026-8037.  
+[24] yury pisarchyk and juhyun lee. 2020. efficient memory management for deep neural net inference. arxiv preprint arxiv:2001.03288 (2020).  
+[25] alec radford, jeffrey wu, rewon child, david luan, dario amodei, and ilya sutskever. 2019. language models are unsupervised multitask learners. openai blog 1, 8 (2019), 9.  
+[26] nvidia research. 2020. cub. https://github.com/nvlabs/cub. [online; accessed august-2020].  
+[27] victor sanh, lysandre debut, julien chaumont, and thomas wolf. 2019. distilbert, a distilled version of bert: smaller, faster, cheaper and lighter. arxiv preprint arxiv:1910.01108 (2019).  
+[28] haichen shen, lequn chen, yuchen jin, liangyu zhao, bingyu kong, matthai philipose, arvind krishnamurthy, and ravi sundaram. 2019. nexus: a gpu cluster engine for accelerating dnn-based video analysis. in proceedings of the 27th acm symposium on operating systems principles. 322-337.  
+[29] christian szegedy, wei liu, yangqing jia, pierre sermanet, scott reed, dragomir anguelov, dumitru erhan, vincent vanhoucke, and andrew rabinovich. 2015. going deeper with convolutions. in proceedings of the ieee conference on computer vision and pattern recognition. 1-9.  
+[30] ashish vaswani, noam shazeer, niki parmar, jakob uszkoreit, llion jones, aidan n gomez, łukasz kaiser, and illia polosukhin. 2017. attention is all you need. in advances in neural information processing systems. 5998-6008.  
+[31] zhilin yang, zihang dai, yiming yang, jaime carbonell, russ r salakhutdinov, and quoc v le. 2019. xlnet: generalized autoregressive pretraining for language understanding. in advances in neural information processing systems. 5753-5763.
+
+# a artifact appendix
+
+# a.1 abstract
+
+the artifact contains the code for the runtime of turbotransformers. we provide instructions for obtaining critical results used in this paper and scripts for running the experiments in the paper.
+
+# a.2 description
+
+# a.2.1 check-list (artifact meta information).
+
+- algorithms: the artifact includes the runtime component of turbotransformers. more specifically, it contains the parallel batch-reduction algorithms proposed in section 4.1.2, as well as the model-aware-allocated proposed in section 4.2.
+
+- datasets: the inputs used for benchmark scripts of the artifact are randomly generated.  
+- compilation: the experiments in the paper used g++ version 7.5.0, nvcc version 10.2. the artifact also provided a docker file to build a docker environment to compile the code. the docker version used is 19.03.8.  
+- runtime environment: the artifact provided a compilation script to run on the centos 7 os installed with cuda version 10.2.  
+- hardware: the artifact can run on a server equipped with at least one nvidia gpu. the supported gpu microarchitecture codenames include pascal, volta, turing.  
+- output: running times of the algorithms are output to the console.  
+- experiment workflow: clone the repository and use the provided scripts to run the experiments.  
+publicly available: yes
+
+a.2.2 how delivered. available as open-source under the bsd license: https://github.com/tencent/turbotransformers. the artifact branch is ppopp21 artifact_centos.
+
+# a.3 installation
+
+# a.3.1 docker.
+
+- build a docker image using the docker file.
+
+```txt
+bash tools/build_docker_gpio.sh $pwd
+```
+
+- run the image as a container
+
+```shell
+nvidia-docker run --gpus all
+--net=host --rm -it -v
+$pwd:/workspace
+--name=turbo_dev:latest
+```
+
+- inside the container, build the artifact.
+
+```shell
+1 cd /workspace  
+2 bash  
+    tools/build_and_run_unittests.sh  
+    $pwd -dwith_gpu=on
+```
+
+# a.3.2 centos.
+
+- use the following command to build the artifact on cenos 7.
+
+```batch
+1 |bash build_centos.sh
+```
+
+# a.4 experiment workflow
+
+you can run the scripts provided in the benchmark directory to compare the speed of turbo runtime with pytorch. run the following script will reproduce the bert and albert results shown in figure 9.
+
+```txt
+1 bashgpu_run_variable_benchmark.sh
+```
+
+run the following script will reproduce the bert and albert result in figure 14.
+
+```txt
+1 bashgpu_run_fixedenchmark.sh
+```

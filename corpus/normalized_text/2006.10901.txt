@@ -1,0 +1,498 @@
+# sparse gpu kernels for deep learning
+
+trevor gale  
+stanford university  
+united states of america  
+tgale@cs.stanford.edu
+
+matei zaharia  
+stanford university  
+united states of america  
+matei@cs.stanford.edu
+
+cliff young google brain united states of america cliffy@google.com
+
+erich elsen deepmind united kingdom eriche@google.com
+
+abstract—scientific workloads have traditionally exploited high levels of sparsity to accelerate computation and reduce memory requirements. while deep neural networks can be made sparse, achieving practical speedups on gpus is difficult because these applications have relatively moderate levels of sparsity that are not sufficient for existing sparse kernels to outperform their dense counterparts. in this work, we study sparse matrices from deep learning applications and identify favorable properties that can be exploited to accelerate computation. based on these insights, we develop high-performance gpu kernels for two sparse matrix operations widely applicable in neural networks: sparse matrix-dense matrix multiplication and sampled dense-dense matrix multiplication. our kernels reach  $27\%$  of single-precision peak on nvidia v100 gpus. using our kernels, we demonstrate sparse transformer and mobilenet models that achieve  $1.2 - 2.1 \times$  speedups and up to  $12.8 \times$  memory savings without sacrificing accuracy.
+
+index terms—neural networks, sparse matrices, graphics processing units
+
+# i. introduction
+
+deep neural network architectures are composed of large, dense matrices used in matrix multiplication and convolutions [1], [2]. these matrices can be made sparse with little to no loss in model quality, leading to models that are more efficient in terms of both the floating-point operations (flops) and parameters required to achieve a given accuracy [3]–[6].
+
+the most common use of sparsity in deep neural networks is to accelerate inference. in addition to the standard training procedure, a sparsification algorithm is applied to produce a neural network where a high fraction of the weights are zero-valued [3], [7]–[9]. the weight matrices can then be stored in a compressed format, and sparse linear algebra kernels can be used to accelerate computation. in the context of generative models, sparsity has been applied to reduce the computational requirements of self-attention in transformer architectures [6], [10], [11]. in addition to these applications, sparsity can be exploited to achieve higher predictive accuracy by training a larger, sparse model for a fixed computational cost [12]–[14]. to make training large sparse models feasible, all computation during training needs to operate directly on the compressed sparse representation of the model's weights.
+
+the potential applications of sparsity in deep learning are numerous. however, it is difficult to realize the benefits of sparsity in real applications due to the lack of efficient kernels for core sparse matrix computations like sparse matrix-matrix multiplication (spmm) and sampled dense-dense matrix multiplication (sddmm) on accelerators like gpus.
+
+![](images/8a878ff3b8428ad69a59a2202b72a87d0ef0dd57513d93f7c2a6b2abcb47bac7.jpg)  
+fig. 1. sparse matrix-matrix multiplication runtime for a weight-sparse long short-term memory network problem. input size 8192, hidden size 2048, and batch size 128 in single-precision on an nvidia v100 gpu with cuda 10.1. using our approach, sparse computation exceeds the performance of dense at as low as  $71\%$  sparsity. existing vendor libraries require  $14\times$  fewer non-zeros to achieve the same performance. this work enables speedups for all problems in the highlighted region.
+
+on parallel architectures, the performance of sparse linear algebra kernels can vary drastically with properties of the sparse matrix such as the topology of nonzero values and level of sparsity. existing gpu kernels for sparse linear algebra are primarily optimized for scientific applications, where matrices are extremely  $(99\% +)$  sparse. with the relatively moderate levels of sparsity found in deep neural networks, these kernels are not able to outperform their dense counterparts.
+
+to address this issue, structure can be enforced on the topology of nonzeros such that nonzero values are grouped into blocks [12]–[14]. while this approach is able to recover much of the performance achieved by dense computation, the constraint on the location of nonzeros can significantly degrade model quality relative to unstructured sparsity [14]–[16].
+
+in this work, we develop an approach for computing spmm and sddmm on gpus which is targeted specifically at deep learning applications. our approach operates directly on the standard compressed sparse row (csr) format and does not enforce any structure on the topology of nonzero values. we make the following specific contributions:
+
+- we conduct a large-scale study of sparse matrices found in deep learning and identify favorable properties that can
+
+![](images/fd43d20ac324c2b65adfb7379d46a0407c84078c33baa664c942ab8a6d3c1358.jpg)  
+fig. 2. properties of sparse matrices from scientific computing and deep learning applications. histograms are partially transparent to show overlapping regions. on average, deep learning matrices are  $13.4 \times$  less sparse, have  $2.3 \times$  longer rows, and have  $25 \times$  less variation in row length within a matrix.
+
+be exploited to accelerate sparse computation.
+
+- we introduce a 1-dimensional tiling scheme for decomposing the computation across processing elements that facilitates reuse of operands and lends itself to an extensible implementation.  
+- we develop two techniques, subwarp tiling and reverse-offset memory alignment, that enable the use of vector memory instructions on misaligned memory addresses in sparse data structures.  
+- we introduce row swizzle load balancing, an approach for load balancing computation between processing elements that is decoupled from the parallelization scheme.
+
+on a large dataset of sparse matrices taken from state-of-the-art deep neural networks, we demonstrate geometric mean speedups of  $3.58 \times$  and  $2.19 \times$  over nvidia cusparse for spmm and sddmm respectively on nvidia v100 gpus. on the top performing problems, our kernels reach  $27\%$  of single-precision peak. using our kernels, we demonstrate sparse transformer and mobilenet models that achieve 1.2– $2.1 \times$  end-to-end speedups and  $12.8 \times$  reductions in memory usage while matching the accuracy of their dense counterparts. our code is open-source and available at https://github.com/google-research/sputnik
+
+# ii. sparse matrices in deep learning
+
+to understand the properties of sparse matrices in deep learning, we constructed a dataset of sparse deep neural network weight matrices from the large-scale study of [17]. the dataset is composed of resnet-50 [1] and transformer [2] models trained on imagenet [18] and wmt14 english-to-german [19] respectively, and includes models trained with four different algorithms for inducing sparsity in neural networks. for transformer, we limit our analysis to models that achieve above 20 bleu on the wmt14 english-german test set. for resnet-50, we include models that achieve over  $70\%$  top-1 accuracy on the imagenet validation set. in total, the collection includes 3,012 matrices from 49 different models.
+
+our analysis focuses on three properties of the matrices: row length (in number of nonzeros) coefficient of variation (cov), average row length, and sparsity. the cov of a matrix's row lengths is the standard deviation of the row lengths divided by their mean. a high cov is indicative of load imbalance
+
+across the rows of a sparse matrix. the average row length captures the average amount of work that will be done on each row of the sparse matrix. longer row lengths are desirable as startup overhead and one-time costs can be amortized over more useful work. sparsity measures the fraction of values that are zero valued in a matrix. depending on the implementation, lower sparsity levels can be useful to increase the likelihood that nonzero values in different rows fall into the same columns, opening up opportunities for the reuse of operands through caches.
+
+we contrast the properties of deep learning workloads with matrices from the suitesparse matrix collection [20], which is made up of 2,833 sparse matrices from a wide range of scientific workloads including circuit simulations, computational fluid dynamics, quantum chemistry, and more.
+
+# a. results & analysis
+
+statistics for our corpus of deep learning matrices and the suitesparse matrix collection are plotted in figure 2. the difference between sparse matrices from scientific workloads and those from deep learning is considerable: on average, deep learning matrices are  $13.4 \times$  less sparse, have  $2.3 \times$  longer rows, and have  $25 \times$  less variation in row length within a matrix. we find it likely that these differences are primarily driven by the desire to maintain high accuracy, which requires deep neural networks with a large number of parameters. this in turn leads to a higher number of nonzeros per row and a lower cov, which is inversely proportional to average row length. for each of the metrics that we studied, deep learning matrices exhibit favorable properties that we can take advantage of to accelerate sparse matrix computations.
+
+# iii. graphics processing units background
+
+this section provides a basic description gpu architecture and terminology. our implementation is written in cuda and thus we opt for the terminology used by nvidia.
+
+gpus are made up of an array of streaming multiprocessors (sms) and gpu kernels are made up of threads that are grouped into sets of 32 called warps. warps are grouped into larger sets of threads called thread blocks. the set of thread blocks that make up a kernel is called a grid. when a kernel is launched to the gpu for execution, each thread
+
+![](images/dd77f64177d04cc889415751ab2c1a2b59cb6201f1b94af84a09c95cac19d7d2.jpg)  
+fig. 3. hierarchical decomposition of spmm with 1-dimensional tiling. visualized with 4 warps in a thread block and 4 threads in a warp for brevity. in each level of the decomposition, matrix  $a$  is a sparse matrix stored in compressed-sparse row format, marked in green and shown on the left. matrix  $b$  is dense, marked in blue and shown on top of the output matrix. the output matrix  $c$  is dense, marked in orange and shown in the bottom right of each level. the dark regions at each level denote data used by the following level. far left: each thread block computes a 1-dimensional tile of the output matrix. all values from the row of sparse matrix  $a$  are needed by all threads. we use all threads in the thread block to collaboratively load values and indices from  $a$  to shared memory where they can be quickly accessed for computation. for each column index loaded from  $a$ , the thread block will load a contiguous vector from matrix  $b$  (marked with dark blue horizontal stripes). center left - far right: threads process independent outputs and thus need disjoint subsets of columns from dense matrix  $b$ . each thread loads the values from  $b$  needed to compute it's outputs and stores them in thread-local registers.
+
+block is scheduled onto an sm. a wave of thread blocks is a set of thread blocks that run concurrently on the gpu [21]. all threads within a thread block can communicate through fast, programmer-managed, shared memory that is local to the sm. all threads also have access to thread-local registers. the number of thread blocks that execute concurrently on an sm is referred to as the occupancy of the kernel. higher occupancy is typically desirable, as thread-level parallelism can be exploited to hide the latency of memory and arithmetic operations. gpus have a large but high-latency global memory that is accessible to all sms, an l2 cache that is shared by all sms, and l1 caches that are local to each sm. when a warp of threads access global memory, gpus try to coalesce the accesses into as few transactions as possible.
+
+# iv. sparse matrix computation
+
+this section explains the operations implemented by our spmm and sddmm kernels.
+
+# a. sparse matrix-matrix multiplication operation
+
+our spmm kernel implements the computation  $ab \rightarrow c$ , where  $a$  is sparse and stored in the standard compressed sparse row (csr) format. in the following sections, we refer to matrices  $a$ ,  $b$  and  $c$  as the sparse matrix, dense matrix, and output matrix respectively.
+
+# b. sampled dense-dense matrix multiplication operation
+
+the sddmm operation is defined as  $ab \odot c \rightarrow d$ , where  $c$  and  $d$  are sparse and  $\odot$  denotes the element-wise product of two matrices [22], [23]. thanks to the element-wise scaling with a sparse matrix, dot-products for zero-valued locations of the output can be skipped to accelerate computation.
+
+in sparse deep neural networks, sddmm is necessary for a number of key computations. for example, in a weight sparse neural network the forward pass computes  $wx \rightarrow y$ , where  $w$
+
+is sparse. in the backward pass, the gradient w.r.t. the sparse weights is computed as  $\delta yx^t\odot \mathbb{i}[w]\rightarrow \delta w$ , where  $\mathbb{i}[w]$  is an indicator function that returns 1 in the location of the nonzero values of the sparse matrix  $w$ . transformer models with sparse attention similarly compute  $qk^{t}\odot \mathbb{i}[y]\rightarrow z$  in the forward pass, where  $q$  and  $k$  are the query and key inputs to the attention mechanism respectively and  $y$  is a sparse matrix that describes the connectivity of the attention mechanism.
+
+these computations differ from the strict definition of sddmm in two ways. first, they do not require the elementwise scaling by the sparse matrix values. secondly, the  $b$  input operand to the sddmm is typically transposed. with these applications in mind, our sddmm implements the computation  $ab^t \odot \mathbb{i}[c] \rightarrow d$ . while we specialize to the computation that arises in deep learning, we note that our approach is easily extensible to the general sddmm computation<sup>1</sup>.
+
+# c. data organization
+
+to enable coalesced memory accesses into all input and output matrices, we store dense matrices in row-major layout and sparse matrices in csr format [24]–[26]. we note that computing spmm as  $ba \rightarrow c$ , where  $a$  is the sparse matrix stored in compressed sparse column format and  $b$  and  $c$  are stored column-major would be equally efficient.
+
+# v. sparse matrix-matrix multiplication
+
+this section details the design of our spmm kernel.
+
+# a. hierarchical 1-dimensional tiling
+
+our scheme for spmm on gpu is diagrammed in figure 3 and presented in cuda pseudo-code in figure 4. the decomposition follows a row-splitting scheme [26], with one
+
+element-wise scaling adds 1 load and 1 multiply instruction prior to storing the output. non-transposed right-hand operand makes memory accesses trivially coalesced and simplifies the kernel relative to the transposed case.
+
+key difference: rather than mapping a thread block to an entire row of the output matrix, we shard the output into 1-dimensional tiles and map independent thread blocks to each.
+
+the motivation for this approach stems from the fact that the number of columns in the dense matrix can vary drastically in deep learning applications. consider various neural network architectures with sparse weight matrices and dense activations. when training rnns this dimension corresponds to the batch size, which is typically between 16-128 elements [27]. in transformer architectures, this dimension is the product of the batch size and sequence length, which can vary from 256 to over 2048 elements [2], [28]. in  $1 \times 1$  convolutions, this dimension is the product of the image height and width with the batch size. in efficientnet architectures, the product of the spatial dimensions alone ranges from 64 to 14,400 [29].
+
+there are three main benefits to 1-dimensional tiling. firstly, we can easily temptatize our implementation for different tile sizes and generate specialized kernel variants for different regions of the problem space. secondly, for problems with small m and k dimensions we launch more thread blocks than would otherwise be possible, enabling us to achieve higher occupancy and a higher fraction of peak throughput. lastly, processing fixed-sized blocks enables us to aggressively unroll loops and compute offsets and constants at compile time. we similarly iterate through the reduction dimension in fixed-size steps, enabling further loop unrolling and static evaluation.
+
+# b. vector memory operations
+
+vector memory instructions are an important tool for mitigating bandwidth bottlenecks and decreasing the number of instructions needed to express a computation [30]. however, it is non-trivial to use these operations in sparse matrix kernels.
+
+first, using vector memory instructions increases the number of values loaded simultaneously by a thread block. for example, a thread block with a single warp using 4-wide vector loads would request 128 floats with a single instruction. in our 1d tiling scheme, this means that some loads from a sparse matrix row of length less than 128 would need to be predicated off. similarly, problems with fewer than 128 columns in the dense matrix would execute with some threads in every thread block predicated off for the entirety of the kernel's execution. these constraints limit the utility of vector memory accesses, applied naively, to very large problems.
+
+secondly, vector memory accesses require that the target values be aligned to the vector width (2 or 4 32-byte values). for accesses into the dense matrix or output matrix this requires that the number of columns be divisible by the vector width such that the start of every row of values is properly aligned. the larger issue is with loads from the sparse matrix. with a 1-dimensional tiling or row-splitting scheme, accesses within a thread block begin at the start of a row of values in the sparse matrix. because rows in a sparse matrix can have arbitrary lengths, these initial addresses have no alignment guarantees regardless of the problem dimensions.
+
+```txt
+template <int kblockitemsk, int kblockitemsx> global void spmmkernel()
+{
+    sparsematrix a, matrix b, matrix c) {
+        // calculate tile indices.
+    }
+    int midx = blockidx.y;
+    int nidx = blockidx.x * kblockitemsx;
+    // calculate the row offset and the number
+    // of nonzeros in this thread block's row.
+    int m_off = a.rowoffssets[midx];
+    int nnz = a.rowoffssets[midx+1] - m_off;
+    // main loop.
+    tile1d c_tile(/*init_to=*/0);
+    for(; nnz > 0; nnz -= kblockitemsk) {
+        tile1d a_tile = loadtile(a);
+        tile2d b_tile = loadtile(b);
+        c_tile += a_tile * b_tile;
+    }
+}
+```
+
+fig. 4. cuda pseudo-code for spmm with 1-dimensional tiling. the output matrix is statically partitioned into 1-dimensional tiles. independent thread blocks are launched to compute each output tile. on each iteration of the main loop, we load a 1-dimensional strip of the sparse matrix and a 2-dimensional tile of the dense matrix and accumulate the vector-matrix product. after processing all nonzero values in the row, the results are written to the output matrix.
+
+1) subwarp tiling: to address the first issue, we extend our scheme to allow mapping of subsets of a warp (i.e., a subwarp) to independent 1d tiles of the output. this reduces the access width constraint by a factor of the number of subwarp's used. this also gives us the flexibility to spread threads across more rows of the output matrix for problems with a smaller number of columns in the dense and output matrices.
+
+with subwarp tiling, our scheme bears some resemblance to a standard two-dimensional tiling scheme at the warp level. the important difference is that subwarps processing different rows of the output matrix are not able to reuse values loaded from the dense matrix. however, depending on the sparsity level, accesses issued by different subwarps are likely to exhibit locality that could be serviced through caches.
+
+the main drawback to this approach is that rows of variable length can result in warp divergence. we address the issue of load imbalance between threads in a warp in section v-c.
+
+2) reverse offset memory alignment: a simple approach to address the second issue is to pad the rows of the sparse matrix with zeros such that all rows are a multiple of four in length. however, this limits the generality of the kernel. to enable the use of vector memory instructions on arbitrary sparse matrices, we introduce a simple trick in the setup portion of the kernel (aka, the prelude): after loading the row offset and calculating the row length, each thread block decrements its row offset to the nearest vector-width-aligned address and updates the number of nonzeros that it needs to process. to maintain correctness, the threads mask any values that were loaded from the previous row prior to accumulating the result in the first iteration of the main loop.
+
+we refer to this trick as reverse offset memory alignment (roma). relative to the explicit padding scheme, roma
+
+does not change the amount of work done by each thread block. the key difference is that instead of explicitly padding the matrix data structure, roma effectively pads the rows of the sparse matrix with values from the row before it<sup>3</sup>.
+
+roma can be implemented very efficiently. the alignment process adds 6 ptx instructions in the kernel prelude: 2 bitwise and, 1 add, 1 setup (set predicate), and 2 selp (select based on predicate). the masking process adds 1 setup and 2 str.shared (shared memory store) instructions to the first iteration of the main loop.
+
+these techniques for enabling the use of vector memory instructions on sparse matrices are visualized in figure 5. figure 8 shows cuda pseudo-code for our spmm kernel with the necessary modifications for subwarp tiling and roma.
+
+# c. row swizzle load balancing
+
+a number of approaches for handling load imbalance in sparse computation have been proposed [23], [26], [32]. however, existing approaches tightly couple load balancing to the parallelization scheme. while these schemes achieve good performance when load imbalance is significant, they typically introduce computational irregularity that can damage performance on more regular problems problems [26]. however, despite the regularity of sparse matrices found in dnns, our kernels still suffer from load imbalance (see figure 7).
+
+when mapping sparse matrix operations to gpus, there are two potential sources of load imbalance [26].
+
+(a) load imbalance between warps or thread blocks: some warps/thread blocks may be assigned less work than others. this can lead to some sms sitting idle while others do useful work.  
+(b) load imbalance within a warp or thread block: some threads within a warp may be assigned less work than others. this can lead to warp divergence and inefficient use of math units and memory bandwidth within an sm.
+
+to address these issues, we make two observations. first, many units of work of varying sizes will be scheduled onto each sm over the course of kernel execution. secondly, we can control what work is assigned to which sm by changing which threads are assigned to process each unit of work. based on these observations, we can ensure the workload is balanced across the processing elements by remapping where work is scheduled such that each processing element is assigned a roughly equal amount of work. we refer to this remapping procedure as a row swizzle<sup>4</sup>. to address both sources of load imbalance, we introduce a two level re-ordering of work:
+
+(a) row binning: given an understanding of how thread blocks are mapped to sms, alter the tile mappings such that each sm receives approximately the same amount of
+
+<sup>3</sup>note that the first row of the sparse matrix is guaranteed to be vector aligned, as all cuda memory allocation routines allocate memory with at least 256-byte alignment [31]  
+4in reference to the similar approach of thread block swizzles, where thread blocks are reordered to improve cache reuse [33] as well as the fact that the reordering in our case is at the granularity of an output row.
+
+![](images/354b04a1462c71aae145120b21aa09789283dde0dc598f0056e0dda3c9423f03.jpg)  
+subwarp tiling
+
+![](images/a87115c11fc2d8a6d74668615378f56cadefb76cd1c5ec8ad0de2aa1db5fa433.jpg)
+
+![](images/034b10895e91690128dd7c9efe3f8c04b6f45e440917f1d9b6ba8bc90262a1c6.jpg)  
+reverse offset memory alignment
+
+![](images/a9a0af89419190e9abd1bffd45c524c7f94fb2cd4305374d9232dc41e975fa51.jpg)  
+fig. 5. techniques for enabling the use of vector memory operations on sparse matrix data structures. top: subwarp tiling maps subsets of a warp to independent 1-dimensional tiles of the output. by splitting warp accesses across multiple rows we reduce the amount of wasted work. rows assigned to a warp/subwarp are marked in blue. load addresses are indicated with arrows and predicated loads are indicated with "x". the hashed region denotes the values loaded by a single set of loads across the warp/subwarp. bottom: reverse offset memory alignment backs up the address of each row to the nearest aligned address. values from the previous row are masked in the first loop iteration to maintain correctness. misaligned addresses are underlined. modified row start addresses are marked with circles and row index.
+
+work to do. this helps to address load imbalance between warps/thread blocks.
+
+(b) row bundling: for kernels where warps are split across multiple rows of the sparse matrix, alter the tile mappings such that each subwarp receives approximately the same amount of work to do. this helps address load imbalance within a warp.
+
+1) volta thread block scheduler: the binning of rows such that sms receive roughly the same amount of work is complex to implement, as it depends on the gpus thread block scheduling algorithm, which is not public knowledge. we reverse engineer the nvidia volta thread block scheduler, following the same general approach as [34].
+
+overall, the volta thread block scheduler is much simpler than the fermi thread block scheduler. thread blocks in the first wave are assigned to sms based on their block index:
+
+$$
+s m \_ i d x = 2 (b l o c k \_ i d x \mod 4 0) + \frac {b l o c k \_ i d x}{4 0} \mod 2
+$$
+
+where block_idx is calculated:
+
+$$
+b l o c k \_ i d x = b l o c k i d x. x + b l o c k i d x. y * g r i d d i m. x
+$$
+
+this mapping distributes thread blocks round-robin over the sms. after the first wave, thread blocks are scheduled in order of block_idx as resources become available.
+
+2) row binning & row bundling heuristics: a simple heuristic for binning rows is to select the first wave to be the heaviest n row bundles and then pair the following n heaviest row bundles with the previous bundles in reverse order of heaviness. to bundle the rows by size, we can greedily create bundles from consecutive rows ordered by size.
+
+given the online thread block scheduling algorithm used by nvidia gpus, these two heuristics can be implemented with a sort of the row indices by row length. given a sorted array of the row indices in order of decreasing size, bundles consist of blocks of consecutive row indices. the first wave of bundles are scheduled round-robin across the sms, and remaining bundles are scheduled in decreasing order of heaviness as bundles complete execution. we note that this heuristic for row binning is similar to guided self-scheduling [35].
+
+an advantage of this approach is that we do not need to know the target bundle size to group similarly sized rows. this means that the heuristic does not need to have insight into any kernel selection heuristics used under the hood.
+
+since the topology of sparse matrices in dnns is typically updated infrequently, the cost of the argsort of the row indices by their row lengths can be amortized over many training steps [6], [13], [17]. implementing the swizzle in the kernel also requires the addition of a single load during the kernel prelude. the memory required to store the sorted indices for the matrix is negligible, as the number of rows in the matrix is typically much smaller than the number of nonzeros in the matrix for our target applications.
+
+figure 6 shows the high-level scheme for row swizzle load balancing. figure 7 shows the performance of row swizzle load balancing for a sample problem as load imbalance increases. figure 8 shows cuda pseudo-code for our spmm kernel with the necessary modifications for row swizzle load balancing.
+
+# d. implementation details
+
+this section details additional low-level optimizations we applied to achieve good performance.
+
+1) index pre-scaling: in each iteration of the main loop of our kernel, we load the sparse matrix values and indices and store them in shared memory. each index will be used by all threads to load from the dense matrix. to avoid redundant work each time an index is loaded, we have each thread scale its portion of the indices prior to storing to shared memory.
+
+2) residue handling: our kernel processes as many full tiles of nonzero values as possible and then executes a residue handler to accumulate the remaining products. as sparse matrix row lengths are rarely divisible by the tile size, it's important that the residue handling code is highly efficient.
+
+to maximize shared memory bandwidth and minimize bank conflicts, we use 128-bit shared memory load instructions whenever possible [36]. this is trivial for the main loop, but difficult for the residue handling code as the number of nonzeros remaining is not necessarily divisible by four. to enable the use of wide shared memory instructions, we zero the shared memory buffers used for sparse matrix values and indices prior to loading the residual values and indices. we then split the loops for dense matrix loading and computation into two, and unroll the inner loop  $4 \times$  without bounds checks.
+
+3) mixed precision: in addition to standard 32-bit floating-point kernels, we extended our spmm implementation to support mixed-precision computation, as is commonly used in deep learning [37]. our kernels support 16-bit floating-point
+
+![](images/e2e79c31fe964a5ea94c813174d9db9f75f036f8f63f8f47408980d535fc2b95.jpg)  
+row swizzle load balancing
+
+![](images/f7af04492ee02a636a8992e6f530ebb8c092a6f52d3cd1fd16557c44b131b4fb.jpg)  
+fig. 6. row swizzle approach for load balancing sparse matrix computation. rows processed by the same warp are marked with the same pattern and color. we introduce a layer of indirection that re-orders when rows are processed. to balance work between threads in a warp, we group rows of similar length into bundles. to balance work between sms, we process row bundles in decreasing order of size.  
+fig. 7. sparse matrix-matrix multiplication runtime with varying levels of load imbalance. m=8192, k=2048, n=128, sparsity=75% in single-precision on an nvidia v100 gpu. throughput measured as a percent of the throughput achieved with a sparse matrix where all rows have the same number of nonzero values. the gray line labeled "neural networks" marks the average cov of sparse matrices in our dataset of deep neural networks. with this problem configuration, performance of the standard row ordering degrades to 47.5% of throughput with a perfectly balanced sparse matrix. our row swizzle load balancing technique maintains 96.5% of the throughput with a perfectly balanced sparse matrix. we document the performance of our row swizzle load balancing technique further in section vii-b
+
+input/output data and use 16-bit integer indices for the sparse matrix meta-data. inside our kernel, we convert fp16 data to fp32 and issue fp32 fused multiply-add instructions, as is standard. we convert the final outputs from fp32 to fp16 before writing the result. due to the reduced representational capacity of 16-bit integers, we do not perform our index pre-scaling optimization for mixed-precision kernels.
+
+# vi. sampled dense-dense matrix multiplication
+
+this section details the design of our sddmm kernel.
+
+# a. hierarchical 1-dimensional tiling
+
+we use the same 1d tiling scheme for sddmm as we do for spmm, with two main differences. first, instead of mapping thread blocks to 1d regions of the output we map them to 1d strips of consecutive nonzeros. because the output is sparse, this ensures better work distribution across thread blocks and is simpler to implement. because the number of nonzeros in each row cannot be inferred without inspecting the sparse matrix, we launch the maximum number of thread blocks that could be needed. on startup, each thread block calculates if it has work to do and returns early if it is not needed. an alternative
+
+approach would be to use dynamic parallelism [38]. however, we do not observe significant overhead from launching extra thread blocks in our benchmarks. for sddmm targeting problems with very high sparsity, it's possible that dynamic parallelism would lead to better performance.
+
+the second difference in our work decomposition is caused by the need to perform the computation with the transpose of the right-hand operand. with the dense matrices stored in row-major layout, naively partitioning the outputs across the threads would result in strided, uncoalesced memory accesses to the right-hand matrix. to avoid this issue, we alter our scheme so that each thread mapped to an output tile computes a portion of the results for all outputs in that tile. we then perform a reduction between these threads using warp shuffle instructions to compute the final results for each thread.
+
+an alternative to this approach would be to perform the transpose of values loaded from the right-hand matrix in shared memory prior to computation. while this would use less registers per-thread, it would double shared memory usage. on nvidia volta gpus shared memory and l1 cache use the same storage. thus, using more shared memory reduces the size of the l1 cache. for these kernels, we found l1 cache capacity to be important for performance and thus decided against performing an explicit shared memory transpose.
+
+# b. vector memory operations
+
+because both inputs are dense, it is trivial to use vector loads/stores for sddmm problems where the inner dimension is divisible by the vector width. for all problems, we use scalar loads/stores on the sparse matrix. these operations only occur at the beginning and end of the kernel and do not significantly affect performance. to enable the use of vector loads/stores on a wider range of problems we process output tiles with subwarps, as explained in the context of spmm.
+
+# c. implementation details
+
+while we do use subwarp tiling to enable the use of vector memory instructions on a wider range of problems, load balancing in sddmm is less critical due to the fact that all dot-products to be computed are of equal length. additionally, problems from deep neural networks commonly have a dot-product length that is divisible by the simt width, making efficient residue handling less critical than in spmm. for the sddmm residual computation we use the same loop structure as the main loop and do not apply our loop-splitting optimization to enable wide shared memory loads.
+
+# vii. experiments
+
+this section provides empirical results and analysis of our spmm and sddmm kernels. for spmm we use a kernel selection heuristic where we select the n-dimension tile size to be  $n$ , rounded up to a power of 2, up to a maximum of 64. for sddmm we use an n-dimension tile size of 32. for both kernels we use the widest vector memory operations possible. all benchmarks were conducted with cuda 10.1.
+
+```txt
+template <int kblockitemsy, int kblockitemsk>
+    int kblockitemsx>
+    __global__void spmmkernel(
+        sparsematrix a, matrix b, matrix c) {
+            // subwarp tiling: calculate tile indices
+            // for this subwarp.
+            int midx = blockidx.y * kblockitemsy + threadidx.y;
+            int nidx = blockidx.x * kblockitemsx;
+            // row swizzle: load this subwarp's row
+            // index from the pre-ordered indices.
+            midx = a.row_values[midx];
+            // calculate the row offset and the number
+            // of nonzeros in this thread block's row.
+            int m_off = a.rowoffssets[midx];
+            int nnz = a.rowoffsets[midx+1] - m_off;
+            // roma: align the row pointer so that we can use vector memory instructions.
+            memoryaligner aligner(m_off, nnz);
+            nnz = aligneralignednonzeros();
+            m_off = aligneralignedrowoffset();
+            // first loop iteration.
+            tile1d c_tile(/*init_to=*/0);
+            if (nnz > 0) {
+                tile1d a_tile = loadtile(a);
+            }
+            aligner maskprefix(a_tile);
+            tile2d b_tile = loadtile(b);
+            c_tile += a_tile * b_tile;
+            nnz -= kblockitemsk;
+        }
+    // main loop.
+    for(; nnz > 0; nnz -= kblockitemsk) {
+        tile1d a_tile = loadtile(a);
+        tile2d b_tile = loadtile(b);
+        c_tile += a_tile * b_tile;
+    }
+}
+```
+
+fig. 8. cuda pseudo-code for spmm with subwarp tiling, roma and row swizzle load balancing. to enable the use of vector memory instructions on a wider range of problem configurations, subsets of a warp are mapped to 1-dimensional output tiles, adding a template parameter that denotes the number of subwarps used (lines 1-2) and altering the index calculations (lines 5-8). to decrease load imbalance, we alter the order in which rows are processed (lines 11-13). to enable the use of vector memory instructions on misaligned addresses in sparse matrices, we back-up the row pointer to the nearest aligned address (lines 20-24). to maintain correctness, we mask any values loaded from the previous row in the first iteration of the main loop (line 30).
+
+# a. kernel benchmarks
+
+1) sparse matrix dataset: we evaluate the performance of our spmm and sddmm kernels by benchmarking on our dataset of sparse matrices from deep neural networks. for each of the 3,012 matrices in the dataset, we benchmark with both training and inference batch sizes. for sddmm, we benchmark the problem corresponding to the gradient with respect to the sparse weight matrix. we benchmark convolution operations found in resnet-50, as an im2col transform on the input data followed by spmm or sddmm [39]. we do not include the time of the im2col transform in our benchmarks. for resnet-50 benchmarks with inference batch size, we pad the batch dimension to the nearest multiple of four
+
+![](images/637c9dfb87a5c994fd3726979f68861d989d41301e879324692ee8582982d7b6.jpg)
+
+![](images/3eee10ba4cab24ffaf5531c2ff75941a977abdffbb367b77c3030d5d1313def3.jpg)
+
+![](images/d30fc5102cea667a4a3444c044b586ce6593569a0d7fa79a7439678aa3c5f552.jpg)
+
+![](images/98f77b4ea71c595a1c5a7a7b2b5b91ae01ad164b7b6bb60c4b638eb8ac4a7b9e.jpg)  
+spmm-fp32  
+sddmm - fp32
+
+![](images/5b57a83d3b062bc4275f80441d3822bb3a9b1204e195ad649983bd84ab3b21d2.jpg)
+
+![](images/b3e26c02c5e4355f970901253048203a08829b942acdcfaa7e3859eb2ea547ed.jpg)  
+spmm - fp16  
+fig. 9. benchmarks on our dataset of sparse matrices from deep neural networks. runtime (left y-axis) and throughput (right y-axis) plotted with increasing problem size for each kernel and precision. benchmarked on an nvidia v100 gpu. top left: spmm benchmarks in single-precision. across all problems, our approach achieves a geometric mean speedup of  $3.58 \times$  and a peak speedup of  $14.2 \times$  over nvidia cusparse. bottom left: sddmm benchmarks in single-precision. across all problems, our approach achieves a geometric mean speedup of  $2.19 \times$  and a peak speedup of  $6.58 \times$  over nvidia cusparse. right: spmm benchmarks in mixed precision with 16-bit data and 32-bit computation. across all problems, our approach achieves a geometric mean speedup of  $5.97 \times$  and a peak speedup of  $297.5 \times$  over nvidia cusparse.
+
+to enable vector memory instructions. all benchmarks are performed on an nvidia v100 gpu. we use nvidia cusparse's cusparsespmm and cusparseconstrainedgemm as the baselines for our spmm and sddmm benchmarks respectively. both cusparse kernels use column-major layouts for dense matrices and csr format for sparse matrices. because cusparseconstrainedgemm does not support transposition of the right-hand operand, we explicitly transpose the matrix using cublas and include the transposition in our timing. we benchmark all problems on a single nvidia v100 gpu. the results of all benchmarks are presented in figure 9. we present statistics for these benchmarks in table i.
+
+across all benchmarks, our spmm and sddmm kernels show significant advantages over nvidia cusparse. for single-precision spmm, our kernel achieves a geometric mean speedup of  $3.58 \times$  and reaches 4.29tflops, representing  $27.3\%$  of single-precision peak. our kernel outperforms cusparse on  $99.75\%$  of the problems in our dataset. for single-precision sddmm, our kernel achieves a geometric mean speedup of  $2.19 \times$  and reaches 4.11tflops, representing  $26.2\%$  of single-precision peak. our kernel outperforms cusparse on  $93.34\%$  of the problems in our dataset.
+
+with mixed-precision, our spmm kernel achieves a geometric mean speedup of  $5.97 \times$  over nvidia cusparse and a peak throughput of 5.57tflops. while our kernel uses 16-bit integers for the sparse matrix meta-data, cusparse only supports 32-bit indices. we find it likely that this contributes to the increased performance gap. our mixed-precision spmm
+
+outperforms cusparse on  $99.7\%$  of the problems in our dataset. we note that cusparse's mixed-precision spmm performs inconsistently on some problems, leading to extreme slowdowns of as much as  $297.5 \times$  relative to our kernel.
+
+2) sparse recurrent neural networks: this section evaluates the performance of our kernels relative to the recently proposed techniques of [26] and [23]. the spmm kernel provided by [26] only supports problems with batch sizes divisible by 32. [23] wrote spmm and sddmm kernels for batch size 32 and 128 and also require that the number of rows in the sparse matrix be divisible by 256. given these constraints, we opt to benchmark these kernels on a dataset of problems from recurrent neural networks, where the problem configurations supported by the kernels from [26] and [23] are realistic for deep neural networks. we benchmark each kernel on rnn, gated recurrent unit (gru) [40], and long short-term memory network (lstm) [41] problems with sparse weights. we generated sparse matrices with random uniform sparsity. we benchmarked problems with state sizes 1k, 2k, 4k, and 8k, sparsities  $70\%$ ,  $80\%$ , and  $90\%$  and batch sizes 32 and 128. all benchmarks were performed on an nvidia v100 in single-precision. we do not include the time require for the pre-processing step used by the adaptive sparse tiling (aspt) approach of [23] in our benchmarks. we benchmark the row-splitting kernel from [26], as all of our benchmarks are beyond the threshold of average row length that the authors use to select between their row-splitting and nonzero-splitting kernels. benchmark results are presented in figure 10.
+
+![](images/92fb1b20c395c5dc7fd4723e26c564d38952cb8134ef64bbebb68d6b2852dc36.jpg)
+
+![](images/2a704d0b167ab39c3185608df105544eaac7d7d3c1ac000467e5c6e1edb55219.jpg)  
+fig. 10. benchmarks on sparse recurrent neural neural network problems. each problem is labeled m/k/n/sparsity. all benchmarks taken on an nvidia v100 gpu in single-precision. top: spmm benchmarks. compared to aspt [23], our kernel achieves a geometric mean speedup of  $1.56\times$  and a peak speedup of  $2.4\times$ . compared to the merged-based approach of [26], our kernel achieves a geometric mean speedup of  $1.59\times$  and a peak speedup of  $2.15\times$ . compared to cusparse, our kernel achieves a geometric mean speedup of  $3.47\times$  and a peak speedup of  $4.45\times$ . bottom: sddmm benchmarks. our kernel performs competitively with the adaptive sparse tiling approach of [23], achieving  $92\%$  of the throughput on average while using  $3\times$  less memory and no-reordering of the sparse matrix. compared to cusparse, our kernel achieves a geometric mean speedup of  $2.69\times$  and a peak speedup of  $3.51\times$ .
+
+for spmm, our approach significantly outperforms other methods. our approach achieves geometric mean speedups of  $1.56 \times$ ,  $1.59 \times$ , and  $3.47 \times$  over mergespmm [26], aspt, and cusparse respectively. for sddmm, our approach significantly outperforms cusparse and achieves performance on-par with aspt. our approach achieves geometric mean speedups of  $2.69 \times$  over cusparse and  $92\%$  of the throughput of aspt on average. while aspt achieves good performance for sddmm, it has a number of limitations. first, including the original csr matrix, aspt requires  $3 \times$  the memory to store the re-ordered matrix as well as meta-data needed for tiled execution. second, the author's implementation uses different re-orderings of the sparse matrix for spmm and sddmm problems. for deep learning applications, this means that gradients calculated with respect to a sparse matrix will be in a different order than the sparse matrix used in the forward pass. in order to perform gradient updates or continue backpropagation, applications must pay the cost of re-ordering the sparse matrix on every training iteration.
+
+# b. ablation study
+
+table ii shows the results of our ablation study on the optimizations we propose for each kernel. we benchmark both kernels on our dataset of sparse matrices from dnns with both training and inference batch sizes. we report statistics for each model and batch size separately to show the effect of each technique on different portions of the problem space.
+
+across these benchmarks we find that techniques like row swizzle load balancing and residue unrolling are robust to varying problem configurations, while vector memory instructions show large benefits for compute heavy problems and less benefit for small problems. one outlier is the superior perfor
+
+mance of scalar memory operations for sddmm. with the small weight matrices found in these models, these problems are largely occupancy-bound and thus benefit from the fact that our scalar kernels process fewer outputs per thread. on the dataset of rnn problems studied in section 10, we observe our vector kernel achieve a geometric mean speedup of  $2.45 \times$  over the scalar variants. these results indicate that better kernel selection heuristics could greatly improve performance.
+
+in addition to these techniques, our kernels benefit from the use of favorable data layouts and an efficient implementation enabled by our 1d tiling scheme.
+
+# c. application: sparse transformer
+
+transformer models are a popular sequence modeling architecture, having been used to achieve state-of-the-art results on tasks such as machine translation [2], language modeling [42], and image generation [28]. transformer models are made up of stacked layers, each of which contains a multi-head attention mechanism followed by a small fully-connected network. the attention mechanism used in transformer takes in a query  $q$ , key  $k$ , and value  $v$  and computes a weighted average of the input values based on the similarity of  $q$  and  $k$ :
+
+$$
+\text {a t t e n t i o n} (q, k, v) = \operatorname {s o f t m a x} \left(\frac {q k ^ {t}}{\sqrt {d _ {k}}}\right) v
+$$
+
+where  $d_{k}$  is the number of features for each element of the sequence. despite the effectiveness of this architecture,  $qk^{t}$  computes the similarity of each token in the sequence with all other tokens, requiring computation and memory that grows quadratically with the sequence length. to alleviate this issue, recent work has explored the use of sparsity in the attention mechanism [6], [10], [11]. with sparse attention, we compute a subset of the outputs of  $qk^{t}$  and then multiply
+
+tablei sparse matrix dataset benchmark results. speedups reported relative to nvidia cusparse.  
+
+<table><tr><td rowspan="2">kernel</td><td colspan="2">single-precision</td><td>mixed-precision</td></tr><tr><td>spmm</td><td>sddmm</td><td>spmm</td></tr><tr><td>geo. mean speedup</td><td>3.58×</td><td>2.19×</td><td>5.97×</td></tr><tr><td>peak speedup</td><td>14.2×</td><td>6.58×</td><td>297.5×</td></tr><tr><td>peak throughput (tflops)</td><td>4.29</td><td>4.11</td><td>5.57</td></tr></table>
+
+the sparse output by  $v$ . with unstructured sparsity, these operations correspond to an sddmm followed by an spmm.
+
+1) experimental setup: we trained a transformer with sparse attention on the imagenet-64x64 image generation dataset which has a sequence length of 12,288. our model consists of 3 layers with 8 attention heads each, a hidden dimension of 1,024 and a filter size of 4,096 in the fully-connected network. we trained our models with a batch size of 8 for 140,000 training steps. for our sparse model, we simulate sparsity during training and convert to a sparse representation for benchmarking. while we train on an image generation task, we note that this architecture can be applied to other sequence learning tasks like language modeling without modification.
+
+for our sparse model, we generated attention masks with a dense band of size 256 along the diagonal and random sparsity off-diagonal sampled with probability inversely proportional to the distance from the diagonal. we set off-diagonal sparsity to  $95\%$ . the sparse attention mask stays the same over the course of training and is shared by all attention heads and layers. the attention mask used by our model is visualized in figure 11. we additionally wrote a kernel that computes the softmax function on a sparse matrix. for each model, we benchmark the forward pass in single-precision.
+
+2) results & analysis: benchmark results are reported in table iii. on a v100 gpu, our sparse model achieves a  $2.09 \times$  speedup and  $12.8 \times$  memory savings over the standard transformer while matching accuracy. we report accuracy in bits per dimension, as is standard for this task. note that lower bits per dimension is desirable. in addition to our results on v100, we exploit the memory savings of our sparse model to benchmark on an nvidia 1080. on a significantly less powerful gpu, our sparse model is able to process 32,039 tokens per second while the standard transformer runs out of memory. the memory savings of the sparse transformer could also be used to train a much larger model, leading to higher accuracy.
+
+# d. application: sparse mobilenetv1
+
+mobilenetv1 is an efficient convolutional neural network for computer vision tasks [43]. while originally designed for resource constrained settings, mobilenetv1 has been found to be highly efficient across platforms and has been influential in the design of computer vision models [29], [44], [45].
+
+mobilenetv1 is made up of alternating depthwise and  $1 \times 1$  convolutions. each convolution is followed by batch normalization [46] and a relu non-linearity. mobilenetv1 defines a range of models with size controlled by a width multiplier. the  $1 \times 1$  convolutions in these models are responsible for the large majority of the flops and can be computed as matrix multiplication if the input data is stored in chw format.
+
+table ii ablation study for our spmm and sddmm kernels. performance measured as a percent of the performance of our complete kernels, averaged across all benchmarks.  
+
+<table><tr><td colspan="5">spmm</td></tr><tr><td>model batch size</td><td>transformer 1</td><td>transformer 8</td><td>resnet-50 1</td><td>resnet-50 256</td></tr><tr><td>-load balancing</td><td>96.1%</td><td>88.9%</td><td>91.7%</td><td>78.5%</td></tr><tr><td>-vector inst.</td><td>100.1%</td><td>80.9%</td><td>87.9%</td><td>64.8%</td></tr><tr><td>-residue unroll</td><td>92.0%</td><td>94.1%</td><td>87.8%</td><td>92.6%</td></tr><tr><td>-index pre-scale</td><td>100.6%</td><td>100.6%</td><td>98.2%</td><td>100.3%</td></tr><tr><td colspan="5">sddmm</td></tr><tr><td>model batch size</td><td>transformer 1</td><td>transformer 8</td><td>resnet-50 1</td><td>resnet-50 256</td></tr><tr><td>-load balancing</td><td>101.1%</td><td>97.1%</td><td>100.9%</td><td>96.8%</td></tr><tr><td>-vector inst.</td><td>98.3%</td><td>132.0%</td><td>120.2%</td><td>170.6%</td></tr></table>
+
+1) experimental setup: we introduce sparsity into the  $1 \times 1$  convolutions of mobilenetv1 using magnitude pruning [5]. we prune all models to  $90\%$  sparsity. we leave the first layer dense, as we found it to be bandwidth bound by the activation matrix and thus saw less benefits from weight sparsity. we trained our baseline models on the imagenet [18] dataset with 32 accelerators for 100 epochs. as we target efficient inference in the regime where inference costs outweigh training costs, we increase training time for our sparse models by  $10 \times$  which helps the sparse models converge while being pruned.
+
+at inference time, batch normalization can be fused into the preceding linear operation. we do this for all depthwise and  $1 \times 1$  convolutions. for depthwise convolution, we wrote kernels that support fused bias and relu operations. we similarly fuse bias and relu into our sparse  $1 \times 1$  convolutions. for the  $1 \times 1$  convolutions in our dense baselines we use nvidia cublas, which is backed by highly-tuned assembly kernels. we additionally wrote a fused bias + relu kernel, which we use following these linear operations. for our sparse models, we use an oracle kernel selector for four  $1 \times 1$  convolutions where our heuristic was sub-optimal. for each model, we benchmark inference in single-precision on an nvidia v100 gpu with a batch size of 1 image, as is common in online inference applications like self-driving cars.
+
+2) results & analysis: the results of our benchmarks are shown in figure 12 and in table iv. across the board, our sparse models offer speedups of  $21 - 24\%$  for a given accuracy, or equivalently,  $1.1\%$  higher accuracy for the same throughput.
+
+because of the accuracy loss from pruning, our sparse models are wider than the dense ones they match accuracy with. increased width also increases the cost of the nonsparse operations relative to those in the dense baseline. better pruning algorithms would help alleviate this and enable further speedups. additionally, the depthwise convolutions become a significant bottleneck after the  $1 \times 1$  convolutions are pruned. tuning these kernels would yield further gains for our sparse models relative to their dense counterparts.
+
+# viii. related work
+
+[47] and [25] propose efficient spmm kernels based on alternative sparse matrix formats designed for gpus [48], [49]. [26] discuss the design of high-performance spmm on
+
+![](images/b97d8074df09b49c7b941f46816d44f8b4718538e1036f8a2d79c5ab62d4d3a2.jpg)  
+fig. 11. transformer attention mechanism connectivity. the upper diagonal is masked so that tokens only attend to those that came before them. left: dense all-to-all attention. right: sparse attention with a small dense band and random off-diagonal sparsity sampled with probability inversely proportional to distance from the diagonal.
+
+![](images/129ee59a8a8a13c09a99ed11d186098ef37c236f05c1142ed561bac83c07e892.jpg)
+
+table iii sparse transformer results  
+
+<table><tr><td colspan="2">model</td><td>transformer</td><td>sparse transformer</td></tr><tr><td colspan="2">bits per dimension</td><td>3.76</td><td>3.77</td></tr><tr><td rowspan="2">v100</td><td>throughput (tokens/s)</td><td>32,477</td><td>67,857</td></tr><tr><td>memory usage (gb)</td><td>9.88</td><td>0.77</td></tr><tr><td rowspan="2">1080</td><td>throughput (tokens/s)</td><td>out-of-memory</td><td>32,039</td></tr><tr><td>memory usage (gb)</td><td>out-of-memory</td><td>0.88</td></tr></table>
+
+gpus. we compare to their approach for computing spmm in section vii-a and reference their taxonomy for spmm design throughout the text. [23] propose an adaptive tiling technique, where csr matrices are partitioned into sets of rows. within each set, the columns are re-ordered such that columns with more nonzeros are grouped. these "heavy" groups are processed together and exploit tiled execution to enable more reuse of operands. the remaining columns are processed with a standard row-splitting scheme. we benchmark and discuss limitations of this approach in section vii-a.
+
+[50] implement an efficient direct sparse convolution for cpus and demonstrate performance gains relative to dense baselines. [51] develop a technique for inducing sparsity in winograd convolutions [52] and design and efficient implementation for cpus. [16] design efficient spmm kernels for cpus and demonstrate significant performance improvements for highly efficient neural networks on mobile processors.
+
+[13] and [15] enforce different forms of structure on sparse matrices to enable efficient mapping to gpus. [13] develop efficient gpu kernels for block-sparse matrices and apply them to neural networks on a range of different tasks. [15] propose fixing the number of nonzeros in small regions of the sparse matrix to balance between performance and accuracy loss from enforcing structure on the topology of nonzeros.
+
+# ix. discussion & conclusion
+
+in addition to the kernels we discuss, training dnns requires the computation  $a^t b \rightarrow c$ , where  $a^t$  is the transpose of a sparse matrix. it's difficult to fuse the transpose into the spmm for csr matrices. however, for dnn training it's possible to cache the row offsets and column indices for  $a^t$  when the sparse matrix topology is updated and perform the transpose as an argsort of the matrix values. alternative
+
+![](images/23255207e89f91f261bb3094da84e0293ae9e4240f76c79bc943afd6e26f5feb.jpg)  
+fig. 12. mobilenetv1 accuracy-routine tradeoff curves. sparse modes are more efficient, achieving speedups of  $21 - 24\%$  for a given accuracy across all model sizes, or equivalently,  $\sim 1.1\%$  higher accuracy for the same throughput.
+
+table iv sparse mobilenetv1 results  
+
+<table><tr><td>model</td><td>width</td><td>accuracy</td><td>throughput (frames/s)</td></tr><tr><td rowspan="3">dense</td><td>1</td><td>72.7%</td><td>2,518</td></tr><tr><td>1.2</td><td>73.8%</td><td>2,046</td></tr><tr><td>1.4</td><td>74.8%</td><td>1,729</td></tr><tr><td rowspan="6">sparse</td><td>1.3</td><td>72.9%</td><td>2,874</td></tr><tr><td>1.4</td><td>73.3%</td><td>2,706</td></tr><tr><td>1.5</td><td>73.8%</td><td>2,537</td></tr><tr><td>1.6</td><td>74.1%</td><td>2,366</td></tr><tr><td>1.7</td><td>74.4%</td><td>2,226</td></tr><tr><td>1.8</td><td>74.9%</td><td>2,095</td></tr></table>
+
+sparse matrix formats are an interesting direction to enable transposed and non-transposed computation [53], [54]
+
+on large problems, the performance of our kernels is limited by shared memory bandwidth. one direction for alleviating this bottleneck is to exploit reuse of values loaded from the right input across multiple rows of the left input matrix.
+
+while our kernels are highly efficient, they are not able to take advantage of dedicated matrix-multiply hardware. for unstructured sparsity, it's possible that unpacking sparse tiles in shared memory could enable the use of these operations. new advances in hardware are likely to enable this further [55]. despite model quality loss, it remains possible to exploit this hardware with vector and block sparsity [12], [13], [16].
+
+in this work, we demonstrate that the sparse matrices found in deep neural networks exhibit favorable properties that can be exploited to accelerate computation. based on this insight, we design high-performance spmm and sddmm kernels targeted specifically at deep learning applications. using our kernels, we demonstrate sparse transformer and mobilenet models that achieve  $1.2 - 2.1 \times$  speedups and up to  $12.8 \times$  memory savings without sacrificing accuracy. we hope that our findings facilitate better support for sparsity in deep learning frameworks and more broadly enable widespread use of sparsity in deep learning.
+
+# acknowledgements
+
+we are grateful to rasmus larsen and deepak narayanan for providing detailed feedback on drafts of this paper. we'd also like to thank penporn koanantakool for her help debugging our kernel benchmarks, artem belevich for his help with bazel and docker and the tensorflow team for answering many questions. finally, we'd like to thank nvidia for their help with our cusparse benchmarks.
+
+this research was supported in part by affiliate members and other supporters of the stanford dawn project—ant financial, facebook, google,infosys, nec, and vmware—as well as toyota research institute, cisco, sap, and the nsf under career grant cns-1651570. trevor gale is supported by the national science foundation graduate research fellowship under grant no. dge-1656518. any opinions, findings, and conclusions or recommendations expressed in this material are those of the authors and do not necessarily reflect the views of the national science foundation. toyota research institute ("tri") provided funds to assist the authors with their research but this article solely reflects the opinions and conclusions of its authors and not tri or any other toyota entity.
+
+# references
+
+[1] k. he, x. zhang, s. ren, and j. sun, "deep residual learning for image recognition," in 2016 ieee conference on computer vision and pattern recognition, cvpr 2016, las vegas, nv, usa, june 27-30, 2016, 2016.  
+[2] a. vaswani, n. shazeer, n. parmar, j. uszkoreit, l. jones, a. n. gomez, l. kaiser, and i. polosukhin, "attention is all you need," in advances in neural information processing systems 30: annual conference on neural information processing systems 2017, 4-9 december 2017, long beach, ca, usa, 2017.  
+[3] s. han, j. pool, j. tran, and w. j. dally, "learning both weights and connections for efficient neural network," in advances in neural information processing systems 28: annual conference on neural information processing systems 2015, december 7-12, 2015, montreal, quebec, canada, 2015.  
+[4] s. narang, g. diamos, s. sengupta, and e. elsen, “exploring sparsity in recurrent neural networks,” in 5th international conference on learning representations, iclr 2017, toulon, france, april 24-26, 2017, conference track proceedings, 2017.  
+[5] m. zhu and s. gupta, “to prune, or not to prune: exploring the efficacy of pruning for model compression,” in 6th international conference on learning representations, iclr 2018, vancouver, bc, canada, april 30 - may 3, 2018, workshop track proceedings, 2018.  
+[6] r. child, s. gray, a. radford, and i. sutskever, "generating long sequences with sparse transformers," corr, vol. abs/1904.10509, 2019.  
+[7] y. lecun, j. s. denker, and s. a. solla, “optimal brain damage,” in advances in neural information processing systems 2, [nips conference, denver, colorado, usa, november 27-30, 1989], 1989.  
+[8] d. molchanov, a. ashukha, and d. p. vetrov, "variational dropout sparsifies deep neural networks," in proceedings of the 34th international conference on machine learning, icml 2017, sydney, nsw, australia, 6-11 august 2017, 2017.  
+[9] c. louizos, m. welling, and d. p. kingma, "learning sparse neural networks through l_0 regularization," in 6th international conference on learning representations, iclr 2018, vancouver, bc, canada, april 30 - may 3, 2018, conference track proceedings, 2018.  
+[10] n. kitaev, l. kaiser, and a. levskaya, "reformer: the efficient transformer," in international conference on learning representations, 2020. [online]. available: https://openreview.net/forum?id=rdgnkkhtvb  
+[11] a. roy, m. saffar, a. vaswani, and d. grangier, "efficient content-based sparse attention with routing transformers," corr, vol. abs/2003.05997, 2020.
+
+[12] s. narang, e. undersander, and g. f. diamos, "block-sparse recurrent neural networks," corr, vol. abs/1711.02782, 2017.  
+[13] s. gray, a. radford, and d. p. kingma, "block-sparsegpu kernels," https://blog.openai.com/block-sparse-gpu-kernels/, 2017.  
+[14] n. kalchbrenner, e. elsen, k. simonyan, s. noury, n. casagrande, e. lockhart, f. timberg, a. van den oord, s. dieleman, and k. kavukcuoglu, "efficient neural audio synthesis," in proceedings of the 35th international conference on machine learning, icml 2018, stockholm, sweden, july 10-15, 2018, 2018.  
+[15] z. yao, s. cao, w. xiao, c. zhang, and l. nie, "balanced sparsity for efficient dnn inference on gpu," in the thirty-third aaai conference on artificial intelligence, aaai 2019, the thirty-first innovative applications of artificial intelligence conference, iaai 2019, the ninth aaai symposium on educational advances in artificial intelligence, eaai 2019, honolulu, hawaii, usa, january 27 - february 1, 2019, 2019, pp. 5676-5683.  
+[16] e. olsen, m. dukhan, t. gale, and k. simonyan, "fast sparse convnets," corr, vol. abs/1911.09723, 2019.  
+[17] t. gale, e. elsen, and s. hooker, “the state of sparsity in deep neural networks,” corr, vol. abs/1902.09574, 2019.  
+[18] o. russakovsky, j. deng, h. su, j. krause, s. satheesh, s. ma, z. huang, a. karpathy, a. khosla, m. s. bernstein, a. c. berg, and f. li, "imagenet large scale visual recognition challenge," int. j. comput. vis., vol. 115, no. 3, pp. 211-252, 2015.  
+[19] o. bojar, c. buck, c. federmann, b. haddow, p. koehn, j. leveling, c. monz, p. pecina, m. post, h. saint-amand, r. soricut, l. specia, and a. tamchyna, “findings of the 2014 workshop on statistical machine translation,” in proceedings of the ninth workshop on statistical machine translation. baltimore, maryland, usa: association for computational linguistics, june 2014, pp. 12–58. [online]. available: http://www.aclweb.org/anthology/w/w14/w14-3302  
+[20] t. a. davis and y. hu, “the university of florida sparse matrix collection,” acm trans. math. softw., vol. 38, no. 1, 2011.  
+[21] p. micikevicius, "gpu performance analysis and optimization," http://on-demand.gputechconf.com/gtc/2012/presentations/s0514-gtc2012-gpu-performance-analysis.pdf, 2012.  
+[22] i. nisa, a. sukumaran-rajam, s. e. kurt, c. hong, and p. sadayappan, "sampled dense matrix multiplication for high-performance machine learning," in 25th ieee international conference on high performance computing, hipc 2018, bengaluru, india, december 17-20, 2018. ieee, 2018, pp. 32-41.  
+[23] c. hong, a. sukumaran-rajam, i. nisa, k. singh, and p. sadayappan, "adaptive sparse tiling for sparse matrix multiplication," in proceedings of the 24th acm sigplan symposium on principles and practice of parallel programming, ppopp 2019, washington, dc, usa, february 16-20, 2019, j. k. hollingsworth and i. keidar, eds. acm, 2019, pp. 300-314.  
+[24] m. naumov, l. s. chien, p. vandermersch, and u. kapasi, "cusparse library," https://www.nvidia.com/content/gtc-2010/pdfs/2070_gtc2010.pdf, 2010.  
+[25] h. anzt, s. tomov, and j. j. dongarra, "accelerating the lobpcg method on gpus using a blocked sparse matrix vector product," in proceedings of the symposium on high performance computing, hpc 2015, part of the 2015 spring simulation multiconference, springsim '15, alexandria, va, usa, april 12-15, 2015. scs/acm, 2015, pp. 75-82.  
+[26] c. yang, a. buluc, and j. d. owens, "design principles for sparse matrix multiplication on the gpu," in euro-par 2018: parallel processing - 24th international conference on parallel and distributed computing, turin, italy; august 27-31, 2018, proceedings, 2018, pp. 672-687.  
+[27] s. narang, "deepbench: benchmarking deep learning operations on different hardware," https://github.com/baidu-research/deepbench, 2016.  
+[28] n. parmar, a. vaswani, j. uszkoreit, l. kaiser, n. shazeer, a. ku, and d. tran, "image transformer," in proceedings of the 35th international conference on machine learning, icml 2018, stockholm, sweden, july 10-15, 2018, 2018.  
+[29] m. tan and q. v. le, "efficientnet: rethinking model scaling for convolutional neural networks," in proceedings of the 36th international conference on machine learning, icml 2019, 9-15 june 2019, long beach, california, usa, 2019.  
+[30] j. luitjens, "cuda pro tip: increase performance with vectorized memory access," https://devblogs.nvidia.com/
+
+cuda-pro-tip-increase-performance-with-vectorized-memory-access/, 2013.  
+[31] nvidia, "cuda c++ programming guide," https://docs.nvidia.com/cuda/cuda-c-programming-guide/, 2019.  
+[32] d. merrill and m. garland, "merge-based parallel sparse matrix-vector multiplication," in proceedings of the international conference for high performance computing, networking, storage and analysis, sc 2016, salt lake city, ut, usa, november 13-18, 2016, 2016.  
+[33] a. kerr, d. merrill, j. demouth, and j. tran, “cutlass: fast linear algebra in cuda c++,” https://devblogs.nvidia.com/ cutlass-linear-algebra-cuda/, 2017.  
+[34] s. pai, "how the fermi thread block scheduler works," https://www.cs.rochester.edu/~sree/fermi-tbs/fermi-tbs.html, 2014.  
+[35] c. d. polychronopoulos and d. j. kuck, "guided self-scheduling: a practical scheduling scheme for parallel supercomputers," ieee trans. computers, vol. 36, no. 12, pp. 1425-1439, 1987.  
+[36] f. zhu, j. pool, m. andersch, j. appleyard, and f. xie, "sparse persistent rnns: squeezing large recurrent networks on-chip," in 6th international conference on learning representations, iclr 2018, vancouver, bc, canada, april 30 - may 3, 2018, conference track proceedings, 2018.  
+[37] p. micikevicius, s. narang, j. alben, g. f. diamos, e. elsen, d. garcía, b. ginsburg, m. houston, o. kuchaiev, g. venkatesh, and h. wu, "mixed precision training," in 6th international conference on learning representations, iclr 2018, vancouver, bc, canada, april 30 - may 3, 2018, conference track proceedings, 2018.  
+[38] a. adinets, "adaptive parallel computation withuda dynamic parallelism," https://devblogs.nvidia.com/introduction-cuda-dynamic-parallelism/, 2014.  
+[39] s. chetlur, c. woolley, p. vandermersch, j. cohen, j. tran, b. catanzaro, and e. shelhamer, "cudnn: efficient primitives for deep learning," corr, vol. abs/1410.0759, 2014.  
+[40] k. cho, b. van merrienboer, c. gülçehre, d. bahdanau, f. bougares, h. schwenk, and y. bengio, "learning phrase representations using rnn encoder-decoder for statistical machine translation," in proceedings of the 2014 conference on empirical methods in natural language processing, emnlp 2014, october 25-29, 2014, doha, qatar; a meeting of sigdat, a special interest group of the acl, a. moschitti, b. pang, and w. daelemans, eds. acl, 2014, pp. 1724-1734.  
+[41] s. hochreiter and j. schmidhuber, “long short-term memory,” neural computation, vol. 9, no. 8, pp. 1735–1780, 1997.  
+[42] z. dai, z. yang, y. yang, j. g. carbonell, q. v. le, and r. salakhutdinov, "transformer-xl: attentive language models beyond a fixed-length context," in proceedings of the 57th conference of the association for computational linguistics, acl 2019, florence, italy, july 28-august 2, 2019, volume 1: long papers, a. korhonen, d. r. traum, and l. marquez, eds. association for computational linguistics, 2019, pp. 2978-2988.  
+[43] a. g. howard, m. zhu, b. chen, d. kalenichenko, w. wang, t. weyand, m. andreetto, and h. adam, "mobilenets: efficient convolutional neural networks for mobile vision applications," corr, vol. abs/1704.04861, 2017.  
+[44] m. sandler, a. g. howard, m. zhu, a. zhmoginov, and l. chen, "mobilenetv2: inverted residuals and linear bottlenecks," in 2018 ieee conference on computer vision and pattern recognition, cvpr 2018, salt lake city, ut, usa, june 18-22, 2018. ieee computer society, 2018, pp. 4510-4520.  
+[45] a. howard, r. pang, h. adam, q. v. le, m. sandler, b. chen, w. wang, l. chen, m. tan, g. chu, v. vasudevan, and y. zhu, “searching for mobilenetv3,” in 2019 ieee/cvf international conference on computer vision, iccv 2019, seoul, korea (south), october 27 - november 2, 2019. ieee, 2019, pp. 1314-1324.  
+[46] s. ioffe and c. szegedy, "batch normalization: accelerating deep network training by reducing internal covariate shift," in proceedings of the 32nd international conference on machine learning, icml 2015, lille, france, 6-11 july 2015, ser. jmlr workshop and conference proceedings, f. r. bach and d. m. blei, eds., vol. 37. jmlr.org, 2015, pp. 448-456.  
+[47] f. vázquez, g. o. lópez, j. fernández, i. garcía, and e. m. garzón, "fast sparse matrix matrix product based on ellr-t and gpu computing," in 10th ieee international symposium on parallel and distributed processing with applications, ispa 2012, leganes, madrid, spain, july 10-13, 2012. ieee computer society, 2012, pp. 669-674.
+
+[48] f. vázquez, j. fernández, and e. m. garzón, “a new approach for sparse matrix vector product on nvidia gpus,” *concurr. comput. pract. exp.*, vol. 23, no. 8, pp. 815–826, 2011.  
+[49] h. anzt, s. tomov, and j. j. dongarra, “implementing a sparse matrix vector product for the sell-c / sell-c-σ formats on nvidia gpus,” 2014.  
+[50] j. park, s. r. li, w. wen, p. t. p. tang, h. li, y. chen, and p. dubey, "faster cnns with direct sparse convolutions and guided pruning," in 5th international conference on learning representations, iclr 2017, toulon, france, april 24-26, 2017, conference track proceedings, 2017.  
+[51] s. r. li, j. park, and p. t. p. tang, “enabling sparse winograd convolution by native pruning,” corr, vol. abs/1702.08597, 2017.  
+[52] a. lavin and s. gray, "fast algorithms for convolutional neural networks," in 2016 ieee conference on computer vision and pattern recognition, cvpr 2016, las vegas, nv, usa, june 27-30, 2016. ieee computer society, 2016, pp. 4013-4021.  
+[53] a. buluc, j. t. fineman, m. frigo, j. r. gilbert, and c. e. leiserson, "parallel sparse matrix-vector and matrix-transpose-vector multiplication using compressed sparse blocks," in spaa 2009: proceedings of the 21st annual acm symposium on parallelism in algorithms and architectures, calgary, alberta, canada, august 11-13, 2009, f. m. auf der heide and m. a. bender, eds. acm, 2009, pp. 233-244.  
+[54] j. li, j. sun, and r. w. vuduc, "hicoo: hierarchical storage of sparse tensors," in proceedings of the international conference for high performance computing, networking, storage, and analysis, sc 2018, dallas, tx, usa, november 11-16, 2018. ieee / acm, 2018, pp. 19:1-19:15.  
+[55] nvidia, "nvidia a100 tensor coregpu architecture," https://www.nvidia.com/content/dam/en-zz/solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf, 2020.

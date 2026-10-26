@@ -1,0 +1,474 @@
+# grip: a graph neural network accelerator architecture
+
+kevin kiningham*, christopher r, philip levis
+
+stanford university
+
+*kkiningh@stanford.edu
+
+abstract—we present grip, a graph neural network accelerator architecture designed for low-latency inference. accelerating gnns is challenging because they combine two distinct types of computation: arithmetic-intensive vertex-centric operations and memory-intensive edge-centric operations. grip splits gnn inference into a fixed set of edge- and vertex-centric execution phases that can be implemented in hardware. we then specialize each unit for the unique computational structure found in each phase. for vertex-centric phases, grip uses a high performance matrix multiply engine coupled with a dedicated memory subsystem for weights to improve reuse. for edge-centric phases, grip use multiple parallel prefetch and reduction engines to alleviate the irregularity in memory accesses. finally, grip supports several gnn optimizations, including a novel optimization called text-tiling which increases the reuse of weight data.
+
+we evaluate grip by performing synthesis and place and route for a  $28\mathrm{nm}$  implementation capable of executing inference for several widely-used gnn models (gcn, graphsage, g-gcn, and gin). across several benchmark graphs, it reduces 99th percentile latency by a geometric mean of  $17\times$  and  $23\times$  compared to a cpu and gpu baseline, respectively, while drawing only  $5\mathrm{w}$ .
+
+index terms—deep learning; hardware acceleration; algorithm-hardware co-design; asic;
+
+# i. introduction
+
+traditional deep neural networks (dnns) rely on regularly structured inputs (e.g. vectors, images, or sequences) making them difficult to use in domains where data is naturally irregular (e.g. user connections on social media). graph neural networks (gnns) tackle this limitation by extending dnns to allow arbitrarily structured graph-valued inputs, where feature vectors are associated with the edges and vertices of a graph<sup>1</sup>. gnns have found significant success in a range of practical tasks, including surfacing related content on social media [46], recommending meals on delivery platforms [24], and improving circuit testability for eda [32].
+
+gnns combine two distinct types of operations [17], [31]: vertex-centric, which are associated with graph vertices, and edge-centric, which are associated with edges. vertex-centric operations are computationally regular and primarily consist of multiplying vertex feature vectors by large weight matrices. these weights are shared across all vertices, leading to significant opportunities for data reuse. edge-centric operations are similar to those found in graph analytics (e.g. neighborhood reduction [42]). their computational structure depends on the
+
+often sparse and irregular structure of the input graph. this results in many random memory accesses and limited data reuse, but also requires relatively little computation.
+
+the combination of these two types of computation makes gnn inference inefficient on existing architectures. as a result, gnns have much higher inference latency than other neural networks, limiting them to applications where inference can be pre-computed offline [46]. most dnn accelerators (e.g. the tpu [25]) are optimized for dense, regular computation, making edge operations hard to implement efficiently [3]. graph analytics accelerators (e.g graphacionado [20]) are designed for workloads that require little computation per-vertex and have difficulty exploiting data reuse in vertex-centric operations. prior work has demonstrated inference on cpus and gpus is limited by architectural issues, such as cache and memory bandwidth bottlenecks [19], [45].
+
+this paper proposes grip (graph inference processor), an accelerator architecture designed for low-latency gnn inference. grip's programming model is inspired by greta [27], a decomposition of gnn inference into a fixed set of edge-and vertex-centric phases. grip implements each phase with separate specialized on-chip memory and execution units. for example, grip alleviates irregularity in the edge-accumulate phase by using multiple parallel prefetch engines to load data. this allows grip to support a broader class of gnns than prior work, including emerging models that perform complex computation per-edge. finally, grip includes hardware support for several optimizations: caching partitions of feature data, inter-phase pipelining, and preloading weights between layers. we also introduce a novel gnn optimization called vertex-tiling that substantially improves latency by increasing the reuse of weight values during inference.
+
+# a. contributions
+
+this paper makes the following contributions:
+
+1) grip, an accelerator architecture for low-latency gnn inference. grip is efficient across a wide range of models and has numerous hardware optimizations to improve inference latency.  
+2) a novel optimization for gnn inference called text-tiling, which improves performance by increasing reuse of weights.  
+3) a detailed description of a  $28\mathrm{nm}$  implementation of grip capable of executing four representative gnns (gcn, graphsage, g-gcn, and gin). evaluated across
+
+![](images/bcb9bdefccc6e0ccfa14d5ab97a8a5356cbe083f6a1444ad4974a51614f16830.jpg)
+
+![](images/1199e30ac8c81735c5cbfa33af87608ad00e745feec9161c2b9ecbeb8648522d.jpg)  
+(a) input graph.  
+(b) nodeflow.
+
+![](images/068c51c8cf4af988a9abe354f644506914b843157977580074fff2468dcae960.jpg)  
+(c) inference dataflow.  
+fig. 1: an example of performing gcn inference on vertex b with two layers. the nodeflow (b) describes the propagation of features during inference (c).
+
+several benchmark graphs, our implementation reduces 99th percentile latency by a geometric mean of  $17 \times$  and  $23 \times$  compared to an intel xeon cpu and nvidia p100 gpu baseline, respectively.
+
+# ii. background and motivation
+
+# a. graph neural networks
+
+gnns [4], [43] are a class of dnn that operate on graph-valued data. unlike traditional dnns, gnns directly take advantage of graph structure during learning and inference. for example, consider the task of classifying web-pages by topic. a pure content approach (e.g. a classic recurrent neural network) considers only features derived from a page's content. however, a significant amount of information is stored in the structure of links between pages. by modeling these links as a graph, a gnn can natively leverage both page content and link structure. gnn-based methods have achieved state of the art performance on a diverse set of graph-related tasks, including link prediction [50], vertex classification [46], and clustering [47].
+
+message-passing layer. modern gnns are typically composed of multiple message-passing layers [17], shown in alg. 1. the layer takes as input a graph  $g$  consisting of a set of vertices  $v$  and edges  $e$ . each vertex and edge is assigned a feature vector  $\pmb{h}_v$  and  $\pmb{h}_{(u,v)}$  respectively. computation is split into three operations:
+
+- send computes a message vector  $\mathbf{m}_{u,v}$  for each edge.  
+- aggregate reduces incoming messages for each vertex to a vector  $\mathbf{a}_v$ . the neighborhood function  $n(v)$  determines
+
+algorithm 1 message passing layer forward pass
+
+input: graph  $g = (v,e)$ ; vertex and edge features  $\pmb{h}_{v}$ ,  $\pmb{h}_{(u,v)}$
+
+output: updated vertex features  $\mathbf{z}_v$
+
+1: for  $(u, v)$  in  $e$  do  
+2:  $\pmb{m}_{u,v} \gets \mathrm{send}(\pmb{h}_v, \pmb{h}_u, \pmb{h}_{(u,v)})$  
+3: for  $v$  in  $v$  do  
+4:  $\pmb{a}_{v} \gets \text{aggregate}(\{\pmb{m}_{u,v} \mid u \in n(v)\})$  
+5:  $\mathbf{z}_v \gets \mathrm{update}(\mathbf{h}_v, \mathbf{a}_v)$
+
+which messages are considered, typically using a fixed size random sample.
+
+- update combines each vertex's current value with the output of aggregation to produce an updated vector  $\mathbf{z}_v$ .
+
+by iteratively applying  $k$  of these layers, the final state for each vertex captures information about the structure of its  $k$ -hop neighborhood.
+
+pooling and readout. two other layer types are also used in some gnns. pooling defines a method of coarsening a graph by combining the features of clusters of vertices. readout is a special case of pooling which uses a single graph-wide cluster to produce a representation for an entire graph (e.g. for graph classification). in this paper, we treat both layers as slightly modified versions of message-passing, where edges connect vertices to clusters rather than other vertices.
+
+nodeflow. a nodeflow [22] is a bipartite data structure that describes how features are propagated during message-passing. it is typically generated during a preprocessing step before inference, but can also be created on-demand (e.g. for dynamic graphs). the nodeflow is most useful when performing inference on a subset of the graph since it makes it easy to determine which edges and vertices are required to update a specific vertex. it can also be used to separate sampling from inference by precomputing the neighborhood function and encoding the result directly in the nodeflow.
+
+in this paper, we denote the nodeflow for a particular layer as the three-tuple  $(u,v,e)$ , where  $u$  is the set of vertices read during inference,  $v$  is the set of vertices updated, and  $e$  is a set of edges connecting vertices in  $u$  to  $v$ . fig. 1 shows an example of using the nodeflow to compute inference in a two layer gnn.
+
+gcn. we use the graph convolutional network [28] (gcn) as a concrete running example of a gnn model. gcn uses multiple message-passing layers with the following send, aggregate, and update operations
+
+$$
+\begin{array}{l} \boldsymbol {m} _ {u, v} \leftarrow \boldsymbol {h} _ {u} \\ \boldsymbol {a} _ {v} \leftarrow \operatorname {m e a n} \left(\left\{\boldsymbol {m} _ {u, v} \mid u \in n (v) \right\}\right) \\ \boldsymbol {z} _ {v} \leftarrow \operatorname {r e l u} \left(w \boldsymbol {a} _ {v}\right) \\ \end{array}
+$$
+
+where  $w$  is a trainable weight matrix. we can rewrite this to use sparse-dense matrix multiplication (spmm)
+
+$$
+z \leftarrow \operatorname {r e l u} (\hat {a} h w) \tag {1}
+$$
+
+where  $\hat{a}$  is a sparse matrix derived from the nodeflow and  $h$  and  $z$  are dense matrices formed from the set of input and output features respectively. this allows gcn inference to be implemented using operations from highly optimized sparse matrix libraries, such as intel mkl [23] or cusparse [35].
+
+# b. performance challenges of gnns
+
+to demonstrate the performance challenges of gnns in practice, we implement 2-layer gcn using the spmm form in eq. 1. our implementation uses tensorflow compiled with intel mlk run on a single socket of an intel xeon e5-2690v4. in fig. 2, we plot measured performance verses arithmetic intensity for each vertex in the pokec dataset. arithmetic intensity depends on the number of unique neighbors that must be read during inference, which is determined by the local graph structure of each vertex.
+
+![](images/f49891cb0f12a83bc9d387829f18592158fb097d7b6ffd824618caf7bcd50449.jpg)  
+fig. 2: cpu performance of gcn inference for vertices in the pokec [29] dataset. bottlenecks in cache bandwidth result in a significant gap between measured performance and the roofline upper bound.
+
+in this dataset, inference performance is theoretically bottlenecked by off-chip memory bandwidth for all vertices. however, there is a significant gap between the theoretical upper bound and the actual measured performance at higher levels of arithmetic intensity. profiling shows the primary bottleneck is last level cache bandwidth, a result consistent with prior analysis of gpu performance [19]. in our experiment, the highest arithmetic intensities occur when a vertex appears in multiple neighborhoods and its feature vector can be reused. however, if multiple cores are reading or writing a vertex in parallel, this also results in higher utilization of cache bandwidth. additionally, features must compete with large weight values that also occupy the cache and consume bandwidth during the vertex-centric update operation.
+
+opportunities for acceleration. while gnn inference performance may be limited on existing hardware, the difficulties described in this section can be overcome with a custom architecture. in particular, we propose using separate specialized memory and execution units for each edge- and vertex-centric operation. to specialize for vertex-centric operations, we use a dedicated high performance matrix-multiplication unit. weights are stored on-chip in dedicated memory with a level of caching to improve reuse. for edge-centric operations, we prefetch data for multiple edges in parallel and specialize the on-chip feature memory to enable fast gather and reduction operations. finally, since the nodeflow is known statically, we can also improve off-chip access efficiency by scheduling bulk transfers of feature
+
+data rather than loading on demand during execution. taken together, this gives a significant opportunity for improving gnn inference performance.
+
+# iii. related work
+
+dnn accelerators. a significant number of custom neural network accelerates have been developed, mostly focused on dense operations [8], [9], [10], [13], [14], [15], [16], [25], [30], [41], [49]. however, edge-centric operations are difficult to implement efficiently on these architectures [3], which are much more computationally irregular than traditional dnns. grip natively supports edge-centric operations by using a graph-processing based programming model (sec. iv) and by a combination of specialized memory for edge accesses and software techniques. in sec. viii-f we estimate grip to be  $2.4 \times$  faster than a comparable tpu-like accelerator modified specifically to improve gnn inference performance.
+
+gcn accelerators. hygcn [45] and graphact [48] are two accelerators designed to for graph convolutional networks, a subclass of graph neural networks. like grip, these accelerators use separate edge- and vertex-centric units for gnn computation. grip builds on these designs by handling a much more general set of gnns that includes models that use computation associated with edges. this is important for many emerging state-of-the-art gnns, such as graph attention networks [40]. additionally, grip's support for vertex-tiling reduces the amount of weight bandwidth required during vertex-oriented operations. in sec. viii-f we estimate this improves performance by  $4.5 \times$  compared to hygcn.
+
+graph analytics accelerators. specialized accelerators have also been proposed for graph analytics workloads [34], [36], [37]. however, these workloads require relatively little computation per-vertex and typically use scalars rather than large feature vectors. thus, the computation and memory access patterns are very different. in sec. viii-f, we estimate grip to be  $8.1 \times$  faster than the approach of graphacionado [20].
+
+gnn optimizations. many optimizations have been proposed to improve gnn performance. common techniques include scheduling computation to reducing the impact of sparsity [3], [11], [31], improved sampling [7], or eliminating redundant computation [48]. these techniques are compatible with grip and can be used for additional performance.
+
+# iv. programming model
+
+grip's programming model is based on greta [27], a graph-processing abstraction specialized for implementing gnns. greta decomposes gnn layers into four stateless user-defined functions (udfs): gather, reduce, transform, and activate. grip invokes each udf in one of three execution phases: edge-accumulate, vertex-accumulate, and vertex-update. grip also allows programs to be composed by using the result of one program as the features or accumulator in another. this flexibility allows a wide range of gnn models to be implemented.
+
+data model. udfs are restricted in the types of data they can access to in order to simplify hardware implementation
+
+# algorithm 2 grip program execution semantics
+
+input: layer nodeflow  $(u,v,e)$ ; vertex data  $h_u$  and  $h_v$ ; edge data  $h_{(u,v)}$ ; accumulators  $e_v$  and  $a_v$ ; weights and biases  $w$
+
+output: updated vertex data  $\mathbf{z}_v$
+
+1: /\* edge-accumulate phase \*/  
+2: for  $(u,v)$  in  $e$  do  
+3:  $e_v = \text{reduce}(e_v, \text{gather}(\pmb{h}_u, \pmb{h}_v, \pmb{h}_{(u,v)}))$  
+4:/\* vertex-accumulate phase \*/  
+5: for  $v$  in  $v$  do  
+6:  $\pmb{a}_v = \mathrm{transform}(\pmb{a}_v, \pmb{e}_v, w)$  
+7: / $\star$  vertex-update phase \*/  
+8: for  $v$  in  $v$  do  
+9:  $z_{v} = \mathrm{active}(\pmb{a}_{v})$
+
+grip programs use four types of data: (1) a nodeflow  $nf = (u, v, e)$  encodes computational structure by defining the vertices and edges to read and update. (2) feature vectors  $h_u, h_v$ , and  $h_{(u,v)}$  associated with nodeflow input vertices, output vertices, and edges respectively. (3) a set of constant layer weights  $w$ . (4) edge-accumulator  $e_v$  and vertex-accumulator  $a_v$  associated with each output vertex.
+
+execution semantics. udfs are executed in three phases:
+
+1) edge-accumulate iterates over nodeflow edges and invokes gather and reduce. gather reads features associated with an edge to produce a message value. reduce accumulates messages sharing an output vertex into  $e_v$ . this results in a single value per output vertex.  
+2) vertex-accumulate iterates over each output vertex and combines  $\boldsymbol{e}_v$  with the previous accumulator state  $\boldsymbol{a}_v$  using transform. transform is the only udf with access to layer weights and is usually the most computationally expensive operation in a layer (e.g. matrix multiplication).  
+3) vertex-update again iterates over each output vertex and applies activate to  $\mathbf{a}_v$ . the activate udf typically implements the non-linear operations required in a layer (e.g. the activation function). this produces a final updated value for each vertex  $\mathbf{z}_v'$ .
+
+# a. layer implementation
+
+the decomposition used by grip is expressive enough to allow implementing a wide variety of gnns. implementing a particular layer is typically straightforward since each phase naturally maps to the operations of the massage-passing layer introduced in sec. ii. however, some complex models may require a layer to be split into multiple programs. this is especially true for models that require significant computation per-edge. for example, consider the following modified gcn send operation
+
+$$
+\boldsymbol {m} _ {u, v} \leftarrow w _ {0} \boldsymbol {h} _ {u} \tag {2}
+$$
+
+this cannot be mapped directly to gather and reduce since they do not have access to the layer weights. instead, we
+
+![](images/2b0deb6acf8c4697cb68e148c1f9beac8adb6860db01e7d237157eba2308c703.jpg)
+
+![](images/65218dc75e5a4db8b46eaad44af487077366570be7fd009a72a5681beacc40f2.jpg)  
+fig. 3: modifying the gcn send operation (eq. 2) requires splitting the layer into two sequential programs (a) and (b). the dashed box in (a) indicates a phase with no computation.  
+(b) gin [44]
+
+![](images/772fa0ac93e097808ba0aabb69d74e061c35902a1898e387996db38a9917d2f9.jpg)  
+alg. 2 shows the full execution semantics of a grip program.  
+(c) g-gcn [2], [5], [33]  
+fig. 4: grip implementation of several gnn models. plusboxes indicate the output of one program is used as the edge or vertex-accumulator of another. phases with no associated computation are omitted.
+
+implement this layer by splitting it into two grip programs as shown in fig. 3. note that splitting a layer may result in each program iterating over a different nodeflow. for example, the program in fig. 3a iterates over an identity nodeflow where all vertices are only self-connected. in fig. 4, we demonstrate the flexibility of this approach by showing the implementation of a variety of different gnn models.
+
+# v. the grip architecture
+
+grip is an accelerator architecture for low-latency gnn inference. rather than designing around a specific gnn, grip allows users to customize the architecture by implementing four processing elements (pes) corresponding to each udf of greta. this allows grip to be used to accelerate a wide variety of models. in this section, we describe an overview of grip and the microarchitecture of each execution unit. a high level overview of grip is shown in fig. 5.
+
+# a. overview
+
+control. grip is controlled by a host system that sends commands to execute different operations or transfer data. the control unit dequeues each command in-order and issues them asynchronously to individual execution units or the memory controller. additionally, almost all buffers use double-buffering to allow overlapping the execution of different operations with moving data between buffers or loading from off-chip. a barrier command is used to enforce dependencies by preventing new
+
+![](images/c6fe3c79a1d841e2ae65941d8171e95bbbe8da9bf47f5338cbf6c69d9716166a.jpg)  
+fig. 5: high-level overview of grip.
+
+commands from being issued until all previous commands have completed. each command also updates a global status register on completion, which can be queried by the host to monitor execution.
+
+execution units. grip has three core execution units: the edge unit, the vertex unit, and the update unit. the edge unit performs the edge-accumulate phase by iterating over the edges of the nodeflow, which is stored in the nodeflow buffer. the edge unit then reads the associated features, executes gather, and finally accumulates the result into the edge accumulator using reduce.
+
+the vertex unit performs the vertex-accumulate phase by iterating over the output vertices corresponding to the accumulated edge values. it then executes transform, accumulating the result into the vertex accumulator. the vertex unit also reads weight values from the tile buffer, which caches tiles of weight values from the global weight buffer. to synchronize the tile buffer and the vertex unit, the weight sequencer controls iterating over the tiles as described in section vi-b. since weight values are shared across all nodeflow output vertices, the global weight buffer is only required to be loaded once at the beginning of a grip program.
+
+finally, the update unit performs the vertex-update phase by reading the accumulated values for each vertex and passing the values to the activate pe. the result is written to the nodeflow buffer as an updated feature, or to the edge or vertex accumulator. this allows efficiently passing values between different grip programs when they are executed in sequence.
+
+pe implementation. grip allows users to customize four pes corresponding to the udfs introduced in sec. iv. these can be implemented in multiple ways depending on the user's needs. for example, they could be implemented using a reconfigurable fabric (e.g. an fpga) for maximum flexibility. alternatively, they could be implemented using a model specific circuit to optimize for area or performance.
+
+our implementation uses a programmable alu based approach. since most common gnns only require a small number of operations in practice, this allows us to support a range of models on the same hardware while remaining reasonably efficient in practice. specifically, we allow gather to be identity (e.g.  $h_u$  or  $h_v$ ), element-wise sum, product, or
+
+scale by constant; reduce to be element-wise sum, max, or mean; transform to be matrix multiplication followed by element-wise sum; and activate to be either relu or a lut operation which we describe in sec. v-d. while these cover most gnn models we investigated, expanding the set of supported operations may be required for other gnns. we leave exploring other possible implementations for future work.
+
+memory controller. the memory controller is responsible for moving data on- and off-chip. instead of each execution unit issuing requests to the memory controller directly, the host is required to statically schedule memory transfers before execution. this is possible since the set of features required for inference can be easily determined from the nodeflow. this also prevents individual units from stalling on external memory accesses, but requires scheduling commands such that loading data fully overlaps with execution (sec. vi-a).
+
+# b. edge unit
+
+![](images/56b6cccf6f00cb27e424f3c5fb5b88483f5751fd7903426e296809c88a1d3c26.jpg)  
+fig. 6: the edge unit pipeline is split into source-oriented (p0-p2) and destination-oriented (r0-r4) sections called lanes that can be independently replicated. stage r0 is only used for models that require reading source features.
+
+the edge unit pipeline is split into two distinct halves (fig. 6). stages p0-p2 implement prefetch, which iterates over the edges of the nodeflow and reads the features corresponding to the source vertex. the result is passed to reduce (stages r0-r4), which reads the corresponding destination feature and then applies gather and reduce, accumulating the result into the edge accumulator. grip allows optionally disabling stage r0 since most models do not require reading source features.
+
+parallelization. the edge-accumulator value for each output vertex can be computed independently. this means there is a significant amount of parallelism that can be exploited to improve the performance of the edge unit. a simple method to
+
+parallelize execution is to duplicate the elements of the edge unit into  $n$  identical copies. each copy can then be assigned a subset of output vertices to process in parallel (e.g. by a random hash of the vertex id). however, since the nodeflow buffer is read every cycle by each lane, this approach requires adding  $2n$  ports to the nodeflow buffer.
+
+instead, grip duplicates prefetch and reduce into  $n$  and  $m$  copies called lanes. each lane is statically assigned a partition of input vertices (for prefetch) or output vertices (for reduce). similarly, edges are assigned to a prefetch lane based on the edge's source vertex. during execution, each prefetch lane iterates over its assigned edges and reads each edge's corresponding feature. it then sends the feature data through an  $n \times m$  crossbar to the reduce lane assigned to the destination vertex. this design restricts each lane to accessing only its assigned subset of features and edges, allowing grip to partition the nodeflow buffer into  $n + m$  separate srams. as a result, grip scales to a much larger number of lanes than the simpler design. additionally, our implementation of grip extends this scheme to include off-chip memory by storing feature data pre-partitioned and setting the number of prefetch lanes equal to the number of dram channels.
+
+# c. vertex unit
+
+the vertex unit implements the vertex-accumulate phase by iterating over the output vertices and applying transform. our implementation restricts transform to a matrix multiplication, which we implement using a  $16 \times 32$  weight stationary pe array [9]. each pe contains a 16-bit multiplier, as well as a local double buffered weight register. the pe array is broken into two  $16 \times 16$  blocks. blocks can be configured to use one of two modes: cooperative, where both blocks operate on the same vertex, or parallel, where blocks operate on different vertices in parallel. parallel mode broadcasts weight values to both blocks, allowing for slightly lower energy consumption at the expense of higher latency when there is only a single output vertex.
+
+unlike many other neural network accelerators, grip does not use a systolic array structure. instead, grip broadcasts inputs across the rows of the array and accumulates results down columns using a reduction tree. the entire operation is pipelined to allow multiple matrix operations to occur without stalling, even as weights are transferred in and out of the array. this results in a significant savings in latency for a single matrix-vector operations; instead of requiring  $16 + 32 = 48$  cycles, our implementation requires just six (three to distribute values, one for multiplication, and two for reduction). this also eliminates the buffers required for input skewing in a systolic design.
+
+# d. update unit
+
+the update unit iterates over each vector in the vertex accumulator and applies activate. our activate pe allows two possible operations: element-wise relu and a two-level configurable lookup-table (lut) that can be used to approximate many activation functions. each lut level is implemented
+
+![](images/7dd3f78d9bfc8e8c3c52031769a0bd5b61c22d96bdacada252fdde6baec582bb.jpg)  
+(a)
+
+![](images/481d4156ceb7a6bacd3c3ce0415363a3d369cad1fd1c7892d90e3feab2d9a14f.jpg)  
+(b)
+
+![](images/ea4561c9fc635d9a121f24686a883f512185654999820764a2f010dfad62e41e.jpg)  
+(c)  
+fig. 7: an example of a nodeflow (a) and corresponding partitions (b) which are processed column-wise. grip also pipelines transferring feature data with execution (c).
+
+as a separate table with 33 and 9 entries, respectively. both cover overlapping ranges of input: the first level from  $-2^{a}$  to  $2^{a}$ , and the second level from  $-2^{b}$  to  $2^{b}$ , where  $a$  and  $b$  are user configurable values. the lut entries lineally partition the range, e.g. entry 0 of level 1 corresponds to  $-2^{a}$ , entry 1 corresponds to  $-2^{a} + 2^{a + 1} / 32$ , etc. to perform an activation computation, the input is first converted to a 16-bit fixed point representation with 4-bits of integer precision. each level is then checked in series to see if the input falls in its range. if so, the closest two lut values are linearly interpolated to produce an output. if the values overflow the range for both levels, the input is either clamped to the closest value in the second level, or a user configured linear function is used. additionally, the overflow behavior can be configured for both positive and negative inputs independently, allowing the implementation of non-symmetric activation functions. this simple approximation covers a large number of activation functions, including sigmoid, which is required for models such as g-gcn.
+
+# vi. optimizations
+
+grip implements two major gnn optimizations: execution partitioning and vertex-tiling. execution partitioning describes a method to split a grip program to operate on partitions of a nodeflow, reducing the amount of on-chip memory required. grip supports pipelining operations on different partitions, improving performance. vertex-tiling improves the locality of weights the vertex-accumulate phase, reducing the memory bandwidth required by the vertex unit. collectively, these optimizations reduce inference latency for grip by a significant factor.
+
+# a. execution partitioning
+
+a common gnn optimization is to split the graph into partitions that can be computed on separately [27], [31], [45]. this reduces the peak amount of on-chip memory required to compute inference since only a portion of the graph must be loaded at once. grip supports a similar optimization we refer to as execution partitioning, shown in fig. 7. first, the user partitions the nodeflow offline by splitting the input and output vertices into fixed chunks of size  $n$  and  $m$ . likewise, the edges are partitioned into blocks of size  $n \times m$ , where block  $nf_{i,j}$  stores the edges connecting input vertices in chunk  $u_i$  to output vertices in chunk  $v_j$ . during inference, grip executes
+
+edge-accumulate for each partition in a column, skipping blocks that are empty. then, grip executes the vertex-accumulate and vertex-update phases once, updating values in the corresponding partition of output vertices. this ensures every incoming edge for each output vertex is processed before vertex-accumulate.
+
+another advantage of execution partitioning is that operations can be pipelined between partitions. grip implements two kinds of pipelining related to partitioning. first, grip pipelines loading data from off-chip with the edge-accumulate phase. this allows overlapping execution with bulk loading feature data for an entire partition. if enough space is available in the nodeflow buffer, grip also optionally caches partition feature data loaded during the processing of the first column to avoid reload data while processing later columns. second, transferring weights from the global buffer can be pipelined with processing an entire column. grip performs inter-layer pipelining by loading the weights of the next layer while processing the last column, and preloads the tile buffer before processing the first column.
+
+# b. vertex-tiling
+
+the bandwidth required to load layer weights can be a significant bottleneck. for example, consider a gcn layer with a feature size of 256. since our implementation of transform cannot hold the entire 1 mb weight matrix locally, new weight values must be loaded every cycle. at an operating frequency of  $1\mathrm{ghz}$ , this requires a maximum of  $2\mathrm{tb / s}$  of tile buffer bandwidth, which we found difficult to implement physically. while this could be resolved by increasing the number of weights stored within the multiplier array, this increases energy usage and lacks flexibility since a model with a larger feature size would still run into the same limitation.
+
+![](images/81fbcfa6f11d3ba6a0cfe82e0706ec197c810b0e2917ffb164535551cd6f8722.jpg)  
+fig. 8: vertex-tiling allows materializing a small tile of edge accumulator values  $(m \times f)$  instead of the full  $m \times f$  matrix. this reduces the memory bandwidth required since a tile of weight values can be reused across  $m$  vertices.
+
+grip's approach is to instead use an optimization we call vertex-tiling. the key insight of vertex-tiling is that in almost all cases transform is affine, which allows us to perform an optimization similar to tiling matrix multiplication. fig. 8 shows a graphical representation of this strategy. here, edgeaccumulate produces  $f$  elements for  $m$  output vertices. this requires storing  $f \times m$  elements in the edge accumulator instead of the full  $f \times m$  matrix. then, we run vertex-accumulate (in this case matrix multiplication), which loads each  $f \times o$  tile from the tile buffer. we then repeat this process, first for all vertex tiles and then for all weight slices, maximizing the locality of the weights. this reduces the bandwidth between
+
+the tile buffer and the matrix unit by a factor of  $1 / m$ . thus, by tuning  $f$  and  $m$  we can trade-off the required bandwidth with the amount of storage required for tiles and edge-accumulate values.
+
+# vii. experimental methodology
+
+datasets. table i describes the properties of the datasets chosen for evaluation. datasets were selected from previous evaluations of gnns [21], the snap project [29], and the uf sparse matrix collection [12]. included datasets were designed to be similar to the workloads used by gnns, as well as provide a range of connectivity. we prepossessed each dataset using the same procedure outlined by the authors of graphsage [21]. the column "2-hop" denotes the median number of unique vertices within the 2-hop neighborhood of a vertex picked uniformly at random from the graph, taking into account the sampling procedure.
+
+table i: datasets used for evaluation.  
+
+<table><tr><td>dataset</td><td>nodes</td><td>edges</td><td>2-hop</td></tr><tr><td>youtube (yt)</td><td>1,134,890</td><td>2,987,624</td><td>25</td></tr><tr><td>livejournal (lj)</td><td>3,997,962</td><td>34,681,189</td><td>65</td></tr><tr><td>pokec (po)</td><td>1,632,803</td><td>30,622,564</td><td>167</td></tr><tr><td>reddit (rd)</td><td>232,383</td><td>47,396,905</td><td>239</td></tr></table>
+
+models. we implemented four gnns which cover a broad range of different model types: gcn [28], the max variant of graphsage [21], gin [44], and g-gcn [2], [5], [33]. for our neighborhood function, we use the same sampling procedure as described by the authors of graphsage. specifically, we deterministically map a given vertex to a fixed-sized, uniform sample of its neighbors. for all models, we use two layers with sample sizes 25 and 10 for the first and second layer, respectively. samples between layers are independent. additionally, we use a feature size of 602 (the feature size of the reddit dataset), a hidden dimension of 512, and an output dimension of 256 for all layers.
+
+baseline. our cpu baseline was a dual socket server containing two, 14-core  $2.60\mathrm{ghz}$  intel xeon e5-2690 v4 cpus, each with four channels of ddr4-2400 memory. we restricted our experiments to a single socket to adhere to tensorflow performance guidelines [18] and to avoid latency variation resulting from numa. in this configuration, we measured a sustained 1.084 tflop/s in a matrix multiply benchmark (93% of 1.164 tflop/s theoretical peak) and 64.5 gib/s of off-chip memory bandwidth (84% of 76.8 gib/s theoretical peak).
+
+we implemented both the baseline and our optimized inference algorithm in tensorflow v2.0 [1] with eager mode disabled and compiled with the intel math kernel library [23]. to discount the overhead of the tensorflow library for each model, we measured the time to evaluate an equivalent model with all tensor dimensions set to zero and subtract it from the latency measurement. we also perform a warm-up inference before all measurements to allow tensorflow to compile and optimize the network.
+
+table ii: architectural characteristics of baseline and grip.  
+
+<table><tr><td></td><td>cpu</td><td>grip</td></tr><tr><td>compute</td><td>1.164 top/s @ 2.6 ghz</td><td>1.088 top/s @ 1.0 ghz</td></tr><tr><td rowspan="3">on-chip memory</td><td>l1d: 14 × 32 kib</td><td>nodeflow: 4 × 20 kib</td></tr><tr><td>l2: 14 × 256 kib</td><td>tile: 2 × 64 kib</td></tr><tr><td>llc: 35 mib</td><td>weight: 2 mib</td></tr><tr><td rowspan="2">off-chip memory</td><td>4 × ddr4-2400</td><td>4 × ddr4-2400</td></tr><tr><td>76.8 gib/s</td><td>76.8 gib/s</td></tr><tr><td>total area</td><td>306.18 mm²</td><td>11.27 mm²</td></tr><tr><td>power</td><td>135 w</td><td>4.9 w</td></tr></table>
+
+asic synthesis: we implemented grip in systemverilog, choosing the architectural parameters to have similar compute and memory bandwidth as our cpu baseline (table ii). the implementation uses 16-bit fixed point, which maintains suitable inference accuracy in the models we evaluate. we then performed synthesis and place and route in a  $28\mathrm{nm}$  cmos process, targeting a  $1\mathrm{ghz}$  operating frequency and worst case pvt corner. the critical path of grip was determined to be  $0.93\mathrm{ns}$ , inside the weight srams. power estimates of each unit was performed by generating activity factors from a cycle accurate simulation of our implementation and applying them to our synthesized design. we used cacti v6.5 [39] to estimate the area and power of the sram memories. we also integrated ramulator [26] into our simulator to estimate dram timings and produce a command trace. these traces were fed to drampower [6] to estimate dram power.
+
+# viii. evaluation
+
+grip aims to accelerate gnn inference for a wide range of models, specifically targeting low latency. we evaluate this by measuring overall inference latency for four different models and compare to a cpu and gpu baseline (sec. viii-a). to better understand grip's performance, we then breakdown the contribution of each architectural feature (sec. viii-b) and how the overall speedup changes as we modify both architectural (sec. viii-c) and model parameters (sec. viii-d). we also measure the impact of each gnn optimization we implemented (sec. viii-e). finally, we compare grip to alternative approaches (sec. viii-f) and present a breakdown of energy consumption during inference (sec. viii-g).
+
+# a. overall performance
+
+to evaluate grip's overall performance, we measured the total end-to-end execution time (latency) to compute inference with a variety of models and datasets. table iii shows grip's inference latency and speedup versus our cpu and gpu implementation. we use 99th percentile latency for consistency with prior evaluations of inference performance [38].
+
+performance vs. cpu. compared to our cpu implementation, grip achieves a latency improvement of between  $29.8 \times$  (gcn, pokec) and  $10.9 \times$  (gin, pokec) with a geometric mean of  $17.0 \times$  across all datasets and models. grip tends to give a smaller speedup on models that perform a larger portion of their
+
+table iii:  $99\%$  -ile inference latency for grip, cpu, and gpu  
+
+<table><tr><td rowspan="2">model</td><td rowspan="2">dataset</td><td colspan="3">gpu</td><td colspan="2">gpu</td></tr><tr><td>grip</td><td>μs</td><td>×</td><td>μs</td><td>×</td></tr><tr><td rowspan="4">gcn</td><td>youtube</td><td>15.4</td><td>309.2</td><td>(20.1)</td><td>1082.4</td><td>(70.5)</td></tr><tr><td>livejournal</td><td>15.8</td><td>466.8</td><td>(29.5)</td><td>1313.6</td><td>(83.1)</td></tr><tr><td>pokec</td><td>16.0</td><td>477.1</td><td>(29.8)</td><td>1085.6</td><td>(67.7)</td></tr><tr><td>reddit</td><td>16.3</td><td>407.1</td><td>(25.0)</td><td>813.2</td><td>(50.0)</td></tr><tr><td rowspan="4">g-gcn</td><td>youtube</td><td>134.1</td><td>2315.9</td><td>(17.3)</td><td>1332.5</td><td>(9.9)</td></tr><tr><td>livejournal</td><td>146.3</td><td>2493.2</td><td>(17.0)</td><td>1837.6</td><td>(12.6)</td></tr><tr><td>pokec</td><td>146.7</td><td>2637.9</td><td>(18.0)</td><td>1409.2</td><td>(9.6)</td></tr><tr><td>reddit</td><td>147.0</td><td>2864.2</td><td>(19.5)</td><td>1133.9</td><td>(7.7)</td></tr><tr><td rowspan="4">gs</td><td>youtube</td><td>113.7</td><td>1545.1</td><td>(13.6)</td><td>1309.0</td><td>(11.5)</td></tr><tr><td>livejournal</td><td>124.4</td><td>1947.4</td><td>(15.7)</td><td>2193.8</td><td>(17.6)</td></tr><tr><td>pokec</td><td>124.9</td><td>2075.7</td><td>(16.6)</td><td>1759.1</td><td>(14.1)</td></tr><tr><td>reddit</td><td>125.3</td><td>2099.0</td><td>(16.8)</td><td>1252.8</td><td>(10.0)</td></tr><tr><td rowspan="4">gin</td><td>youtube</td><td>30.5</td><td>344.7</td><td>(11.3)</td><td>1387.6</td><td>(45.5)</td></tr><tr><td>livejournal</td><td>30.9</td><td>416.1</td><td>(13.5)</td><td>1221.5</td><td>(39.5)</td></tr><tr><td>pokec</td><td>31.1</td><td>340.7</td><td>(10.9)</td><td>855.5</td><td>(27.5)</td></tr><tr><td>reddit</td><td>31.4</td><td>354.8</td><td>(11.3)</td><td>1009.4</td><td>(32.2)</td></tr></table>
+
+computation during the update step of the message-passing layer. for example, gin's update uses a two-layer mlp that requires roughly double the computation of gcn's single matrix multiplication. however, the additional computation results in similar overall cpu inference latency since our implementation is largely bottlenecked by non-computational factors (sec. ii-b). this results in grip achieving a smaller performance improvement of  $10.9 - 13.5 \times$  compared to an improvement of more than  $13.6 \times$  for all other models.
+
+performance vs. gpu. practical deployments of online gnn inference most often use cpus due to the large memory requirements for graph features and low utilization at small batch sizes. however, for completeness we also benchmark grip against an nvidia p100 gpu implementation for each model. grip's speedup on gpu ranges from  $83.1 \times$  (livejournal, gcn) to  $7.7 \times$  (reddit, g-gcn) with a geometric mean of  $23.4 \times$ . for models with relatively low overall latency (gcn, gin) we see a significantly higher speedup than with our cpu implementation. this is largely due to the overhead of transferring embeddings from host to gpu memory (roughly  $200 - 500 \mu s$ , depending on the neighborhood size) which comprises a large portion of the overall execution time for models like gcn ( $25\% - 50\%$  of total latency). grip does not incur this penalty since features and weights are already stored in device dram and do not have to be transferred from the host. on models with a higher total execution time (e.g. g-gcn), grip still achieves a significant speedup due to low gpu utilization. with a batch size of 1, there is not sufficient computation during each layer to fully utilize the computational resources of the gpu and overhead of launching each kernel tends to dominate.
+
+![](images/39e03956b5e69a4616975303ba5aef293a9210df06acb7199412d5112b611ae3.jpg)  
+(a) speedup breakdown for each component of grip versus baseline.
+
+![](images/c258894cb13dd349cb1345f5c61bdf330ac2eb871c8001adeca67655a9b34724.jpg)  
+(b) estimated speedups of prior work versus baseline and grip.
+
+# b. breakdown of performance
+
+in this subsection, we breakdown the performance impact of each architectural feature of grip. specifically, we modify our cycle-accurate simulator to match the bottlenecks exhibited by our cpu implementation and then progressively remove each modification to measure the impact of different units. as a performance benchmark, we use the geometric mean speedup of gcn for the largest neighborhood in each dataset.
+
+baseline configuration. our baseline configuration emulates each core being assigned independent vertices and performing all greta phases, with weights and partition data being first loaded into l3 cache and intermediate values accumulated directly in l2. this results in the following simulator modifications. first, we modify our vertex unit to use  $14$ ,  $8 \times 2$  matrix multiply units, with each unit assigned independent vertices within a partition. this emulates the effect of each cpu core using two 8-element simd units. second, we increase the number of fetch and gather units to 14 and the crossbar width to 32 bytes, matching the number of cores and l2 cache bandwidth, respectively. we also disable pipelining between the edge and vertex units to emulate a single core performing both functions. third, we merge the weight and nodeflow buffers into a single sram and limit the maximum read bandwidth to 16 bytes per cycle per fetch unit, matching the bandwidth of the l3 cache. finally, we disable pipelining between the vertex and update unit to model both operations being performed by the same core. this configuration overestimates the performance of the cpu in practice since it models ideal performance and no additional computation required for auxiliary operations, such as indexing calculations. in particular, with a  $2.6\mathrm{ghz}$  clock and an element width of 4-bytes, our model is  $2.07\times$  faster than the measured cpu latency.
+
+breakdown. in fig. 9a, we show the impact of different units in grip by progressively removing each modification from our baseline in reverse order. first, we split the weight and nodeflow memories into separate srams. this results in a  $2.8 \times$  speedup due to removing contention between fetching features and weights from the same sram  $(2.0 \times)$ , as well doubling the bandwidth available to load weight values into the vertex unit  $(1.4 \times)$ . second, we add the edge unit, resulting in an additional improvement of  $3.4 \times$ . while this is partially
+
+![](images/7a170fb9c40e265f00343bc6e3b33fee5d122f3d90b514baf2abb2ae6bf627e5.jpg)  
+fig. 9: breakdown of performance improvements.  
+fig. 10: impact of scaling architectural parameters. dashed vertical line indicates our implementation's parameters. in fig. 10a the number of edge unit lanes is kept equal to the number of channels.
+
+due to increased crossbar bandwidth after adjusting the number of fetch and gather units  $(1.14\times)$ , the majority of the speedup is due to allowing loading data, edge-accumulate, and vertex-accumulate phases to overlap by using a dedicated unit for each phase  $(2.97\times)$ . third, we enable the vertex unit and revert to using a single  $16\times 32$  matrix multiply unit, resulting in an additional  $1.87\times$  speedup. this is due to increased overall top/s  $(1.63\times)$  and using a single unit rather than multiple units, which allows units to not be wasted when the overall number of output vertices is small  $(1.15\times)$ . finally, separating and pipelining the update unit produces a small speedup of  $1.02\times$ .
+
+# c. architectural parameters
+
+here, we discuss the impact of several high level architectural parameters on inference performance.
+
+number of dram channels. the number of dram channels determines the overall memory bandwidth available to transfer data on- and off-chip. in fig. 10a, we observe that grip's performance is strongly related to the number of channels until around 8 channels ( $\sim 150\mathrm{gib / s}$ ). this indicates that grip's performance is primarily limited by off-chip memory bandwidth.
+
+weight bandwidth. the weight bandwidth determines how many values can be read from the global weight buffer each cycle. if this is set too low, loading weight values can become a bottleneck during vertex-accumulate. we observe this effect in fig. 10b below  $128\mathrm{gib / s}$ , which corresponds to loading 64 weight values each cycle.
+
+crossbar port width. the crossbar port width determines the number of elements accumulated by each gather unit in a single cycle. in our experiments, the average number of edges per vertex is fairly small (sampled to be less than 25). since edge-accumulate typically takes much less time than vertex-accumulate or loading data from dram, increasing the width has a limited impact on performance (fig. 10c). however, it is preferable to over-allocate the crossbar width in order to ensure high performance even on dense nodeflows.
+
+matrix multiply top/s. the total number of top/s grip can achieve is determined primarily by the size of the matrix multiply unit. in fig. 10d we see that performance is strongly related to the size of this unit, until reaching around 2 top/s at which point grip is limited by memory bandwidth. thus, our
+
+![](images/2ebe08f5b49c5f50da6a4975c533cae2b14105b4eabbd80ecafd42da01fd0761.jpg)  
+(a) impact of feature dimensions.
+
+![](images/321d033c977d502bab54d460f605196dee82e29680f5f92c665bd442251a83bc.jpg)  
+(b) impact of sampling.
+
+implementation of grip would see a relatively small benefit from a substantially larger matrix unit (1.14× for a 4× larger unit).
+
+# d. model parameters
+
+a key aspect grip's design is balancing the performance between greta's edge and vertex-centric phases. here, we evaluate how this balance changes as the parameters of the gnn model are altered.
+
+feature dimensions. in fig. 11a, we evaluate how varying the number of the input and output features impacts the percent of time spent in matrix multiplication. the proportion is initially low ( $\sim 8\%$ ) for small features and increases linearly until 32 features. this is due to the fact that when the feature size is smaller than the native width of the dram interface, dram bandwidth is poorly utilized due to many random accesses. in our implementation, we use two dual-channel dram controllers, which each have an interface of 64 2-byte elements. above this point, the proportion of time spent performing vertex-accumulation stays flat, reflecting the fact that each additional feature results in a constant amount of additional computation during inference. however, this analysis does not hold for the output features, which can be increased without needing to increase the number of values loaded from dram. we see that increasing the output feature size always increases the percent of time performing vertex-accumulate. thus, models with large output feature sizes are likely to be limited by compute rather than memory.
+
+sampled edges. another important model parameter is the number of sampled edges per output vertex. in fig. 11b, we evaluate how the number of edges impacts the percent of total time spent performing edge-accumulate. for less than 8 edges per vertex, grip's performance is mostly limited by computation and overhead related to accessing data from dram. above this threshold, the memory and crossbar bandwidth becomes a bottleneck, and grip spends an increasing portion of execution loading data.
+
+neighborhood size. the neighborhood size heavily impacts grip's overall latency and is influenced by local graph structure. to demonstrate the impact of the neighborhood
+
+![](images/4182b9aa0ceebc89e1514a563227d2ed4e9d8e5fc29d94c8ffa07253440633c8.jpg)  
+fig. 11: the impact of scaling different gcn parameters on the balance of time spent in each operation. scaling the output feature size increases the amount of time spent performing matrix multiplication, while increasing the number of edges decreases it.  
+(a)  
+fig. 12: impact of different neighborhood sizes on latency for the gcn model. grip's latency linearly increases with neighborhood size due to more computation being required for inference. the speedup is roughly constant until a neighborhood size of about 95, at which point intermediate values no longer fit into the cache of a single cpu core.
+
+![](images/230f2b9dfd4a1f3e9bc0fb74331ead562bee03e50b118302a476430a2271664e.jpg)  
+(b)
+
+size on performance, we plot grip's minimum, median, and 99th percentile inference latency for gcn across different neighborhoods of the livejournal dataset in fig. 12a. the result is a strong linear relationship between the neighborhood size and latency across the entire distribution. each vertex added to the neighborhood results in a roughly constant increase in the amount of work during inference. additionally, we observe that as the neighborhood size increases, the median latency moves closer to the 99th percentile. this is the result of larger neighborhoods being more likely to be densely connected, leading to a larger number of reductions that must be computed.
+
+in fig. 12, we evaluate the latency speedup compared to the cpu baseline across different neighborhood sizes. below a neighborhood size of 95, we see a roughly constant speedup of between  $12 \times$  and  $18 \times$ . for these neighborhood sizes, all intermediate values fit into the l1 and l2 cache of a single cpu core. after this point, some feature values must be stored in the l3 cache and inference performance becomes limited by the cache bandwidth (sec. ii-b).
+
+# e. optimizations
+
+![](images/ab1dbc6afed37316480a697d5a538c01456c9b7db69d6c2935188e7faabde59e.jpg)  
+(a) impact of pipelining  
+fig. 13: impact of partitioning and tiling optimizations.
+
+![](images/45f975c4b05b24cd61575e7519c788c763b64f43e49aa0457874192a66a86e3b.jpg)  
+(b) speedup of vertex-tiling
+
+in this subsection, we evaluate the impact of each optimization used by grip.
+
+partitioning and pipelining. in fig. 13a we show the cumulative speedups of each optimization enabled by partitioning.
+
+we compare to an unoptimized baseline, where feature values are loaded from off-chip on demand and no pipelining exists between stages. first, by caching feature data on-chip, grip achieves a  $1.3 \times$  speedup. this is due to the decreased memory traffic required to reload data between partition columns and by the improved throughput from bulk loading data for an entire partition. second, pipelining operations between different partitions results in an additional  $1.3 \times$  speedup due to overlapping execution with memory transfers. finally, we can also pipeline the transfer of weights from the global weight buffer into the vertex-update unit. this increases the overall speed-up to a total of  $2.5 \times$ .
+
+vertex-tiling. in fig. 13b, we show the speedup compared to no tiling as we alter the two tiling parameters  $m$  (the number of vertices in a tile) and  $f$  (the number of elements per vertex). we see that performance generally reaches a maximum around  $f = 64$  elements. above  $f = 64$ , increasing  $f$  causes the vertex unit to stall more often while waiting for a tile to be produced by the edge unit. the performance degradation is not linear because the time taken to accumulate a tile depends on the connectedness of the noduleflow. we also see degraded performance below  $f = 64$ . this is because  $f$  features are loaded from memory for each vertex. as  $f$  decreases, more random dram accesses are required to load features, degrading dram throughput. increasing  $m$  also increases performance until around 12 vertices. the maximum number of output vertices in our model is 11. increasing  $m$  beyond this only adds additional latency associated with processing empty dummy vertices.
+
+# f. comparisons to prior work
+
+several other approaches have been proposed to accelerate neural networks and graph algorithms. here, we analyze the bottlenecks present in each approach and compare performance with grip.
+
+hygcn. hygcn [45] is an accelerator designed for graph convolutional networks, a subset of gnns that do not have computation associated with edges. hygcn and grip take a similar approach of using separate units for edge- and vertex-centric operations. however, grip addresses two major bottlenecks present in the hygcn design.
+
+first, hygcn uses 32 8-lane simd units to perform edge-oriented operations, but can only issue a single edge at a time. this means the throughput of edge operations will be limited when the number of features is smaller than the total number of simd lanes. in contrast, grip allows for multiple edges to be issued in parallel.
+
+second, hygcn requires an entire feature vector to be computed and stored before performing vertex-oriented operations. in order to process multiple vertices in parallel, this requires a large buffer to store accumulated values (16 mb in the hygcn implementation). the size of this buffer is also reported by the hygcn authors to have a significant impact on their overall performance  $(1.3 - 4 \times$  worse performance for a  $16 \times$  smaller buffer.) in contrast, grip uses vertex-tiling to only store a small number of elements from multiple feature
+
+vectors. this allows grip to use a roughly  $10,000 \times$  smaller buffer (1.5 kib) while achieving comparable performance.
+
+we demonstrate these limitations by modifying our simulator to emulate the hygcn approach. specifically, we set the number of gather and fetch units to 1 and the crossbar width to 256 to match the number of simd lanes. we disable all tiling and force feature vectors to be fully accumulated before vertex-accumulate. we then set all other parameters to be the same as grip, including the same partitioning used in our evaluation of grip.
+
+this configuration results in a speedup of  $4.4 \times$  the baseline, shown in fig. 9b. however, it performs  $4.5 \times$  slower than grip due to limits in the available on-chip memory bandwidth for weights. incorporating vertex tiling would allow for a much smaller edge accumulate buffer and reduce the required bandwidth by increasing the reuse of the weights.
+
+modified tpu. the tpu [25] is a dnn accelerator designed around a large 2-d systolic array. unfortunately, gnns are difficult to implement efficiently for the tpu due to a lack of support for edge-oriented operations [3]. instead, we compare grip to a modified version of the tpu architecture that addresses this limitation by incorporating features from grip. we refer to this modified design as the  $\mathrm{tpu + }$
+
+specifically, the tpu+ has an additional unit similar to grip's edge-unit between the tpu's unified buffer and the systolic data setup. this allows the tpu+ to natively support the greta programming model by mapping edge-accumulate onto the new edge-unit, vertex-accumulate onto tpu's systolic array, and vertex-update onto the activation pipeline. this design also supports both the execution partitioning and vertextiling optimizations described in sec. vi.
+
+we estimate the performance of the tpu+ by modifying our cycle-accurate model to use a single fetch and gather unit. we also replace the vertex-unit with an identically sized  $16 \times 32$  systolic array. as in the original tpu design, weights are stored off-chip and the dedicated weight bandwidth is limited to  $30\mathrm{gib / s}$ . all other parameters remain unchanged compared to our evaluation of grip, including the use of  $4 \times$  ddr4-2400 for off-chip memory and the same partitioning and vertex-tiling optimizations.
+
+this configuration achieves a  $11.3 \times$  speedup (fig. 9b) compared to our baseline in sec. viii-b. the main bottleneck in this approach is the limited bandwidth dedicated to weights. moving weights on-chip as in grip results in a  $1.72 \times$  speedup. higher performance memory for weights (e.g. hbm as used by later versions of the tpu) could also address this bottleneck. however, we leave a fuller exploration for future work.
+
+graphicacion. graphicacion [20] is an accelerator architecture designed for graph analytics. like grip, graphicacion allows several units to be specialized for a particular algorithms, such as gcn inference. however, it is designed for algorithms that use a small amount of state per-vertex. as a result, it suffers from two bottlenecks. first, like hygcn, it cannot perform vertex-tiling since it requires full feature vectors to be accumulated. this results in a bottleneck similar to hygcn since weight data cannot be easily reused between different
+
+vertices. second, each lane has independent vertex units instead of using a single shared unit, increasing the required weight bandwidth by an amount proportional to the number of lanes.
+
+we estimate the impact of these bottlenecks by modifying our simulator by disabling tiling and splitting the vertex unit into two units lanes that share a single tile buffer port. we also use the same partitioning scheme used for grip. this configuration results in a small speedup of  $2.4 \times$  over the baseline, shown in fig. 9b. however, this is  $8.1 \times$  slower than grip due to significant bottlenecks in weight bandwidth.
+
+# g. energy
+
+table iv shows the power consumption for each of grip's core top level modules during gcn inference. the single most energy intensive during inference is loading embeddings from dram, consuming more than the rest of the accelerator combined (53.7%). this is due to the fact that both the number of vertices and the feature size is the largest at the input of gcn, leading to more data being initially loaded in the first layer. additionally, grip optimizes for latency with four high performance dram channels, requiring a large amount of energy per transfer. the rest of the energy is mostly used by loading weights from the global weight and nodeflow buffers. both are fairly large, leading to a high energy cost per read and write. in total, grip uses just 4.9 w, a significant improvement over the 135 w tdp of the baseline cpu.
+
+table iv: breakdown of power for gcn inference.  
+
+<table><tr><td></td><td>module</td><td>mw</td><td>(%)</td></tr><tr><td rowspan="3">execution units</td><td>edge</td><td>4.1</td><td>0.1</td></tr><tr><td>vertex</td><td>656.6</td><td>12.6</td></tr><tr><td>update</td><td>0.4</td><td>&lt; 0.1</td></tr><tr><td rowspan="2">sram</td><td>weight</td><td>1476.7</td><td>28.3</td></tr><tr><td>nodeflow</td><td>269.5</td><td>5.1</td></tr><tr><td>dram</td><td>-</td><td>2794.7</td><td>53.7</td></tr><tr><td></td><td>total</td><td>4932.4</td><td>100</td></tr></table>
+
+# ix. conclusion
+
+gnns represent a promising new method in machine learning to learn directly from graph-structured data. however, the computational costs of gnns represent a significant barrier for deployment in many applications, especially in the scenario of online inference.
+
+this paper presents grip, an accelerator architecture designed for low latency gnn inference. grip splits gnn operations into a series of edge- and vertex-centric phases. each phase is implemented independently in hardware, allowing for specialization of both the memory subsystem and execution units to improve performance. additionally, grip has hardware support for several optimizations that further reduce latency, including pipelining operations between nodeflow partitions and vertex-tiling. we then implement grip as  $28\mathrm{nm}$  asic capable of executing a range of different gnns. on a variety of real graphs, our implementation improves 99th percentile
+
+latency by a geometric mean of  $17 \times$  and  $23 \times$  compared to a cpu and gpu baseline, respectively, while drawing only  $5\mathrm{w}$ .
+
+# references
+
+[1] m. abadi, a. agarwal, p. barham, e. brevdo, z. chen, c. citro, g. s. corrado, a. davis, j. dean, m. devin, s. ghemawat, i. goodfellow, a. harp, g. irving, m. isard, y. jia, r. jozefowicz, l. kaiser, m. kudllur, j. levenberg, d. mané, r. monga, s. moore, d. murray, c. olah, m. schuster, j. shlens, b. steiner, i. sutskever, k. talwar, p. tucker, v. vanhoucke, v. vasudevan, f. viégas, o. vinyals, p. warden, m. wattenberg, m. wicke, y. yu, and x. zheng, "tensorflow: large-scale machine learning on heterogeneous systems," 2015, software available from tensorflow.org. [online]. available: http://tensorflow.org/  
+[2] m. allamanis, m. brockschmidt, and m. khademi, "learning to represent programs with graphs," in 6th international conference on learning representations, iclr, 2018. [online]. available: https://openreview.net/forum?id=bjofetxr  
+[3] m. balog, b. van merrienboer, s. moitra, y. li, and d. tarlow, "fast training of sparse graph neural networks on dense hardware," arxiv preprint arxiv:1906.11786, 2019.  
+[4] p. w. battaglia, j. b. hamrick, v. bapst, a. sanchez-gonzalez, v. zambaldi, m. malinowski, a. tacchetti, d. raposo, a. santoro, r. faulkner et al., “relational inductive biases, deep learning, and graph networks,” arxiv preprint arxiv:1806.01261, 2018.  
+[5] x. bresson and t. laurent, “residual gated graph convnets,” arxiv preprint arxiv:1711.07553, 2017.  
+[6] k. chandrasekar, c. weis, y. li, s. goossens, m. jung, o. naji, b. akesson, n. wehn, and k. goossens, "drampower: open-source dram power & energy estimation tool," url: http://www.drampower.info, vol. 22, 2012.  
+[7] j. chen, t. ma, and c. xiao, "fastgcn: fast learning with graph convolutional networks via importance sampling," international conference on learning representations (iclr), 2018.  
+[8] t. chen, z. du, n. sun, j. wang, c. wu, y. chen, and o. temam, "diannao: a small-footprint high-throughput accelerator for ubiquitous machine-learning," in proceedings of the 19th international conference on architectural support for programming languages and operating systems, ser. asplos '14. new york, ny, usa: acm, 2014, pp. 269-284. [online]. available: http://doi.acm.org/10.1145/2541940.2541967  
+[9] y.-h. chen, t. krishna, j. s. emer, and v. sze, "eyeriss: an energy-efficient reconfigurable accelerator for deep convolutional neural networks," ieee journal of solid-state circuits, vol. 52, no. 1, pp. 127-138, 2017.  
+[10] y. chen, t. luo, s. liu, s. zhang, l. he, j. wang, l. li, t. chen, z. xu, n. sun, and o. temam, "dadiannao: a machine-learning supercomputer," in proceedings of the 47th annual ieee/acm international symposium on microarchitecture, ser. micro-47. washington, dc, usa: ieee computer society, 2014, pp. 609-622. [online]. available: http://dx.doi.org/10.1109/micro.2014.58  
+[11] w.-l. chiang, x. liu, s. si, y. li, s. bengio, and c.-j. hsieh, "cluster-gcn: an efficient algorithm for training deep and large graph convolutional networks," in proceedings of the 25th acm sigkdd international conference on knowledge discovery; data mining, ser. kdd '19. new york, ny, usa: acm, 2019, pp. 257-266. [online]. available: http://doi.acm.org/10.1145/3292500.3330925  
+[12] t. a. davis and y. hu, “the university of florida sparse matrix collection,” acm transactions on mathematical software (toms), vol. 38, no. 1, p. 1, 2011.  
+[13] z. du, r. fasthuber, t. chen, p. ienne, l. li, t. luo, x. feng, y. chen, and o. temam, "shidiannao: shifting vision processing closer to the sensor," in 2015 acm/ieee 42nd annual international symposium on computer architecture (isca), june 2015, pp. 92-104.  
+[14] c. farabet, b. martini, b. corda, p. akselrod, e. culurciello, and y. lecun, "neuflow: a runtime reconfigurable dataflow processor for vision," in 2011 ieee computer society conference on computer vision and pattern recognition workshops (cvpr workshops 2011). ieee, 2011, pp. 109-116.  
+[15] m. gao, j. pu, x. yang, m. horowitz, and c. kozyrakis, “tetris: scalable and efficient neural network acceleration with 3d memory,” in proceedings of the twenty-second international conference on architectural support for programming languages and operating systems, ser. asplos '17. new york, ny, usa: acm, 2017, pp. 751–764. [online]. available: http://doi.acm.org/10.1145/3037697.3037702
+
+[16] m. gao, x. yang, j. pu, m. horowitz, and c. kozyrakis, "tangram: optimized coarse-grained dataflow for scalable nn accelerators," in proceedings of the twenty-fourth international conference on architectural support for programming languages and operating systems, ser. asplos '19. new york, ny, usa: acm, 2019, pp. 807-820. [online]. available: http://doi.acm.org/10.1145/3297858.3304014  
+[17] j. gilmer, s. s. schoenholz, p. f. riley, o. vinyals, and g. e. dahl, “neural message passing for quantum chemistry,” in proceedings of the 34th international conference on machine learning-volume 70. jmlr.org, 2017, pp. 1263–1272.  
+[18] n. greeneltch and j. x, "maximize tensorflow performance on cpu: considerations and recommendations for inference workloads," https://software.intel.com/en-us/articles/maximize-tensorflow-performance-on-cpu-considerations-and-recommendations-for-inference, 2019.  
+[19] gunrock developers, "hive workflow report for graphsage gpu implementation," https://gunrock.github.io/docs/hive/hive_graphsage.html, accessed: 2020-02-20.  
+[20] t. j. ham, l. wu, n. sundaram, n. satish, and m. martonosi, "graphicacion: a high-performance and energy-efficient accelerator for graph analytics," in 2016 49th annual ieee/acm international symposium on microarchitecture (micro). ieee, 2016, pp. 1-13.  
+[21] w. hamilton, z. ying, and j. leskovec, "inductive representation learning on large graphs," in advances in neural information processing systems, 2017, pp. 1024-1034.  
+[22] z. huang, d. zheng, q. gan, j. zhou, and z. zhang, "nodeflow and sampling," 2019, https://doc.dgl.ai/tutorials/models/5_giant_graph/1_sampling_mx.html#nodeflow, accessed 2020-01-01.  
+[23] intel corporation, intel math kernel library. reference manual. santa clara, usa: intel corporation, 2019.  
+[24] a. jain, i. liu, a. sarda, and p. molino, "food discovery with uber eats: using graph learning to power recommendations," https://eng.uber.com/uber-eats-graph-learning/, accessed: 2020-02-20.  
+[25] n. p. jouppi, c. young, n. patil, d. patterson, g. agrawal, r. bajwa, s. bates, s. bhatia, n. boden, a. borchers, r. boyle, p-i. cantin, c. chao, c. clark, j. coriell, m. daley, m. dau, j. dean, b. gelb, t. v. ghaemmaghami, r. gottipati, w. gulland, r. hagemann, c. r. ho, d. hogberg, j. hu, r. hundt, d. hurt, j. ibarz, a. jaffey, a. jaworski, a. kaplan, h. khaitan, d. killebrew, a. koch, n. kumar, s. lacy, j. laudon, j. law, d. le, c. leary, z. liu, k. lucke, a. lundin, g. mackean, a. maggiore, m. mahony, k. miller, r. nagarajan, r. narayanaswami, r. ni, k. nix, t. norrie, m. omernick, n. penukonda, a. phelps, j. ross, m. ross, a. salek, e. samadiani, c. severn, g. sizikov, m. snelham, j. souter, d. steinberg, a. swing, m. tan, g. thorson, b. tian, h. toma, e. tuttle, v. vasudevan, r. walter, w. wang, e. wilcox, and d. h. yoon "in-datacenter performance analysis of a tensor processing unit," in proceedings of the 44th annual international symposium on computer architecture, ser.isca '17.new york,nyusa:acm2017pp.1-12.[online]. available: http://doi.acm.org/10.1145/3079856.3080246  
+[26] y. kim, w. yang, and o. mutlu, “ramulator: a fast and extensible dram simulator,” ieee computer architecture letters, vol. 15, no. 1, pp. 45–49, 2016.  
+[27] k. kiningham, p. levis, and c. re, "greta: hardware optimized graph processing for gnns," in proceedings of the workshop on resource-constrained machine learning (recoml 2020), march 2020.  
+[28] t. n. kipf and m. welling, "semi-supervised classification with graph convolutional networks," in international conference on learning representations (iclr), 2017.  
+[29] j. leskovec and a. krevl, “snap datasets: stanford large network dataset collection,” http://snap.stanford.edu/data, jun. 2014.  
+[30] w. lu, g. yan, j. li, s. gong, y. han, and x. li, “flexflow: a flexible dataflow accelerator architecture for convolutional neural networks,” in 2017 ieee international symposium on high performance computer architecture (hpca). ieee, 2017, pp. 553–564.  
+[31] l. ma, z. yang, y. miao, j. xue, m. wu, l. zhou, and y. dai, "neugraph: parallel deep neural network computation on large graphs," in 2019 usenix annual technical conference (usenix atc '19). renton, wa: usenix association, jul. 2019, pp. 443-458. [online]. available: https://www.usenix.org/conference/atc19/presentation/ma  
+[32] y. ma, h. ren, b. khailany, h. sikka, l. luo, k. natarajan, and b. yu, "high performance graph convolutional networks with applications in testability analysis," in proceedings of the 56th annual design automation conference 2019, 2019, pp. 1-6.
+
+[33] d. marcheggiani and i. titov, "encoding sentences with graph convolutional networks for semantic role labeling," in proceedings of the 2017 conference on empirical methods in natural language processing. copenhagen, denmark: association for computational linguistics, september 2017, pp. 1507-1516. [online]. available: https://www.aclweb.org/anthology/d17-1159  
+[34] e. nurvitadhi, g. weisz, y. wang, s. hurkat, m. nguyen, j. c. hoe, j. f. martínez, and c. guestrin, "graphgen: an fpga framework for vertex-centric graph computation," in 2014 ieee 22nd annual international symposium on field-programmable custom computing machines. ieee, 2014, pp. 25-28.  
+[35] nvidia corporation, cusparse library. nvidia corporation, 2019.  
+[36] t. oguntebi and k. olukotun, "graphops: a dataflow library for graph analytics acceleration," in proceedings of the 2016 acm/sigda international symposium on field-programmable gate arrays. acm, 2016, pp. 111-117.  
+[37] m. m. ozdal, s. yesil, t. kim, a. ayupov, j. greth, s. burns, and o. ozturk, "graph analytics accelerators for cognitive systems," ieee micro, vol. 37, no. 1, pp. 42-51, 2017.  
+[38] v. j. reddi, c. cheng, d. kanter, p. mattson, g. schmuelling, c.-j. wu, b. anderson, m. breughe, m. charlebois, w. chou, r. chukka, c. coleman, s. davis, p. deng, g. diamos, j. duke, d. fick, j. s. gardner, i. hubara, s. idgunji, t. b. jablin, j. jiao, t. s. john, p. kanwar, d. lee, j. liao, a. lokhmotov, f. massa, p. meng, p. micikevicius, c. osborne, g. pekhimenko, a. t. r. rajan, d. sequeira, a. sirasao, f. sun, h. tang, m. thomson, f. wei, e. wu, l. xu, k. yamada, b. yu, g. yuan, a. zhong, p. zhang, and y. zhou, "mlperf inference benchmark," arxiv preprint arxiv:1911.02549, 2019.  
+[39] p. shivakumar and n. p. jouppi, "cacti 3.0: an integrated cache timing, power, and area model," compaq computer corporation, tech. rep., 2001.  
+[40] p. velicković, g. cucurull, a. casanova, a. romero, p. lio, and y. bengio, “graph attention networks,” in international conference on learning representations, 2018. [online]. available: https://openreview.net/forum?id=rjxmpikcz  
+[41] s. venkataramani, a. ranjan, s. banerjee, d. das, s. avancha, a. jagannathan, a. durg, d. nagaraj, b. kaul, p. dubey, and a. raghunathan, "scaledeep: a scalable compute architecture for learning and evaluating deep networks," in proceedings of the 44th annual international symposium on computer architecture, ser. isca '17. new york, ny, usa: acm, 2017, pp. 13-26. [online]. available: http://doi.acm.org/10.1145/3079856.3080244  
+[42] y. wang, y. pan, a. davidson, y. wu, c. yang, l. wang, m. oshima, c. yuan, w. liu, a. t. riffel et al., "gunrock: gpu graph analytics," acm transactions on parallel computing (topc), vol. 4, no. 1, pp. 1-49, 2017.  
+[43] z. wu, s. pan, f. chen, g. long, c. zhang, and p. s. yu, “a comprehensive survey on graph neural networks,” arxiv preprint arxiv:1901.00596, 2019.  
+[44] k. xu, w. hu, j. leskovec, and s. jegelka, "how powerful are graph neural networks?" in international conference on learning representations, 2019. [online]. available: https://openreview.net/forum?id=rygs6ia5km  
+[45] m. yan, l. deng, x. hu, l. liang, y. feng, x. ye, z. zhang, d. fan, and y. xie, "hygcn: a gcn accelerator with hybrid architecture." ieee, 2020.  
+[46] r. ying, r. he, k. chen, p. eksombatchai, w. l. hamilton, and j. leskovec, "graph convolutional neural networks for web-scale recommender systems," in proceedings of the 24th acm sigkdd international conference on knowledge discovery & data mining, acm, 2018, pp. 974-983.  
+[47] z. ying, j. you, c. morris, x. ren, w. hamilton, and j. leskovec, "hierarchical graph representation learning with differentiable pooling," in advances in neural information processing systems, 2018, pp. 4800-4810.  
+[48] h. zeng and v. prasanna, "graphact: accelerating gcn training on cpu-fpga heterogeneous platforms," in the 2020 acm/sigda international symposium on field-programmable gate arrays, 2020, pp. 255-265.  
+[49] c. zhang, p. li, g. sun, y. guan, b. xiao, and j. cong, "optimizing fpga-based accelerator design for deep convolutional neural networks," in proceedings of the 2015 acm/sigda international symposium on field-programmable gate arrays. acm, 2015, pp. 161-170.
+
+[50] m. zhang and y. chen, “link prediction based on graph neural networks,” 5175. in advances in neural information processing systems, 2018, pp. 5165–

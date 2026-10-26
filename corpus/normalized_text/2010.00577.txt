@@ -1,0 +1,432 @@
+# interpreting graph neural networks for nlp with differentiable edge masking
+
+michael sejr schlichtkrull  $^{1,2}$ , nicola de cao  $^{1,2}$ , ivan titov  $^{1,2}$
+
+<sup>1</sup>university of amsterdam, <sup>2</sup>university of edinburgh
+
+mss84@cam.ac.uk, nicola.decao@gmail.com, ititov@inf.ed.ac.uk
+
+# abstract
+
+graph neural networks (gnns) have become a popular approach to integrating structural inductive biases into nlp models. however, there has been little work on interpreting them, and specifically on understanding which parts of the graphs (e.g. syntactic trees or co-reference structures) contribute to a prediction. in this work, we introduce a post-hoc method for interpreting the predictions of gnns which identifies unnecessary edges. given a trained gnn model, we learn a simple classifier that, for every edge in every layer, predicts if that edge can be dropped. we demonstrate that such a classifier can be trained in a fully differentiable fashion, employing stochastic gates and encouraging sparsity through the expected  $l_{0}$  norm. we use our technique as an attribution method to analyse gnn models for two tasks – question answering and semantic role labelling – providing insights into the information flow in these models. we show that we can drop a large proportion of edges without deteriorating the performance of the model, while we can analyse the remaining edges for interpreting model predictions.
+
+# 1 introduction
+
+graph neural networks (gnns) have in recent years been shown to provide a scalable and highly performant means of incorporating linguistic information and other structural biases into nlp models. they have been applied to various kinds of representations (e.g., syntactic and semantic graphs, co-reference structures, knowledge bases linked to text, database schemas) and shown effective on a range of tasks, including relation extraction (zhang et al., 2018; zhu et al., 2019; sun et al., 2019a; guo et al., 2019), question answering (sorokin & gurevych, 2018; sun et al., 2018; de cao et al., 2019), syntactic and semantic parsing tasks (marcheggiani & titov, 2017; bogin et al., 2019; ji et al., 2019), summarisation (fernandes et al., 2019), machine translation (bastings et al., 2017) and abusive language detection in social networks (mishra et al., 2019).
+
+while gnns often yield strong performance, such models are complex, and it can be difficult to understand the 'reasoning' behind their predictions. for nlp practitioners, it is highly desirable to know which linguistic information a given model encodes and how that encoding happens (jumelet & hupkes, 2018; giulianelli et al., 2018; goldberg, 2019). the difficulty in interpreting gnns represents a barrier to such analysis. furthermore, this opaqueness decreases user trust, impedes the discovery of harmful biases, and complicates error analysis (kim, 2015; ribeiro et al., 2016b; sun et al., 2019b; holstein et al., 2019). the latter is a particular issue for gnns, where seemingly small implementation differences can make or break models (zaheer et al., 2017; xu et al., 2019). in this work, we focus on post-hoc analysis of gnns. we are interested especially in developing a method for understanding how the gnn uses the input graph. as such, we seek to identify which edges in the graph the gnn relies on, and at which layer they are used. we formulate some desiderata for an interpretation method, seeking a technique that is:
+
+1. able to identify relevant paths in the input graph, as paths are one of the most natural ways of presenting gnn reasoning patterns to users;  
+2. sufficiently tractable to be applicable to modern gnn-based nlp models;  
+3. as faithful (jacovi & goldberg, 2020) as possible, providing insights into how the model truly arrives at the prediction.
+
+![](images/ec81eb171af9a7b54b8642b8fc93a76b9b626924a881b6b2174206f194cd4108.jpg)  
+figure 1: graphmask uses vertex hidden states and messages at layer  $k$  (left) as input to a classifier  $g$  that predicts a mask  $z^{(\ell)}$ . we use this to mask the messages of the  $k$ th layer and re-compute the forward pass with modified node states (right). the classifier  $g$  is trained to mask as many hidden states as possible without changing the output of the gated model.
+
+a simple way to perform interpretation is to use erasure search (li et al., 2016; feng et al., 2018), an approach wherein attribution happens by searching for a maximal subset of features that can be entirely removed without affecting model predictions. the removal guarantees that all information about the discarded features is ignored by the model. this contrasts with approaches which use heuristics to define feature importance, for example attention-based methods (serrano & smith, 2019; jain & wallace, 2019) or back-propagation techniques (bach et al., 2015; sundararajan et al., 2017). they do not guarantee that the model ignores low-scoring features, attracting criticism in recent years (nie et al., 2018; sixt et al., 2019; jain & wallace, 2019). the trust in erasure search is reflected in the literature through other methods motivated as approximations of erasure (baehrens et al., 2010; simonyan et al., 2014), or through new attribution techniques evaluated using erasure search as ground truth (serrano & smith, 2019; jain & wallace, 2019).
+
+applied to gnns, erasure search would involve searching for the largest subgraph which can be completely discarded. besides faithfulness considerations and conceptual simplicity, discrete attributions would also simplify the comparison of relevance between paths; this contrasts with continuous attribution to edges, where it is not straightforward to extract and visualise important paths. furthermore, in contrast to techniques based on artificial gradients (pope et al., 2019; xie & lu, 2019; schwarzenberg et al., 2019), erasure search would provide implementation invariance (sundararajan et al., 2017). this is important in nlp, as models commonly use highly parametrised decoders on top of gnns (e.g., koncel-kedziorski et al. (2019)).
+
+while arguably satisfying criteria (1) and (3) in our desiderata, erasure search unfortunately fails on tractability. in practical scenarios, it is infeasible, and even approximations, which remove one feature at a time (zintgraf et al., 2017) and underestimate their contribution due to saturation (shrikumar et al., 2017), remain prohibitively expensive.
+
+our graphmask aims at meeting the above desiderata by achieving the same benefits as erasure search in a scalable manner. that is, our method makes easily interpretable hard choices on whether to retain or discard edges such that discarded edges have no relevance to model predictions, while remaining tractable and model-agnostic (ribeiro et al., 2016a). graphmask can be understood as a differentiable form of subset erasure, where, instead of finding an optimal subset to erase for every given example, we learn an erasure function which predicts for every edge  $\langle u,v\rangle$  at every layer  $k$  whether that connection should be retained. given an example graph  $\mathcal{g}$ , our method returns for each layer  $k$  a subgraph  $\mathcal{g}_s^{(k)}$  such that we can faithfully claim that no edges outside  $\mathcal{g}_s^{(k)}$  influence the predictions of the model. to enable gradient-based optimization for our erasure function, we rely on sparse stochastic gates (louizos et al., 2018; bastings et al., 2019).
+
+in erasure search, optimisation happens individually for each example. this can result in a form of overfitting where even non-superfluous edges are aggressively pruned because a similar prediction could be made using an alternative smaller subgraph; we refer to this problem as *hindsight bias*. because our interpretation method relies on a parametrised erasure function rather than an individual per-edge choice, we can address this issue by *amorting* parameter learning over a training dataset through a process similar to the readout bottleneck introduced in schulz et al. (2020). in other words, the decision to drop or keep an edge is made based on the information available in the network (i.e., representation of the graph nodes) without having access to the final prediction (or to the gold standard). as we demonstrate in section 4, this strategy avoids *hindsight* bias.
+
+contributions our contributions are as follows:
+
+- we present a novel interpretation method for gnns, applicable potentially to any end-to-end neural model which has a gnn as a component.  
+- we demonstrate using artificial data the shortcomings of the closest existing method, and show how our method addresses those shortcomings and improves faithfulness.  
+- we use graphmask to analyse gnn models for two nlp tasks: semantic role labeling (marcheggiani & titov, 2017) and multi-hop question answering (de cao et al., 2019).
+
+# 2 related work
+
+several recent papers have focused on developing interpretability techniques for gnns. the closest to ours is gnnexplainer (ying et al., 2019), wherein a soft erasure function for edges is learned individually for each example. unlike our method (and erasure search), gnnexplainer cannot as such guarantee that gated edges do not affect predictions. furthermore, as we show in our experiments (section 4), separate optimisation for each example results in hindsight bias and compromises faithfulness. pope et al. (2019); xie & lu (2019) explore gradient-based methods, including gradient heatmaps, grad-cam, and excitation backpropagation. similarly, schwarzenberg et al. (2019); baldassarre & azizpour (2019); schnake et al. (2020) apply layerwise relevance propagation (bach et al., 2015) to the gnn setting. these methods represent an alternative to graphmask, but as we have noted their faithfulness is questionable (nie et al., 2018; sixt et al., 2019; jain & wallace, 2019), and the lack of implementation invariance (sundararajan et al., 2017) is problematic (see appendix h). furthermore, significant engineering is still required to develop these techniques for certain gnns, e.g. networks with attention as the aggregation function (velicković et al., 2018).
+
+another popular approach is to treat attention or gate scores as a measure of importance (serrano & smith, 2019). however, even leaving questionable faithfulness (jain & wallace, 2019) aside, many gnns use neither gates nor attention. for those that do (marcheggiani & titov, 2017; velicković et al., 2018; neil et al., 2018; xie & grossman, 2018), such scores are, as we demonstrate in section 6, not necessarily informative, as gates can function to scale rather than filter messages.
+
+outside of graph-specific methods, one line of research involves decomposing the output into a part attributed to a specific subset of features and a part attributed to the remaining features (shapley, 1953; murdoch et al., 2019; singh et al., 2019; jin et al., 2020). for gnns, the computational cost for realistic use cases (e.g. the thousands of edges per example in de cao et al. (2019)) is prohibitive. lime (ribeiro et al., 2016b) like us relies on a trained erasure model, but interprets local models in place of global models. local models cannot trivially identify useful paths or long-distance dependent pairs of edges, and as also pointed out in ying et al. (2019) lime cannot be easily applied for large general graphs. similarly, it is unclear how to apply integrated gradients (sundararajan et al., 2017) to retrieve relevant paths, especially for deep gnns operating in large graphs.
+
+masking messages in graphmask can be equivalently thought of as adding a certain type of noise to these messages. therefore, graphmask can be categorised as belonging to the recently introduced class of perturbation-based methods (guan et al., 2019; taghanaki et al., 2019; schulz et al., 2020) which equate feature importance with sensitivity of the prediction to the perturbations of that feature. the closest to our model is schulz et al. (2020), wherein the authors like us apply a secondary, trained model to predict the relevancy of a feature in a given layer. unlike us, this trained model has 'look-ahead', i.e. access to layers above the studied layer, making their model vulnerable to hindsight bias. their approach uses soft gates on individual hidden state dimension to interpolate between hidden states, gaussian noise in order to detect important features for cnns on an image processing task, and makes independent gaussian assumptions on the features to derive their objective. we adapted their method to gnns and used it as a baseline in our experiments.
+
+in our very recent work (de cao et al., 2020) we have introduced a similar differentiable masking approach to post-hoc analysis for transformers. we used sparse stochastic gates and  $l_{0}$  regularisation to determine which input tokens can be dropped, conditioning on various hidden layers. concurrently to this paper, luo et al. (2020) have also developed an interpretability technique for gnns relying on differentiable edge masking. their approach uses a mutual information objective like gnnexplainer, along with local binary concrete classifiers as in graphmask.
+
+# 3 method
+
+# 3.1 graph neural networks
+
+a graph neural network is a layered architecture which takes an input graph  $\mathcal{g} = \langle \mathcal{v},\mathcal{e}\rangle$  (i.e., nodes and edges) to produce a prediction. at every layer  $k$ , a gnn computes a node representation  $h_u^{(k)}$  for each node  $u\in \mathcal{v}$  based on representations of nodes from the previous layer. at the bottom layer, vertices are assigned an initial embedding  $h_u^{(0)}$  - e.g. glove embeddings, or the hidden states of an lstm. for layers  $k > 0$ , a gnn can be defined through a message function  $m$  and an aggregation function  $a$  such that for the  $k$ -th layer:
+
+$$
+m _ {u, v} ^ {(k)} = m ^ {(k)} \left(h _ {u} ^ {(k - 1)}, h _ {v} ^ {(k - 1)}, r _ {u, v}\right) \quad (1) \quad h _ {v} ^ {(k)} = a ^ {(k)} \left(\left\{m _ {u, v} ^ {(k)}: u \in \mathcal {n} (v) \right\}\right), \tag {2}
+$$
+
+where  $r_{u,v}$  indicates the relation type between nodes  $u$  and  $v$ , and  $\mathcal{n}(v)$  the set of neighbour nodes of  $v$ . typical implementations of gnns rely on either mean-, sum-, or max-pooling for aggregation.
+
+# 3.2 graphmask
+
+our goal is to detect which edges  $(u,v)$  at layer  $k$  can be ignored without affecting model predictions. we refer to these edges and the corresponding messages  $m_{u,v}^{(k)}$  as superfluous. gnns can be highly sensitive to changes in the graph structure. a gnn trained on graphs where all vertices  $v$  have degree  $d(v) \gg n$  for some integer  $n$  may become unstable if applied to a graph where some vertices have degree  $d(v) \ll n$ . hence, dropping edges without affecting predictions can be difficult. nevertheless, many edges in that graph may be superfluous for all purposes other than normalization. therefore, it is not enough to search for edges which can be dropped – instead, we search for edges which, through a binary choice  $z_{u,v}^{(k)} \in \{0,1\}$ , can be replaced with a learned baseline  $b^{(k)}$ :
+
+$$
+\widetilde {m} _ {u, v} ^ {(k)} = z _ {u, v} ^ {(k)} \cdot m _ {u, v} ^ {(k)} + b ^ {(k)} \cdot \left(1 - z _ {u, v} ^ {(k)}\right). \tag {3}
+$$
+
+conceptually, the search for a subset that generates the same prediction can be understood as a form of subset erasure (li et al., 2016; feng et al., 2018). unfortunately, erasure breaks with the principles we proposed in section 1 in two important ways. first, since it involves searching over all the possible candidates that could be dropped, it is not tractable. second, since the search happens individually for each example, there is a danger of hindsight bias. that is, the search algorithm finds a minimal set of features that could produce the given prediction, but which is not faithful to how the model originally behaved (as confirmed in our experiments, section 4). to overcome those issues, we compute  $z_{u,v}^{(k)}$  through a simple function, learned once for every task across data points:
+
+$$
+z _ {u, v} ^ {(k)} = g _ {\pi} \left(h _ {u} ^ {(k - 1)}, h _ {v} ^ {(k - 1)}, m _ {u, v} ^ {(k)}\right), \tag {4}
+$$
+
+where  $\pi$  denotes the parameters of  $g$ , which is implemented as a single-layer neural network (see appendix a for the architecture).
+
+instead of selecting gate values  $z_{u,v}^{(k)}$  individually for each prediction, the parameters  $\pi$  are trained on multiple datapoints, and used to explain predictions for examples unseen in the training phase. moreover, each  $z_{u,v}^{(k)}$  is computed relying only on information also available to the original model when computing the corresponding gnn message (i.e. states of nodes at layer  $k$ ,  $h_u^{(k)}$  and  $h_v^{(k)}$ ). as such, the explainer is not provided with a look-ahead. these two aspects, by design, work to prevent hindsight bias. we refer to this strategy as amortisation. the alternative to amortisation is to choose the parameters  $\pi$  independently for each gate, without any parameter sharing across gates. in that case, optimisation would be performed directly on the analysed (i.e. test) examples. we refer to this strategy as the non-amortized version of graphmask. we will show in section 4 that this version of graphmask, unlike the amortized approach, is susceptible to hindsight bias.
+
+![](images/52ed43ed7e0d9412de0984377989c6f3f6b15dd4ef7dce7388d3f4bf0d2e956d.jpg)  
+(a) erasure search
+
+![](images/868ceeb039ad1fafadbb6c4f8627474ff6b386181c37945f1f8048732e958e90.jpg)  
+(b) integrated gradients
+
+![](images/a5fabfecdc88e7950a7c27052ffad8f6bf451ca782822e499e81ed038ccd2cdd.jpg)  
+(c) information bottleneck
+
+![](images/85214e58ef3871fb632da5daefc00ef21ae0f70db00921a236af49f400bd6759.jpg)  
+(d) gnnexplainer
+
+![](images/d5b0bcb3233b5b81edc8e893c78f1e939c99f8877b99aff5072dc08a1d7b4146.jpg)  
+(e) ours (non-amortized)
+
+![](images/23e706f7f4fd8a29197be1b2d455cc1b728b3e5039de0df78ad6e9ca487dde9c.jpg)  
+(f) ours (amortized)  
+figure 2: toy example: a model predicts whether there are more black edges  $(\rightarrow)$  than blue edges.  $(\rightarrow)$ . erasure search, gnnexplainer, and non-amortized graphmask overfit by retaining only a single black edge (top left). integrated gradients and the information bottleneck approach give unsatisfying results as all edges have attribution. only amortized graphmask correctly assigns attribution to and only to black and blue edges.
+
+after  $g$  is trained, to analyse a data point with graphmask, we first execute the original model over that data point to obtain  $h_u^{(k)}, h_v^{(k)}$ , and  $m_{u,v}^{(k)}$ . we then compute gates for every edge at every layer, and execute a sparsified version of the model as shown in figure 1. for the first layer, the messages of the original model are gated according to equation 3. for subsequent layers, we aggregate the masked messages using equation 2 to obtain vertex embeddings  $h_v^{\prime (k)}$ , which we then use to obtain the next set of masked messages. note that the only learned parameters of graphmask are the parameters  $\pi$  of the erasure function and the learned baseline vectors  $b^{(1)},\ldots ,b^{(k)}$  - the parameters of the original model are kept constant. as long as the prediction relying on the sparsified graph is the same as when using the original one, we can interpret masked messages as superfluous.
+
+# 3.3 parameter estimation
+
+given a gnn  $f$  of  $l$  layers, a graph  $\mathcal{g}$ , and input embeddings  $\mathcal{x}$  (e.g., initial node vectors or additional inputs), our task is to identify a set  $\mathcal{g}_s = \{\mathcal{g}_s^{(1)},\dots,\mathcal{g}_s^{(l)}\}$  of informative sub-graphs such that  $\mathcal{g}_s^{(k)} \subseteq \mathcal{g} \forall k \in 1,\ldots ,l$ . we search for a graph with the minimal number of edges while maintaining  $f(\mathcal{g}_s,\mathcal{x}) \approx f(\mathcal{g},\mathcal{x})$ .<sup>4</sup> we can cast this, quite naturally, in the language of constrained optimization and employ a method that enables gradient descent such as lagrangian relaxation. in general, however, it is not possible to guarantee equality between  $f(\mathcal{g},\mathcal{x})$  and  $f(\mathcal{g}_s,\mathcal{x})$  since  $f$  is a smooth function, and as therefore a minimal change in its input cannot produce the exact same output. as such, we introduce i) a divergence  $\mathrm{d}_{\star}[f(\mathcal{g},\mathcal{x})||f(\mathcal{g}_s,\mathcal{x})]$  to measure how much the two outputs differ, and ii) a tolerance level  $\beta \in \mathbb{r}_{>0}$  within which differences are regarded as acceptable. the choice of  $\mathrm{d}_{\star}$  depends on the structure of the output of the original model. a practical way to minimize the number of non-zeros predicted by  $g$  is minimizing the  $l_0$  'norm' (i.e., the total number of edges that are not masked). hence, formally, we define our objective over a dataset  $\mathcal{d}$  as
+
+$$
+\max  _ {\lambda} \min  _ {\pi , b} \sum_ {\mathcal {g}, \mathcal {x} \in \mathcal {d}} \left(\sum_ {k = 1} ^ {l} \sum_ {(u, v) \in \mathcal {e}} \mathbf {1} _ {[ \mathbb {r} \neq 0 ]} \left(z _ {u, v} ^ {(k)}\right)\right) + \lambda \left(\mathrm {d} _ {\star} [ f (\mathcal {g}, \mathcal {x}) \| f (\mathcal {g} _ {s}, \mathcal {x}) ] - \beta\right), \tag {5}
+$$
+
+<table><tr><td>method</td><td>prec.</td><td>recall</td><td>f1</td></tr><tr><td>erasure search*</td><td>100.0</td><td>16.7</td><td>28.6</td></tr><tr><td>integrated gradients</td><td>88.3</td><td>93.5</td><td>90.8</td></tr><tr><td>information bottleneck</td><td>55.3</td><td>51.5</td><td>52.6</td></tr><tr><td>gnnexplainer</td><td>100.0</td><td>16.8</td><td>28.7</td></tr><tr><td>ours (non-amortized)</td><td>96.7</td><td>26.2</td><td>41.2</td></tr><tr><td>ours (amortized)</td><td>98.8</td><td>100.0</td><td>99.4</td></tr></table>
+
+table 1: comparison using the faithfulness gold standard on the toy task. *as in li et al. (2016).  
+
+<table><tr><td>edge type</td><td>k = 0</td><td>k = 1</td><td>k = 2</td></tr><tr><td>match (8.1%)</td><td>9.4%</td><td>11.1%</td><td>8.9%</td></tr><tr><td>doc-based (13.2%)</td><td>5.9%</td><td>17.7%</td><td>10.7%</td></tr><tr><td>coref (4.2%)</td><td>4.4%</td><td>0%</td><td>0%</td></tr><tr><td>complement (73.5%)</td><td>31.9%</td><td>0%</td><td>0%</td></tr><tr><td>total (100%)</td><td>51.6%</td><td>28.8%</td><td>19.6%</td></tr></table>
+
+table 2: retained edges for de cao et al.'s (2019) question answering gnn by layer  $(k)$  and type.
+
+where  $\mathbf{1}$  is the indicator function and  $\lambda \in \mathbb{r}_{\geq 0}$  denotes the lagrange multiplier.
+
+unfortunately, our objective is not differentiable. we cannot use gradient-based optimization since i)  $l_{0}$  is discontinuous and has zero derivatives almost everywhere, and ii) outputting a binary value needs a discontinuous activation, e.g. the step function. a solution is to address the objective in expectation and employ either score function estimation i.e. reinforce (williams, 1992), biased straight-through estimators (maddison et al., 2017; jang et al., 2017), or sparse relaxation (louizos et al., 2018; bastings et al., 2019). we choose the latter since it exhibits low variance compared to reinforce and is an unbiased estimator. we use the hard concrete distribution, a mixed discrete-continuous distribution on the closed interval [0, 1]. this distribution assigns a non-zero probability to exact zeroes. at the same time, it also admits continuous outcomes in the unit interval, for which an unbiased and low variance gradient can be computed via the reparameterization trick (kingma & welling, 2014). we refer to louizos et al. (2018) for details. attribution scores correspond to the expectation of sampling non-zero masks, since any non-zero value can leak information. in our experiments, graphmask converges to a distribution where scores in expectation assume near-binary values.
+
+# 4 synthetic experiment
+
+we first apply graphmask in a setup where a clearly defined ground-truth attribution is known. as opposed to the real-world tasks we address in sections 5 and 6, this allows for evaluation with respect to faithfulness. the task is defined as follows: a star graph  $\mathcal{g}$  with a single centroid vertex  $v_{0}$ , leaf vertices  $v_{1},\ldots,v_{n}$ , and edges  $(v_{1},v_{0}),\ldots,(v_{n},v_{0})$  is given such that every edge  $(u,v)$  is assigned one of several colours  $c_{u,v} \in c$ . then, given a query  $\langle x,y \rangle \in c \times c$ , the task is to predict whether the number of edges assigned  $x$  is greater than the number of edges assigned  $y$ . we generate examples randomly with 6 to 12 leaves, and apply a simple one-layer r-gcn (schlichtkrull et al., 2018) (see appendix e for details). the trained model perfectly classifies every example. we know precisely which edges are useful for a given example - those which match the two colours being counted in that example. the gnn must count all instances of both to compute the maximum, and no other edges should affect the prediction. we define a gold standard for faithfulness on this basis: for  $x > y$ , all edges of type  $x$  and  $y$  should be retained, and all others should be discarded.
+
+in table 1, we compare graphmask to four baselines: erasure search (li et al., 2016), integrated gradients (sundararajan et al., 2017), an information bottleneck approach (schulz et al., 2020), and gnnexplainer (ying et al., 2019). neither integrated gradients nor the information bottleneck approach were designed for graphs, and as such we adapt them for this setting (see appendices f and g for details). since gnnexplainer and information bottleneck do not make hard predictions, we define for both any gate  $\sigma_{i}$  where  $\sigma_{i} > t$  for some threshold  $t$  as open, and closed otherwise. for integrated gradients we normalize attributions to the interval  $[-1;1]$ , take the absolute value, and apply a threshold  $t$ . we select  $t \in \{0.1, \dots, 0.9\}$  to maximize  $\mathrm{f}_{1}$  score on validation data.
+
+only the amortized version of our method approximately replicates the gold standard. in fact, erasure search, gnnexplainer, and non-amortized graphmask recall only a fraction of the nonsuperfluous edges. visually inspecting the scores assigned by various methods (figure 2), we see that erasure search, gnnexplainer, and the non-amortized version of our method all exploit their training regime to reach the same low-penalty solution with perfect model performance, but which is not faithful to the original model behaviour. since the task is to predict whether  $x > y$ , the model achieves a perfect score with only one edge of type  $x$  retained. conversely, for any  $x \leq y$ , the model
+
+![](images/db939ab965a5df240893db0a8a1c53f01ae7c607191041c8087eab5e8001374a.jpg)  
+figure 3: subgraph of retained edges (21% of the original) for the query "record_label phi".  $\rightarrow$  is doc-based,  $\rightarrow$  is complement, and  $\rightarrow$  is match where edge labels indicate in which layer graphmask retains such edge.
+
+![](images/1181db3d04a1054426cbe77a94941b5711d02892edba6c54f1735fddcba9f95f.jpg)  
+figure 4: percentage of paths used in predictions as a function of the distance between the predicate and the predicted role for the lstm+gnn model (on the left) and the gnn only model (on the right).
+
+![](images/ccbb45393a47bb7ef1a8d2e104b7b707f42106b6d3a1b2ced0dbc6aae6186797.jpg)
+
+achieves a perfect score with all edges dropped. amortization prevents this type of overfitting to the objective. for integrated gradients, inspecting predictions shows that the scalar attribution scores vary greatly across examples with different numbers of edges. hence, a single  $t$  cannot be defined to always distinguish between useful and superfluous edges, even on this simple task.
+
+# 5 question answering
+
+we now apply graphmask (amortized) to analyse predictions for a real model. due to the complexity, no human gold standard for attribution can be constructed in this setting (jacovi & goldberg, 2020). we choose the gnn-based model for multi-hop qa presented in de cao et al. (2019), evaluated on wikihop (welbl et al., 2018). the task is, given a query sentence and a set of context documents, to find the entity within the context which best answers the query. nodes in the gnn graph correspond to mentions of entities within the query and context, and four types of edges between those are introduced: string match (match), document-level co-occurrence (doc-based), coreference resolution (coref), and, finally, the absence of any other edge (complement).
+
+the model consists of a two-layer bilstm reading the query, and three layers of r-gcn (schlichtkrull et al., 2018) with shared parameters. node representations at the bottom layer are obtained by concatenating the query representation to embeddings for the mention in question. here, we focus on their glove-based model. finally, the mention representations are combined into entity representations through max-pooling.
+
+graphmask replicates the performance of the original model with a performance change of  $-0.4\%$  accuracy.  $27\%$  of edges are retained, with the majority occurring in the bottom layer (see table 2). to ensure that the choice of superfluous edges is not just a consequence of the random seed, i.e. to verify the stability of our method, we compute fleiss' kappa scores between each individual measurement of  $z_{u,v}^{(k)}$  across 5 different seeds. we find high agreement with  $\kappa = 0.65$ . dropping just a random  $25\%$  of these retained edges greatly harms performance (see appendix j).
+
+for comparison, if we do not amortize to provide resilience against hindsight bias, the retained edges are different, with  $0.4\%$  of retained edges in the bottom and  $91.0\%$  in the top layer. similarly, gnnexplainer and integrated gradients assign to the bottom layer, respectively, only  $4.3\%$  and  $11.3\%$  of their total attribution score. in contrast, dropping the bottom layer on all examples yields a much larger accuracy drop  $(-26\%)$  than any other layer (e.g.,  $-7\%$  for the top one). this suggests that these techniques do not produce faithful attributions. we provide more details in appendix k.
+
+in table 2, we investigate which edge types are used across the three layers of the model. de cao et al.'s (2019) ablation test suggested that coref edges provide marginal benefit to the model; our analysis does not entirely agree. investigating further, we see that only  $2.3\%$  of the retained coref edges overlap with match edges (compared to  $32.4\%$  for the entire dataset). in other words, the system relies on coref edges only in harder cases not handled by the surface match heuristic. the role complement edges play is interesting as well: this class represents the majority of nonsuperfluous edges in the bottom layer, but is always superfluous in subsequent layers. the model relies on an initial propagation-step across these edges, perhaps for an initial pooling of context.
+
+![](images/6479dbf69921b248310bda415c9d247a03d1ffff7ce2405d28fb728797447fb9.jpg)  
+figure 5: example analysis on srl from the gnn+lstm model (superfluous arcs are excluded).
+
+de cao et al.'s (2019) model concatenates a representation of the query to every node in the graph before running gnn. as such, one might expect edges connecting mentions of the query entity to the rest of the graph to be superfluous. this, however, is not the case – at least one such edge is retained in  $92.7\%$  of all cases, and in  $84.1\%$  of cases in the bottom layer. we hypothesize that the model relies on gnn to see whether other mentions share a surface form or co-occur with mentions of the query entity, and, if not, how they otherwise connect to those. to investigate this, we measure the percentage of retained edges at each layer that occur on paths originating from query entities.
+
+we find that the proportion of edges that occur on paths from mentions of the query increases drastically by layer, from  $11.8\%$  at layer 0, to  $42.7\%$  at layer 1, and culminating in  $73.8\%$  in the top layer. a mention corresponding to the predicted answer is for  $99.7\%$  of examples the target of some retained edge. however, the chance that the predicted entity is connected to the query  $(72.1\%)$  is near-identical to that of the average candidate entity  $(69.2\%)$ . as such, the gnn is responsible not only for propagating evidence to the predicted answer through the graph, but also for propagating evidence to alternate candidates. the majority of paths take one of two forms - a complement edge followed by either a match or a doc-based edge  $(22\%)$ , or a complement edge followed by two match or doc-based edges  $(52\%)$ . match and doc-based edges in the bottom layer tend to represent one-hop paths rather than being the first edge on a longer path.
+
+relations used by de cao et al. (2019) are symmetric (e.g., a coreference works in both directions). a distinct feature of the subgraphs retained by graphmask is that pairs of an edge and its inverse are both judged to be either superfluous or non-superfluous (individually in each layer). in figure 3, this can be seen for the doc-based edges in layer 2 between japan and johnny & associates. indeed,  $49\%$ ,  $98\%$  and  $79\%$  of retained edges in, respectively, layers 0, 1 and 2 have their inverses also retained. in other words, 'undirected' message exchange between mentions, resulting in enriched mention representations, appears crucial.
+
+<table><tr><td rowspan="3">type</td><td rowspan="3">length</td><td colspan="5">retained edges</td></tr><tr><td colspan="3">gnn-only</td><td colspan="2">lstm+gnn</td></tr><tr><td>0</td><td>1</td><td>2</td><td>0</td><td>1</td></tr><tr><td rowspan="3">v</td><td>1 (5755)</td><td>0.01</td><td>0.99</td><td>-</td><td>0.01</td><td>0.99</td></tr><tr><td>2 (1104)</td><td>0.07</td><td>0.74</td><td>0.19</td><td>0.10</td><td>0.90</td></tr><tr><td>≥ 3 (10904)</td><td>0.74</td><td>0.22</td><td>0.04</td><td>0.79</td><td>0.21</td></tr><tr><td rowspan="3">n</td><td>1 (3336)</td><td>0.02</td><td>0.98</td><td>-</td><td>0.01</td><td>0.99</td></tr><tr><td>2 (2935)</td><td>0.30</td><td>0.25</td><td>0.45</td><td>0.89</td><td>0.11</td></tr><tr><td>≥ 3 (3251)</td><td>0.56</td><td>0.32</td><td>0.12</td><td>0.73</td><td>0.27</td></tr></table>
+
+table 3: percentages of paths with either 0, 1, or 2 edges retained, split by path length and predicate type, for the two models. for the lstm+gnn model, at most one edge can be included per path as only a single gnn layer is employed.
+
+# 6 semantic role labeling
+
+we now turn to the gnn-based srl system of marcheggiani & titov (2017). the task here is to identify arguments of a given predicate and assign them to semantic roles; see the labels below the sentence in figure 5. their gnn relies on automatically predicted syntactic dependency trees, allowing for information flow in both directions between syntactic dependents and their heads. we investigate both their best-performing model, which includes a bilstm and one layer of a gnn, and their gnn-only model. for lstm+gnn, the masked model has a minuscule performance change of  $-0.62\%$  f and retains only  $4 \%$  of messages. the gnn-only model has a similarly small performance change of  $-0.79\%$  f and retains  $16 \%$  of messages. we again compute fleiss' kappa scores between graphmask with 5 different seeds, finding a substantial agreement of respectively  $\kappa = 0.79$  and  $\kappa = 0.74$  for the full and gnn-only models.
+
+the gnn, in this case, employs scalar, sigmoidal gates on every message. a naive method for interpretability could be to inspect their values. however, gates do not necessarily reflect the importance of individual messages; rather, they may provide scaling as a component in the model. on development data, the mean gate takes the value 0.16, with a standard deviation of 0.07. we evaluate the model with every message where the corresponding gate value is more than one  $\sigma$  below the mean dropped, and find that performance decreases by  $16.1\% \mathrm{f}_1$  score even though only  $42\%$  of edges are removed. thus, we see that these gates act as scaling rather than reflecting the contribution of each edge to the prediction (see also appendix l for soft gate values for the example in figure 5). this matches the intuition from jain & wallace (2019) that gates do not necessarily indicate attribution.
+
+we first investigate which dependency types the gnn relies on. we summarise our finding in figure 8 in appendix i. the behaviour differs strongly for nominal and verbal predicates – nmod dominates for nominals, whereas sbj and obj play the largest roles for verbal predicates. this is unsurprising, because these edges often directly connect the predicate to the predicted roles. even where this is not the case – see rebound in the example in figure 5 – these edges connect predictions to tokens close to the predicate, easily reachable via the lstm. interestingly, several frequent relations (occurring in  $>10\%$  of examples) are entirely superfluous – these include p, name, coord, cv, conj, hyph, suffix, and posthon. for the lstm-gnn model, we find that  $88\%$  of retained edges point to predicted roles (e.g. rebound), and the remaining  $12\%$  mostly point to arguments of other predicates in the same sentence (e.g. which).<sup>6</sup>
+
+marcheggiani & titov's (2017) original findings suggest that the gnn is especially useful for predicting roles far removed from the predicate, where the lstm struggles to propagate information. this could be accomplished by using paths in the graph; either relying on the entire path, or partially relying on the last several edges in the path. we plot in figure 4 the percentage of paths from predicate to a predicted argument, such that a subpath (i.e. at least one edge) ending in the predicted argument was retained. for the lstm+gnn model, we find that the reliance on paths decreases as the distance to the predicate increases, but only for nominal predicates. for the gnn-only model, we see the opposite: reliance on paths increases as the distance to the predicate increases. we investigate in table 3 the proportion of edges retained on paths of varying length between the predicate and predicted roles. practically all direct connections between the predicate and the roles are kept – this is unsurprising, as those edges are the most immediate indication of their syntactic relationships. longer paths are often useful in both models, although at a lower rate for nominal predicates in the lstm+gnn model. our findings are consistent with the literature, where dependency paths connecting predicate and argument represent strong features for srl (johansson & nugues, 2008; roth & lapata, 2016).
+
+# 7 conclusion
+
+we introduced graphmask, a post-hoc interpretation method applicable to any gnn model. by learning end-to-end differentiable hard gates for every message and amortising over the training data, graphmask is faithful to the studied model, scalable to modern gnn models, and capable of identifying both how edges and paths influence predictions. we applied our method to analyse the predictions of two nlp models from the literature – an srl model, and a qa model. graphmask uncovers which edge types these models rely on, and how they employ paths when making predictions. while these findings may be interesting per se, they also illustrate the types of analysis enabled by graphmask. here we have focused on applications to nlp, where there is a strong demand for interpretability techniques applicable to graph-based models injecting linguistic and structural priors – we leave the application of our method to other domains for future work.
+
+# 7.1 acknowledgement
+
+the authors want to thank benedek rozemberczki, elena voita, wilker aziz, and dieuwke hupkes for helpful discussions. this project is supported by the dutch organization for scientific research (nwo) vidi 639.022.518, sap innovation center network, and erc starting grant broadsem (678254).
+
+# references
+
+sebastian bach, alexander binder, gregoire montavon, frederick klauschen, klaus-robert müller, and wojciech samek. on pixel-wise explanations for non-linear classifier decisions by layer-wise relevance propagation. *plos one*, 10(7):e0130140, 2015.  
+david baehrens, timon schroeter, stefan harmeling, motoaki kawanabe, katja hansen, and klaus-robert müller. how to explain individual classification decisions. journal of machine learning research, 11(jun):1803-1831, 2010.  
+federico baldassarre and hossein azizpour. explainability techniques for graph convolutional networks. arxiv preprint arxiv:1905.13686, 2019.  
+jasmijn bastings, ivan titov, wilker aziz, diego marcheggiani, and khalil sima'an. graph convolutional encoders for syntax-aware neural machine translation. in proceedings of the 2017 conference on empirical methods in natural language processing, pp. 1957-1967, copenhagen, denmark, september 2017. association for computational linguistics. doi: 10.18653/v1/d17-1209. url https://www.aclweb.org/anthology/d17-1209.  
+jasmijn bastings, wilker aziz, and ivan titov. interpretable neural predictions with differentiable binary variables. in proceedings of the 57th annual meeting of the association for computational linguistics, pp. 2963-2977, florence, italy, july 2019. association for computational linguistics. doi: 10.18653/v1/p19-1284. url https://www.aclweb.org/anthology/p19-1284.  
+ben boin, jonathan berant, and matt gardner. representing schema structure with graph neural networks for text-to-sql parsing. in proceedings of the 57th annual meeting of the association for computational linguistics, pp. 4560-4565, florence, italy, july 2019. association for computational linguistics. doi: 10.18653/v1/p19-1448. url https://www.aclweb.org/anthology/p19-1448.  
+nicola de cao, wilker aziz, and ivan titov. question answering by reasoning across documents with graph convolutional networks. in proceedings of the 2019 conference of the north american chapter of the association for computational linguistics: human language technologies, volume 1 (long and short papers), pp. 2306-2317, minneapolis, minnesota, june 2019. association for computational linguistics. doi: 10.18653/v1/n19-1240. url https://www.aclweb.org/anthology/n19-1240.  
+nicola de cao, michael schlichtkrull, wilker aziz, and ivan titov. how do decisions emerge across layers in neural models? interpretation with differentiable masking. arxiv preprint arxiv:2004.14992, 2020.  
+shi feng, eric wallace, alvin grissom ii, mohit iyyer, pedro rodriguez, and jordan boyd-graber. pathologies of neural models make interpretations difficult. in proceedings of the 2018 conference on empirical methods in natural language processing, pp. 3719-3728, brussels, belgium, october-november 2018. association for computational linguistics. doi: 10.18653/v1/d18-1407. url https://www.aclweb.org/anthology/d18-1407.  
+patrick fernandes, miltiadis allamanis, and marc brockschmidt. structured neural summarization. in international conference on learning representations (iclr), 2019. url https://openreview.net/forum?id=hlersorqtm.  
+mario giulianielli, jack harding, florian mohnert, dieuwke hupkes, and willem zuidema. under the hood: using diagnostic classifiers to investigate and improve how language models track agreement information. in proceedings of the 2018 emnlp workshop blackboxnlp: analyzing and interpreting neural networks for nlp, pp. 240-248, brussels, belgium, november 2018. association for computational linguistics. doi: 10.18653/v1/w18-5426. url https://www.aclweb.org/anthology/w18-5426.  
+yoav goldberg. assessing bert's syntactic abilities. arxiv preprint arxiv:1901.05287, 2019.  
+chaoyu guan, xiting wang, quanshi zhang, runjin chen, di he, and xing xie. towards a deep and unified understanding of deep neural models in nlp. in international conference on machine learning, pp. 2454-2463, 2019.
+
+zhijiang guo, yan zhang, and wei lu. attention guided graph convolutional networks for relation extraction. in proceedings of the 57th annual meeting of the association for computational linguistics, pp. 241-251, florence, italy, july 2019. association for computational linguistics. doi: 10.18653/v1/p19-1024. url https://www.aclweb.org/anthology/p19-1024.  
+jan hajic, massimiliano ciaramita, richard johansson, daisuke kawahara, maria antonia martí, lluis marquez, adam meyers, joakim nivre, sebastian padó, jan štepánek, pavel stranák, mihai surdeanu, nianwen xue, and yi zhang. the conll-2009 shared task: syntactic and semantic dependencies in multiple languages. in proceedings of the thirteenth conference on computational natural language learning (conll 2009): shared task, pp. 1-18, boulder, colorado, june 2009. association for computational linguistics. url https://www.aclweb.org/anthology/w09-1201.  
+kenneth holstein, jennifer wortman vaughan, hal daumé iii, miro dudik, and hanna wallach. improving fairness in machine learning systems: what do industry practitioners need? in proceedings of the 2019 chi conference on human factors in computing systems, pp. 1-16, 2019.  
+alon jacovi and yoav goldberg. towards faithfully interpretable nlp systems: how should we define and evaluate faithfulness? proceedings of the 58th annual meeting of the association for computational linguistics, 2020.  
+sarthak jain and byron c. wallace. attention is not explanation. in proceedings of the 2019 conference of the north american chapter of the association for computational linguistics: human language technologies, volume 1 (long and short papers), pp. 3543-3556, minneapolis, minnesota, june 2019. association for computational linguistics. doi: 10.18653/v1/n19-1357. url https://www.aclweb.org/anthology/n19-1357.  
+eric jang, shixiang gu, and ben poole. categorical reparameterization with gumbel-softmax. international conference on learning representations., 2017.  
+tao ji, yuanbin wu, and man lan. graph-based dependency parsing with graph neural networks. in proceedings of the 57th annual meeting of the association for computational linguistics, pp. 2475-2485, 2019.  
+xisen jin, junyi du, zhongyu wei, xiangyang xue, and xiang ren. towards hierarchical importance attribution: explaining compositional semantics for neural sequence models. international conference on learning representations, 2020.  
+richard johansson and pierre nugues. dependency-based semantic role labeling of propbank. in proceedings of the 2008 conference on empirical methods in natural language processing, pp. 69-78, 2008.  
+jaap jumelet and dieuwke hupkes. do language models understand anything? on the ability of lstms to understand negative polarity items. in proceedings of the 2018 emnlp workshop blackboxnlp: analyzing and interpreting neural networks for nlp, pp. 222-231, brussels, belgium, november 2018. association for computational linguistics. doi: 10.18653/v1/w18-5424. url https://www.aclweb.org/anthology/w18-5424.  
+been kim. interactive and interpretable machine learning models for human machine collaboration. phd thesis, massachusetts institute of technology, 2015.  
+diederik p kingma and jimmy ba. adam: a method for stochastic optimization. international conference on learning representations, 2015.  
+diederik p kingma and max welling. auto-encoding variational bayes. proceedings of the 2nd international conference on learning representations (iclr), 2014.  
+thomas n kipf and max welling. semi-supervised classification with graph convolutional networks. international conference on learning representations (iclr), 2017.
+
+rik koncel-kedziorski, dhanush bekal, yi luan, mirella lapata, and hannaneh hajishirzi. text generation from knowledge graphs with graph transformers. in proceedings of the 2019 conference of the north american chapter of the association for computational linguistics: human language technologies, volume 1 (long and short papers), pp. 2284-2293, minneapolis, minnesota, june 2019. association for computational linguistics. doi: 10.18653/v1/n19-1238. url https://www.aclweb.org/anthology/n19-1238.  
+jiwei li, will monroe, and dan jurafsky. understanding neural networks through representation erasure. arxiv preprint arxiv:1612.08220, 2016.  
+christos louizos, max welling, and diederik p. kingma. learning sparse neural networks through  $l_0$  regularization. in international conference on learning representations, 2018. url https://openreview.net/forum?id=h1y8hhg0b.  
+dongsheng luo, wei cheng, dongkuan xu, wenchao yu, bo zong, haifeng chen, and xiang zhang. parameterized explainer for graph neural network. advances in neural information processing systems, 33, 2020.  
+chris j maddison, andriy mnih, and yee whye teh. the concrete distribution: a continuous relaxation of discrete random variables. international conference on learning representations (iclr), 2017.  
+diego marcheggiani and ivan titov. encoding sentences with graph convolutional networks for semantic role labeling. in proceedings of the 2017 conference on empirical methods in natural language processing, pp. 1507-1516, copenhagen, denmark, september 2017. association for computational linguistics. url https://www.aclweb.org/anthology/d17-1159.  
+pushkar mishra, marco del tredici, helen yannakoudakis, and ekaterina shutova. abusive language detection with graph convolutional networks. in proceedings of the 2019 conference of the north american chapter of the association for computational linguistics: human language technologies, volume 1 (long and short papers), pp. 2145-2150, 2019.  
+w. james murdoch, peter j liu, and bin yu. beyond word importance: contextual decomposition to extract interactions from lstms. international conference on learning representations (iclr), 2019.  
+daniel neil, joss briody, alix lacoste, aaron sim, paidi creed, and amir saffari. interpretable graph convolutional neural networks for inference on noisy knowledge graphs. machine learning for health (ml4h) workshop at neurips, 2018.  
+weili nie, yang zhang, and ankit patel. a theoretical explanation for perplexing behaviors of backpropagation-based visualizations. arxiv preprint arxiv:1805.07039, 2018.  
+phillip e pope, soheil kolouri, mohammad rostami, charles e martin, and heiko hoffmann. explainability methods for graph convolutional neural networks. in proceedings of the ieee conference on computer vision and pattern recognition, pp. 10772-10781, 2019.  
+danilo jimenez rezende, shakir mohamed, and daan wierstra. stochastic backpropagation and approximate inference in deep generative models. international conference on machine learning (icml), 2014.  
+marco tulio ribeiro, sameer singh, and carlos guestrin. model-agnostic interpretability of machine learning. international conference on machine learning (icml) workshop on human interpretability in machine learning, 2016a.  
+marco tulio ribeiro, sameer singh, and carlos guestrin. "why should i trust you?" explaining the predictions of any classifier. in proceedings of the 22nd acm sigkdd international conference on knowledge discovery and data mining, pp. 1135-1144, 2016b.  
+michael roth and mirella lapata. neural semantic role labeling with dependency path embeddings. in proceedings of the 54th annual meeting of the association for computational linguistics (volume 1: long papers), pp. 1192-1202, berlin, germany, august 2016. association for computational linguistics. doi: 10.18653/v1/p16-1113. url https://www.aclweb.org/anthology/p16-1113.
+
+michael schlichtkrull, thomas n kipf, peter bloem, rianne van den berg, ivan titov, and max welling. modeling relational data with graph convolutional networks. in european semantic web conference, pp. 593-607. springer, 2018.  
+thomas schnake, oliver eberle, jonas lederer, shinichi nakajima, kristof t schütt, klaus-robert müller, and grégoire montavon. xai for graphs: explaining graph neural network predictions by identifying relevant walks. arxiv preprint arxiv:2006.03589, 2020.  
+karl schulz, leon sixt, federico tombari, and tim landgraf. restricting the flow: information bottlenecks for attribution. in international conference on learning representations, 2020. url https://openreview.net/forum?id=s1xwh1rywb.  
+robert schwarzenberg, marc hübner, david harbecke, christoph alt, and leonhard hennig. layerwise relevance visualization in convolutional text graph classifiers. in proceedings of the thirteenth workshop on graph-based methods for natural language processing (textgraphs13), pp. 58-62, hong kong, november 2019. association for computational linguistics. doi: 10.18653/v1/d19-5308. url https://www.aclweb.org/anthology/d19-5308.  
+sofia serrano and noah a. smith. is attention interpretable? in proceedings of the 57th annual meeting of the association for computational linguistics, pp. 2931-2951, florence, italy, july 2019. association for computational linguistics. doi: 10.18653/v1/p19-1282. url https://www.aclweb.org/anthology/p19-1282.  
+lloyd s shapley. a value for n-person games. contributions to the theory of games, 2(28):307-317, 1953.  
+avanti shrikumar, peyton greenside, and anshul kundaje. learning important features through propagating activation differences. in proceedings of the 34th international conference on machine learning-volume 70, pp. 3145-3153. jmlr.org, 2017.  
+karen simonyan, andrea vedaldi, and andrew zisserman. deep inside convolutional networks: visualising image classification models and saliency maps. workshop at international conference on learning representations, 2014.  
+chandan singh, w james murdoch, and bin yu. hierarchical interpretations for neural network predictions. international conference on learning representations (iclr), 2019.  
+leon sixt, maximilian granz, and tim landgraf. when explanations lie: why modified bp attribution fails. arxiv preprint arxiv:1912.09818, 2019.  
+daniil sorokin and iryna gurevych. modeling semantics with gated graph neural networks for knowledge base question answering. in proceedings of the 27th international conference on computational linguistics, pp. 3306-3317, 2018.  
+pascal sturmfels, scott lundberg, and su-in lee. visualizing the impact of feature attribution baselines. distill, 5(1):e22, 2020.  
+changzhi sun, yeyun gong, yuanbin wu, ming gong, daxin jiang, man lan, shiliang sun, and nan duan. joint type inference on entities and relations via graph convolutional networks. in proceedings of the 57th annual meeting of the association for computational linguistics, pp. 1361-1370, florence, italy, july 2019a. association for computational linguistics. doi: 10. 18653/v1/p19-1131. url https://www.aclweb.org/anthology/p19-1131.  
+haitian sun, bhuwan dhingra, manzil zaheer, kathryn mazaitis, ruslan salakhutdinov, and william cohen. open domain question answering using early fusion of knowledge bases and text. in proceedings of the 2018 conference on empirical methods in natural language processing, pp. 4231-4242, 2018.  
+tony sun, andrew gaut, shirlyn tang, yuxin huang, mai elsherief, jieyu zhao, diba mirza, elizabeth belding, kai-wei chang, and william yang wang. mitigating gender bias in natural language processing: literature review. in proceedings of the 57th annual meeting of the association for computational linguistics, pp. 1630-1640, florence, italy, july 2019b. association for computational linguistics. doi: 10.18653/v1/p19-1159. url https://www.aclweb.org/anthology/p19-1159.
+
+mukund sundararajan, ankur taly, and qiqi yan. axiomatic attribution for deep networks. in proceedings of the 34th international conference on machine learning-volume 70, pp. 3319-3328. jmlr.org, 2017.  
+saeid asgari taghanaki, mohammad havaei, tess berthier, francis dutil, lisa di jorio, ghassan hamarneh, and yoshua bengio. infomask: masked variational latent representation to localize chest disease. in international conference on medical image computing and computer-assisted intervention, pp. 739-747. springer, 2019.  
+tijmen tieleman and geoffrey hinton. lecture 6.5-rmsprop: divide the gradient by a running average of its recent magnitude. coursera: neural networks for machine learning, 4(2):26-31, 2012.  
+petar velicković, guillem cucurull, arantxa casanova, adriana romero, pietro lio, and yoshua bengio. graph attention networks. international conference on learning representations, 2018. url https://openreview.net/forum?id=rjxmpikcz. accepted as poster.  
+johannes welbl, pontus stenetorp, and sebastian riedel. constructing datasets for multi-hop reading comprehension across documents. transactions of the association for computational linguistics, 6:287-302, 2018.  
+ronald j williams. simple statistical gradient-following algorithms for connectionist reinforcement learning. machine learning, 8(3-4):229-256, 1992.  
+shangsheng xie and mingming lu. interpreting and understanding graph convolutional neural network using gradient-based attribution method. arxiv preprint arxiv:1903.03768, 2019.  
+tian xie and jeffrey c grossman. crystal graph convolutional neural networks for an accurate and interpretable prediction of material properties. physical review letters, 120(14):145301, 2018.  
+keyulu xu, weihua hu, jure leskovec, and stefanie jegelka. how powerful are graph neural networks? international conference on learning representations (iclr), 2019.  
+zhitao ying, dylan bourgeois, jiaxuan you, marinka zitnik, and jure leskovec. gnnexplainer: generating explanations for graph neural networks. in advances in neural information processing systems, pp. 9240-9251, 2019.  
+manzil zaheer, satwik kottur, siamak ravanbakhsh, barnabas poczos, russ r salakhutdinov, and alexander j smola. deep sets. in advances in neural information processing systems, pp. 3391-3401, 2017.  
+yuhao zhang, peng qi, and christopher d. manning. graph convolution over pruned dependency trees improves relation extraction. in proceedings of the 2018 conference on empirical methods in natural language processing, pp. 2205-2215, brussels, belgium, october-november 2018. association for computational linguistics. doi: 10.18653/v1/d18-1244. url https://www.aclweb.org/anthology/d18-1244.  
+hao zhu, yankai lin, zhiyuan liu, jie fu, tat-seng chua, and maosong sun. graph neural networks with generated parameters for relation extraction. in proceedings of the 57th annual meeting of the association for computational linguistics, pp. 1331-1339, 2019.  
+luisa m zintgraf, taco s. cohen, tameem adel, and max welling. visualizing deep neural network decisions: prediction difference analysis. international conference on learning representations (iclr), 2017.
+
+# a erasure function architecture
+
+we compute the parameters  $\pi$  for the function erasure function  $g_{\pi}$  defined in equation 6 through a simple multilayer perceptron. we first derive a representation  $q_{u,v}^{(k)}$  of an edge at layer  $k$  simply through concatenation:
+
+$$
+q _ {u, v} ^ {(k)} = \left[ h _ {u} ^ {(k)}, h _ {v} ^ {(k)}, m _ {u, v} ^ {(k)} \right] \tag {6}
+$$
+
+we then compute the scalar location parameters  $\gamma_{u,v}^{(k)}$  for the hard concrete distribution based on  $q_{u,v}^{(k)}$ :
+
+$$
+\gamma_ {u, v} ^ {(k)} = w _ {2} ^ {(k)} \operatorname {r e l u} \left(\ln \left(w _ {1} ^ {(k)} q _ {u, v} ^ {(k)}\right)\right) \tag {7}
+$$
+
+where ln represents layer normalization.
+
+in addition to the formulation of gnn which we define in equations 1 and 2, some implementations employ a faster – but less expressive – formulation, where aggregation is done through matrix multiplication between the vertex embeddings matrix  $h^{(k)}$  and a (normalized, relation-specific) adjacency matrix  $\hat{a}_r$  (kipf & welling, 2017; schlichtkrull et al., 2018; de cao et al., 2019):
+
+$$
+h ^ {(k)} = \hat {a} _ {r} h ^ {(k - 1)} w ^ {(k)} \tag {8}
+$$
+
+applying the computation of  $q_{u,v}^{(k)}$  from equation 6 within that scheme would be prohibitively expensive, as  $q_{u,v}^{(k)}$  would need to be computed for every possible combination of  $u$  and  $v$  rather than just those actually connected by edges. the complexity would as such rise to  $o(v^2)$  rather than  $o(v + e)$ , which for large graphs can be problematic. to apply our method in such cases, we also develop a faster alternative computation of  $\gamma_{u,v}^{(k)}$  based on a bilinear product. in this case rather than enumerating all possible messages, we rely purely on the source and target vertex embeddings  $h_u^{(k)}$  and  $h_v^{(k)}$ . taking inspiration from r-gcn (schlichtkrull et al., 2018), we compute an alternative matrix-form  $\hat{\gamma}^{(k)}$  as:
+
+$$
+\hat {\gamma} ^ {(k)} = \hat {w} _ {r} ^ {(k)} \operatorname {r e l u} \left(\operatorname {l n} \left(\hat {w} _ {1} ^ {(k)} h ^ {(k)}\right)\right) h ^ {(k) \top} \tag {9}
+$$
+
+where  $\hat{w}_r^{(k)}$  is unique to the relation  $r$ . we sample relation-specific matrix-form gates  $\hat{z}_r^{(k)}$ , and apply these using an alternate - but equivalent - version of equation 3 to derive a representation matrix  $\widetilde{h}^{(k)}$  for the vertices in the masked model:
+
+$$
+\sum_ {r} \left(\hat {z} _ {r} ^ {(k)} \hat {a} _ {r}\right) h ^ {(k - 1)} w ^ {(k)} + \left(\left(j - \hat {z} _ {r} ^ {(k)}\right) \hat {a} _ {r}\right) b ^ {(k)} \tag {10}
+$$
+
+where  $j$  represents the all-one matrix. in our experiments, we rely on the adjacency-list formulation for srl in section 6 and the adjacency-matrix formulation for qa in section 5.
+
+# b the hard concrete distribution
+
+the hard concrete distribution assigns density to continuous outcomes in the open interval  $(0,1)$  and non-zero mass to exactly 0 and exactly 1. a particularly appealing property of this distribution is that sampling can be done via a differentiable reparameterization (rezende et al., 2014; kingma & welling, 2014). in this way, the  $l_0$  loss in equation 5 becomes an expectation:
+
+$$
+\sum_ {k = 1} ^ {l} \sum_ {(u, v) \in \mathcal {e}} \mathbf {1} _ {[ \mathbb {r} \neq 0 ]} (z _ {u, v} ^ {(k)}) = \sum_ {k = 1} ^ {l} \sum_ {\langle u, v \rangle \in \mathcal {e}} \mathbb {e} _ {p _ {\pi} (z _ {u, v} ^ {(k)} | \mathcal {g}, \mathcal {x})} \left[ z _ {u, v} ^ {(k)} \neq 0 \right], \tag {11}
+$$
+
+for which the gradient can be estimated via monte carlo sampling without the need for reinforce and without introducing biases.
+
+the distribution a stretched and rectified binary concrete (also known as hard concrete) distribution is obtained applying an affine transformation to the binary concrete distribution (maddison et al., 2017; jang et al., 2017) and rectifying its samples in the interval  $[0,1]$  (see figure 6). a binary concrete is defined over the open interval  $(0,1)$  ( $p_c$  in figure 6a) and it is parameterised by a location parameter  $\gamma \in \mathbb{r}$  and temperature parameter  $\tau \in \mathbb{r}_{>0}$ . the location acts as a logit and controls
+
+![](images/c1f8904bf7cec9a179cc686728db9b2c4407d7841455173302dc4005b294c658.jpg)  
+(a)
+
+![](images/81459632da0e12310f9859a4ab7fd42a133488a5e26e237cc8983eedeca0a179.jpg)  
+(b)  
+figure 6: binary concrete distributions: (a) a concrete  $p_c$  and its stretched version  $p_{sc}$ ; (b) a rectified and stretched (hard) concrete  $p_{hc}$ .
+
+the probability mass skewing the distribution towards 0 in case of negative location and towards 1 in case of positive location. the temperature parameter controls the concentration of the distribution. the binary concrete is then stretched with an affine transformation extending its support to  $(l, r)$  with  $l \leq 0$  and  $r \geq 1$  ( $p_{sc}$  in figure 6a). finally, we obtain a hard concrete distribution rectifying samples in the interval  $[0, 1]$ . this corresponds to collapsing the probability mass over the interval  $(l, 0]$  to 0, and the mass over the interval  $[1, r)$  to 1 ( $p_{hc}$  in figure 6b). this induces a distribution over the close interval  $[0, 1]$  with non-zero mass at 0 and 1. samples are obtained according to
+
+$$
+s = \sigma \left(\left(\log u - \log (1 - u) + \gamma\right) / \tau\right)
+$$
+
+$$
+z = \min  (1, \max  (0, s \cdot (l - r) + r)) \tag {12}
+$$
+
+where  $\sigma$  is the sigmoid function  $\sigma(x) = (1 + e^{-x})^{-1}$  and  $u \sim \mathcal{u}(0,1)$ . we point to the appendix b of louizos et al. (2018) for more information about the density of the resulting distribution and its cumulative density function.
+
+in our experiments, we found a constant temperature  $\tau = 1/3$  to work well. message specific location parameters  $\gamma_{u,v}^{(k)}$  are computed as specified in the previous section. we found it practical to shift the initial location using a bias  $c = 2$ , e.g. rather than directly using  $\gamma_{u,v}^{(k)}$  in equation 12 we substitute  $\gamma_{u,v}^{(k)} + c$ . this places the model in an initial state where all gates are open, which is essential for learning.
+
+# c training details
+
+when training graphmask, we found it helpful to employ a regime wherein gates are progressively added to layers, starting from the top. for a model with  $k$  layers, we begin by adding gates only for layer  $k$ , and train the parameters for these gates for  $\delta$  iterations. we then add gates for the next layer  $k - 1$ , train all sets of gates for another  $\delta$  iterations, and continue downwards in this manner. optimising for sparsity under the performance constraint using the development set, we found the method to perform best with  $\delta = 1$  for srl, while the optimal setting for qa was  $\delta = 3$ .
+
+we found it necessary to use separate optimizers and learning for the lagrangian  $\lambda$  parameter and for the parameters of graphmask. thus, we employ adam (kingma & ba, 2015) with initial learning rate  $1e - 4$  for graphmask, and rmsprop (tieleman & hinton, 2012) with learning rate  $1e - 2$  for  $\lambda$ . for the tolerance parameter  $\beta$ , we found  $\beta = 0.03$  to perform well for all tasks.
+
+we carried out all experiments on a single titan x-gpu. as graphmask executes the model which it analyses, training- and run-time depends on the complexity of that model. at training time, graphmask requires a single forward pass to compute gate values, followed by a backward pass through the sparsified model. thus, every iteration requires at most twice the computation time of an equivalent iteration using the investigated model.
+
+# d datasets
+
+srl we used the english conll-2009 shared task dataset (hajic et al., 2009). this dataset contains 179.014 training predicates, 6390 validation predicates, and 10498 test predicates. the dataset can be accessed at https://ufal.mff.cuni.cz/conl2009-st/.
+
+qa for question answering, we used the wikihop dataset (welbl et al., 2018), and the preprocessing script from de cao et al. (2019). see table 4 for details. the dataset can be accessed at https://qangaroo.cs.ucl.ac.uk/.
+
+<table><tr><td></td><td>min</td><td>max</td><td>avg.</td><td>med.</td></tr><tr><td># candidates</td><td>2</td><td>9</td><td>19.8</td><td>14</td></tr><tr><td># documents</td><td>3</td><td>63</td><td>13.7</td><td>11</td></tr><tr><td># tokens/doc.</td><td>4</td><td>2,046</td><td>100.4</td><td>91</td></tr></table>
+
+table 4: wikihop dataset statistics from welbl et al. (2018): number of candidates and documents per sample and document length. table taken from de cao et al. (2019).
+
+# e synthetic task model
+
+for the synthetic task discussed in section 4, we employ a model consisting of a one-layer r-gcn (schlichtkrull et al., 2018). vertex embeddings are initialized with the concatenation of a one-hot-encoding of  $x$  and a one-hot-encoding of  $y$ . these are fed into an initial mlp with one hidden layer to construct zeroth-layer vertex embeddings  $h_u^{(0)}$ . for every leaf, messages are then computed as:
+
+$$
+m _ {u, v} ^ {(1)} = \operatorname {r e l u} \left(w _ {c _ {u, v}} h _ {u} ^ {(0)} + b _ {c _ {u, v}}\right) \tag {13}
+$$
+
+aggregation of messages is implemented as sum-pooling, and predictions are made from an mlp with one hidden layer computed from the embedding  $h_{v_0}^{(1)}$  of the centroid. we use a dimensionality of 50 for r-gcn states, and a dimensionality of 100 for the mlp hidden states. the model is trained with adam (kingma & ba, 2015), with an initial learning rate of  $1e - 4$ .
+
+# f integrated gradients for graphs
+
+to apply integrated gradients to assign attributions to edges, we take the simplistic approach of defining a scalar variable  $\hat{z}_{u,v}^{k}$  by which the message from  $u$  to  $v$  at layer  $k$  is multiplied, and interpolate between  $\hat{z}_{u,v}^{k} = 1$  and  $\hat{z}_{u,v}^{k} = 0$ . we then compute the relative attribution of  $\hat{z}_{u,v}^{k}$ , using 0 as a baseline; that is, we assume that the problem can be modelled as interpolating between edges being "fully present" and "fully absent" through "partially present" states. we note that it is nontrivial to extend this approach to multi-layer gnns, since "partially present" edges in upper layers affect gradient flow and thus attribution to lower layers during interpolation. for this reason, information that has to travel through many edges - e.g., long-distance paths - is systematically underestimated in terms of importance. for the synthetic task where we rely on a single-layer gnn, we do not encounter this problem as no long-distance connections are possible; for real-world problems, this may not be the case (see e.g. our findings for qa in appendix k). furthermore, as we have noted in section 3.2, the zero-vector may not be an appropriate baseline for general gnns as it changes the degree statistics of the graph. this could harm the performance of integrated gradients (sturmfels et al., 2020); however, as we have constructed our synthetic task such that the number of leaves and thus the degree of the centroid changes, a gnn which achieves a perfect score for this task must be robust with respect to changing degree statistics. to make binary predictions, we normalise attributions to the interval  $[-1;1]$ , take the absolute value, and again apply a threshold  $t \in \{0.1,\dots,0.9\}$  to determine useful and superfluous edges.
+
+# g information bottleneck for graphs
+
+a related attribution technique to ours is the information bottleneck approach proposed by schulz et al. (2020). their technique involves computing individual soft sigmoidal gates  $\xi_{hi}$  for each dimension  $i$  of the hidden state  $h$  of a cnn to attribute importance. instead of a learned baseline, gated vectors are replaced with samples from a gaussian distribution. the mean and variance for this gaussian are computed over all examples in the training dataset. to promote sparsity, the kl divergence between the dataset distribution and the distribution obtained by interpolating between that distribution and the observed value through the gate is used as regularisation.
+
+in section 4, we also include results for an adaptation of schulz et al. (2020) to the problem of attributing importance to messages in a graph neural network. to apply the information bottleneck approach for our setting, we do the following. first, instead of individual gates  $\xi_{mi}$  for each dimension of the message  $m$ , we use a single gate  $\xi_{m}$ . we use their readout bottleneck approach, which can be seen as a parallel to our amortisation strategy. we predict logits for each gate by conditioning on the source and target embeddings, as well as on the message itself, similar to how we compute parameters for graphmask (see appendix a). this contrasts with the original approach of using 1x1-convolutions over the depth dimension - conditioning on "downstream" messages in the gnn could cause hindsight bias. training is done with the kl-divergence based loss introduced in schulz et al. (2020). finally, we compute the mean and variance of the gaussian noise used as a baseline (and for the loss) in their approach using all messages in the same layer over the entire training dataset. we found using the entire training data to collect statistics to work better than collecting statistics individually per example.
+
+# h implementation invariance for gnns
+
+![](images/3c851d86e4b97e7454f3a09ca1768657fb246d8932a5414e698aadbe3ad0abad.jpg)  
+figure 7: attributions for two functionally equivalent networks. we give a graph as an input to a gnn (on the left) where  $x$  is the edge from the top-right node to the central right node. the gnn update rule is simply aggregation with a sum over the neighbour nodes and no activation function. after one gnn layer we apply an mlp (on the right), which is implemented with two functionally equivalent networks  $f(t_{1}, t_{2})$  and  $g(t_{1}, t_{2})$  (exactly the same as in the counterexample provided in figure 7 in sundararajan et al., 2017). since lrp is not implementation invariant, it will produce two different attributions for the node  $t$  (i.e.,  $t'$  and  $t''$ ), and as a consequence of the propagation rule (schwarzenberg et al., 2019), the attribution to  $x$  will also be affected (i.e.,  $x'$  and  $x''$ ).
+
+# i srl distribution over edge types for retained edges
+
+![](images/f822ff7ca48e3b63d20a940f2a2e72f182356e425e9cf2b991e081a7b58323d0.jpg)  
+figure 8: distribution over edge types for retained edges (left) and probability of keeping each edge type (right); in both cases split by nominal (n) and verbal (v) predicates; edge types are a dependency function including computation directionality: flow from the head,  $(\neg >)$  or flow to the head  $(< -)$ . excludes edges that occur in less than  $10\%$  cases, and edges judged superfluous in more than  $99\%$  cases.
+
+![](images/6abe64f5a7557fb3916fddcf647136ff8abb91fda43f16c6046e2c3aca92c246.jpg)
+
+# j gradually dropping retained edges
+
+<table><tr><td>retained edges</td><td>acc.</td></tr><tr><td>100% (orig. model)</td><td>59.0</td></tr><tr><td>27% (graphmask)</td><td>58.6</td></tr><tr><td>20.25%</td><td>55.2</td></tr><tr><td>13.5%</td><td>52.8</td></tr><tr><td>6.25%</td><td>47.7</td></tr><tr><td>0%</td><td>45.2</td></tr></table>
+
+(a) question answering  
+
+<table><tr><td>retained edges</td><td>f1</td></tr><tr><td>100% (orig. model)</td><td>87.1</td></tr><tr><td>4% (graphmask)</td><td>86.6</td></tr><tr><td>3%</td><td>83.1</td></tr><tr><td>2%</td><td>74.3</td></tr><tr><td>1%</td><td>68.9</td></tr><tr><td>0%</td><td>63.8</td></tr></table>
+
+(b) srl: lstm+gnn  
+
+<table><tr><td>retained edges</td><td>f1</td></tr><tr><td>100% (orig. model)</td><td>83.8</td></tr><tr><td>16% (graphmask)</td><td>83.1</td></tr><tr><td>12%</td><td>74.4</td></tr><tr><td>8%</td><td>66.1</td></tr><tr><td>4%</td><td>58.9</td></tr><tr><td>0%</td><td>56.5</td></tr></table>
+
+(c) srl: gnn-only
+
+table 5: performance of the three real-world models using the original input graphs, using the subgraphs retained after masking with graphmask, and using only a randomly selected  $0/25/50/75/100\%$  of the edges retained after masking with graphmask. dropping the edges marked superfluous by our technique does not impact performance; dropping the remaining edges, even if only a randomly selected  $25\%$  of them, significantly hurts the model.
+
+# k baseline performance on question answering
+
+although we cannot directly measure and compare the faithfulness of different techniques on real tasks through a human-produced gold standard (jacovi & goldberg, 2020), we can identify clear pathologies in the attributions provided by both gnexplorer and integrated gradients. an important clue is the level of attribution assigned by each technique to the individual layers of the gnn. in figure 9, we plot for each layer of the question answering model the mean percentage of edges assigned specific attribution levels by each technique.
+
+gnnexplainer and integrated gradients both assign low levels of attribution to the first two layers, relying primarily on the top layer. however, as we see in table 6, dropping the bottom layer yields a much larger performance decrease  $(-26\%)$  than dropping the top layer  $(-7\%)$ . this is at odds with the predicted attributions. for gnnexplainer, manual inspection reveals this to be a product of hindsight bias. very specific configurations of top-layer edges adjacent to the predicted answer
+
+![](images/7e88d0cd2ff144aa89745096510c7aa93905a70568c77fc10f30e13149b805a7.jpg)  
+(a) layer 0
+
+![](images/9c3e5e024ec977846f63b346b7c721562f42177a53f43640338b8ddfd1228d77.jpg)  
+(b) layer 1  
+figure 9: mean percentage of messages assigned attribution scores above a certain level in the qa model of section 5, separated by layer. we report scores for gnnexplainer  $(\rightarrow)$ , integrated gradients  $(\rightarrow)$ , and graphmask  $(\rightarrow)$ .
+
+![](images/123bb9b949f7095bb067c6607ca55b392133c5a6ceb1c7154e297152e2f5e357.jpg)  
+(c) layer 2
+
+(in most cases, retaining only edges where the predicted answer is the target) generates the same predictions as the original model. this mirrors a common pathology of erasure search on qa for textual data, where the answer span and nothing else is selected as an explanation (feng et al., 2018).
+
+for integrated gradients, the low scoring of the bottom layer is a result of long-distance information (e.g. information from edges and vertices far from the predicted answer, which must travel through half-open pseudo-gates in the other layers to reach the predicted answer) being systematically underestimated as we discuss in appendix f. this prevents meaningful comparisons of attribution scores between layers.
+
+<table><tr><td>layers discarded</td><td>accuracy</td></tr><tr><td>full model</td><td>59.0</td></tr><tr><td>- layer 0</td><td>33.1</td></tr><tr><td>- layer 1</td><td>41.6</td></tr><tr><td>- layer 2</td><td>52.0</td></tr></table>
+
+table 6: performance of the question answering model with all edges in each individual gnn layer dropped.  
+
+<table><tr><td>model</td><td>k=0</td><td>k=1</td><td>k=2</td></tr><tr><td>gnnexplainer</td><td>4.3</td><td>11.9</td><td>83.8</td></tr><tr><td>integrated gradients</td><td>11.3</td><td>33.0</td><td>55.7</td></tr><tr><td>graphmask</td><td>51.6</td><td>28.8</td><td>19.6</td></tr></table>
+
+table 7: mean percentage of the total attribution score allocated to each layer for the question answering model, according to gnnexplainer, integrated gradients, and graphmask.
+
+another approach is to compare the proportion of the total attribution score that different techniques assign to each layer; ideally, this should reflect the importance of that layer. in table 7, we compute the mean percentage of the total score assigned to messages in each layer. as in figure 9, we see gnnexplainer and integrated gradients assign low levels of attribution to the bottom layer, at odds with the empirical performance loss from excluding that layer. this again indicates that the baselines are unlikely to be faithful.
+
+# l srl example with soft gates
+
+![](images/9b8a2a230b9e93e08484678f55d6ec295b4e5ebc37a265cab79fa26ed7ae7a1e.jpg)  
+figure 10: the example analysis from figure 5, using the analysis heuristic where edges with soft gate values more than one standard deviation below the mean are discarded. directions are combined into one arc.

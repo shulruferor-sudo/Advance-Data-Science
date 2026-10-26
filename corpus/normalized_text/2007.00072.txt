@@ -1,0 +1,590 @@
+# data movement is all you need: a case study on optimizing transformers
+
+andrei ivanov $^{1}$  nikoli dryden $^{1}$  tal ben-nun $^{1}$  shigang li $^{1}$  torsten hoeffer $^{1}$
+
+# abstract
+
+transformers are one of the most important machine learning workloads today. training one is a very comput-intensive task, often taking days or weeks, and significant attention has been given to optimizing transformers. despite this, existing implementations do not efficiently utilize gpus. we find that data movement is the key bottleneck when training. due to amdahl's law and massive improvements in compute performance, training has now become memory-bound. further, existing frameworks use suboptimal data layouts. using these insights, we present a recipe for globally optimizing data movement in transformers. we reduce data movement by up to  $22.91\%$  and overall achieve a  $1.30\times$  performance improvement over state-of-the-art frameworks when training a bert encoder layer and  $1.19\times$  for the entire bert. our approach is applicable more broadly to optimizing deep neural networks, and offers insight into how to tackle emerging performance bottlenecks.
+
+# 1 introduction
+
+transformers (vaswani et al., 2017) are a class of deep neural network architecture for sequence transduction (graves, 2012), with similar applicability as rnns (rumelhart et al., 1986) and lstms (hochreiter & schmidhuber, 1997). they have recently had a major impact on natural language processing (nlp), including language modeling (radford et al., 2018; wang et al., 2018; 2019), question-answering (rajpurkar et al., 2018), translation (vaswani et al., 2017), and many other applications. the significant improvement in accuracy brought by transformers to nlp tasks is comparable to the improvement brought to computer vision by alexnet (krizhevsky et al., 2012) and subsequent convolutional neural networks. transformers have also begun to be applied to domains beyond nlp, including vision (dosovitskiy et al., 2020), speech recognition (yeh et al., 2019), reinforcement learning (parisotto et al., 2019), molecular property prediction (maziarka et al., 2020), and symbolic mathematics (lample & charton, 2019).
+
+training transformers is very compute-intensive, often taking days on hundreds of gpus or tpus (devlin et al., 2019; yang et al., 2019; liu et al., 2019; keskar et al., 2019; shoeybi et al., 2019; lan et al., 2019; raffel et al., 2019). further, generalization only improves with model size (radford et al., 2019; shoeybi et al., 2019; raffel et al., 2019;
+
+* equal contribution  ${}^{1}$  department of computer science,eth zürich,switzerland. correspondence to: andrei ivanov <ani- vanov@inf.ethz.ch>.
+
+proceedings of the  $4^{th}$  mlsys conference, san jose, ca, usa, 2021. copyright 2021 by the author(s).
+
+microsoft, 2020b), number of training samples (raffel et al., 2019; liu et al., 2019), and total iterations (liu et al., 2019; kaplan et al., 2020). these all significantly increase compute requirements. indeed, transformers are becoming the dominant task for machine learning compute where training a model can cost tens of thousands to millions of dollars and even cause environmental concerns (strubell et al., 2019). these trends will only accelerate with pushes toward models with tens of billions to trillions of parameters (microsoft, 2020b;c), their corresponding compute requirements (openai, 2018), and increasing corporate investment towards challenges such as artificial general intelligence (openai, 2019). thus, improving transformer performance has been in the focus of numerous research and industrial groups.
+
+significant attention has been given to optimizing transformers: local and fixed-window attention (bahdanau et al., 2014; luong et al., 2015; shen et al., 2018; parmar et al., 2018; tay et al., 2019), more general structured sparsity (child et al., 2019), learned sparsity (correia et al., 2019; sukhbaatar et al., 2019; tay et al., 2020), and other algorithmic techniques (lan et al., 2019; kitaev et al., 2020) improve the performance of transformers. major hardware efforts, such as tensor cores and tpus (jouppi et al., 2017) have accelerated tensor operations like matrix-matrix multiplication (mmm), a core transformer operation. despite this, existing implementations do not efficiently utilize gpus. even optimized implementations such as megaatron (shoeybi et al., 2019) report achieving only  $30\%$  of peak gpu floating point operations per second (flop/s).
+
+we find that the key bottleneck when training transformers is data movement. improvements in compute perfor
+
+@dace.program
+
+def mha.forward(
+
+```python
+wq: dace.float16[p, h, i], bq: dace.float16[p, h], q: dace.float16[i, b, j],  
+wk: dace.float16[p, h, i], bk: dace.float16[p, h], k: dace.float16[i, b, k],  
+wv: dace.float16[w, h, i], bv: dace.float16[w, h], v: dace.float16[i, b, k],  
+wo: dace.float16[w, h, i], bo: dace.float16[i],scaler: dace.float16  
+:  
+qq = np.einsum("phi, ibj->phbj", wq, q) + bq[:, :, none, none]  
+kk = np.einsum("phi, ibk->phbk", wk, k) + bk[:, :, none, none]  
+vv = np.einsum("whi, ibk->whbk", vv, v) + bv[:, :, none, none]  
+beta =scaler * np.einsum("phbk, phbj->hjk", kk, qq)  
+alpha = dropout(softmax(beta))  
+gamma = np.einsum("whbk, hjk->whbj", vv, alpha)  
+out = np.einsum("whi, whbj->ibj", wo, gamma) +bo[:, none, none]  
+return out
+```
+
+![](images/fdacec4827ce5e3089a5f6731663135d5bd72eda11b9b938e71b1837d735aaac.jpg)  
+(a) input code  
+(b) resulting dataflow  
+figure 1. input code and stateful dataflow multigraph (sdfg) for multi-head attention. throughout the paper, if not stated otherwise, the values are given for the following set of parameters:  $p = w = 64$ ,  $h = 16$ ,  $i = p \cdot h = 1024$ ,  $b = 8$ ,  $j = k = 512$ . p/w: key/value projection size; h: # heads; i: embedding size; b: batch size; j/k: input/output sequence length.
+
+mance have reached the point that, due to amdahl's law and the acceleration of tensor contractions, training is now memory-bound. over a third (37%) of the runtime in a bert training iteration is spent in memory-bound operators: while tensor contractions account for over 99% of the arithmetic operations performed, they constitute only 61% of the runtime. by optimizing these, we show that the overhead of data movement can be reduced by up to 22.91%. further, while mmm is highly tuned by blas libraries and hardware, we also find that existing frameworks use suboptimal data layouts. using better layouts enables us to speed up mmm by up to 52%. combining these insights requires moving beyond peephole-style optimizations and globally optimizing data movement, as selecting a single layout is insufficient. overall, we achieve at least  $1.30 \times$  performance improvements in training over general-purpose deep learning frameworks, and  $1.08 \times$  over deepspeed (microsoft, 2020a), the state of the art manually-tuned implementation of bert. for robustly training bert (liu et al., 2019), this translates to a savings of over $85,000 on aws using pytorch. for the gpt-3 transformer model (brown et al., 2020) with a training cost of $12m (wiggers, 2020), our optimizations could save $3.6m and more than 120 mwh energy. to go beyond this, we develop a recipe for systematically optimizing data movement in dnn training.
+
+our approach constructs a dataflow graph for the training process, which we use to identify operator dependency patterns and data volume. with this representation, we identify opportunities for data movement reduction to guide optimization. we aim to maximize data reuse using various forms of fusion. then we select performant data layouts, which is particularly impactful for normalization and ten
+
+sor contraction operators, where it provides opportunities for vectorization and different tiling strategies. the performance data gathered is then used to find operator configurations that produce an optimized end-to-end implementation.
+
+we evaluate these implementations first for multi-head attention, a core primitive within transformers and one that has significant applications beyond transformers (bello et al., 2019; parmar et al., 2019; cordonnier et al., 2020). we then consider the encoder layer from bert (devlin et al., 2019), a widely-used transformer architecture. in each case, we compare against existing highly optimized implementations to provide strong baselines. using this recipe, we are able to demonstrate significant performance improvements in both microbenchmarks and end-to-end training, outperforming pytorch (paszke et al., 2019), tensorflow+xla (abadi et al., 2015), cudnn (chetlur et al., 2014), and deepspeed (microsoft, 2020a). while we focus our work on particular transformer models, our approach is generally applicable to other dnn models and architectures. we summarize our contributions as follows:
+
+- we find transformer training to be memory-bound and significantly underperforming on gpus.  
+- we develop a generic recipe for optimizing training using dataflow analyses.  
+- using this recipe, we systematically explore performance of operators and the benefits of different optimizations.  
+- we demonstrate significant performance improvements, reducing data movement overheads by up to  $22.91\%$  over existing implementations, and achieving at least  $1.08 \times$  performance improvements over specialized libraries, and  $1.30 \times$  over general-purpose frameworks.  
+- we make our code publicly available at https://github. com/spcl/substation.
+
+![](images/c2d10521d87bf00ccc1797ac960fb48cf803533c4aac520020f177330e1d2574.jpg)  
+figure 2. forward and backpropagation for a bert-large encoder layer, and the ratio of flop to memory accesses (words) when training on a batch  $b = 8$  and sequence length  $j = k = 512$ .
+
+# 2 background
+
+here we provide a brief overview of our terminology, transformers, and data-centric programming. we assume the reader is generally familiar with training deep neural networks (see goodfellow et al. (2016) for an overview) and transformers (see sec. a.1 for a more complete overview).
+
+# 2.1 transformers
+
+we use the standard data-parallel approach to training, wherein a mini-batch of samples is partitioned among many gpus. during backpropagation, we distinguish between two stages: computing the gradients with respect to a layer's input  $(dx)$ , and computing the gradients with respect to the layer's parameters  $(dw)$ . note that the second stage is relevant only for layers with learnable parameters.
+
+the transformer architecture (vaswani et al., 2017) consists of two main components: multi-head attention (mha) and a feed-forward network. we provide python code and an illustration of mha forward propagation in fig. 1. attention has three input tensors, queries  $(\mathbf{q})$ , keys  $(\mathbf{k})$ , and values  $(\mathbf{v})$ . the inputs are first multiplied by weight ten
+
+sors wq, wk, wv, respectively, as a learned input projection (we use einstein-notation sums, or einsums, for tensor contractions). the query and key tensors are subsequently multiplied together and scaled (stored in beta), followed by a softmax operation. this is then multiplied with vv to produce the per-head output (gamma). the outputs of all heads are finally concatenated and linearly projected back to the input dimension size (i).
+
+the respective dataflow graph (fig. 1b) immediately exposes coarse- (whole graph) and fine-grained (within rectangular nodes) parallelism, as well as data reuse. as every edge represents exact data movement, their characteristics (access sets and movement volume) can be inspected for bottlenecks and potential solution analysis.
+
+we focus on bert (devlin et al., 2019). fig. 2 illustrates the forward and backward pass for a single bert encoder layer. the layer essentially consists of mha followed by a feed-forward neural network (two linear layers with bias and relu activations after the first layer). dropout (srivastava et al., 2014), layer normalization (ba et al., 2016), and residual connections (he et al., 2016) are also used.
+
+# 2.2 data-centric programming
+
+as dnn processing is among the most popular compute-intensive applications today, considerable efforts have been made to optimize its core operators (ben-nun & hoefler, 2019). this has driven the field to the point where optimization today is almost exclusively performed beyond the individual operator, either on the whole network (google, 2020; pytorch team, 2020) or repeated modules.
+
+performance optimization on modern architectures consists of mutations to the original code, sometimes algorithmic (chellapilla et al., 2006; mathieu et al., 2013; lavin & gray, 2016) but mostly relating to hardware-specific mapping of computations and caching schemes. this includes tiling computations for specific memory hierarchies, using specialized units (e.g., tensor cores) for bulk-processing of tiles, modifying data layout to enable parallel reductions, hiding memory latency via multiple buffering, pipelining, and using vectorized operations. it is thus apparent that all current optimization techniques revolve around careful tuning of data movement and maximizing data reuse.
+
+the data-centric (dace) parallel programming framework (ben-nun et al., 2019) enables performance optimization on heterogeneous architectures by defining a development workflow that enforces a separation between computation and data movement. the core concept powering program transformation is the stateful dataflow multigraph (sdfg), a graph intermediate representation that defines containers and computation as nodes, and data movement as edges. dace takes input code written in python or dsls,
+
+and outputs corresponding sdfgs. programmers can mutate the dataflow via user-extensible graph-rewriting transformations to change the schedule of operations, the layout of data containers, mapping of data and computation to certain processing elements, or any adaptation to the data movement that does not change the underlying computation.
+
+as opposed to traditional optimizing compilers and deep learning frameworks (e.g., xla, torchscript), dace promotes a white-box approach for performance optimization. the framework provides an api to programmatically instrument and explore, e.g., layouts and kernel fusion strategies, without modifying the original code. dace can map applications to different hardware architectures, including cpus, gpus, and fpgas (ben-nun et al., 2019), enabling both whole-program and micro-optimizations of nontrivial applications to state-of-the-art performance (ziogas et al., 2019).
+
+the combination of the separation of the algorithm from the transformed representation and white-box approach for optimization enables us to inspect and optimize the data movement characteristics of transformer networks. as we shall show in the next sections, this drives a methodical approach to optimizing a complex composition of linear algebraic operations beyond the current state of the art.
+
+# 3 optimizing transformers
+
+we now apply our recipe to optimize data movement in training, using a bert encoder layer as an example. we focus on a single encoder layer, since these are simply repeated throughout the network, and other components (e.g., embedding layers) are not a significant component of the runtime. in this section, we discuss dataflow and our operator classification. sections 4 and 5 discuss our optimizations and section 6 presents end-to-end results for transformers.
+
+at a high level, our recipe consists of the following steps:
+
+1. construct a dataflow graph for training and analyze the computation to identify common operator classes.  
+2. identify opportunities for data movement reduction within each operator class using data reuse as a guide.  
+3. systematically evaluate the performance of operators with respect to data layout to find near-optimal layouts.  
+4. find the best configurations to optimize end-to-end performance of the training process.
+
+# 3.1 dataflow analysis
+
+we use sdfgs and the dace environment to construct and analyze dataflow graphs. fig. 2 provides a simplified representation of dataflow in a transformer encoder layer. each node represents an operator, which is a particular computation along with its associated input and output, which may vary in size. an operator may be implemented as multiple compute kernels, but is logically one operation for our
+
+table 1. proportions for operator classes in pytorch.  
+
+<table><tr><td>operator class</td><td>% flop</td><td>% runtime</td></tr><tr><td>△ tensor contraction</td><td>99.80</td><td>61.0</td></tr><tr><td>□ stat. normalization</td><td>0.17</td><td>25.5</td></tr><tr><td>○ element-wise</td><td>0.03</td><td>13.5</td></tr></table>
+
+analysis. to produce an sdfg, all that is required is a simple implementation using numpy. as the goal of this stage is to understand the dataflow, we do not need to optimize this implementation: it is simply a specification of the computations and data movement.
+
+using dace, we can estimate data access volume and the number of floating point operations (flop) required for each computation. fig. 2 is annotated with flop and the ratio of flop to data volume, and we provide a precise comparison with pytorch in tab. a.1. the key observation is that the ratio of data movement to operations performed varies significantly among operators. in many cases, the runtime of an operator is dominated by data movement, rather than computation, and this should be the target for optimization.
+
+# 3.2 operators in transformers
+
+with this analysis, we can now identify high-level patterns that allow us to classify operators. we base our classification both on the data movement to operation ratio and the structure of the computations. this classification is useful as it allows us to consider optimizations at a more general level, as opposed to working on each operator (or kernel) individually. for transformers, we find three classes: tensor contractions, statistical normalizations, and element-wise operations. the border of each operator in fig. 2 indicates its class and tab. 1 gives the proportion of flop and runtime for a bert encoder layer for each class.
+
+tensor contractions  $\triangle$  these are matrix-matrix multiplications (mmms), batched mmms, and in principle could include arbitrary tensor contractions. we consider only mmms and batched mmms for simplicity, as these are efficiently supported by cublas. in transformers, these are linear layers and components of mha. these operations are the most compute-intensive part of training a transformer. for good performance, data layout and algorithm selection (e.g., tiling strategy) are critical.
+
+statistical normalizations these are operators such as softmax and layer normalization. these are less compute- intensive than tensor contractions, and involve one or more reduction operation, the result of which is then applied via a map. this compute pattern means that data layout and vectorization is important for operator performance.
+
+element-wise operators  $\bigcirc$  these are the remaining operators: biases, dropout, activations, and residual connections.
+
+![](images/ac276986575883bd1f1c27e82bdf7c7dfb1652bc39729a29bc4a89b009d5c2a1.jpg)  
+figure 3. examples of operator fusion.
+
+these are the least compute-intensive operations.
+
+# 3.3 memory usage efficiency (mue)
+
+the mue metric (fuhrer et al., 2018) provides a measure of the memory efficiency of an operation, both with respect to its implementation and achieved memory performance. this provides another method for understanding performance beyond flop/s that is particularly relevant for applications that are bottlenecked by data movement. mue evaluates the efficiency of a particular implementation by comparing the amount of memory moved  $(d)$  to the theoretical i/o lower bound (jia-wei & kung, 1981)  $(q)$  and the ratio of achieved  $(b)$  to peak  $(\hat{b})$  memory bandwidth:  $\mathrm{mue} = q / d \cdot b / \hat{b} \cdot 100$ . if an implementation both performs the minimum number of operations and fully utilizes the memory bandwidth, it achieves mue  $= 100$ . this can be thought of as similar to the percent of peak memory bandwidth.
+
+# 3.4 evaluation details
+
+we use the lassen supercomputer (livermore computing center, 2020), where each node has four 16 gb nvidia v100 gpus with nvlink2. for comparison, we use cudnn 8.0.4, pytorch 1.6.0 (pt), tensorflow 2.1 from ibm powerai with xla, and a recent development version of deepspeed (ds). see sec. a.3 for more details. our running example is training bert-large. we use a mini-batch size of  $b = 8$ , sequence length  $l = 512$ , embedding size  $n = 1024$ ,  $h = 16$  heads, and a projection size  $p = 64$ .
+
+# 4 fusion
+
+a significant portion of the runtime in existing transformer implementations is in statistical normalization and elementwise operators (tab. 1). thus, fusion is a major opportunity for promoting data reuse, as when operators cover identical
+
+iteration spaces, global memory writes and subsequent reads between them can be removed.
+
+we develop a set of fusion rules applicable to any application with operators similar to the three here. the process consists of two steps: detecting which operations can be fused and then deciding whether it is beneficial to fuse them.
+
+to discover fusion opportunities, we analyze iteration spaces. every operator has independent dimensions. statistical normalization operators also have reduction dimensions; tensor contractions also have reduction dimensions and special independent dimensions for the two input tensors.
+
+the type of iteration space implementation determines which tools are used to make them. independent dimensions can be implemented using gpu block or thread parallelism, or "for" loops within a single thread. reduction dimensions use these techniques but also specify how the reduction is to be performed: accumulating to the same memory location ("for" loops), or as grid-, block-, or warp-reductions.
+
+two operators can be fused if their iteration space implementations are compatible: they are either the same or the only difference is that one operator performs a reduction. the order and size of dimensions and the implementation for each must match. if the first operator produces output the second uses as input, partial fusion can be done: the outermost independent dimensions can be shared, but the innermost iteration spaces are put in sequential order inside.
+
+when a fusion opportunity is detected, we take it in two cases: first, if we can perform fewer kernel launches by merging iteration spaces. second, if we achieve less data movement by avoiding loads and stores between operators. theoretically, the first case could increase memory pressure, but we observe it provides benefits in practice.
+
+we attempt to fuse maximally. there are four structural patterns (fig. 3) in the dataflow graph for the encoder layer when fusion rules above are applied to a pair of non-tensor contraction operators. using the sdfg, we fuse two adjacent operators whenever we detect these patterns and continue until we cannot fuse further. this means we fuse until either a reduction dimension or iteration space changes. as a further constraint, we only fuse simple element-wise scaling operations into tensor contraction operators.
+
+each fused operator is implemented as a cuda kernel specialized for a specific data layout. due to space limitations, we detail our implementation and fused kernels in sec. a.2.
+
+# 4.1 results
+
+tab. a.1 presents our comprehensive results, including operator fusion. in this, we show a detailed breakdown of the required and observed flop, data movement, runtime, and mue for each operator within the encoder layer, for both
+
+pytorch and our implementation, with our fused operators marked. we can easily observe that while the vast majority of flop are in tensor contractions, much of the runtime is in statistical normalization and element-wise operators (see also tab. 1). these operators are indeed memory-bound.
+
+in forward propagation, every fused operator outperforms pytorch's. in backpropagation, this trend generally holds, but ebsb and baob are slower due to our configuration selection algorithm choosing a suboptimal layout for some operators to optimize the overall performance (see sec. 6).
+
+by studying the mue and flop/s, we can reason about the bottlenecks behind each operator. for the fused operators, we see that high mue rates are often achieved. in fact, the mue from tab. a.1 and the theoretical flop/io ratio from fig. 2 are highly correlated across operators. we say that a kernel is memory bound if its mue is larger than the achieved peak flop/s, and compute bound otherwise. this insight aids in analyzing the bottlenecks of general dnns and automated tuning of operators, prior to measuring their performance. we note that for our operators, which involve multiple tensors of different shapes,  $100\%$  mue is potentially unattainable as achieving peak memory bandwidth requires a highly regular access pattern into dram.
+
+as for the tensor contraction results, we see that the attained mue is consistently under  $50\%$ . this is acceptable, since the underlying matrix multiplications are generally computable. however, we note that some cases, such as  $qk^t$ , are both low in flop/s and mue. a more in-depth look into the dimensions of the contraction reveals that the dimensions are small, which then indicates that the tensor cores are underutilized. this may result from insufficient scheduled threads, or low memory throughput to compute ratio. we thus try to increase hardware utilization by fusing additional operators into the contractions next.
+
+additional fusion approaches we considered two additional fusion approaches, fusing operators into tensor contractions and algebraic fusion, which we discuss in sec. a.5 due to limited space. we find that fusing into tensor contractions is not profitable, but algebraic fusion to combine input projection operations in mha is.
+
+# 5 data layout
+
+we now consider data layout selection, which enables efficient access patterns, vectorization, and tiling strategies for tensor contraction and statistical normalization operators. to study this systematically, for each operator, including fused operators produced in the prior step, we benchmark every feasible data layout, as well as varying other parameters depending on the specific operator. the best parameterization of an operator is highly dependent on the gpu model and tensor sizes, and may not be obvious a priori; hence it
+
+is important to consider this empirically.
+
+because there are a myriad of potential configurations for each operator, we summarize the distribution of runtimes over all configurations using violin plots. the width of the violin represents the relative number of configurations with the same runtime. this allows us to see not only the best runtime but sensitivity of operators to layouts, an important factor for global layout optimization in step 4 of our recipe.
+
+# 5.1 tensor contractions
+
+using the einsum notation for tensor contractions, we consider all equivalent permutations of the summation string. the einsum is then mapped to a single cublas mmm or batched mmm call. while this notation allows us to express arbitrary tensor contractions, as cublas does not support all configurations, we limit ourselves to these two types.
+
+in addition, we consider every possible cublas algorithm for each layout, as we have observed that the heuristic default selection is not always optimal. we use the cublasgemmex api to manually select algorithms. we use both regular and tensor core operations, and perform all accumulations at single-precision, in line with best practices for mixed-precision training (micikevicius et al., 2018).
+
+fig. 4 presents performance distributions over all data layouts for every tensor contraction in the encoder layer training, including algebraic fusion variants. each plot is for different tensor sizes and shows the performance with and without tensor cores. since input matrices for cublas mmms can be easily swapped, results for both orders are merged into the plot and labeled with  $m > n$ . interestingly, in several cases (where  $n$  or  $k$  is 64) the performance is quite close to the regular floating point units, due to a failure to saturate the tensor cores. among the tensor core results, we can typically see there are several modes in the performance distributions; these correspond to particularly important axes for data layout. indeed, for many configurations, one of these is near to or contains the best-performing configuration, indicating that many slightly different data layouts could be used with little impact on performance depending on the needs of our global optimization pass. however, this does not mean that any data layout is acceptable; in every case, the majority of the layouts do not perform well, illustrating the importance of careful tuning.
+
+we also investigated how the default cublas algorithm compares to the best-performing configuration. on half precision, we found that the algorithm chosen by cublas's heuristic was up to  $14.24\%$  worse than the best algorithm (in  $dx1qk^t$ ). we also investigated the performance at single-precision and found similar results with up to  $7.18\%$  worse performance. this demonstrates the importance of tuning for particular hardware and workload.
+
+![](images/85f58b6e153010ba0a1f5fc8b0862dd5c434191aa670ccbbd593d0a341bb75a1.jpg)  
+figure 4. tensor contraction performance. tensor core peak: 125 tflop/s; fp16 peak: 31.4 tflop/s.
+
+# 5.2 fused operators
+
+for our fused operators, we consider all combinations of input and output layout permutations. this enables us to include transposes of the output data as part of the operator, should the next operator perform better in a different layout than the input. the data layout is especially critical for statistical normalization operators, where the appropriate data layout can enable vectorization opportunities, especially vectorized loads and stores for more efficient memory access. we therefore also consider vectorization dimensions, the mapping of dimensions to gpu warps, etc. our implementation takes advantage of these layouts when feasible.
+
+fig. 5 presents the runtime distribution for all configurations of our fused operators (note that some are used twice; see sec. a.2 for details of each operator). the distributions here are qualitatively similar to those in fig. 4, except these have much longer tails: a bad configuration is, relatively, much worse, potentially by orders of magnitude.
+
+all kernels support changing the layouts of tensors they use. this change is done via template parameterization, so the compiler can generate efficient code. all kernels support selecting different vectorization dimensions. the brd and bei kernels can select the dimension used for cuda thread distribution; bsb, ebsb, and bdrb can select the warp reduction dimension, as they reduce over two dimensions.
+
+the most noticeable performance improvement is made by layouts that enable vectorized memory access, showing that the main performance limitation is the amount of moved data. the second notable category are layouts with the same reduce and vector dimensions. joining these dimensions
+
+![](images/4de35d029e7c2f2f044b7ea6c05a17ddfcf4b43ce4e1204dac25b8f83b27125a.jpg)  
+figure 5. performance of fused kernels for element-wise and statistical normalization operators.
+
+decreases the number of registers required to store partially reduced values from the vector size (eight at fp16) to one.
+
+we can expect to get good performance restricting ourselves to configurations in the two groups described above. usually, the best layout discovered follows them. for example, the sm kernel has the same warp and reduction dimensions, and these dimensions are the last and sequential ones for involved arrays. however, this intuition is not always correct. from the results in fig. 5, we find that there are configurations that both satisfy these intuitive rules yet are very slow. for example, the best configuration of aib takes  $65\mu s$ , and the worst "intuitively good" configuration takes  $771\mu s$ .
+
+configurations discovered through exhaustive search can enhance our intuitive understanding of what is required for good performance. for example, the brd kernel uses four 3d tensors, which can use six possible layouts. intuitively, we want to place the vectorized dimension last to make it sequential for all tensors. surprisingly, however, the best configuration has only two tensors vectorized. with this information, intuition can be refined: the likely factor that limits vectorization over all tensors is excessive register usage. however, unlike the exhaustive search, intuition does not help to identify which tensors to vectorize.
+
+# 6 end-to-end optimization
+
+the final step is to assemble fused components and select data layouts for each operator to yield a complete implementation. this is the culmination of the prior steps performing dataflow analysis, fusion, and layout selection. from these, we have performance data for all data layouts and algebraic fusion strategies. one cannot simply pick a single layout a priori, as the benefit of running two operators in different layouts may outweigh the overhead of transposing data. our assembled implementation is structured using the sdfgs produced in step 1. we integrate it into pytorch (paszke et al., 2019) via its  $\mathrm{c}++$  operator api.
+
+# 6.1 configuration selection
+
+we develop an automatic configuration selection algorithm to globally optimize our implementation using the performance data. we construct a directed graph (fig. 6) based on the dataflow graph of the operators. beginning from the input data and proceeding in a topological order, we add a node to the graph for each input and output data layout of the operator. an edge is added from the input to the output layout, weighted with the minimum runtime of any configuration with that layout. determining this simply requires a linear search over the matching performance data. this allows us to select both the best data layout and any other operator knobs (e.g., vectorization dimension). to minimize the size of the graph, we only add a configuration
+
+![](images/89f6644432e86ed16eb265c74ce269e5c2c613d3f73820310fca990d7ed5fe0b.jpg)  
+figure 6. example configuration selection graph for sssp.
+
+from an operator when it has at least one input and output edge. we then run a single-source shortest-path (sssp) algorithm from the input to the output in the graph; the resulting path gives our final configuration. because this graph is a dag and the number of feasible input/output configurations for each operator is small, sssp takes linear time asymptotically and seconds for bert. the path is saved to a configuration file which is used to automatically define tensor layouts at the start of training.
+
+to simplify the implementation, we omit dataflow connections between forward and backpropagation operators. this assumption could be relaxed in a future version of this algorithm. although this means we are not guaranteed to find a globally optimal data layout, the runtime of our configuration is nevertheless within  $6\%$  of an ideal (incorrect) layout configuration that ignores data layout constraints.
+
+# 6.2 multi-head attention
+
+we first analyze the performance of multi-head self-attention. while it is a key primitive in bert, mha is also used outside of transformers, so understanding its performance in isolation can inform other models too. tab. 2 compares our globally-optimized implementation with pytorch, tensorflow+xla, and cudnn. cudnn's mha implementation (cudnnmultiheadattnforward and related) supports six data layouts; we report the fastest.
+
+cudnn's performance is significantly worse than the others; as it is a black box, our ability to understand it is limited. however, profiling shows that its implementation launches very large numbers of softmax kernels, which dominate the runtime, indicating additional fusion would be profitable. tensorflow+xla finds several fusion opportunities for softmax. however, its implementation does not perform algebraic fusion for the queries, keys, and values, and it uses subpar data layouts for tensor contractions.
+
+our performance results in tab. a.1 illustrate the source of our performance advantage over pytorch: our data layout and algorithm selection results in faster tensor contractions overall. this is despite the gamma stage actually being slower than pytorch's: sometimes locally suboptimal lay
+
+table 2. multi-head attention performance for bert.  
+
+<table><tr><td></td><td>tf+xla</td><td>pt</td><td>cudnn</td><td>ours</td></tr><tr><td>forward (ms)</td><td>1.60</td><td>1.90</td><td>3.86</td><td>1.25</td></tr><tr><td>backward (ms)</td><td>2.25</td><td>2.77</td><td>680</td><td>1.86</td></tr></table>
+
+outs need to be selected to improve performance globally.
+
+# 6.3 end-to-end performance
+
+we present overall performance results for the encoder layer in tab. 3. for forward and backpropagation combined, we are  $1.30 \times$  faster than pytorch and  $1.20 \times$  faster than tensorflow+xla, including framework overheads. at a high level, this is because we perform a superset of the optimizations used by both frameworks, and globally combine them to get all the advantages while minimizing drawbacks. as a general guideline, we use flop and mue rates as proxies for which operators require the most attention and their corresponding bottlenecks. this ensures a guided optimization rather than tuning all operators aggressively.
+
+we also include performance results from deepspeed, which we are  $1.08 \times$  faster than. this is despite deepspeed being a manually-optimized library tuned specifically for bert on v100s. note also that deepspeed modifies some operations, e.g., to be reversible or to exploit output sparsity, and so is not always strictly comparable to the other implementations. this also provides it opportunities for optimization that we do not consider.
+
+the total data movement reduction we attain is  $\sim 22.91\%$  over the standard implementation. we obtain this information from tab. a.1, where for each fused kernel we omit the interim outputs and inputs that are not part of the overall i/o that the fused kernels perform. tensorflow+xla's automatic kernel fusion reduces data movement similarly to ours. however, the data layouts used for tensor contractions are not optimal, and its bert encoder implementation does not use algebraic fusion in mha. pytorch's data layouts enable faster tensor contractions and it implements the algebraic fusion, but it has higher overheads for other operators.
+
+our fusion pass finds all the opportunities that tf+xla does, plus several additional ones; for example, we implement layernorm as a single fused kernel. our data layout selection picks better layouts than pytorch in nearly every individual instance; when it does not, this is because the layout change enables greater performance gains downstream. in tab. a.1, we also see that pytorch performs more flop than predicted. some of this is due to padding in cublas operations, and generic methods performing excess operations. however, we also discovered that some cublas gemm algorithms, including ones called by pytorch, incorrectly perform twice as many flops as necessary; our
+
+table 3. full bert encoder layer performance.  
+
+<table><tr><td></td><td>tf+xla</td><td>pt</td><td>ds</td><td>ours</td></tr><tr><td>forward (ms)</td><td>3.2</td><td>3.45</td><td>2.8</td><td>2.63</td></tr><tr><td>backward (ms)</td><td>5.2</td><td>5.69</td><td>4.8</td><td>4.38</td></tr></table>
+
+![](images/adeda1a6f4d3de05c7ae75bf2f2dfe4cf603d4879de40d1ec3faf26835b45d94.jpg)  
+figure 7. pretraining curve for bert-large.
+
+recipe avoids these cases automatically.
+
+we also considered another configuration for training bert, where we change the batch size to  $b = 96$  and the sequence length to  $l = 128$ , and retuned our layout selection. in this case, forward and backpropagation for a single encoder layer takes  $18.43 \mathrm{~ms}$  in pytorch,  $16.19 \mathrm{~ms}$  in deepspeed, and  $15.42 \mathrm{~ms}$  in our implementation. we outperform both pytorch and deepspeed in this case (even with its additional optimizations). we believe that with improvements to our layout selection algorithm, the performance of our implementation will improve further.
+
+finally, we performed end-to-end training of bert at scale. we observe an overall speedup of  $1.19 \times$ , despite additional training overheads. we show pretraining curves in fig. 7 and present full details of the experiment in sec. a.6.
+
+beyond bert, other transformers have very similar layers, such as decoder layers in gpt-2/3. with very few changes, our recipe and implementations are directly applicable to these. our implementation can also be extended to support a full training pipeline by stacking our optimized layers.
+
+# 7 related work
+
+we provide a brief overview of related work here, and a more comprehensive discussion in sec. a.7.
+
+most directly relevant are other approaches specifically to accelerate transformer training. distributed-memory techniques, such as zero (rajbhandari et al., 2019), megatron (shoeybi et al., 2019), and mesh-tensorflow (shazeer et al., 2018) scale training to many gpus to accelerate it. mesh-tensorflow also presents a classification of operators similar to ours. large batches have also been used to accelerate training via lamb (you et al., 2020) or nvlamb (nvidia ai, 2019). none of these directly address the performance of a single gpu as done in this paper. deepspeed (microsoft, 2020a), which we compare with in section 6.3, is closest to our work, but performs all
+
+optimizations and layout selections manually.
+
+many frameworks provide optimizations that can also be applied to transformers, such as xla or tvm (chen et al., 2018). none of these works provide all the optimizations or the systematic study of data movement and its impact on performance provided here. beyond deep learning, data movement reduction is a core component of high-level optimization (unat et al., 2017) and polyhedral optimizations (e.g., grosser et al. (2012)). other white-box approaches for optimization exist (e.g., halide (ragan-kelley et al., 2013) and mlir (lattner et al., 2020)). the data-centric optimization approach proposed here using dataflow graphs allows us to perform and tune complex data layout and fusion transformations that span granularity levels, surpassing the optimization capabilities of the aforementioned tools and achieving state-of-the-art performance.
+
+# 8 discussion
+
+the recipe we propose in this paper can be directly adopted in other dnn architectures. additional transformer networks, such as megatron-lm (shoeybi et al., 2019) and gpt-3 (brown et al., 2020), only differ by dimensions and minor aspects in the encoder and decoder blocks (e.g., dropout position, biases). once a data-centric graph is constructed from them, the recipe remains unchanged.
+
+# 8.1 beyond transformers
+
+the classification of operators into three groups covers a wide variety of operators that span beyond transformers.
+
+large tensors and their contraction are ubiquitous in modern dnns. for mlps and recurrent neural networks (rnns), there is little change, as the core operator types are essentially the same. convolutions, pooling, and other local spatial operators can be treated similarly to tensor contractions, owing to their arithmetic intensity properties and abundance of optimized implementations. therefore, the same considerations we take here are just as critical in cnns. however, as opposed to contractions (see section a.5.1), further fusion is typically considered for convolutions.
+
+statistical normalization also takes different forms in dnns. this includes a variety of reductions, as well as instance, group, and batch normalization, where the latter constitutes the second largest computation in resnets after convolutions. when varying data layouts, these operators share properties (normalizing a dimension) and are optimized in exactly the same way. lastly, element-wise operators always exist in dnns and benefit from the same fusion and bulk data movement optimizations as we perform here. for graph neural networks (bronstein et al., 2017), capsule neural networks (sabour et al., 2017), and other emerging architectures, the operators change more significantly, but
+
+the basic procedure applies.
+
+due to the prohibitively large search space of configurations in transformers, writing manually-optimized kernels becomes infeasible. instead, each of our data-centric implementations chooses an optimization scheme (e.g., tiling, vectorization, warp-aggregated reductions) automatically, according to the input data layout and the operator type. combined with automated configuration selection (section 6.1), we rely only on the dataflow graph structure to choose the best feasible data layout configuration.
+
+# 8.2 hardware implications
+
+the implications of data movement reduction extend beyond software. given that the best performance for different operators is achieved with different data layouts, there would be significant benefits if future machine learning accelerators included built-in support for fast data layout changes. we confirm this in our mue results (tab. a.1), as even the most compute-intensive tensor contractions are bounded by the hardware's capability of transferring data to tensor cores.
+
+hardware trends indicate a similar situation. new architectures are moving towards reducing data format conversion (e.g., tf32 (nvidia, 2020)), increased on-chip memory and low-latency interconnects (jia et al., 2019c), and coarse-grained spatial hardware (cerebras, 2020). for the latter two, the recipe and analysis provided here is crucial to maintain high utilization in pipelined dnn execution. more generally, we expect our recipe to be applicable to any load-store architecture (e.g., tpu's (jouppi et al., 2017)). the  $\%$  of peak and mue are fundamental quantities and analyzing them will allow one to study bottlenecks and optimize appropriately.
+
+# 9 conclusions
+
+despite the importance of transformer neural networks, training them is memory-bound and underutilizes gpus. using our recipe for data movement analysis, we identified bottlenecks and optimizations, yielding improved implementations that outperform the already highly tuned state-of-the-art. as training transformers is already a major workload that will only grow larger, our improvements offer significant real-world impacts for both research and industry.
+
+our approach is applicable more broadly to deep learning; many dnns easily fit within our operator classification. this is especially important for guiding the optimization of emerging model architectures, which do not benefit from existing acceleration libraries. our results also highlight the importance of considering data movement at every level of the training stack—from the application down to hardware.
+
+# acknowledgments
+
+this project received funding from the european research council (erc) under the european union's horizon 2020 programme (grant agreements dapp, no. 678880, and epigram-hs, no. 801039). n.d. is supported by the eth postdoctoral fellowship. t.b.n. is supported by the swiss national science foundation (ambizione project #185778). experiments were performed at the livermore computing facility.
+
+# references
+
+abadi, m., agarwal, a., barham, p., brevdo, e., chen, z., citro, c., corrado, g. s., davis, a., dean, j., devin, m., ghemawat, s., goodfellow, i., harp, a., irving, g., isard, m., jia, y., jozefowicz, r., kaiser, l., kudlur, m., levenberg, j., mané, d., monga, r., moore, s., murray, d., olah, c., schuster, m., shlens, j., steiner, b., sutskever, i., talwar, k., tucker, p., vanhoucke, v., vasudevan, v., viégas, f., vinyals, o., warden, p., wattenberg, m., wicke, m., yu, y., and zheng, x. tensorflow: large-scale machine learning on heterogeneous systems, 2015. url https://www.tensorflow.org/.  
+akiba, t., suzuki, s., and fukuda, k. extremely large minibatch sgd: training resnet-50 on imagenet in 15 minutes. in neurips 2017 workshop: deep learning at supercomputer scale, 2017.  
+ba, j. l., kiros, j. r., and hinton, g. e. layer normalization. arxiv preprint arxiv:1607.06450, 2016.  
+baghdadi, r., debbagh, a. n., abdous, k., zohra, b. f., renda, a., frankle, j. e., carbin, m., and amarasinghe, s. tiramisu: a polyhedral compiler for dense and sparse deep learning. in workshop on systems for ml at neurips, 2019.  
+bahdanau, d., cho, k., and bengio, y. neural machine translation by jointly learning to align and translate. in proceedings of the third international conference on learning representations (iclr), 2014.  
+bauer, m., treichler, s., slaughter, e., and aiken, a. legion: expressing locality and independence with logical regions. in proceedings of the international conference on high performance computing, networking, storage and analysis (sc), 2012.  
+bello, i., zoph, b., vaswani, a., shlens, j., and le, q. v. attention augmented convolutional networks. in proceedings of the ieee international conference on computer vision (cvpr), 2019.  
+ben-nun, t. and hoefler, t. demystifying parallel and distributed deep learning: an in-depth concurrency analysis. acm comput. surv., 52(4), 2019.
+
+ben-nun, t., de fine licht, j., ziogas, a. n., schneider, t., and hoefler, t. stateful dataflow multigraphs: a data-centric model for performance portability on heterogeneous architectures. in proceedings of the international conference for high performance computing, networking, storage and analysis (sc), 2019.  
+bondhugula, u., baskaran, m., krishnamoorthy, s., ramanujam, j., rountev, a., and sadayappan, p. automatic transformations for communication-minimized parallelization and locality optimization in the polyhedral model. in international conference on compiler construction (etaps cc), 2008.  
+bradbury, j., frostig, r., hawkins, p., johnson, m. j., leary, c., maclaurin, d., and wanderman-milne, s. jax: com-  
+posable transformations of python+numpy programs, 2018. url http://github.com/google/jax.  
+bronstein, m. m., bruna, j., lecun, y., szlam, a., and vandergheynst, p. geometric deep learning: going beyond euclidean data. ieee signal processing magazine, 34 (4), 2017.  
+brown, t. b., mann, b., ryder, n., subbiah, m., kaplan, j., dhariwal, p., neelakantan, a., shyam, p., sastry, g., askell, a., et al. language models are few-shot learners. arxiv preprint arxiv:2005.14165, 2020.  
+buchlovsky, p., budden, d., grewe, d., jones, c., aslanides, j., besse, f., brock, a., clark, a., colmenarejo, s. g., pope, a., et al. tf-replicator: distributed machine learning for researchers. arxiv preprint arxiv:1902.00465, 2019.  
+cerebras. cerebras cs-1 product overview, 2020. url https://www.cerebras.net/product.  
+chellapilla, k., puri, s., and simard, p. high performance convolutional neural networks for document processing. in tenth international workshop on frontiers in handwriting recognition, 2006.  
+chen, t., xu, b., zhang, c., and guestrin, c. training deep nets with sublinear memory cost. arxiv preprint arxiv:1604.06174, 2016.  
+chen, t., moreau, t., jiang, z., zheng, l., yan, e., shen, h., cowan, m., wang, l., hu, y., ceze, l., guestrin, c., and krishnamurthy, a. tvm: an end-to-end optimization stack for deep learning. in 13th usenix symposium on operating systems design and implementation (osdi), 2018.  
+chen, x., eversole, a., li, g., yu, d., and seide, f. pipelined back-propagation for context-dependent deep neural networks. in thirteenth annual conference of the international speech communication association (interspeech), 2012.
+
+chetlur, s., woolley, c., vandermersch, p., cohen, j., tran, j., catanzaro, b., and shelhamer, e. cudnn: efficient primitives for deep learning. arxiv preprint arxiv:1410.0759, 2014.  
+child, r., gray, s., radford, a., and sutskever, i. generating long sequences with sparse transformers. arxiv preprint arxiv:1904.10509, 2019.  
+chilimbi, t., suzue, y., apacible, j., and kalyanaraman, k. project adam: building an efficient and scalable deep learning training system. in 11th usenix symposium on operating systems design and implementation (osdi), 2014.  
+cho, k., van merrienboer, b., gulcehre, c., bahdanau, d., bougares, f., schwenk, h., and bengio, y. learning phrase representations using rnn encoder-decoder for statistical machine translation. in proceedings of the 2014 conference on empirical methods in natural language processing (emnlp), 2014.  
+coates, a., huval, b., wang, t., wu, d., catanzaro, b., and andrew, n. deep learning with cots hpc systems. in international conference on machine learning (icml), 2013.  
+cordonnier, j.-b., loukas, a., and jaggi, m. on the relationship between self-attention and convolutional layers. in proceedings of the eighth international conference on learning representations (iclr), 2020.  
+correia, g. m., niculae, v., and martins, a. f. adaptively sparse transformers. in proceedings of the 2019 conference on empirical methods in natural language processing and the 9th international joint conference on natural language processing (emnlp-ijcnlp), 2019.  
+cypers, s., bansal, a. k., bhiwandiwalla, a., bobba, j., brookhart, m., chakraborty, a., constable, w., convey, c., cook, l., kanawi, o., et al. intel ngraph: an intermediate representation, compiler, and executor for deep learning. arxiv preprint arxiv:1801.08058, 2018.  
+dai, z., yang, z., yang, y., carbonell, j., le, q. v., and salakhutdinov, r. transformer-xl: attentive language models beyond a fixed-length context. in proceedings of the 57th annual meeting of the association for computational linguistics (acl), 2019.  
+dean, j., corrado, g., monga, r., chen, k., devin, m., mao, m., ranzato, m., senior, a., tucker, p., yang, k., et al. large scale distributed deep networks. in advances in neural information processing systems (neurips), 2012.
+
+devlin, j., chang, m.-w., lee, k., and toutanova, k. bert: pre-training of deep bidirectional transformers for language understanding. in proceedings of the 2019 conference of the north american chapter of the association for computational linguistics (naacl), 2019.  
+dong, x., liu, l., zhao, p., li, g., li, j., wang, x., and feng, x. acorns: a framework for accelerating deep neural networks with input sparsity. in 2019 28th international conference on parallel architectures and compilation techniques (pact), 2019.  
+dosovitskiy, a., beyer, l., kolesnikov, a., weissenborn, d., zhai, x., unterthiner, t., dehghani, m., minderer, m., heigold, g., gelly, s., et al. an image is worth 16x16 words: transformers for image recognition at scale. arxiv preprint arxiv:2010.11929, 2020.  
+dryden, n., maruyama, n., benson, t., moon, t., snir, m., and van essen, b. improving strong-scaling of cnn training by exploiting finer-grained parallelism. in 2019 ieee international parallel and distributed processing symposium (ipdps), 2019a.  
+dryden, n., maruyama, n., moon, t., benson, t., snir, m., and van essen, b. channel and filter parallelism for large-scale cnn training. in proceedings of the international conference for high performance computing, networking, storage and analysis (sc), 2019b.  
+elango, v., rubin, n., ravishankar, m., sandanagobalane, h., and grover, v. diesel: dsl for linear algebra and neural net computations on gpus. in proceedings of the 2nd acm sigplan international workshop on machine learning and programming languages, 2018.  
+facebook. caffe2, 2020. url https://caffe2.ai/.  
+frostig, r., johnson, m. j., and leary, c. compiling machine learning programs via high-level tracing. systems for machine learning, 2018.  
+fuhrer, o., chadha, t., hoefer, t., kwasniewski, g., lapillonne, x., leutwyler, d., luthi, d., osuna, c., schar, c., schulthess, t. c., et al. near-global climate simulation at  $1\mathrm{km}$  resolution: establishing a performance baseline on 4888 gpus with cosmo 5.0. geoscientific model development, 11(4), 2018.  
+gholami, a., azad, a., jin, p., keutzer, k., and buluc, a. integrated model, batch, and domain parallelism in training neural networks. in proceedings of the 30th on symposium on parallelism in algorithms and architectures (spaa), 2018.  
+gomez, a. n., ren, m., urtasun, r., and grosse, r. b. the reversible residual network: backpropagation without storing activations. in advances in neural information processing systems (neurips), 2017.
+
+goodfellow, i., bengio, y., and courville, a. deep learning. mit press, 2016. http://www.deeplearningbook.org.  
+google. xla: optimizing compiler for machine learning, 2020. url https://www.tensorflow.org/xla.  
+goyal, p., dollar, p., girshick, r., noordhuis, p., wesolowski, l., kyrola, a., tulloch, a., jia, y., and he, k. accurate, large minibatch sgd: training imagenet in 1 hour. arxiv preprint arxiv:1706.02677, 2017.  
+graves, a. sequence transduction with recurrent neural networks. international conference on machine learning (icml) workshop on representation learning, 2012.  
+grosser, t., größlinger, a., and lengauer, c. polly - performing polyhedral optimizations on a low-level intermediate representation. parallel processing letters, 22(4), 2012.  
+he, k., zhang, x., ren, s., and sun, j. deep residual learning for image recognition. in proceedings of the ieee international conference on computer vision (cvpr), 2016.  
+hochreiter, s. and schmidhuber, j. long short-term memory. neural computation, 9(8), 1997.  
+huang, y., cheng, y., bapna, a., first, o., chen, d., chen, m., lee, h., ngiam, j., le, q. v., wu, y., et al. gpipe: efficient training of giant neural networks using pipeline parallelism. in advances in neural information processing systems (neurips), 2019.  
+jain, p., jain, a., nrusimha, a., gholami, a., abbeel, p., keutzer, k., stoica, i., and gonzalez, j. e. checkmate: breaking the memory wall with optimal tensor rematerialization. in proceedings of the third conference on machine learning and systems (mlsys), 2020.  
+jia, z., padon, o., thomas, j., warszawski, t., zaharia, m., and aiken, a. taso: optimizing deep learning computation with automatic generation of graph substitutions. in proceedings of the 27th acm symposium on operating systems principles (sosp), 2019a.  
+jia, z., thomas, j., warszawski, t., gao, m., zaharia, m., and aiken, a. optimizing dnn computation with relaxed graph substitutions. in proceedings of the 2nd conference on systems and machine learning (sysml), 2019b.  
+jia, z., tillman, b., maggioni, m., and scarpazza, d. p. dissecting the graphcore ipu architecture via microbenchmarking, 2019c.
+
+jia, z., zaharia, m., and aiken, a. beyond data and model parallelism for deep neural networks. in proceedings of the 2nd conference on systems and machine learning (sysml), 2019d.  
+jia-wei, h. and kung, h.-t. i/o complexity: the red-blue pebble game. in proceedings of the thirteenth annual acm symposium on theory of computing, 1981.  
+jouppi, n. p., young, c., patil, n., patterson, d., agrawal, g., bajwa, r., bates, s., bhatia, s., boden, n., borchers, a., et al. in-datacenter performance analysis of a tensor processing unit. in proceedings of the 44th annual international symposium on computer architecture (isca), 2017.  
+kalchbrenner, n. and blunsom, p. recurrent continuous translation models. in proceedings of the 2013 conference on empirical methods in natural language processing (emnlp), 2013.  
+kaplan, j., mccandlish, s., henighan, t., brown, t. b., chess, b., child, r., gray, s., radford, a., wu, j., and amodei, d. scaling laws for neural language models. arxiv preprint arxiv:2001.08361, 2020.  
+keskar, n. s., mccann, b., varshney, l. r., xiong, c., and socher, r. ctrl: a conditional transformer language model for controllable generation. arxiv preprint arxiv:1909.05858, 2019.  
+kitaev, n., kaiser, l., and levskaya, a. reformer: the efficient transformer. in proceedings of the eighth international conference on learning representations (iclr), 2020.  
+krizhevsky, a., sutskever, i., and hinton, g. e. imagenet classification with deep convolutional neural networks. in advances in neural information processing systems (neurips), 2012.  
+lample, g. and charton, f. deep learning for symbolic mathematics. arxiv preprint arxiv:1912.01412, 2019.  
+lan, z., chen, m., goodman, s., gimpel, k., sharma, p., and soricut, r. albert: a lite bert for self-supervised learning of language representations. in proceedings of the seventh international conference on learning representations (iclr), 2019.  
+lattner, c., pienaar, j., amini, m., bondhugula, u., riddle, r., cohen, a., shpeisman, t., davis, a., vasilache, n., and zinenko, o. mlir: a compiler infrastructure for the end of moore's law. arxiv preprint arxiv:2002.11054, 2020.  
+lavin, a. and gray, s. fast algorithms for convolutional neural networks. in proceedings of the ieee conference
+
+on computer vision and pattern recognition (cvpr), 2016.  
+lethin, r. polyhedral optimization of tensorflow computation graphs. in sixth workshop on extreme-scale programming tools (espt), 2017.  
+li, c., yang, y., feng, m., chakradhar, s., and zhou, h. optimizing memory efficiency for deep convolutional neural networks on gpus. in proceedings of the international conference for high performance computing, networking, storage and analysis (sc), 2016.  
+li, y., yu, m., li, s., avestimehr, s., kim, n. s., and schwing, a. pipe-sgd: a decentralized pipelined sgd framework for distributed deep net training. in advances in neural information processing systems (neurips), 2018.  
+li, z., wallace, e., shen, s., lin, k., keutzer, k., klein, d., and gonzalez, j. e. train large, then compress: rethinking model size for efficient training and inference of transformers. arxiv preprint arxiv:2002.11794, 2020.  
+liu, y., ott, m., goyal, n., du, j., joshi, m., chen, d., levy, o., lewis, m., zettlemoyer, l., and stoyanov, v. roberta: a robustly optimized bert pretraining approach. arxiv preprint arxiv:1907.11692, 2019.  
+livermore computing center. lassen, 2020. url https://hpc.llnl.gov/hardware/ platforms/lassen.  
+luong, m.-t., pham, h., and manning, c. d. effective approaches to attention-based neural machine translation. in proceedings of the 2015 conference on empirical methods in natural language processing (emnlp), 2015.  
+mathieu, m., henaff, m., and lecun, y. fast training of convolutional networks through ffts. arxiv preprint arxiv:1312.5851, 2013.  
+maziarka, l., danel, t., mucha, s., rataj, k., tabor, j., and jastrzejbski, s. molecule attention transformer. arxiv preprint arxiv:2002.08264, 2020.  
+micikevicius, p., narang, s., alben, j., diamos, g., elsen, e., garcia, d., ginsburg, b., houston, m., kuchaiev, o., venkatesh, g., et al. mixed precision training. in proceedings of the sixth international conference on learning representations (iclr), 2018.  
+microsoft. deepspeed, 2020a. url deepspeed.ai.  
+microsoft. turing-nlg: a 17-billion-parameter language model by microsoft, 2020b. url https://www.microsoft.com/en-us/research/blog/turing-nlg-a-17-billion-parameter-lang
+
+microsoft. zero & deepspeed: new system optimizations enable training models with over 100 billion parameters, 2020c. url https://www.microsoft.com/en-us/research/blog/zero-deepspeed-new-system-optimizations-enable-tr  
+microsoft. onnx runtime, 2020. url https://microsoft.github.io/onnxruntime/.  
+mikami, h., suganuma, h., u-chupala, p., tanaka, y., and kageyama, y. massively distributed sgd: imagenet/resnet-50 training in a flash. arxiv preprint arxiv:1811.05233, 2018.  
+mikolov, t., chen, k., corrado, g., and dean, j. efficient estimation of word representations in vector space. arxiv preprint arxiv:1301.3781, 2013a.  
+mikolov, t., sutskever, i., chen, k., corrado, g. s., and dean, j. distributed representations of words and phrases and their compositionality. in advances in neural information processing systems (neurips), 2013b.  
+mikolov, t., yih, w.-t., and zweig, g. linguistic regularities in continuous space word representations. in proceedings of the 2013 conference of the north american chapter of the association for computational linguistics (naacl), 2013c.  
+mirhoseini, a., pham, h., le, q. v., steiner, b., larsen, r., zhou, y., kumar, n., norouzi, m., bengio, s., and dean, j. device placement optimization with reinforcement learning. in proceedings of the 34th international conference on machine learning, 2017.  
+narayanan, d., harlap, a., phanishayee, a., seshadri, v., devanur, n. r., ganger, g. r., gibbons, p. b., and zaharia, m. pipedream: generalized pipeline parallelism for cnn training. in proceedings of the 27th acm symposium on operating systems principles (sosp), 2019.  
+nvidia. apex (a pytorch extension), 2020a. url https://nvidia.github.io/apex/.  
+nvidia. cutclass: cuda templates for linear algebra subroutines, 2020b. url https://github.com/nvidia/cutlass.  
+nvidia. nvidia deep learning examples, 2020a. url https://github.com/nvidia/deeplearningexamples.  
+nvidia. nvidia tensorrt, 2020b. url https://developer.nvidia.com/tensorsortr.  
+nvidia. tensorfloat-32 in the a100 gpu accelerates ai training, hpc up to 20x, 2020. url https://blogs.nvidia.com/blog/2020/05/14/aget-emodesdelf-loyatmi32-rqsofti/sion-format.
+
+nvidia ai. a guide to optimizer implementation for bert at scale, 2019. url https://medium.com/nvidia-ai/a-guide-to-optimizer-implementation-fc  
+openai. ai and compute, 2018. url https://openai.com/blog/ai-and-compute/.  
+openai. microsoft invests in and partners with openai to support us building beneficial agi, 2019. url https://openai.com/blog/microsoft/.  
+ott, m., edunov, s., baevski, a., fan, a., gross, s., ng, n., grangier, d., and auli, m. faireq: a fast, extensible toolkit for sequence modeling. in proceedings of naacl-hlt 2019: demonstrations, 2019.  
+oyama, y., ben-nun, t., hoefler, t., and matsuoka, s. accelerating deep learning frameworks with micro-batches. in 2018 ieee international conference on cluster computing (cluster), 2018.  
+parisotto, e., song, h. f., rae, j. w., pascanu, r., gulcehre, c., jayakumar, s. m., jaderberg, m., kaufman, r. l., clark, a., noury, s., et al. stabilizing transformers for reinforcement learning. arxiv preprint arxiv:1910.06764, 2019.  
+parmar, n., vaswani, a., uszkoreit, j., kaiser, l., shazeer, n., ku, a., and tran, d. image transformer. in proceedings of the 35th international conference on machine learning (icml), 2018.  
+parmar, n., ramachandran, p., vaswani, a., bello, i., levskaya, a., and shlens, j. stand-alone self-attention in vision models. in advances in neural information processing systems (neurips), 2019.  
+paszke, a., gross, s., massa, f., lerer, a., bradbury, j., chanan, g., killeen, t., lin, z., gimelshein, n., antiga, l., et al. pytorch: an imperative style, high-performance deep learning library. in advances in neural information processing systems (neurips), 2019.  
+paul g. allen school of computer science & engineering, university of washington, amazon web service ai team, and dmlc open-source community. nnvm compiler: open compiler for ai frameworks, 2017. url https://tvm.apache.org/2017/10/06/ nnvm-compiler-announcement.  
+pytorch team. torchscript, 2020. url https://pytorch.org/docs/stable/jit.html.  
+radford, a., narasimhan, k., salimans, t., and sutskever, i. improving language understanding by generative pre-training, 2018. url https://s3-us-west-2.amazonaws.
+
+com/openai-assetss/research-covers/ language-unsupervised/language_ understanding_paper.pdf. cert-at-scale-8338cc7f45fd.  
+radford, a., wu, j., child, r., luan, d., amodei, d., and sutskever, i. language models are unsupervised multitask learners, 2019. url https://openai.com/blog/better-language-models/.  
+raffel, c., shazeer, n., roberts, a., lee, k., narang, s., matena, m., zhou, y., li, w., and liu, p. j. exploring the limits of transfer learning with a unified text-to-text transformer. arxiv preprint arxiv:1910.10683, 2019.  
+ragan-kelley, j., barnes, c., adams, a., paris, s., durand, f., and amarasinghe, s. halide: a language and compiler for optimizing parallelism, locality, and recomputation in image processing pipelines. acm sigplan notices, 48 (6), 2013.  
+rajbhandari, s., rasley, j., ruwase, o., and he, y. zero: memory optimization towards training a trillion parameter models. arxiv preprint arxiv:1910.02054, 2019.  
+rajpurkar, p., jia, r., and liang, p. know what you don't know: unanswerable questions for squad. in proceedings of the 56th annual meeting of the association for computational linguistics (acl), 2018.  
+rosenfeld, j. s., rosenfeld, a., belinkov, y., and shavit, n. a constructive prediction of the generalization error across scales. in proceedings of the eighth international conference on learning representations (iclr), 2020.  
+rotem, n., fix, j., abdulrasool, s., catron, g., deng, s., dzhabarov, r., gibson, n., hegeman, j., lele, m., levenstein, r., et al. glow: graph lowering compiler techniques for neural networks. arxiv preprint arxiv:1805.00907, 2018.  
+rumelhart, d. e., hinton, g. e., and williams, r. j. learning representations by back-propagating errors. nature, 323(6088), 1986.  
+sabour, s., frosst, n., and hinton, g. e. dynamic routing between capsules. in advances in neural information processing systems (neurips), 2017.  
+sanh, v., debut, l., chaumond, j., and wolf, t. distilbert, a distilled version of bert: smaller, faster, cheaper and lighter. in fifth workshop on energy efficient machine learning and cognitive computing at neurips 2019, 2019.  
+shazeer, n. fast transformer decoding: one write-head is all you need. arxiv preprint arxiv:1911.02150, 2019.
+
+shazeer, n., cheng, y., parmar, n., tran, d., vaswani, a., koanantakool, p., hawkins, p., lee, h., hong, m., young, c., et al. mesh-tensorflow: deep learning for supercomputers. in advances in neural information processing systems (neurips), 2018.  
+shen, t., zhou, t., long, g., jiang, j., and zhang, c. bi-directional block self-attention for fast and memory-efficient sequence modeling. in proceedings of the sixth international conference on learning representations (iclr), 2018.  
+shoeybi, m., patwary, m., puri, r., legresley, p., casper, j., and catanzaro, b. megatron-lm: training multi-billion parameter language models using gpu model parallelism. arxiv preprint arxiv:1909.08053, 2019.  
+sivathanu, m., chugh, t., singapuram, s. s., and zhou, l. astra: exploiting predictability to optimize deep learning. in proceedings of the twenty-fourth international conference on architectural support for programming languages and operating systems (asplos), 2019.  
+srivastava, n., hinton, g., krizhevsky, a., sutskever, i., and salakhutdinov, r. dropout: a simple way to prevent neural networks from overfitting. journal of machine learning research (jmlr), 15(1), 2014.  
+steuwer, m., remmelg, t., and dubach, c. lift: a functional data-parallel ir for high-performancegpu code generation. in proceedings of the 2017 international symposium on code generation and optimization (cgo), 2017.  
+strubell, e., ganesh, a., and mccallum, a. energy and policy considerations for deep learning in nlp. in proceedings of the 57th annual meeting of the association for computational linguistics (acl), 2019.  
+sukhbaatar, s., grave, e., bojanowski, p., and joulin, a. adaptive attention span in transformers. in proceedings of the 57th annual meeting of the association for computational linguistics (acl), 2019.  
+sutskever, i., vinyals, o., and le, q. v. sequence to sequence learning with neural networks. in advances in neural information processing systems (neurips), 2014.  
+tay, y., wang, s., tuan, l. a., fu, j., phan, m. c., yuan, x., rao, j., hui, s. c., and zhang, a. simple and effective curriculum pointer-generator networks for reading comprehension over long narratives. in proceedings of the 57th annual meeting of the association for computational linguistics (acl), 2019.  
+tay, y., bahri, d., yang, l., metzler, d., and juan, d.-c. sparse sinkhorn attention. arxiv preprint arxiv:2002.11296, 2020.
+
+truong, l., barik, r., totoni, e., liu, h., markley, c., fox, a., and shpeisman, t. latte: a language, compiler, and runtime for elegant and efficient deep neural networks. in proceedings of the 37th acm sigplan conference on programming language design and implementation (pldi), 2016.  
+unat, d., dubey, a., hoefler, t., shalf, j., abraham, m., bianco, m., chamberlain, b. l., cledat, r., edwards, h. c., finkel, h., fuerlinger, k., hannig, f., jeannot, e., kamil, a., keasler, j., kelly, p. h. j., leung, v., ltaief, h., maruyama, n., newburn, c. j., and pericas, m. trends in data locality abstractions for hpc systems. ieee transactions on parallel and distributed systems (tpds), 28(10), 2017.  
+van essen, b., kim, h., pearce, r., boakye, k., and chen, b. lbann: livermore big artificial neural network hpc toolkit. in proceedings of the workshop on machine learning in high-performance computing environments (mlhpc), 2015.  
+vasilache, n., zinenko, o., theodoridis, t., goyal, p., devito, z., moses, w. s., verdoolaege, s., adams, a., and cohen, a. tensor comprehensions: framework-agnostic high-performance machine learning abstractions. arxiv preprint arxiv:1802.04730, 2018.  
+vaswani, a., shazeer, n., parmar, n., uszkoreit, j., jones, l., gomez, a. n., kaiser, l., and polosukhin, i. attention is all you need. in advances in neural information processing systems (neurips), 2017.  
+venkat, a., rusira, t., barik, r., hall, m., and truong, l. swirl: high-performance many-core cpu code generation for deep neural networks. the international journal of high performance computing applications, 33(6), 2019.  
+voita, e., talbot, d., moiseev, f., sennrich, r., and titov, i. analyzing multi-head self-attention: specialized heads do the heavy lifting, the rest can be pruned. in proceedings of the 57th annual meeting of the association for computational linguistics (acl), 2019.  
+wang, a., singh, a., michael, j., hill, f., levy, o., and bowman, s. r. glue: a multi-task benchmark and analysis platform for natural language understanding. in proceedings of the 2018 emnlp workshop blackboxnlp: analyzing and interpreting neural networks for nlp, 2018.  
+wang, a., pruksachatkun, y., nangia, n., singh, a., michael, j., hill, f., levy, o., and bowman, s. superglue: a stickier benchmark for general-purpose language understanding systems. in advances in neural information processing systems (neurips), 2019.
+
+wei, r., schwartz, l., and adve, v. dlvm: a modern compiler infrastructure for deep learning systems. in proceedings of the sixth international conference on learning representations - workshop track (iclr), 2018.  
+wiggers, k. openai's massive gpt-3 model is impressive, but size isn't everything, 2020. url https://venturebeat.com/2020/06/01/ ai-machine-learning-openai-gpt-3-size-isnt-ismt-everything/.  
+wolf, t., debut, l., sanh, v., chaumont, j., delangue, c., moi, a., cistac, p., rault, t., louf, r., funtowicz, m., and brew, j. huggingface's transformers: state-of-the-art natural language processing. arxiv preprint arxiv:1910.03771, 2019.  
+yang, z., dai, z., yang, y., carbonell, j., salakhutdinov, r. r., and le, q. v. xlnet: generalized autoregressive pretraining for language understanding. in advances in neural information processing systems (neurips), 2019.  
+yeh, c.-f., mahadeokar, j., kalgaonkar, k., wang, y., le, d., jain, m., schubert, k., fuegen, c., and seltzer, m. l. transformer-transducer: end-to-end speech recognition with self-attention. arxiv preprint arxiv:1910.12977, 2019.  
+ying, c., kumar, s., chen, d., wang, t., and cheng, y. image classification at supercomputer scale. in neurips systems for ml workshop, 2018.  
+you, y., zhang, z., hsieh, c.-j., demmel, j., and keutzer, k. imagenet training in minutes. in proceedings of the 47th international conference on parallel processing (icpp), 2018.  
+you, y., li, j., reddi, s., hseu, j., kumar, s., bhojanapalli, s., song, x., demmel, j., keutzer, k., and hsieh, c.-j. large batch optimization for deep learning: training bert in 76 minutes. in proceedings of the eighth international conference on learning representations (iclr), 2020.  
+ziogas, a. n., ben-nun, t., fernandez, g. i., schneider, t., luisier, m., and hoefler, t. a data-centric approach to extreme-scale ab initio dissipative quantum transport simulations. in proceedings of the international conference for high performance computing, networking, storage and analysis (sc), 2019.
+
+# a supplementary material
+
+# a.1 additional background
+
+we use the standard data-parallel approach to training, wherein a mini-batch of samples is partitioned among many gpus. during backpropagation, we distinguish between two stages: computing the gradients with respect to a layer's input  $(dx)$ , and computing the gradients with respect to the layer's parameters  $(dw)$ . note that the second stage is relevant only for layers with learnable parameters.
+
+# a.1.1 transformers
+
+the transformer architecture (vaswani et al., 2017), originally developed for machine translation, is a neural network architecture for sequence transduction, or transforming an input sequence into an output sequence. transformers build upon a long sequence of work within natural language processing, most relevantly beginning with word embeddings (mikolov et al., 2013c;a;b), neural machine translation (kalchbrenner & blunsom, 2013; cho et al., 2014), and sequence-to-sequence learning (sutskever et al., 2014). a key component is attention (bahdanau et al., 2014; luong et al., 2015), which enables a model to learn to focus on particular parts of a sequence.
+
+the transformer makes two key contributions. first, it generalizes attention to multi-head attention, which we discuss below. second, the transformer neglects recurrent or convolutional mechanisms for processing sequences, and relies entirely on attention. critically, this enables significantly more parallelism during training, as the model can process every element of a sequence simultaneously, instead of having a serial dependence on the prior element.
+
+# a.1.2 multi-head attention
+
+multi-head attention (mha) generalizes attention, and uses attention “heads” in parallel to attend to different learned projections of a sequence. we provide python code and an illustration of mha forward propagation in fig. 1.
+
+each attention head is an instance of scaled dot-product attention, with input tensors: queries (q), keys (k), and values (v). conceptually, attention finds values corresponding to the keys closest to the input queries. heads are augmented with learned linear layers that project their inputs into a lower-dimensional space. the three inputs are first multiplied by weight tensors wq, wk, wv, respectively, as a learned input projection (we use einstein-notation sums, or einsums, for tensor contractions). the query and key tensors are subsequently multiplied together and scaled (stored in beta), followed by applying the softmax operation in order to weight and select the most important results. this is then multiplied with vv to produce the per-head output (gamma). the outputs of all heads are finally concatenated
+
+and linearly projected back to the input dimension size  $(\dot{1})$
+
+the respective dataflow graph (fig. 1b) immediately exposes coarse- (whole graph) and fine-grained (within rectangular nodes) parallelism, as well as data reuse. as every edge represents exact data movement, their characteristics (access sets and movement volume) can be inspected for guided bottlenecks and potential solution analysis.
+
+there are three broad classes of mha, distinguished by their inputs. general attention uses distinct tensors as the queries, keys, and values. encoder/decoder attention uses the same tensor for both keys and values. self-attention uses the same tensor for all three inputs. mha may also have a masking step, which is used during training to prevent a model from "seeing the future" and using information from a later part of a sequence.
+
+# a.1.3 transformer architectures
+
+bert (devlin et al., 2019) is a widely-used transformer for nlp tasks. fig. 2 illustrates the forward and backward pass for a single bert encoder layer. the layer essentially consists of mha (as self-attention) followed by a feedforward neural network (two linear layers with bias and relu activations after the first layer). dropout (srivastava et al., 2014), layer normalization (ba et al., 2016), and residual connections (he et al., 2016) are also used.
+
+transformers also incorporate several other layers that we will not discuss in detail: embedding layers for input sequences and various output layers, depending on the task. other transformer architectures, such as the original transformer and gpt-2/3 (radford et al., 2019; brown et al., 2020) have very similar architectures.
+
+# a.2 fusion implementation
+
+we implement each fused operator as a single custom cuda kernel and specialize it for a specific data layout using templates to maximize opportunities for compiler optimization. to correctly handle data dependencies, if a reduction is the first operator in a fusion kernel, it is implemented with two loops: the first computes the reduction and the second uses it. otherwise, each kernel is implemented as a single loop.
+
+reduction operations in statistical normalizations use a warp allreduce among all threads in a warp, implemented with cuda intrinsics. if the number of elements to be reduced exceeds the warp size, we perform a sequential reduction over smaller chunks first. layout-permuting, we use vectorized loads, stores, and arithmetic within a single thread, and fall back to word-wise implementations otherwise. for dropout operators, which must generate a random mask, we use curand for random number generation.
+
+after fusion, we have the following fused element-wise and
+
+normalization operations. fig. 3 illustrates several cases.
+
+- aib: attention input bias.  
+baob: backward attention output bias.  
+baib: backward attention input bias.  
+- sm: softmax with scaling and dropout.  
+- brd: bias, relu, and dropout.  
+- bdrln: bias, dropout, residual, and layernorm.  
+bsb: backward layernorm scale and bias.  
+- blnrd: backward layernorm dx and dropout, saving the intermediate result for the residual connection.  
+- bdrb: backward dropout, relu, and bias.  
+- ebsb: backward residual and layernorm scale and bias.  
+- bs: backward dropout and softmax with scaling.  
+bei: backward encoder input residual connection.
+
+# a.3 evaluation details
+
+all our results were produced on the lassen supercomputer (livermore computing center, 2020), which consists of 795 nodes, each with two ibm power9 cpus and four nvidia v100 gpus with nvlink2 and 16 gb of memory. we use cuda 10.1.243 and gcc 7.3.1 to build our code. for comparison, we use cudnn 7.6.5, pytorch 1.6.0 (pt) (built-in transformer implementation), tensorflow 2.1 from ibm powerai with xla enabled (transformer adapted from wolf et al. (2019)) (tf+xla), and a recent development version of deepspeed (ds). unless noted, our results use mixed-precision training (micikevicius et al., 2018), with fp16 data and accumulations performed at fp32. in pytorch, we use apex (nvidia, 2020a) for mixed-precision; in tensorflow and deepspeed, we use the built-in automatic mixed-precision. results are the mean of 100 measurements. when we compute the percent of peak performance, we use the 125 gflop/s tensor core peak on our v100s for tensor contraction operations, and the 31.4 gflop/s half-precision peak for other operations.
+
+# a.4 flop analysis
+
+tab. a.1 presents our complete flop analysis. see sec. 4.1 for details.
+
+# a.5 additional fusion opportunities
+
+# a.5.1 fusing into tensor contractions
+
+because cublas does not support fusing arbitrary operators into (batched) mmms, we evaluated cutlass (nvidia, 2020b) version 2.1 as an alternative, which does support fusing element-wise operators. we conducted a simple benchmark comparing cublas with a separate bias kernel to cutlass for the first linear layer of bert. we found that the batched mmm in cutlass is approximately  $40~\mu \mathrm{s}$  slower than cublas. the reduction in runtime by fusing the bias is less than this. hence, we only consider cublas for
+
+tensor contractions. cublas does support simple scaling operations, which we use to implement the scaling for the scaled softmax operator.
+
+# a.5.2 algebraic fusion
+
+there is an additional opportunity for fusion among certain tensor contraction operators. using domain knowledge and the dataflow graph, we can identify some operations that can be combined into a single algebraically equivalent operation. for example, there are several different ways to perform the input projections (batched mmms) in self-attention, since the input queries, keys, and values are the same tensor,  $x$ :
+
+1.  $x$  can be multiplied by each of the projection matrices:  $w^{q}x, w^{k}x$ , and  $w^{v}x$ .  
+2. the  $w^q$  and  $w^k$  matrices can be stacked and two multiplications performed:  $[w^q w^k ]x$  and  $w^{v}x$ . similarly, the  $w^k$  and  $w^v$  matrices can be stacked.  
+3. all three can be stacked:  $\left[\widetilde{q}\widetilde{k}\widetilde{v}\right] = \left[w^{q}w^{k}w^{v}\right]x.$
+
+in backpropagation, the  $dw$  and  $dx$  computations for each projection matrix can be similarly fused:  $x[d\widetilde{q} d\widetilde{k} d\widetilde{v}]$  and  $[w^q w^k w^v][d\widetilde{q} d\widetilde{k} d\widetilde{v}]$ , respectively.
+
+there are different tradeoffs to these approaches, which must be determined empirically. performing separate mmms may enable task parallelism. on the other hand, this stacking enables data reuse, since  $x$  is used only once.
+
+tab. a.2 presents results for each of these cases. fully fusing this batched mmm performs best. unfortunately, cublas launches kernels that utilize the entire gpu, so task parallelism is not profitable. this example can also be adapted to fuse keys and values in encoder/decoder attention.
+
+# a.6 end-to-end training
+
+we conducted end-to-end training of bert-large on the wikipedia data corpus. we adapted the bert implementation from the nvidia deep learning examples (nvidia, 2020a) and performed training on lassen using 32 nodes with 128 gpus. the training consists of two phases, one using a sequence length of 128 and the other with a sequence length of 512.
+
+pretraining loss versus time is presented in fig. a.1. we achieve a  $1.18 \times$  speedup in phase 1 and a  $1.22 \times$  speedup in phase 2, for an overall speedup of  $1.19 \times$ . note this is less than our  $1.30 \times$  speedup over pytorch for an encoder layer for several reasons: the nvidia implementation includes some further optimizations, such as fused layer normalization kernels; there are additional operations (e.g., embedding layers, loss functions) that we do not currently optimize; and overheads from distributed training and data loading.
+
+table a.1. flop analysis for bert encoder layer.  $\triangle$  - tensor contraction,  $\square$  - statistical normalization,  $\bigcirc$  - element-wise. mha operators are filled black. we bold whichever is greater,  $\%$  peak (compute-bound) or mue (memory-bound). the speedup is computed for kernels in isolation, overall speedup may be different due to measurement overheads.  
+
+<table><tr><td rowspan="2">operator</td><td colspan="2">input</td><td colspan="2">output</td><td colspan="3">pytorch</td><td colspan="3">ours</td><td rowspan="2">speedup</td><td rowspan="2">kernel</td></tr><tr><td>gflop</td><td>(1e6)</td><td>(1e6)</td><td>gflop</td><td>time (μs)</td><td>% peak</td><td>time (μs)</td><td>% peak</td><td>mue</td><td>speedup</td></tr><tr><td rowspan="19">forward ▲q, k, v</td><td>25.770</td><td>7.34</td><td>12.58</td><td>25.782</td><td>333</td><td>56.2</td><td>306</td><td>61.2</td><td>12</td><td>1.08</td><td>—</td><td></td></tr><tr><td>0.013</td><td>12.59</td><td>12.58</td><td>0.025</td><td>90</td><td>0.4</td><td>66</td><td>0.5</td><td>78</td><td>1.35</td><td>aib</td><td></td></tr><tr><td>4.295</td><td>8.39</td><td>33.55</td><td>4.329</td><td>189</td><td>16.5</td><td>143</td><td>21.8</td><td>50</td><td>1.32</td><td>—</td><td></td></tr><tr><td>0.201</td><td>33.55</td><td>100.66</td><td>0.956</td><td>453</td><td>1.3</td><td>433</td><td>1.3</td><td>32</td><td>1.04</td><td>sm</td><td></td></tr><tr><td>4.295</td><td>37.75</td><td>4.19</td><td>8.598</td><td>142</td><td>21.9</td><td>160</td><td>19.4</td><td>6</td><td>0.88</td><td>—</td><td></td></tr><tr><td>8.590</td><td>5.24</td><td>4.19</td><td>8.686</td><td>136</td><td>45.9</td><td>120</td><td>52</td><td>10</td><td>1.13</td><td>—</td><td></td></tr><tr><td>0.004</td><td>4.20</td><td>4.19</td><td>0.008</td><td>34</td><td>0.4</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td>0.004</td><td>4.19</td><td>8.39</td><td>0.014</td><td>37</td><td>0.3</td><td>102</td><td>0.1</td><td>42</td><td>1.68</td><td>drln</td><td></td></tr><tr><td>0.004</td><td>8.39</td><td>4.19</td><td>0.008</td><td>36</td><td>0.3</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td>0.029</td><td>4.20</td><td>4.19</td><td>0.052</td><td>63</td><td>1.3</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td>34.360</td><td>8.39</td><td>16.78</td><td>34.377</td><td>451</td><td>55.4</td><td>402</td><td>62.1</td><td>12</td><td>1.12</td><td>—</td><td></td></tr><tr><td>0.017</td><td>16.78</td><td>16.78</td><td>0.034</td><td>116</td><td>0.4</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td>—</td><td>16.78</td><td>16.78</td><td>—</td><td>112</td><td>0</td><td>183</td><td>0.3</td><td>76</td><td>1.90</td><td>brd</td><td></td></tr><tr><td>0.017</td><td>16.78</td><td>33.55</td><td>0.052</td><td>120</td><td>0.4</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td>34.360</td><td>20.97</td><td>4.19</td><td>34.456</td><td>449</td><td>55.6</td><td>369</td><td>67.6</td><td>6</td><td>1.21</td><td>—</td><td></td></tr><tr><td>0.004</td><td>4.20</td><td>4.19</td><td>0.008</td><td>35</td><td>0.3</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td>0.004</td><td>4.19</td><td>8.39</td><td>0.014</td><td>37</td><td>0.3</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td>0.004</td><td>8.39</td><td>4.19</td><td>0.008</td><td>37</td><td>0.3</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td>0.029</td><td>8.39</td><td>4.19</td><td>0.052</td><td>63</td><td>1.3</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td rowspan="31">backward ▲layernorm dw</td><td>0.017</td><td>8.39</td><td>&lt;0.01</td><td>0.021</td><td>184</td><td>0.3</td><td>150</td><td>0.3</td><td>6</td><td>1.22</td><td>bsb</td><td></td></tr><tr><td>0.038</td><td>8.40</td><td>4.19</td><td>0.064</td><td>78</td><td>1.4</td><td>71</td><td>1.5</td><td>37</td><td>1.58</td><td>blnrd</td><td></td></tr><tr><td>0.004</td><td>8.39</td><td>4.19</td><td>0.008</td><td>34</td><td>0.4</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td>34.360</td><td>8.39</td><td>16.78</td><td>34.377</td><td>427</td><td>58.4</td><td>414</td><td>60.3</td><td>5</td><td>1.03</td><td>—</td><td></td></tr><tr><td>34.360</td><td>20.97</td><td>4.19</td><td>34.389</td><td>424</td><td>58.9</td><td>378</td><td>66</td><td>13</td><td>1.11</td><td>—</td><td></td></tr><tr><td>0.004</td><td>4.19</td><td>&lt;0.01</td><td>0.005</td><td>24</td><td>0.5</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td>0.004</td><td>33.55</td><td>16.78</td><td>0.034</td><td>129</td><td>0.4</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td>—</td><td>33.55</td><td>16.78</td><td>—</td><td>166</td><td>0</td><td>362</td><td>&lt;0.1</td><td>38</td><td>1.05</td><td>bdrb</td><td></td></tr><tr><td>0.017</td><td>16.78</td><td>&lt;0.01</td><td>0.021</td><td>61</td><td>0.8</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td>34.360</td><td>20.97</td><td>4.19</td><td>34.389</td><td>417</td><td>59.9</td><td>398</td><td>62.7</td><td>6</td><td>1.04</td><td>—</td><td></td></tr><tr><td>34.360</td><td>20.97</td><td>4.19</td><td>34.456</td><td>437</td><td>57.2</td><td>372</td><td>67.2</td><td>6</td><td>1.17</td><td>—</td><td></td></tr><tr><td>0.004</td><td>8.39</td><td>4.19</td><td>0.008</td><td>36</td><td>0.3</td><td>250</td><td>&lt;0.1</td><td>17</td><td>0.89</td><td>ebsb</td><td></td></tr><tr><td>0.017</td><td>8.39</td><td>&lt;0.01</td><td>0.021</td><td>186</td><td>0.3</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td>0.038</td><td>8.40</td><td>4.19</td><td>0.064</td><td>80</td><td>1.4</td><td></td><td></td><td></td><td></td><td></td><td></td></tr><tr><td>0.004</td><td>8.39</td><td>4.19</td><td>0.008</td><td>34</td><td>0.4</td><td>69</td><td>1.6</td><td>37</td><td>1.64</td><td>blnrd</td><td></td></tr><tr><td>0.004</td><td>4.19</td><td>&lt;0.01</td><td>0.005</td><td>23</td><td>0.5</td><td>38</td><td>0.3</td><td>22</td><td>0.60</td><td>baob</td><td></td></tr><tr><td>8.590</td><td>4.33</td><td>4.19</td><td>8.637</td><td>131</td><td>47.6</td><td>119</td><td>52.2</td><td>10</td><td>1.09</td><td>—</td><td></td></tr><tr><td>8.590</td><td>8.39</td><td>1.05</td><td>8.686</td><td>136</td><td>45.9</td><td>113</td><td>54.8</td><td>5</td><td>1.19</td><td>—</td><td></td></tr><tr><td>4.295</td><td>8.39</td><td>33.55</td><td>8.598</td><td>136</td><td>22.8</td><td>147</td><td>21.2</td><td>7</td><td>0.93</td><td>—</td><td></td></tr><tr><td>4.295</td><td>67.11</td><td>33.55</td><td>4.329</td><td>188</td><td>16.6</td><td>123</td><td>25.2</td><td>8</td><td>1.52</td><td>—</td><td></td></tr><tr><td>0.168</td><td>12.58</td><td>4.19</td><td>0.214</td><td>790</td><td>0.6</td><td>426</td><td>1.1</td><td>49</td><td>1.85</td><td>bs</td><td></td></tr><tr><td>4.295</td><td>37.75</td><td>4.19</td><td>4.299</td><td>135</td><td>23.1</td><td>155</td><td>20</td><td>7</td><td>0.86</td><td>—</td><td></td></tr><tr><td>4.295</td><td>37.75</td><td>4.19</td><td>8.598</td><td>139</td><td>22.3</td><td>115</td><td>26.9</td><td>9</td><td>1.20</td><td>—</td><td></td></tr><tr><td>25.770</td><td>15.73</td><td>4.19</td><td>25.799</td><td>344</td><td>54.4</td><td>274</td><td>68.2</td><td>6</td><td>1.25</td><td>—</td><td></td></tr><tr><td>25.770</td><td>20.46</td><td>1.05</td><td>25.911</td><td>329</td><td>57</td><td>293</td><td>64</td><td>6</td><td>1.12</td><td>—</td><td></td></tr><tr><td>0.013</td><td>12.58</td><td>&lt;0.01</td><td>0.016</td><td>52</td><td>0.7</td><td>39</td><td>0.9</td><td>66</td><td>1.32</td><td>baib</td><td></td></tr><tr><td>0.004</td><td>8.39</td><td>4.19</td><td>0.008</td><td>35</td><td>0.3</td><td>31</td><td>0.4</td><td>83</td><td>1.14</td><td>bei</td><td></td></tr><tr><td>335.007</td><td>—</td><td>—</td><td>348.698</td><td>4951</td><td>43.1</td><td>4411</td><td>48.5</td><td>—</td><td>1.12</td><td></td><td></td></tr><tr><td>0.575</td><td>—</td><td>—</td><td>1.492</td><td>2063</td><td>0.9</td><td>1591</td><td>0.6</td><td>—</td><td>1.29</td><td></td><td></td></tr><tr><td>0.105</td><td>—</td><td>—</td><td>0.239</td><td>1096</td><td>0.3</td><td>735</td><td>0.1</td><td>—</td><td>1.49</td><td></td><td></td></tr><tr><td>335.687</td><td>—</td><td>—</td><td>350.429</td><td>8110</td><td>31.1</td><td>6739</td><td>35</td><td>—</td><td>1.20</td><td></td><td></td></tr></table>
+
+table a.2. algebraic fusion for mha q/k/v (μs).  
+
+<table><tr><td></td><td>unfused</td><td>qk fused</td><td>qkv fused</td></tr><tr><td>forward</td><td>345</td><td>294</td><td>275</td></tr><tr><td>backward</td><td>342</td><td>312</td><td>291</td></tr></table>
+
+![](images/032cbc98f0f8b2ea866b33c97223b5dc23f2ce75dc7d0ce187ba7e649a069c10.jpg)  
+figure a.1. pretraining loss and time curves for bert.
+
+# a.7 additional related work
+
+there has been significant work optimizing both transformers in particular and deep learning in general. for a comprehensive overview, see ben-nun & hoefler (2019). to help guide training regimes for transformers, recent work has provided empirical recommendations on model size, batch size, and so on (li et al., 2020; kaplan et al., 2020; rosenfeld et al., 2020). many of the subsequent techniques we review are complementary to our work.
+
+most directly relevant are other approaches specifically to accelerate transformer training. distributed-memory techniques, such as zero (rajbhandari et al., 2019), megatron (shoeybi et al., 2019), and mesh-tensorflow (shazeer et al., 2018) scale training to many gpus to accelerate it. mesh-tensorflow also presents a classification of operators similar to ours. large batches have also been used to accelerate training via lamb (you et al., 2020) or nvlamb (nvidia ai, 2019). none of these directly address the performance of a single gpu as done in this paper. deepspeed (microsoft, 2020a), which we compare with in section 6.3, is closest to our work, but performs all optimizations and layout selections manually.
+
+transformer architectures to enable improved training have also been the subject of significant recent work. albert (lan et al., 2019) used a combination of weight sharing and factorized embedding layers to reduce memory requirements; however, compute times are unaffected. transformer-xl (dai et al., 2019) caches prior hidden states to learn long sequences. revnets (gomez et al., 2017), a
+
+variant of resnets which allow activations to be reconstructed during backpropagation, have been applied to transformers. notably, reformer (kitaev et al., 2020) combines reversible residual layers with locality-sensitive hashing to improve the efficiency of multi-head attention. sparsity optimizations for attention (bahdanau et al., 2014; luong et al., 2015; shen et al., 2018; parmar et al., 2018; tay et al., 2019; child et al., 2019; correia et al., 2019; sukhbaatar et al., 2019; tay et al., 2020) reduce memory and compute requirements. we view these as orthogonal to our work: the same principles of data-flow analysis can be applied to optimize for sparsity and reuse.
+
+there has also been much work on optimizing deep learning in general. many frameworks provide implementations of transformers or their components, such as pytorch (paszke et al., 2019), tensorflow (abadi et al., 2015), cudnn (chetlur et al., 2014), and others built atop these (ott et al., 2019; wolf et al., 2019). optimizing frameworks can also be applied to transformers (google, 2020; frostig et al., 2018; bradbury et al., 2018; pytorch team, 2020; rotem et al., 2018; jia et al., 2019d;b;a; chen et al., 2018; paul g. allen school of computer science & engineering, university of washington et al., 2017; sivathanu et al., 2019; mirhoseini et al., 2017; cyphers et al., 2018; baghdadi et al., 2019; vasilache et al., 2018; lethin, 2017; wei et al., 2018; truong et al., 2016; venkat et al., 2019; dong et al., 2019; elango et al., 2018). none of these frameworks provide all the optimizations or the systematic study of data movement and its impact on performance. we have specifically compared against some of the most popular production frameworks: pytorch, tensorflow with xla, and cudnn. beyond these, taso (jia et al., 2019a) targets similar optimizations to ours by using graph substitutions, but considers only inference and does not exhaustively explore the search space.
+
+other optimizations, including model parallelism (van essen et al., 2015; jia et al., 2019d; gholami et al., 2018; dean et al., 2012; chilimbi et al., 2014; shazeer et al., 2018; buchlovsky et al., 2019), pipeline parallelism (chen et al., 2012; li et al., 2018; narayanan et al., 2019; huang et al., 2019), microbatching (oyama et al., 2018), and recomputation for memory reduction (chen et al., 2016; jain et al., 2020) are all also applicable. communication can also be a major bottleneck for training transformers, due to the large model size (shoeybi et al., 2019; shazeer et al., 2018). frameworks for inference, including tensorrt (nvidia, 2020b), caffe2 (facebook, 2020), and the onnx runtime (microsoft, 2020), all help to enable a suite of optimizations primarily applicable during inference. pruning (shazeer, 2019; voita et al., 2019) and distillation (sanh et al., 2019) has also been used to accelerate inference.
+
+neural architecture-specific optimizations have a long his
+
+tory outside of transformers, and have primarily targeted cnns (krizhevsky et al., 2012; coates et al., 2013; goyal et al., 2017; akiba et al., 2017; you et al., 2018; mikami et al., 2018; ying et al., 2018; dryden et al., 2019a,b). notably, li et al. (2016) optimized data layouts for convolution.
+
+in general, data movement reduction is a core component of high-level optimization (unat et al., 2017). optimizing compilers, most notably components that specialize in polyhedral programs (grosser et al., 2012; bondhugula et al., 2008), apply loop transformations (e.g., tiling, skewing) that belong to the class of data movement optimization. other white-box approaches for separation of program definition from data optimization passes include halide (ragan-kelley et al., 2013), jax (frostig et al., 2018; bradbury et al., 2018), legion (bauer et al., 2012), lift (steuwer et al., 2017), and mlir (lattner et al., 2020). the data-centric approach proposed here enables user-extensible coarse- and fine-grained data movement optimization via the flat (yet parametric) dataflow graph representation. this allows us to perform and tune complex data layout and fusion transformations that span multiple granularity levels, surpassing the optimization capabilities of the aforementioned tools and achieving state-of-the-art performance.

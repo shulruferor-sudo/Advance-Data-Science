@@ -1,0 +1,629 @@
+# counterfactual data augmentation using locally factored dynamics
+
+silviu pitis, elliot creager, animesh garg
+
+department of computer science, university of toronto, vector institute
+
+{spitis, creager, garg}@cs.toronto.edu
+
+# abstract
+
+many dynamic processes, including common scenarios in robotic control and reinforcement learning (rl), involve a set of interacting subprocesses. though the subprocesses are not independent, their interactions are often sparse, and the dynamics at any given time step can often be decomposed into locally independent causal mechanisms. such local causal structures can be leveraged to improve the sample efficiency of sequence prediction and off-policy reinforcement learning. we formalize this by introducing local causal models (lcms), which are induced from a global causal model by conditioning on a subset of the state space. we propose an approach to inferring these structures given an object-oriented state representation, as well as a novel algorithm for counterfactual data augmentation (coda). coda uses local structures and an experience replay to generate counterfactual experiences that are causally valid in the global model. we find that coda significantly improves the performance of rl agents in locally factored tasks, including the batch-constrained and goal-conditioned settings. $^{1}$
+
+# 1 introduction
+
+high-dimensional dynamical systems are often composed of simple subprocesses that affect one another through sparse interaction. if the subprocesses never interacted, an agent could realize significant gains in sample efficiency by globally factoring the dynamics and modeling each subprocess independently [28, 29]. in most cases, however, the subprocesses do eventually interact and so the prevailing approach is to model the entire process using a monolithic, unfactored model. in this paper, we take advantage of the observation that locally—during the time between their interactions—the subprocesses are causally independent. by locally factoring dynamic processes in this way, we are able to capture the benefits of factorization even when their subprocesses interact on the global scale.
+
+consider a game of billiards, where each ball can be viewed as a separate physical subprocess. predicting the opening break is difficult because all balls are mechanically coupled by their initial placement. indeed, a dynamics model with dense coupling amongst balls may seem sensible when considering the expected outcomes over the course of the game, as each ball has a non-zero chance of colliding with the others. but at any given timestep, interactions between balls are usually sparse.
+
+one way to take advantage of sparse interactions between otherwise disentangled entities is to use a structured state representation together with a graph neural network or other message passing transition model that captures the local interactions [26, 39]. when it is tractable to do so, such architectures can be used to model the world dynamics directly, producing transferable, task-agnostic models. in many cases, however, the underlying processes are difficult to model precisely, and model-free [46, 87] or task-oriented model-based [18, 63] approaches are less biased and exhibit superior performance. in this paper we argue that knowledge of whether or not local interactions
+
+![](images/c0338967caf8628aebf3fdee72bc818c30bfe599902138e299652a6f3ad4a63f.jpg)  
+figure 1: counterfactual data augmentation (coda). given 3 factual samples, knowledge of the local causal structure lets us mix and match factored subprocesses to form counterfactual samples. the first proposal is rejected because one of its factual sources (the blue ball) is not locally factored. the third proposal is rejected because it is not itself factored. the second proposal is accepted, and can be used as additional training data for a reinforcement learning agent.
+
+occur is useful in and of itself, and can be used to generate causally-valid counterfactual data even in absence of a forward dynamics model. in fact, if two trajectories have the same local factorization in their transition dynamics, then under mild conditions we can produce new counterfactually plausible data using our proposed counterfactual data augmentation (coda) technique, wherein factorized subspaces of observed trajectory pairs are swapped (figure 1). this lets us sample from a counterfactual data distribution by stitching together subsamples from observed transitions. since coda acts only on the agent's training data, it is compatible with any agent architecture (including unfactored ones).
+
+in the remainder of this paper, we formalize this data augmentation strategy and discuss how it can improve performance of model-free rl agents in locally factored tasks.
+
+our main contributions are:
+
+1. we define local causal models (lcms), which are induced from a global model by conditioning on a subset of the state space, and show how local structure can simplify counterfactual reasoning.  
+2. we introduce coda as a generalized data augmentation strategy that is able to leverage local factorizations to manufacture unseen, yet causally valid, samples of the environment dynamics. we show that goal relabeling [36, 1] and visual augmentation [2, 46] are instances of coda that use global independence relations and we propose a locally conditioned variant of coda that swaps independent subprocesses to form counterfactual experiences (figure 1).  
+3. using an attention-based method for discovering local causal structure in a disentangled state space, we show that our coda algorithm significantly improves the sample efficiency in standard, batch-constrained, and goal-conditioned reinforcement learning settings.
+
+# 2 local causality in mdps
+
+# 2.1 preliminaries and problem setup
+
+the basic model for decision making in a controlled dynamic process is a markov decision process (mdp), described by tuple  $\langle s, \mathcal{a}, p, r, \gamma \rangle$  consisting of the state space, action space, transition function, reward function, and discount factor, respectively [72, 83]. note that mdps generalize uncontrolled markov processes (set  $a = \emptyset$ ), so that our work applies also to sequential prediction. we denote individual states and actions using lowercase  $s \in s$  and  $a \in \mathcal{a}$ , and variables using the uppercase  $s$  and  $a$  (e.g.,  $s \in \text{range}(s) \subseteq s$ ). a policy  $\pi: s \times \mathcal{a} \to [0,1]$  defines a probability distribution over the agent's actions at each state, and an agent is typically tasked with learning a parameterized policy  $\pi_{\theta}$  that maximizes value  $\mathbb{e}_{p,\pi} \sum_{t} \gamma^{t} r(s_{t}, a_{t})$ .
+
+in most non-trivial cases, the state  $s \in s$  can be described as an object hierarchy together with global context. for instance, this decomposition will emerge naturally in any simulated process or game that is defined using a high-level programming language (e.g., the commonly used atari [7] or minecraft [35] simulators). in this paper we consider mdps with a single, known top-level decomposition of the state space  $s = s^1 \oplus s^2 \oplus \dots \oplus s^n$  for fixed  $n$ , leaving extensions to hierarchical decomposition and
+
+multiple representations [32, 17], dynamic factor count  $n$  [92], and (learned) latent representations [13] to future work. the action space might be similarly decomposed:  $\mathcal{a} = \mathcal{a}^1 \oplus \mathcal{a}^2 \oplus \dots \oplus \mathcal{a}^m$ .
+
+given such state and action decompositions, we may model time slice  $(t,t + 1)$  using a structural causal model (scm)  $\mathcal{m}_t = \langle v_t,u_t,\mathcal{f}\rangle$  ([65], ch. 7) with directed acyclic graph (dag)  $\mathcal{g}$ , where:
+
+-  $v_{t} = \{v_{t[+1]}^{i}\}_{i=0}^{2n+m} = \{s_{t}^{1} \ldots s_{t}^{n}, a_{t}^{1} \ldots a_{t}^{m}, s_{t+1}^{1} \ldots s_{t+1}^{n}\}$  are the nodes (variables) of  $\mathcal{g}$ .  
+-  $u_{t} = \{u_{t[+1]}^{i}\}_{i=0}^{2n+m}$  is a set of noise variables, one for each  $v^{i}$ , determined by the initial state, past actions, and environment stochasticity. we assume that noise variables at time  $t + 1$  are independent from other noise variables:  $u_{t+1}^{i} \perp u_{t[+1]}^{j} \forall i, j$ . the instance  $u = (u^{1}, u^{2}, \ldots, u^{2n+m})$  of  $u_{t}$  denotes an individual realization of the noise variables.  
+-  $\mathcal{f} = \{f^i\}_{i=0}^{2n+m}$  is a set of functions ("structural equations") that map from  $u_{t[+1]}^i \times \mathrm{pa}(v_{t[+1]}^i)$  to  $v_{t[+1]}^i$ , where  $\mathrm{pa}(v_{t[+1]}^i) \subset v_t \setminus v_{t[+1]}^i$  are the parents of  $v_{t[+1]}^i$  in  $\mathcal{g}$ ; hence each  $f^i$  is associated with the set of incoming edges to node  $v_{t[+1]}^i$  in  $\mathcal{g}$ ; see, e.g., figure 2 (center).
+
+note that while  $v_{t}$ ,  $u_{t}$ , and  $\mathcal{m}_t$  are indexed by  $t$  (their distributions change over time), the structural equations  $f^{i}\in \mathcal{f}$  and causal graph  $\mathcal{g}$  represent the global transition function  $p$  and apply at all times  $t$ . to reduce clutter, we drop the subscript  $t$  on  $v$ ,  $u$ , and  $\mathcal{m}$  when no confusion can arise.
+
+critically, we require the set of edges in  $\mathcal{g}$  (and thus the number of inputs to each  $f^i$ ) to be structurally minimal ([67], remark 6.6).
+
+assumption (structural minimality).  $v^{j} \in pa(v^{i})$  if and only if there exists some  $\{u^i, v^{-ij}\}$  with  $u^i \in \text{range}(u^i), v^{-ij} \in \text{range}(v \setminus \{v^i, v^j\})$  and pair  $(v_1^j, v_2^j)$  with  $v_1^j, v_2^j \in \text{range}(v^j)$  such that  $v_1^i = f^i(\{u^i, v^{-ij}, v_1^j\}) \neq f^i(\{u^i, v^{-ij}, v_2^j\}) = v_2^j$ .
+
+intuitively, structural minimality says that  $v^{j}$  is a parent of  $v^{i}$  if and only if setting the value of  $v^{j}$  can have a nonzero direct effect<sup>2</sup> on the child  $v^{i}$  through the structural equation  $f^{i}$ . the structurally minimal representation is unique [67].
+
+given structural minimality, we can think of edges in  $\mathcal{g}$  as representing global causal dependence. the probability distribution of  $s_{t + 1}^{i}$  is fully specified by its parents  $\mathrm{pa}(s_{t + 1}^{i})$  together with its noise variable  $u_{i}$ ; that is, we have  $p(s_{t + 1}^{i}|s_{t},a_{t}) = p(s_{t + 1}^{i}|\mathrm{pa}(s_{t + 1}^{i}))$  so that  $s_{t + 1}^{i}\perp v^{j}|\mathrm{pa}(s_{t + 1}^{i})$  for all nodes  $v^{j}\notin \mathrm{pa}(s_{t + 1}^{i})$ . we call an mdp with this structure a factored mdp [37]. when edges in  $\mathcal{g}$  are sparse, factored mdps admit more efficient solutions than unfactored mdps [28].
+
+# 2.2 local causal models (lcms)
+
+limitations of global models unfortunately, even if states and actions can be cleanly decomposed into several nodes, in most practical scenarios the dag  $\mathcal{g}$  is fully connected (or nearly so): since the  $f^i$  apply globally, so too does structural minimality, and edge  $(s_k^i,s_{k + 1}^j)$  at time  $k$  is present so long as there is a single instance—at any time  $t$ , no matter how unlikely—in which  $s_t^i$  influences  $s_{t + 1}^j$ . in the words of andrew gelman, “there are (almost) no true zeros” [24]. as a result, the factorized causal model  $\mathcal{m}_t$ , based on globally factorized dynamics, rarely offers an advantage over a simpler causal model that treats states and actions as monolithic entities (e.g., [12]).
+
+lcms our key insight is that for each pair of nodes  $(v_{t}^{i}, s_{t+1}^{j})$  with  $v_{t}^{i} \in \mathrm{pa}(s_{t+1}^{j})$  in  $\mathcal{g}$ , there often exists a large subspace  $\mathcal{l}^{(j\perp i)} \subset s \times \mathcal{a}$  for which  $s_{t+1}^{j} \perp v_{t}^{i} \mid \mathrm{pa}(s_{t+1}^{j}) \backslash v_{t}^{i}$ ,  $(s_{t}, a_{t}) \in \mathcal{l}^{(j\perp i)}$ . for example, in case of a two-armed robot (figure 2), there is a large subspace of states in which the two arms are too far apart to influence each other physically. thus, if we restrict our attention to  $(s_{t}, a_{t}) \in \mathcal{l}^{(j\perp i)}$ , we can consider a local causal model  $\mathcal{m}_{t}^{\mathcal{l}^{(j\perp i)}}$  whose local dag  $\mathcal{g}^{\mathcal{l}^{(j\perp i)}}$  is strictly sparser than the global dag  $\mathcal{g}$ , as the structural minimality assumption applied to  $\mathcal{g}^{\mathcal{l}^{(j\perp i)}}$  implies that there is no edge from  $v_{t}^{i}$  to  $s_{t+1}^{j}$ . more generally, for any subspace  $\mathcal{l} \subseteq s \times a$ , we can induce the local causal model (lcm)  $\mathcal{m}_{t}^{\mathcal{l}} = \langle v_{t}^{\mathcal{l}}, u_{t}^{\mathcal{l}}, \mathcal{f}^{\mathcal{l}} \rangle$  with dag  $\mathcal{g}^{\mathcal{l}}$  from the global model  $\mathcal{m}_{t}$  as:
+
+![](images/5b56aa2b0a4db9d09ea6486d1ca8d4b64a2b190e64a8efd3e63978f070b639ff.jpg)  
+figure 2: a two-armed robot (left) might be modeled as an mdp whose state and action spaces decompose into left and right subspaces:  $s = s^l \oplus s^r$ ,  $\mathcal{a} = \mathcal{a}^l \oplus \mathcal{a}^r$ . because the arms can touch, the global causal model (center left) between time steps is fully connected, even though left-to-right and right-to-left connections (dashed red edges) are rarely active. by restricting our attention to the subspace of states in which left and right dynamics are independent we get a local causal model (center right) with two components that can be considered separately for training and inference.
+
+![](images/4a75dea44878794bb89d94b133577dc32b39ca81a728c00996fc89df62421aeb.jpg)
+
+![](images/e04ab3552651efaeb55e47de039ca0fa30ff094250ffb464cd24f622fa23b46f.jpg)
+
+-  $v_{t}^{\mathcal{l}} = \{v_{t[+1]}^{\mathcal{l},i}\}_{i=0}^{2n+m}$ , where  $p(v_{t[+1]}^{\mathcal{l},i}) = p(v_{t[+1]}^{i} \mid (s_{t}, a_{t}) \in \mathcal{l})$ .  
+-  $u_{t}^{\mathcal{l}} = \{u_{t[+1]}^{\mathcal{l},i}\}_{i=0}^{2n+m}$ , where  $p(u_{t[+1]}^{\mathcal{l},i}) = p(u_{t[+1]}^{i}|(s_{t},a_{t})\in \mathcal{l})$ .  
+-  $\mathcal{f}^{\mathcal{l}} = \{f^{\mathcal{l},i}\}_{i=0}^{2n+m}$ , where  $f^{\mathcal{l},i} = f^i|_{\mathcal{l}}$  ( $f^i$  with range of input variables restricted to  $\mathcal{l}$ ). due to structural minimality, the signature of  $f^{\mathcal{l},i}$  may shrink (as the range of the relevant variables is now restricted to  $\mathcal{l}$ ), and corresponding edges in  $\mathcal{g}$  will not be present in  $\mathcal{g}^{\mathcal{l}}$ .<sup>3</sup>
+
+in case of the two-armed robot, conditioning on the arms being far apart simplifies the global dag to a local dag with two connected components (figure 2). this can make counterfactual reasoning considerably more efficient: given a factual situation in which the robot's arms are far apart, we can carry out separate counterfactual reasoning about each arm.
+
+leveraging lcms to see the efficiency therein, consider a general case with global causal model  $\mathcal{m}$ . to answer the counterfactual question, "what might the transition at time  $t$  have looked like if component  $s_{t}^{i}$  had value  $x$  instead of value  $y$ ?", we would ordinarily apply pearl's do-calculus to  $\mathcal{m}$  to obtain submodel  $\mathcal{m}_{\mathrm{do}(s_t^i = x)} = \langle v,u,\mathcal{f}_x\rangle$ , where  $\mathcal{f}_x = \mathcal{f}\setminus f^i\cup \{s_t^i = x\}$  and incoming edges to  $s_{t}^{i}$  are removed from  $\mathcal{g}_{\mathrm{do}(s_t^i = x)}$  [65]. the component distributions at time  $t + 1$  can be computed by reevaluating each function  $f^{j}$  that depends on  $s_{t}^{i}$ . when  $s_{t}^{i}$  has many children (as is often the case in the global  $\mathcal{g}$ ), this requires one to estimate outcomes for many structural equations  $\{f^{j}|v^{j}\in \mathrm{children}(v_{t}^{i})\}$ . but if both the original value of  $s_{t}$  (with  $s_{t}^{i} = y$ ) and its new value (with  $s_{t}^{i} = x$ ) are in the set  $\mathcal{l}$ , the intervention is "within the bounds" of local model  $\mathcal{m}^{\mathcal{l}}$  and we can instead work directly with local submodel  $\mathcal{m}_{\mathrm{do}(s_t^i = x)}^{\mathcal{l}}$  (defined accordingly). the validity of this follows from the definitions: since  $f^{\mathcal{l},j} = f^{j}|_{\mathcal{l}}$  for all of  $s_{t}^{i}$ 's children, the nodes  $v_{t}^{k}$  for  $k\neq i$  at time  $t$  are held fixed, and the noise variables at time  $t + 1$  are unaffected, the distribution at time  $t + 1$  is the same under both models. when  $s_{t}^{i}$  has fewer children in  $\mathcal{m}^{\mathcal{l}}$  than in  $\mathcal{m}$ , this reduces the number of structural equations that need to be considered.
+
+# 3 counterfactual data augmentation
+
+we hypothesize that local causal models will have several applications, and potentially lead to improved agent designs, algorithms, and interpretability. in this paper we focus on improving off-policy learning in rl by exploiting causal independence in local models for counterfactual data augmentation (coda). coda augments real data by making counterfactual modifications to a subset of the causal factors at time  $t$ , leaving the rest of the factors untouched. following the logic outlined in the subsection 2.2, this can be understood as manufacturing "fake" data samples using the counterfactual model  $\mathcal{m}_{\mathrm{do}(s_t^{i\dots j} = x)}^{[\mathcal{l}]}$ , where we modify the causal factors  $s_{t}^{i\dots j}$  and resample their children. while this is always possible using a model-based approach if we have good models of the structural equations, it is particularly nice when the causal mechanisms are independent, as we can do counterfactual reasoning directly by reusing subsamples from observed trajectories.
+
+![](images/08a5b1086d3a079f92fb2c69d7e06772f3367d3acd7f237f3cb316eb6ac8582b.jpg)  
+(a) goal relabeling
+
+![](images/4a8b50ed86a23c1984fe61490c5b5e28c11f31482538bce504a03d478deedf58.jpg)  
+(b) visual augmentation
+
+![](images/1f455d88e712ff6e726e311521864e699096bd9c772850994a84e80a95f32eca.jpg)  
+(c) dyna (model-based)  
+figure 3: four instances of coda; orange nodes are relabeled, noise variables omitted for clarity. first: goal relabeling [36], including her [1], augments transitions with counterfactual goals. second: visual feature augmentation [2, 46] uses domain knowledge to change visual features  $s_{t}^{v}$  (such as textures, lighting, and camera positions) that the designer knows do not impact the physical state  $s_{t + 1}^{p}$ . third: dyna [82], including mbpo [34], augments real states with new actions and resamples the next state using a learned dynamics model. fourth (ours): given two transitions that share local causal structures, we propose to swap connected components to form new transitions.
+
+![](images/4ab8cb060ff1f5f25cf299bf797b8110bb974fa457f3856b3f7c0fa8cd54ecec.jpg)  
+(d) counterfactual data augmentation by swapping locally independent subspaces (ours)
+
+definition. the causal mechanisms represented by subgraphs  $\mathcal{g}_i, \mathcal{g}_j \subset \mathcal{g}$  are independent when  $\mathcal{g}_i$  and  $\mathcal{g}_j$  are disconnected in  $\mathcal{g}$ .
+
+when  $\mathcal{g}$  is divisible into two (or more) connected components, we can think of each subgraph as an independent causal mechanism that can be reasoned about separately.
+
+existing data augmentation techniques can be interpreted as specific instances of coda (figure 3). for example, goal relabeling [36], as used in hindsight experience replay (her) [1] and q-learning for reward machines [33], exploits the independence of the goal dynamics  $g_{t} \mapsto g_{t+1}$  (identity map) and the next state dynamics  $s_{t} \times a_{t} \mapsto s_{t+1}$  in order to relabel the goal variable  $g_{t}$  with a counterfactual goal. while the goal relabeling is done model-free, we typically assume knowledge of the goal-based reward mechanism  $g_{t} \times s_{t} \times a_{t} \times s_{t+1} \mapsto r_{t+1}$  to relabel the reward, ultimately mixing model-free and model-based reasoning. similarly, visual feature augmentation, as used in reinforcement learning from pixels [46, 41] and sim-to-real transfer [2], exploits the independence of the physical dynamics  $s_{t}^{p} \times a_{t} \mapsto s_{t+1}^{p}$  and visual feature dynamics  $s_{t}^{v} \mapsto s_{t+1}^{v}$  such as textures and camera position, assumed to be static ( $s_{t+1}^{v} = s_{t}^{v}$ ), to counterfactually augment visual features. both goal relabeling and visual data augmentation rely on global independence relationships.
+
+we propose a novel form of known, particularly, we observe that whenever an environment transition is within the bounds of some local model  $\mathcal{m}^{\mathcal{l}}$  whose graph  $\mathcal{g}^{\mathcal{l}}$  has the locally independent causal mechanism  $\mathcal{g}_i$  as a disconnected subgraph (note:  $\mathcal{g}_i$  itself need not be connected), that transition contains an unbiased sample from  $\mathcal{g}_i$ . thus, given two transitions in  $\mathcal{l}$ , we may mix and match the samples of  $\mathcal{g}_i$  to generate counterfactual data, so long as the resulting transitions are themselves in  $\mathcal{l}$ .
+
+remark 3.1. how much data can we generate using our coda algorithm? if we have  $n$  independent samples from subspace  $\mathcal{l}$  whose graph  $\mathcal{g}^{\mathcal{l}}$  has  $m$  connected components, we have  $n$  choices for each of the  $m$  components, for a total of  $n^m$  coda samples—an exponential increase in data! one might term this the "blessing of independent subspaces."
+
+remark 3.2. our discussion has been at the level of a single transition (time slice  $(t, t + 1)$ ), which is consistent with the form of data that rl agents typically consume. but we could also use coda to mix and match locally independent components over several time steps (see, e.g., figure 1).
+
+remark 3.3. as is typical, counterfactual reasoning changes the data distribution. while off-policy agents are typically robust to distributional shift, future work might explore different ways to control or prioritize the counterfactual data distribution [77, 43]. we note, however, that certain prioritization schemes may introduce selection bias [31], effectively entangling otherwise independent causal mechanisms (e.g., her's "future" strategy [1] may introduce "hindsight bias" [45, 78]).
+
+remark 3.4. the global independence relations relied upon by goal relabeling and image augmentation are incredibly general, as evidenced by their wide applicability. we posit that certain local independence relations are similarly general. for example, the physical independence of objects separated by space (the billiards balls of figure 1, the two-armed robot of figure 2, and the environments used in section 4), and the independence between an agent's actions and the truth of (but not belief about) certain facts the agent is ignorant of (e.g., an opponent's true beliefs).
+
+algorithm 1 mask-based counterfactual data augmentation (coda)  
+
+<table><tr><td>function coda(transitions t1, transitions t2): 
+s1, a1, s1&#x27; ← t1 
+s2, a2, s2&#x27; ← t2 
+m1, m2 ← mask(s1, a1), mask(s2, a2) 
+d1 ← components(m1) 
+d2 ← components(m2) 
+d ← random sample from (d1 ∩ d2) 
+$\tilde{s}$, $\tilde{a}$, $\tilde{s}$&#x27; ← copy(s1, a1, s1&#x27;) 
+$\tilde{s}$ [d], $\tilde{a}$ [d], $\tilde{s}$&#x27; [d] ← s2 [d], a2 [d], s2&#x27; [d] 
+$\tilde{d}$ ← components(mask($\tilde{s}$, $\tilde{a}$)) 
+return ($\tilde{s}$, $\tilde{a}$, $\tilde{s}$&#x27;) if d ∈ $\tilde{d}$ else $\empty$</td><td>function mask(state s, action a): 
+returns (n+m) × (n) matrix indicating if the n 
+next state components (columns) locally depend 
+on the n state and m action components (rows). 
+function components(mask m): 
+using the mask as the adjacency matrix for $\mathcal{g}^{\mathcal{l}}$ 
+(with dummy columns for next action), finds the 
+set of connected components c = {cj}, and 
+returns the set of independent components 
+d = {g_i = $\bigcup_{k}$c_i^i | c_i^i ⊂ powerset(c)}.</td></tr></table>
+
+implementing coda we implement coda, as outlined above and visualized in figure 3(d), as a function of two factual transitions and a mask function  $m(s_{t},a_{t}):s\times \mathcal{a}\to \{0,1\}^{(n + m)\times n}$  that represents the adjacency matrix of the sparsest local causal graph  $\mathcal{g}^{\mathcal{l}}$  such that  $\mathcal{l}$  is a neighborhood of  $(s_t,a_t)$ .<sup>4</sup> we apply  $m$  to each transition to obtain local masks  $\mathfrak{m}_1$  and  $\mathfrak{m}_2$ , compute their connected components, and swap independent components  $\mathcal{g}_i$  and  $\mathcal{g}_j$  (mutually disjoint and collectively exhaustive groups of connected components) between the transitions to produce a counterfactual proposal. we then apply  $m$  to the counterfactual  $(\tilde{s}_t,\tilde{a}_t)$  to validate the proposal—if the counterfactual mask  $\tilde{\mathfrak{m}}$  shares the same graph partitions as  $\mathfrak{m}_1$  and  $\mathfrak{m}_2$ , we accept the proposal as a coda sample. see algorithm 1.
+
+note that masks  $\mathfrak{m}_1, \mathfrak{m}_2$  and  $\tilde{\mathfrak{m}}$  correspond to different neighborhoods  $\mathcal{l}_1, \mathcal{l}_2$  and  $\tilde{\mathcal{l}}$ , so it is not clear that we are "within the bounds" of any model  $\mathcal{m}^{\mathcal{l}}$  as was required in subsection 2.2 for valid counterfactual reasoning. to correct this discrepancy we use the following proposition and additionally require the causal mechanisms (subgraphs) for independent components  $\mathcal{g}_i$  and  $\mathcal{g}_j$  to share structural equations in each local neighborhood:  $f^{\mathcal{l}_1,i} = f^{\mathcal{l}_2,i} = f^{\tilde{\mathcal{l}},i}$  and  $f^{\mathcal{l}_1,j} = f^{\mathcal{l}_2,j} = f^{\tilde{\mathcal{l}},j}$ . this makes our reasoning valid in the local subspace  $\mathcal{l}^{*} = \mathcal{l}_{1} \cup \mathcal{l}_{2} \cup \tilde{\mathcal{l}}$ . see appendix a for proof.
+
+proposition 1. the causal mechanisms represented by  $\mathcal{g}_i, \mathcal{g}_j \subset \mathcal{g}$  are independent in  $\mathcal{g}^{\mathcal{l}_1 \cup \mathcal{l}_2}$  if and only if  $\mathcal{g}_i$  and  $\mathcal{g}_j$  are independent in both  $\mathcal{g}^{\mathcal{l}_1}$  and  $\mathcal{g}^{\mathcal{l}_2}$ , and  $f^{\mathcal{l}_{1,i}} = f^{\mathcal{l}_{2,i}}$ ,  $f^{\mathcal{l}_{1,j}} = f^{\mathcal{l}_{2,j}}$ .
+
+since coda only modifies data within local subspaces, this biases the resulting replay buffer to have more factorized transitions. in our experiments below, we specify the ratio of observed-to-counterfactual data heuristically to control this selection bias, but find that off-policy agents are reasonably robust to large proportions of coda-sampled trajectories. we leave a full characterization of the selection bias in coda to future studies, noting that knowledge of graph topology was shown to be useful in mitigating selection bias for causal effect estimation [5, 6].
+
+inferring local factorization while the ground truth mask function  $m$  may be available in rare cases as part of a simulator, the general case either requires a domain expert to specify an approximate causal model (as in goal relabeling and visual data augmentation) or requires the agent to learn the local factorization from data. given how common independence due to physical separation of objects is, the former option will often be available. in the latter case, we note that the same data could also be used to learn a forward model. thus, there is an implicit assumption in the latter case that learning the local factorization is easier than modeling the dynamics. we think this assumption is rather mild, as an accurate forward dynamics model would subsume the factorization, and we provide some empirical evidence of its validity in section 4.
+
+learning the local factorization is similar to conditional causal structure discovery [81, 75, 67], conditioned on neighborhood  $\mathcal{l}$  of  $(s_t,a_t)$ , except that the same structural equations must be applied globally (if the structural equations were conditioned on  $\mathcal{l}$ , proposition 1 would fail). as there are many algorithms for general structure discovery [81, 75], and the arrow of time simplifies the inquiry
+
+[27, 67], there may be many ways to approach this problem. for now, we consider a generalization of the global network mask approach used by made [25] (eq. 10) for autoregressive distribution modeling and gran-dag [44] (eq. 6) for causal discovery, which additionally conditions the mask on the current state and action.
+
+this approach computes a locally conditioned network mask  $m(s_{t},a_{t})$  by taking the matrix product of locally conditioned layer masks:  $m(s_{t},a_{t}) = \pi_{\ell = 1}^{l}m_{\ell}(s_{t},a_{t})$ . this mask can be understood as an upper bound on the network's absolute jacobian (see appendix c). again, there may be several models allow one to compute conditional layer masks. we tested two such models: a mixture of mlp experts and a single-head set transformer architecture [85, 47]. each is described in more detail in appendix c. both are trained to model forward dynamics using an l2 prediction loss and induce a sparse network mask either via a sparsity penalty (in case of the mixture of experts model) or via a sparse attention mechanism (in case of the set transformer). in preliminary experiments (appendix c) we found that the set transformer performed better, and proceed to use it in our main experiments (section 4). the set transformer uses the attention mask at each layer as the layer mask for that layer, so that the network mask is simply the product of the attention masks. though trained to model forward dynamics, the coda models are used by the agent to infer local factorization rather than to directly sample future states as is typical in model-based rl. we found this produced reasonable results in the tested domains (below). see appendix c for details. future work should consider other approaches to inferring local structure such as graph neural networks [39, 13].
+
+# 4 experiments
+
+our experiments evaluate coda in the online, batch, and goal-conditioned settings, in each case finding that coda significantly improves agent performance as compared to non-coda baselines. since coda only modifies an agent's training data, we expect these improvements to extend to other off-policy task settings in which the state space can be accurately disentangled. below we outline our experimental design and results, deferring specific details and additional results to appendix b.
+
+standard online rl we extend spriteworld [89] to construct a "bouncing ball" environment (right), that consists of multiple objects (sprites) that move and collide within a confined 2d canvas. we use tasks of varying difficulty, where the agent must navigate  $n \in \{1,2,3,4\}$  of 4 sprites to their fixed target positions. the agent receives reward of  $1 / n$  for each of the  $n$  sprites placed; e.g., the hardest task (place 4) gives  $1 / 4$  reward for each of 4 sprites placed. for each task,
+
+![](images/73ed333839b274d3904a23c1e5d726cc931217b4fa20170e09dba86f879358a3.jpg)
+
+we use coda to expand the replay buffer of a td3 agent [22] by about 8 times. we compare coda with a ground truth masking function (available via the spriteworld environment) and learned masking function to the base td3 agent, as well as a dyna agent that generates additional training data by sampling from a model. for fair comparison, we use the same transformer used for coda masks for dyna, which we pretrain using approximately 42,000 samples from a random policy. as in her, we assume access to the ground truth reward function to relabel the rewards. the results in figure 4 show that both variants of coda significantly improve sample complexity over the baseline. by contrast, the dyna agent suffers from model bias, even though it uses the same model as coda.
+
+![](images/1d7db02cdb8f51001dfad85bf3c187c840255118ed2d247aa7bbe3bb5d490bda.jpg)  
+figure 4: standard online rl (3 seeds): coda with the ground truth mask always performs the best, validating our basic idea. coda with a pretrained model also offers a significant early boost in sample efficiency and maintains its lead over the base td3 agent throughout training. using the same model to generate data directly (a la dyna [82]) performs poorly, suggesting significant model bias.
+
+![](images/1437867c473ae350230a3d52b2e9461b81409f0a5f8ac1010a02835aa6184510.jpg)
+
+![](images/727d16349565eaf1f55ff468372ed947aa3f06e205b1d2749622141fc17f873c.jpg)
+
+![](images/45fdaa0909db25d86201e59a7d445beb4b2d15356bd2c01cbc52c17adb60c0fa.jpg)
+
+<table><tr><td rowspan="2">|d|(1000s)</td><td rowspan="2">real data1r</td><td rowspan="2">mbpo1r:1m</td><td colspan="4">ratio of real:coda [:mbpo] data (ours)</td></tr><tr><td>1r:1c</td><td>1r:3c</td><td>1r:5c</td><td>1r:3c:1m</td></tr><tr><td>25</td><td>13.2 ± 0.7</td><td>18.5 ± 1.5</td><td>43.8 ± 2.8</td><td>40.9 ± 2.5</td><td>38.4 ± 4.9</td><td>46.8 ± 3.1</td></tr><tr><td>50</td><td>22.8 ± 3.0</td><td>36.6 ± 4.3</td><td>66.6 ± 3.8</td><td>64.4 ± 3.1</td><td>62.5 ± 3.5</td><td>70.4 ± 3.8</td></tr><tr><td>75</td><td>43.2 ± 4.9</td><td>46.0 ± 4.7</td><td>73.4 ± 2.8</td><td>76.7 ± 2.6</td><td>75.0 ± 3.4</td><td>74.6 ± 3.2</td></tr><tr><td>100</td><td>63.0 ± 3.1</td><td>66.4 ± 4.9</td><td>77.8 ± 2.0</td><td>82.7 ± 1.5</td><td>76.6 ± 3.0</td><td>73.7 ± 2.9</td></tr><tr><td>150</td><td>77.4 ± 1.2</td><td>72.6 ± 5.6</td><td>82.2 ± 1.8</td><td>85.8 ± 1.4</td><td>84.2 ± 1.0</td><td>79.7 ± 3.6</td></tr><tr><td>250</td><td>78.2 ± 2.7</td><td>77.9 ± 2.4</td><td>85.0 ± 2.9</td><td>87.8 ± 1.8</td><td>87.0 ± 1.0</td><td>78.3 ± 4.9</td></tr></table>
+
+table 1: batch rl (10 seeds): mean success ( $\pm$  standard error, estimated using 1000 bootstrap resamples) on pong environment. coda with learned masking function more than doubles the effective data size, resulting in a  $3\mathrm{x}$  performance boost at smaller data sizes. note that a  $1\mathrm{r}:5\mathrm{c}$  real:coda ratio performs slightly worse than a  $1\mathrm{r}:3\mathrm{c}$  ratio due to distributional shift (remark 3.3).
+
+batch rl a natural setting for coda is batch-constrained rl, where an agent has access to an existing transition-level dataset, but cannot collect more data via exploration [21, 48]. another reason why coda is attractive in this setting is that there is no a priori reason to prefer the given batch data distribution to a counterfactual one. for this experiment we use a continuous control pong environment based on roboschoolpong [40]. the agent must hit the ball past
+
+the opponent, receiving reward of  $+1$  when the ball is behind the opponent's paddle, -1 when the ball is behind the agent's paddle, and 0 otherwise. since our transformer model performed poorly when used as a dynamics model, our dyna baseline for batch rl adopts a state-of-the-art architecture [34] that employs a 7-model ensemble (mbpo). we collect datasets of up to 250,000 samples from an pretrained policy with added noise. for each dataset, we train both mask and reward functions (and in case of mbpo, the dynamics model) on the provided data and use them to generate different amounts of counterfactual data. we also consider combining coda with mbpo, by first expanding the dataset with mbpo and then applying coda to the result. we train the same td3 agent on the expanded datasets in batch mode for 500,000 optimization steps. the results in table 1 show that with only 3 state factors (two paddles and ball), applying coda is approximately equivalent to doubling the amount of real data.
+
+![](images/cb60575d4169f2e6e57efa22ad0a20c0eda248d869e5797d64e1cf0dacafa6e4.jpg)
+
+![](images/2460a4d0719b7f9f86ca110935dc545e9b8f0e47850e0d85a71f1373df814f0b.jpg)
+
+![](images/a5c420fd8617e1a83a3da92148ad7f5ce6294b8ad1e67c27b611cbc7f0d1f01f.jpg)  
+fig. 5: goal-conditioned rl (5 seeds): in fetchpush and the challenging slide2 environment, a her agent whose dataset has been enlarged with coda approximately doubles the sample efficiency of the base her agent.
+
+goal-conditioned rl as her [1] is an instance of prioritized coda that greatly improves sample efficiency in sparse-reward tasks, can our unprioritized coda algorithm further improve her agents? we use her to relabel goals on real data only, relying on random coda-style goal relabeling for coda data. after finding that coda obtains state-of-the-art results in fetchpush-v1 [71], we show that coda also accelerates learning in a novel and significantly more
+
+![](images/80da8c3c5e75b0094041f435e3b8834eacd917ceb8b663ba8191163aa565f14d.jpg)
+
+challenging slide2 environment, where the agent must slide two pucks onto their targets (figure 5). for this experiment, we specified a heuristic mask using domain knowledge ("objects are disentangled if more than  $10\mathrm{cm}$  apart") that worked in both fetchpush and slide2 despite different dynamics.
+
+# 5 related work
+
+factored mdps [28, 29, 90] consider mdps where state variables are only influenced by a fixed subset of "parent" variables at the previous timestep. the notion of "context specific independence" (csi), which was used to compactly represent single factors of a bayes net [10] or mdp [9] for efficient inference and model storage, $^6$  is closely related to the local factorizations we study in this
+
+paper. csi can be understood as going one step beyond coda, exploiting not only knowledge of the local factorization, but also the structural equations at play in the local factorization; csi could be leveraged for model-based rl approaches where faithful models of factored dynamics can be realized. object-oriented and relational approaches to rl and prediction [15, 26, 39, 50, 93, 94] represent the dynamics as a set of interacting entities. factored actions and policies have been used to formulate dimension-wise policy gradient baselines in standard and multi-agent settings [19, 54, 91].
+
+a growing body of work applies causal reasoning the rl setting to improve sample efficiency, interpretability and learn better representations [55, 57, 74]. particularly relevant is the work by buesing et al. [12], which improves sample efficiency by using a causal model to sample counterfactual trajectories, thereby reducing variance of off-policy gradient estimates in a guided policy search framework. these counterfactuals use coarse-grained representations at the trajectory level, while our approach uses factored representations within a single transition. batch rl [48, 21, 58] and more generally off-policy rl [88, 60] are counterfactual by nature, and are particularly important when it is costly or dangerous to obtain on-policy data [84]. the use of counterfactual goals to accelerate learning goal-conditioned rl [36, 76, 71] is what inspired our local coda algorithm.
+
+data augmentation is also widely used in supervised learning, and is considered a required best practice in high dimensional problems [42, 46, 66]. heuristics for data augmentation often encode a causal invariance statement with respect to certain perturbations on the inputs. thus model performance on counterfactual/augmented data can be seen as a measure of robustness. assuring that models perform robustly in this sense is relevant to applications where fairness is a concern, as counterfactuals can be used to achieve robust performance and debias data [23, 64, 8].
+
+# 6 conclusion
+
+in this paper we proposed a local causal model (lcm) framework that captures the benefits of decomposition in settings where the global causal model is densely connected. we used our framework to design a local counterfactual data augmentation (coda) algorithm that expands available training data with counterfactual samples by stitching together locally independent subsamples from the environment. empirically, we showed that coda can more than double the sample efficiency and final performance of reinforcement learning agents in locally factored environments.
+
+there are several interesting avenues for future work. first, the sizable gap between ground truth and learned coda in our sprinteworld results suggest there is room for improvement in our approach to learning the masking function. second, we have applied coda in a random, unprioritized fashion, but past work [1, 77] suggests there is significant benefit to prioritization. third, we have applied coda in a way that might be considered model-free, insofar as we reuse subsamples from the environment dynamics rather than generating samples using our models of the causal mechanisms. however, our lcm formalism allows for mixing model-free and model-based reasoning, which could further improve sample efficiency. fourth, we used fully-observable, disentangled state spaces with a fixed top-level decomposition, but ultimately we would like to deploy coda in partially observable, entangled settings (e.g. rl from pixels) with multiple dynamic, multi-level decompositions [32, 17, 92]. unsupervised learning of factorized latent representations is an active area of research [16, 39, 52, 53, 89], and it would be interesting to combine these methods with coda. finally, it would be interesting to explore applications of our lcm framework to other areas such as interpretability [56, 59], exploration [61, 86], and off-policy evaluation [84].
+
+# acknowledgments and disclosure of funding
+
+we thank jimmy ba, harris chan, seyed kamyar seyed ghasemipour, james lucas, david madras, yuhuai wu and lunjun zhang for helpful comments and discussions. we also thank the anonymous reviewers for their feedback, which improved the final manuscript. sp is supported by an nserc pgs-d award. ec is a student researcher at google brain in toronto. resources used in preparing this research were provided, in part, by the province of ontario, the government of canada through ci-far, and companies sponsoring the vector institute (https://vectorinstitute.ai/partners).
+
+# broader impact
+
+considerations related to counterfactual reasoning coda transforms the observational data distribution into a counterfactual one. this incurs several risks and benefits, listed below.
+
+- modern machine learning models and reinforcement learning agents often generalize poorly under distributional shift (sometimes called "covariate shift") [49, 14]. coda has the potential to produce out-of-distribution data, that would never show up in the observational distribution. thus, care should be taken when applying agent modules that have been trained only on observational data to counterfactual data, as their performance could decline sharply, thereby creating safety risks. we anticipate that work on uncertainty will be essential to controlling the risks associated with distributional shift [80].  
+- the fact that coda creates distributional shift can also provide benefits in the form of distributional robustness and fairness. training on out-of-distribution data can make models more robust [79], increasing their trustworthiness and practical applicability. as noted in section 5, counterfactual reasoning can be leveraged in areas where fairness is a concern. for example, [64] propose to reduce gender bias in natural language processing by generating counterfactual sentences with swapped gender pronouns. we anticipate that a version of coda that prioritizes fairness concerns in a similar manner could be applied in the reinforcement learning and computer vision contexts.  
+- in reinforcement learning specifically, a shift in data distribution requires either (1) the use of an off-policy algorithm, or (2) high variance off-policy corrections for on-policy algorithms. in the former case, it should be noted that in case of function approximation, even off-policy algorithms may be negatively affected by large shifts in their training distribution [83, 20]. more work is needed to quantify these effects and their implications for agent performance.
+
+improving rl in batch-constrained settings in many settings, such as medicine and education, obtaining large quantities of observational data using a random policy is prohibitively expensive and/or unethical [84, 60]. as such, agents that can efficiently learn effective policies from batch-constrained data are needed, as are accurate ways to estimate agent performance from off-policy data [58, 62, 73]. we see coda as complementary to both goals, as subspace swapping is a powerful tool to produce large quantities of counterfactual data given a modest observational dataset. however, subspace swapping alone may be insufficient to generate plausible "exploratory" data for evaluating and learning new policies. for example, medical records from certain demographic groups may be unavailable or improperly collected/labeled. it is conceivable that a coda with a suitable prioritization scheme could compensate for such sample bias, but applied work in batch-constrained domains that characterizes the effect of sample bias on coda should nevertheless be carried out.
+
+general considerations related to artificial agency to the extent that coda is a general technique for improving the ability of artificial agents to achieve their goals, it inherits the potential risks and benefits associated with empowered artificial agency, including but not limited to:
+
+(a) the pursuit of misguided or dangerous goals, whether due to mispecification by a benevolent principal, the self-serving motives of its principals, or interference by malicious parties or other deviations from proper intents,  
+(b) the unsafe and improper pursuit of goals due to poor modeling or representation, resource constraints and lack of capacity, constraint mispecification, partial observability, or inadequate encoding and understanding of human values, and  
+(c) improvements to capital processes and automation of human labor, which could improve economic efficiency and raise the overall social welfare, but also run the risk of increased inequality, workforce displacement, and technological unemployment.
+
+the risk associated with points (a) and (b) may be exacerbated in case of coda due to the risks associated with counterfactual reasoning outlined above: to the extent that coda is done with a poorly fit local factorization model, or with a local factorization model that does not generalize well to the counterfactual distribution, this could cause the agent to pursue poorly formulated counterfactual (imagined) goals, or create causally invalid data that hurts agent performance.
+
+# references
+
+[1] marcin andrychowicz, filip wolski, alex ray, jonas schneider, rachel fong, peter welinder, bob mcgrew, josh tobin, openai pieter abbeel, and wojciech zaremba. hindsight experience replay. in advances in neural information processing systems, pages 5048-5058, 2017.  
+[2] openai: marcin andrychowicz, bowen baker, maciek chociej, rafal jozefowicz, bob mcgrew, jakub pachocki, arthur petron, matthias plappert, glenn powell, alex ray, et al. learning dexterous in-hand manipulation. the international journal of robotics research, 39(1):3-20, 2020.  
+[3] martin arjovsky, soumith chintala, and léon bottou. wasserstein gan. arxiv preprint arxiv:1701.07875, 2017.  
+[4] jimmy lei ba, jamie ryan kiros, and geoffrey e hinton. layer normalization. arxiv preprint arxiv:1607.06450, 2016.  
+[5] elias bareinboim and judea pearl. controlling selection bias in causal inference. in artificial intelligence and statistics, pages 100-108, 2012.  
+[6] elias bareinboim, jin tian, and judea pearl. recovering from selection bias in causal and statistical inference. in aaai, pages 2410-2416. citeseer, 2014.  
+[7] marc g bellemare, yavar naddaf, joel veness, and michael bowling. the arcade learning environment: an evaluation platform for general agents. journal of artificial intelligence research, 47:253-279, 2013.  
+[8] tolga bolukbasi, kai-wei chang, james y zou, venkatesh saligrama, and adam t kalai. man is to computer programmer as woman is to homemaker? debiasing word embeddings. in advances in neural information processing systems, pages 4349-4357, 2016.  
+[9] craig boutilier, richard dearden, moises goldszmidt, et al. exploiting structure in policy construction. in ijcai, volume 14, pages 1104-1113, 1995.  
+[10] craig boutilier, nir friedman, moises goldszmidt, and daphne koller. context-specific independence in bayesian networks. arxiv preprint arxiv:1302.3562, 2013.  
+[11] greg brockman, vicki cheung, ludwig pettersson, jonas schneider, john schulman, jie tang, and wojciech zaremba. openai gym. arxiv preprint arxiv:1606.01540, 2016.  
+[12] lars buesing, theophane weber, yori zwols, sebastien racaniere, arthur guez, jean-baptiste lespiau, and nicolas heess. woulda, coulda, shoulda: counterfactually-guided policy search. international conference on learning representations, 2019.  
+[13] christopher p burgess, loic matthew, nicholas watters, rishabh kabra, irina higgins, matt botvinick, and alexander lerchner. monet: unsupervised scene decomposition and representation. arxiv preprint arxiv:1901.11390, 2019.  
+[14] karl cobbe, oleg klimov, chris hesse, taehoon kim, and john schulman. quantifying generalization in reinforcement learning. arxiv preprint arxiv:1812.02341, 2018.  
+[15] carlos diuk, andre cohen, and michael l littman. an object-oriented representation for efficient reinforcement learning. in proceedings of the 25th international conference on machine learning, pages 240-247, 2008.  
+[16] aysegul dundar, kevin j shih, animesh garg, robert pottorf, andrew tao, and bryan catanzaro. unsupervised disentanglement of pose, appearance and background from images and videos. arxiv preprint arxiv:2001.09518, 2020.  
+[17] babak esmaeili, hao wu, sarthak jain, alican bozkurt, n siddharth, brooks paige, dana h brooks, jennifer dy, and jan-willem meent. structured disentangled representations. in the 22nd international conference on artificial intelligence and statistics, pages 2525-2534, 2019.  
+[18] amir-massoud farahmand, andre barreto, and daniel nikovski. value-aware loss function for model-based reinforcement learning. in artificial intelligence and statistics, pages 1486-1494, 2017.  
+[19] jakob n foerster, gregory farquhar, triantafyllos afouras, nantas nardelli, and shimon whiteson. counterfactual multi-agent policy gradients. in thirty-second aaai conference on artificial intelligence, 2018.  
+[20] justin fu, aviral kumar, matthew soh, and sergey levine. diagnosing bottlenecks in deep q-learning algorithms. arxiv preprint arxiv:1902.10250, 2019.
+
+[21] scott fujimoto, david meger, and doina precup. off-policy deep reinforcement learning without exploration. arxiv preprint arxiv:1812.02900, 2018.  
+[22] scott fujimoto, herke van hoof, and david meger. addressing function approximation error in actor-critic methods. arxiv preprint arxiv:1802.09477, 2018.  
+[23] sahaj garg, vincent perot, nicole limtiaco, ankur taly, ed h chi, and alex beutel. counterfactual fairness in text classification through robustness. in proceedings of the 2019 aaai/acm conference on ai, ethics, and society, pages 219-226, 2019.  
+[24] andrew gelman. causality and statistical learning, 2011.  
+[25] mathieu germain, karol gregor, iain murray, and hugo larochelle. made: masked autoencoder for distribution estimation. in international conference on machine learning, pages 881-889, 2015.  
+[26] anirudh goyal, alex lamb, jordan hoffmann, shagun sodhani, sergey levine, yoshua bengio, and bernhard schölkopf. recurrent independent mechanisms. arxiv preprint arxiv:1909.10893, 2019.  
+[27] clive wj granger. investigating causal relations by econometric models and cross-spectral methods. econometrica: journal of the econometric society, pages 424-438, 1969.  
+[28] carlos guestrin, daphne koller, ronald parr, and shobha venkataraman. efficient solution algorithms for factored mdps. journal of artificial intelligence research, 19:399-468, 2003.  
+[29] assaf hallak, françois schnitzler, timothy mann, and shie mannor. off-policy model-based learning under unknown factored dynamics. in international conference on machine learning, pages 711-719, 2015.  
+[30] dan hendrycks and kevin gimpel. gaussian error linear units (gelus). arxiv preprint arxiv:1606.08415, 2016.  
+[31] ma hernán and jm robins. causal inference: what if. boca raton: chapman & hill/crc, 2020.  
+[32] irina higgins, nicolas sonnerat, loic matthew, arka pal, christopher p burgess, matko bošnjak, murray shanahan, matthew botvinick, demis hassabis, and alexander lerchner. scan: learning hierarchical compositional visual concepts. in international conference on learning representations, 2018. url https://openreview.net/forum?id=rkn2i1-rz.  
+[33] rodrigo toro icarte, toryn klassen, richard valenzano, and sheila mcilraith. using reward machines for high-level task specification and decomposition in reinforcement learning. in international conference on machine learning, pages 2107-2116, 2018.  
+[34] michael janner, justin fu, marvin zhang, and sergey levine. when to trust your model: model-based policy optimization. in advances in neural information processing systems, pages 12498-12509, 2019.  
+[35] matthew johnson, katja hofmann, tim hutton, and david bignell. the malmo platform for artificial intelligence experimentation. in ijcai, pages 4246-4247, 2016.  
+[36] leslie pack kaelbling. learning to achieve goals. in ijcai, pages 1094-1099. citeseer, 1993.  
+[37] michael kearns and daphne koller. efficient reinforcement learning in factored mdps. in *ijcai*, volume 16, pages 740-747, 1999.  
+[38] diederik p kingma and jimmy ba. adam: a method for stochastic optimization. arxiv preprint arxiv:1412.6980, 2014.  
+[39] thomas kipf, elise van der pol, and max welling. contrastive learning of structured world models. arxiv preprint arxiv:1911.12247, 2019.  
+[40] oleg klimov and john schulman. roboschool, 2017.  
+[41] ilya kostrikov, denis yarats, and rob fergus. image augmentation is all you need: regularizing deep reinforcement learning from pixels. arxiv preprint arxiv:2004.13649, 2020.  
+[42] alex krizhevsky, ilya sutskever, and geoffrey e hinton. imagenet classification with deep convolutional neural networks. in advances in neural information processing systems, pages 1097-1105, 2012.  
+[43] aviral kumar, abhishek gupta, and sergey levine. discor: corrective feedback in reinforcement learning via distribution correction. arxiv preprint arxiv:2003.07305, 2020.
+
+[44] sébastien lachapelle, philippe brouillard, tristan deleu, and simon lacoste-julien. gradient-based neural dag learning. arxiv preprint arxiv:1906.02226, 2019.  
+[45] sameera lanka and tianfu wu. archer: aggressive rewards to counter bias in hindsight experience replay. arxiv preprint arxiv:1809.02070, 2018.  
+[46] michael laskin, kimin lee, adam stooke, lerrel pinto, pieter abbeel, and aravind srinivas. reinforcement learning with augmented data. arxiv preprint arxiv:2004.14990, 2020.  
+[47] juho lee, yoonho lee, jungtaek kim, adam r kosiorek, seungjin choi, and yee whye teh. set transformer: a framework for attention-based permutation-invariant neural networks. arxiv preprint arxiv:1810.00825, 2018.  
+[48] sergey levine, aviral kumar, george tucker, and justin fu. offline reinforcement learning: tutorial, review, and perspectives on open problems. arxiv preprint arxiv:2005.01643, 2020.  
+[49] da li, yongxin yang, yi-zhe song, and timothy m hospedales. learning to generalize: meta-learning for domain generalization. in thirty-second aaai conference on artificial intelligence, 2018.  
+[50] richard li, allan jabri, trevor darrell, and pulkit agrawal. towards practical multi-object manipulation using relational reinforcement learning. arxiv preprint arxiv:1912.11032, 2019.  
+[51] timothy p lillicrap, jonathan j hunt, alexander pritzel, nicolas heess, tom erez, yuval tassa, david silver, and daan wierstra. continuous control with deep reinforcement learning. arxiv preprint arxiv:1509.02971, 2015.  
+[52] francesco locatello, stefan bauer, mario lucic, gunnar ratsch, sylvain gelly, bernhard scholkopf, and olivier bachem. challenging common assumptions in the unsupervised learning of disentangled representations. arxiv preprint arxiv:1811.12359, 2018.  
+[53] francesco locatello, ben poole, gunnar ratsch, bernhard scholkopf, olivier bachem, and michael tschannen. weakly-supervised disentanglement without compromises. arxiv preprint arxiv:2002.02886, 2020.  
+[54] ryan lowe, yi wu, aviv tamar, jean harb, openai pieter abbeel, and igor mordatch. multi-agent actor-critic for mixed cooperative-competitive environments. in advances in neural information processing systems, pages 6379–6390, 2017.  
+[55] chaochao lu, bernhard scholkopf, and josé miguel hernández-lobato. deconfounding reinforcement learning in observational settings. arxiv preprint arxiv:1812.10576, 2018.  
+[56] daoming lyu, fangkai yang, bo liu, and steven gustafson. sdrl: interpretable and data-efficient deep reinforcement learning leveraging symbolic planning. in proceedings of the aaai conference on artificial intelligence, volume 33, pages 2970-2977, 2019.  
+[57] prashan madumal, tim miller, liz sonenberg, and frank vetere. explainable reinforcement learning through a causal lens. arxiv preprint arxiv:1905.10958, 2019.  
+[58] travis mandel, yun-en liu, sergey levine, emma brunskill, and zoran popovic. offline policy evaluation across representations with applications to educational games. in aamas, pages 1077–1084, 2014.  
+[59] alexander mott, daniel zoran, mike chrzanowski, daan wierstra, and danilo jimenez rezende. towards interpretable reinforcement learning using attention augmented agents. in advances in neural information processing systems, pages 12329-12338, 2019.  
+[60] rémi munos, tom stepleton, anna harutyunyan, and marc bellemare. safe and efficient off-policy reinforcement learning. in advances in neural information processing systems, pages 1054–1062, 2016.  
+[61] ashvin v nair, vitchy r pong, murtaza dalal, shikhar bahl, steven lin, and sergey levine. visual reinforcement learning with imagined goals. in advances in neural information processing systems, pages 9191-9200, 2018.  
+[62] michael oberst and david sontag. counterfactual off-policy evaluation with gumbel-max structural causal models. arxiv preprint arxiv:1905.05824, 2019.  
+[63] junhyuk oh, satinder singh, and honglak lee. value prediction network. in advances in neural information processing systems, pages 6118-6128, 2017.  
+[64] ji ho park, jamin shin, and pascale fung. reducing gender bias in abusive language detection. arxiv preprint arxiv:1808.07231, 2018.
+
+[65] judea pearl. causal inference in statistics: an overview. statistics surveys, 3:96-146, 2009.  
+[66] luis perez and jason wang. the effectiveness of data augmentation in image classification using deep learning. arxiv preprint arxiv:1712.04621, 2017.  
+[67] jonas peters, dominik janzing, and bernhard schölkopf. elements of causal inference: foundations and learning algorithms. mit press, 2017.  
+[68] silviu pitis, harris chan, and jimmy ba. protoge: prototype goal encodings for multi-goal reinforcement learning. the 4th multidisciplinary conference on reinforcement learning and decision making (rldm2019), 2019.  
+[69] silviu pitis, harris chan, and stephen zhao. mrl: modular rl. https://github.com/spitis/mrl, 2020.  
+[70] silviu pitis, harris chan, stephen zhao, bradly stadie, and jimmy ba. maximum entropy gain exploration for long horizon multi-goal reinforcement learning. in proceedings of the thirty-seventh international conference on machine learning, 2020.  
+[71] matthias plappert, marcin andrychowicz, alex ray, bob mcgrew, bowen baker, glenn powell, jonas schneider, josh tobin, maciek chogiej, peter welinder, et al. multi-goal reinforcement learning: challenging robotics environments and request for research. arxiv preprint arxiv:1802.09464, 2018.  
+[72] martin l puterman. markov decision processes: discrete stochastic dynamic programming. john wiley & sons, 2014.  
+[73] aniruddh raghu, omer gottesman, yao liu, matthieu komorowski, aldo faisal, finale doshi-velez, and emma brunskill. behaviour policy estimation in off-policy policy evaluation: calibration matters. arxiv preprint arxiv:1807.01066, 2018.  
+[74] danilo j rezende, ivo danihelka, george papamakarios, nan rosemary ke, ray jiang, theophane weber, karol gregor, hamza merzic, fabio viola, jane wang, et al. causally correct partial models for reinforcement learning. arxiv preprint arxiv:2002.02836, 2020.  
+[75] jakob runge, sebastian bathiany, erik bollt, gustau camps-valls, dim coumou, ethan doyle, clark glymour, marlene kretschmer, miguel d mahecha, jordi muñoz-martí, et al. inferring causation from time series in earth system sciences. nature communications, 10(1):1-13, 2019.  
+[76] tom schaul, daniel horgan, karol gregor, and david silver. universal value function approximators. in international conference on machine learning, pages 1312-1320, 2015.  
+[77] tom schaul, john quan, ioannis antonoglou, and david silver. prioritized experience replay. arxiv preprint arxiv:1511.05952, 2015.  
+[78] yannick schroecker and charles isbell. universal value density estimation for imitation learning and goal-conditioned reinforcement learning. arxiv preprint arxiv:2002.06473, 2020.  
+[79] aman sinha, hongseok namkoong, and john duchi. certifying some distributional robustness with principled adversarial training. arxiv preprint arxiv:1710.10571, 2017.  
+[80] jasper snoek, yaniv ovadia, emily fertig, balaji lakshminarayanan, sebastian nowozin, d sculley, joshua dillon, jie ren, and zachary nado. can you trust your model's uncertainty? evaluating predictive uncertainty under dataset shift. in advances in neural information processing systems, pages 13969-13980, 2019.  
+[81] peter spirtes, clark n glymour, richard scheines, and david heckerman. causation, prediction, and search. mit press, 2000.  
+[82] richard s sutton. dyna, an integrated architecture for learning, planning, and reacting. acm sigart bulletin, 2(4):160-163, 1991.  
+[83] richard s sutton and andrew g barto. reinforcement learning: an introduction. mit press, 2018.  
+[84] philip thomas and emma brunskill. data-efficient off-policy policy evaluation for reinforcement learning. in international conference on machine learning, pages 2139-2148, 2016.  
+[85] ashish vaswani, noam shazeer, niki parmar, jakob uszkoreit, llion jones, aidan n gomez, lukasz kaiser, and illia polosukhin. attention is all you need. in advances in neural information processing systems, pages 5998-6008, 2017.
+
+[86] maya zhe wang and benjamin y hayden. monkeys are curious about counterfactual outcomes. cognition, 189:1-10, 2019.  
+[87] tingwu wang, xuchan bao, ignasi clavera, jerrick hoang, yeming wen, eric langlois, shunshi zhang, guodong zhang, pieter abbeel, and jimmy ba. benchmarking model-based reinforcement learning. arxiv preprint arxiv:1907.02057, 2019.  
+[88] christopher jch watkins and peter dayan. q-learning. machine learning, 8(3-4):279-292, 1992.  
+[89] nicholas watters, loic matthew, matko bosnjak, christopher p burgess, and alexander lerchner. cobra: data-efficient model-based rl through unsupervised object discovery and curiosity-driven exploration. arxiv preprint arxiv:1905.09275, 2019.  
+[90] théophane weber, nicolas heess, lars buesing, and david silver. credit assignment techniques in stochastic computation graphs. arxiv preprint arxiv:1901.01761, 2019.  
+[91] cathy wu, aravind rajeswaran, yan duan, vikash kumar, alexandre m bayen, sham kakade, igor mordatch, and pieter abbeel. variance reduction for policy gradient with action-dependent factorized baselines. arxiv preprint arxiv:1803.07246, 2018.  
+[92] manzil zaheer, satwik kottur, siamak ravanbakhsh, barnabas poczos, russ r salakhutdinov, and alexander j smola. deep sets. in advances in neural information processing systems, pages 3391-3401, 2017.  
+[93] vinicius zambaldi, david raposo, adam santoro, victor bapst, yujia li, igor babuschkin, karl tuyls, david reichert, timothy lillicrap, edward lockhart, et al. relational deep reinforcement learning. arxiv preprint arxiv:1806.01830, 2018.  
+[94] guangxiang zhu, zhiao huang, and chongjie zhang. object-oriented dynamics predictor. in advances in neural information processing systems, pages 9804–9815, 2018.
+
+# a proof of proposition 1
+
+lemma 1. if  $v^j \in pa^{\mathcal{l}}(v^i)$  in dag  $g^{\mathcal{l}}$  of (local) causal model  $\mathcal{m}^{\mathcal{l}}$ , and  $\mathcal{l} \subset \mathcal{x}$ , then  $v^j \in pa^{\mathcal{x}}(v^i)$  in dag  $g^{\mathcal{x}}$  corresponding to causal model  $\mathcal{m}^{\mathcal{x}}$ .
+
+proof. by minimality, there exist  $\{u^i,v^{-j},v_1^j\}$  and  $\{u^i,v^{-j},v_2^j\}$  with  $v^{-j}\in \mathrm{pa}^{\mathcal{l}}(v^{i})\backslash v^{j}$  for which  $f^{i}(\{u^{i},v^{-j},v_{1}^{j}\})\neq f^{i}(\{u^{i},v^{-j},v_{2}^{j}\})$  . expand  $\{v^{-j},v_1^j\}$  and  $\{v^{-j},v_2^j\}$  to  $(s_1,a_1),(s_2,a_2)\in \mathcal{l}$  (with any values of other components). but  $\mathcal{l}\subset \mathcal{x}$  , so  $(s_1,a_1),(s_2,a_2)\in \mathcal{x}$  and it follows from minimality in  $\mathcal{x}$  that  $v^{j}\in \operatorname {pa}^{\mathcal{x}}(v^{i})$
+
+corollary 1. if  $\mathcal{l} \subset \mathcal{x}$ ,  $g^{\mathcal{l}}$  is sparser (has fewer edges) than  $g^{\mathcal{x}}$ .
+
+proposition 1. the causal mechanisms represented by  $\mathcal{g}_i, \mathcal{g}_j \subset \mathcal{g}$  are independent in  $\mathcal{g}^{\mathcal{l}_1 \cup \mathcal{l}_2}$  if and only if  $\mathcal{g}_i$  and  $\mathcal{g}_j$  are independent in both  $\mathcal{g}^{\mathcal{l}_1}$  and  $\mathcal{g}^{\mathcal{l}_2}$ , and  $f^{\mathcal{l}_{1,i}} = f^{\mathcal{l}_{2,i}}$ ,  $f^{\mathcal{l}_{1,j}} = f^{\mathcal{l}_{2,j}}$ .
+
+proof.  $(\rightarrow)$  if  $\mathcal{g}_i$  and  $\mathcal{g}_j$  are independent in  $g^{\mathcal{l}_1 \cup \mathcal{l}_2}$ , independence in  $\mathcal{g}^{\mathcal{l}_1}$  and  $\mathcal{g}^{\mathcal{l}_2}$  follows from corollary 1. that  $f^{\mathcal{l}_{1}, i} = f^{\mathcal{l}_{2}, i}$  (and  $f^{\mathcal{l}_{1}, j} = f^{\mathcal{l}_{2}, j}$ ), on their shared domain, follows since each is a restriction of the same function  $f^{\mathcal{l}_1 \cup \mathcal{l}_{2}, i}$  (or  $f^{\mathcal{l}_1 \cup \mathcal{l}_{2}, j}$ ).
+
+$(\leftarrow)$  suppose  $\mathcal{g}_i$  and  $\mathcal{g}_j$  are independent in  $\mathcal{g}^{\mathcal{l}_1}$  and  $\mathcal{g}^{\mathcal{l}_2}$  but not  $g^{\mathcal{l}_1 \cup \mathcal{l}_2}$ . by the definition of independence applied to  $g^{\mathcal{l}_1 \cup \mathcal{l}_2}$ , we have that, without loss of generality, there is a  $v_i \in \mathcal{g}_i$ ,  $v_j \in \mathcal{g}_j$  with  $v_j \in \mathrm{pa}^{\mathcal{l}_1 \cup \mathcal{l}_2}(v_i)$ . then, from the definition of minimality, it follows that there exist  $(s_1, a_1), (s_2, a_2) \in \mathcal{l}_1 \cup \mathcal{l}_2$  that differ only in the value of  $v_j$ , and  $u_i \in \mathrm{range}(u_i)$  for which  $f^i(s_1, a_1, u_i) \neq f^i(s_2, a_2, u_i)$ .
+
+clearly, if  $(s_1,a_1)$  and  $(s_2,a_2)$  are both in  $\mathcal{l}_1$  (or  $\mathcal{l}_2$ ), there will be an edge from  $v_{j}$  to  $v_{i}$  in  $\mathcal{g}^{\mathcal{l}_1}$  (or  $\mathcal{g}^{\mathcal{l}_2}$ ) and the claim follows by contradiction. thus, the only interesting case is when, without loss of generality,  $(s_1,a_1)\in \mathcal{l}_1$  and  $(s_2,a_2)\in \mathcal{l}_2$ . the key observation is that  $(s_1,a_1)$  and  $(s_2,a_2)$  differ only in the value of node  $v_{j}\notin \mathcal{g}_{i}$ : since  $\mathcal{g}_i$  is an independent causal mechanism in both  $\mathcal{g}^{\mathcal{l}_1}$  and  $\mathcal{g}^{\mathcal{l}_2}$  and the parents of  $v_{i}$  take on the same values in each, we have that  $f^{i}(s_{1},a_{1},u_{i}) = f^{i,\mathcal{l}_{1}}(s_{1},a_{1},u_{i}) = f^{i,\mathcal{l}_{2}}(s_{2},a_{2},u_{i}) = f^{i}(s_{2},a_{2},u_{i})$  and the claim follows by contradiction.
+
+# b additional experiment details
+
+this section provides training details for the experiments discussed in section 4 as well as some additional results. code is available at https://github.com/spritis/mrl [69].
+
+# b.1 online rl
+
+here we detail the procedure used in the online rl experiments in the spriteworld environment.
+
+implementation we work with the original td3 codebase, architecture, and hyperparameters (except batch size; see below), and focus our efforts solely on modifying the agent's training distribution.
+
+environment we extend the base spriteworld framework [89] with (1) basic collisions (to induce a local factorization / so that a global factorization will not work), (2) a new continuous action space (2-dimensional), (3) a disentangled state renderer that returns the position and velocity of each sprite (a total of 16-dimensions in tasks with four sprites), (4) a mask renderer that returns the ground truth masking function (allows us to evaluate our masking function in appendix c), and (5) a suite of partial and sparse reward tasks that we use for experiments. these extensions will include with the release of our code.
+
+data augmentation every 1000 environment steps, we sample 2000 pairs of random transitions from the agent's replay buffer, and apply coda to produce a maximum of 5 unique coda samples per pair. we apply two forms of coda, using (1) an oracle / ground truth mask function that we back out of the simulator, and (2) the mask of a pre-trained transformer model (see section c). the mask function was trained using approximately 42,000 samples from a random policy (5/6 of 50,000, with
+
+![](images/932ecc504c7908f8a67e4db66a81be18fe75fc65c92e42d44cc4ad4cf371324d.jpg)  
+figure 6: average reward on sparse reward bouncing ball environment. as in the partial reward case (figure 4), we observe that coda agents outperform the other agents (except in place 4, where no agent achieves any reward).
+
+![](images/28a63151e0e16935348143af8bb5867b8106172167d8f367647c577882fe425b.jpg)
+
+![](images/86807e9b5e67a74c0582f2daa783ace0a5e3cc7fe778d9dc67645b53019f1c63.jpg)
+
+![](images/862c339b7a19d8f3b31a56a3439c396266a4d96aae8d7db3e515c994891c968c.jpg)
+
+the rest of the data used for validation). coda samples are added to a second coda replay buffer. for purposes of this experiment both buffers are have effectively infinite capacity (they are never filled). during training, the agent's batches are sampled proportionally from the real and coda replay buffers (this means that approximately 7/8 of the data that the agent trains on is counterfactual).
+
+baselines in addition to the base td3 agent and coda, we also use the transformer model that is used as a mask function to generate data by performing forward rollouts with a random policy, as in dyna [82]. so that this baseline produces approximately the same number of samples as coda with the learned mask, we roll the model out for 5 steps from 1500 random samples from the replay buffer, again every 1000 environment steps. this produces 7500 model-based samples for every 1000 environment transitions.
+
+use of the transformer mask function requires setting the threshold value  $\tau$ , which we do by monitoring accuracy and f1 scores for sparsity prediction (as discussed in appendix c) on validation data, ultimately using the value  $\tau = 0.05$ .
+
+batch size since coda samples are plentiful we increase the agent's batch size from 256 to 1000 to allow it to train on more environment samples in the same number of training steps. we found that this slightly improved the performance of the base td3 agent. an increase in batch size also allows the agent to see more of its own on-policy data in the face of many off-policy coda samples.
+
+additional results in sparse reward task variants in addition to the partial reward tasks described in section 4, we also tested coda in four sparse reward tasks of varying difficulty. these are the same as the partial reward tasks, except that a sparse reward of 1 is granted only when all n sprites are in their target locations. while these tasks were much harder (and perhaps impossible in the case of place 4 due to moving sprites), as shown in figure 6, the coda agents maintain a clear advantage.
+
+results plot the results plot shows the 3 seeds in reduced opacity together with their smoothed mean.
+
+# b.2 batch rl
+
+here we detail the procedure used in the batch rl experiments in the pong environment.
+
+implementation this experiment works with a different codebase than the spriteworld experiment, in order to simplify the use of coda in a batch rl setting. our experiment first builds the agent's dataset (consisting of real data, dyna data and/or coda data), then instantiates a td3 agent by filling its replay buffer with the dataset. the replay buffer is always expanded to include the entire enlarged dataset (for the 5x coda ratio at 250,000 data size this means the buffer has 1.5e6 experiences). the agent is run for 500,000 optimization steps.
+
+hyperparameters we used similar hyperparameters to the original td3 codebase, with the following differences:
+
+- we use a discount factor of  $\gamma = 0.98$  instead of 0.99.
+
+- since pong is a sparse reward task with  $\gamma = 0.98$ , we clip critic targets to  $(-50, 50)$ .  
+- we use networks of size (128, 128) instead of (256, 256).  
+- as for our sprinteworld experiment, we use a batch size of 1000.
+
+environment we base our pong environment on roboschoolpong-v1 [40]. the original environment allowed the ball to teleport back to the center after one of the players scored, offered a small dense reward signal for hitting the ball, and included a stray "timeout" feature in the agent's state representation. we fix the environment so that the ball does not teleport, and instead have the episode reset every 150 steps, and also 10 steps after either player scores. the environment is treated as continuous and never returns a done signal that is not also accompanied by a timelimit.truncated indicator [11]. we change the reward to be strictly sparse, with reward of  $\pm 1$  given when the ball is behind one of the players' paddles. finally, we drop the stray "timeout" feature, so that the state space is 12-dimensional, where each set of 4 dimensions is the x-position, y-position, x-velocity, and y-velocity of the corresponding object (2 paddles and one ball).
+
+training the coda model without access to a ground truth mask, we needed to train a masking function c to identify local disentanglement. we also forewent the ground truth reward, instead training our own reward classifier. in each case we used the batch dataset given, and so we trained different models for each random seed. for our masking model, we stacked two single-head transformer blocks (without positional encodings) and used the product of their attention masks as the mask. each block consists of query  $q$ , key  $k$ , and value  $v$  networks that each have 3-layers of 256 neurons each, with the attention computed as usual [85, 47]. the transformer is trained to minimize the l2 error of the next state prediction given the current state and action as inputs. the input is disentangled, and so has shape (batch_size, num_components, num_features). in each row (component representation) of each sample, features corresponding to other components are set to zero. the transformer is trained for 2000 steps with a batch size of 256, adam optimizer [38] with learning rate of 3e-4 and weight decay of 1e-5. for our reward function we use a fully-connected neural network with 1 hidden layer of 128 units. the reward network accepts an  $(s, a, s')$  tuple as input (not disentangled) and outputs a softmax over the possible reward values of  $[-1, 0, 1]$ . it is trained for 2000 steps with a batch size of 512, adam optimizer [38] with learning reate of 1e-3 and weight decay of 1e-4. all hyperparameters were rather arbitrary (we used the default setting, or in case it did not work, the first setting that gave reasonable results, as was determined by inspection). to ensure that our model and reward functions are trained appropriately (i.e., do not diverge) for each seed, we confirm that the average loss of the coda model is below 0.005 at the training and that the average loss of the reward model is below 0.1, which values were found by inspection of a prototype run. these conditions were met by all seeds.
+
+when used to produce masks, we chose a threshold of  $\tau = 0.02$  by inspection, which seemed to produce reasonable results. a more principled approach would do cross-validation on the available data, as we did for spriteworld (appendix c).
+
+tested configurations table 1 reports a subset of our tested configurations. we report our results in full below. we considered the following configurations:
+
+1. real data only.  
+2. coda + real data: after training the coda model, we expand the base dataset by either 2, 3, 4 or 6 times.  
+3. dyna (using coda model): after training the coda model, we use it as a forward dynamics model instead of for coda; we use 1-step rollouts with random actions from random states in the given dataset to expand the dataset by  $2x$ . we also tried with 5-step rollouts, but found that this further hurt performance (not shown). note that dyna results use only 5 seeds.  
+4. dyna (using mbpo model): as the coda model exhibits significant model bias when used as a forward dynamics model, we replicate the state-of-the-art model-based architecture used by mbpo [34] and use it as a forward dynamics model for dyna; we experimented with 1-step and 5-step rollouts with random actions from random states in the given dataset to expand the dataset by  $2\mathrm{x}$ . this time we found that the 5-step rollouts do better, which we attribute to the lower model bias together with the ability to create a more diverse dataset
+
+<table><tr><td rowspan="2">|d|(1000s)</td><td rowspan="2">real data1r</td><td rowspan="2">dyna1r:1m</td><td rowspan="2">mbpo1r:1m</td><td colspan="5">ratio of real:coda [:mbpo] data (ours)</td></tr><tr><td>1r:1c</td><td>1r:2c</td><td>1r:3c</td><td>1r:5c</td><td>1r:3c:1m</td></tr><tr><td>25</td><td>13.2 ± 0.7</td><td>12.2 ± 1.4</td><td>18.5 ± 1.5</td><td>43.8 ± 2.7</td><td>41.6 ± 3.7</td><td>40.9 ± 2.5</td><td>38.4 ± 4.9</td><td>46.8 ± 3.2</td></tr><tr><td>50</td><td>22.8 ± 3.2</td><td>17.4 ± 3.0</td><td>36.6 ± 4.0</td><td>66.6 ± 3.7</td><td>58.4 ± 4.7</td><td>64.4 ± 3.1</td><td>62.5 ± 3.5</td><td>70.4 ± 3.7</td></tr><tr><td>75</td><td>43.2 ± 4.7</td><td>23.3 ± 4.7</td><td>46.0 ± 4.5</td><td>73.4 ± 2.8</td><td>71.6 ± 3.8</td><td>76.7 ± 2.6</td><td>75.0 ± 3.3</td><td>74.6 ± 3.3</td></tr><tr><td>100</td><td>63.0 ± 3.0</td><td>25.9 ± 7.4</td><td>66.4 ± 5.2</td><td>77.8 ± 2.0</td><td>77.4 ± 1.8</td><td>82.7 ± 1.5</td><td>76.6 ± 3.0</td><td>73.7 ± 2.9</td></tr><tr><td>150</td><td>77.4 ± 1.3</td><td>34.1 ± 1.5</td><td>72.6 ± 5.6</td><td>82.2 ± 1.7</td><td>84.0 ± 1.2</td><td>85.8 ± 1.4</td><td>84.2 ± 1.0</td><td>79.7 ± 3.5</td></tr><tr><td>250</td><td>78.2 ± 2.7</td><td>44.2 ± 4.0</td><td>77.9 ± 2.3</td><td>85.0 ± 2.8</td><td>88.1 ± 1.0</td><td>87.8 ± 1.7</td><td>87.0 ± 1.0</td><td>78.3 ± 5.0</td></tr></table>
+
+table 2: extended batch rl results. mean success (± standard error, estimated using 1000 bootstrap resamples) on pong environment. all results average over 10 seeds, except dyna, which uses 5.
+
+(1-step not shown). the mbpo model is described below. we use the same reward model as coda to relabel rewards for the mbpo model, which only predicts next state.
+
+5. mbpo + coda: as mbpo improved performance over the baseline (real data only) at lower dataset sizes, we considered using mbpo together with coda. we use the base dataset to train the mbpo, coda, and reward models, as described above. we then use the mbpo model to expand the base dataset by  $2x$ , as described above. we then use the coda model to expand the expanded dataset by  $3x$  the original dataset size. thus the final dataset is  $5x$  as large as the original dataset (1 real : 1 mbpo : 3 coda).
+
+all configurations alter only the training dataset, and the same agent architecture/hyperparameters (reported above) are used in each case.
+
+mbpo model since using the coda model for dyna harms rather than helps, we consider using a stronger, state-of-the-art model-based approach. in particular, we adopt the model used by model-based policy optimization [34]. this model consists of a size 7 ensemble of neural networks, each with 4 layers of 200 neurons. we use relu activations, adam optimizer [38] with weight decay of 5e-5, and have each network output a the mean and (log) diagonal covariance of a multi-variate gaussian. we train the networks with a maximum likelihood loss. to sample from the model, we choose an ensemble member uniformly at random and sample from its output distribution, as in [34].
+
+full results see table 2 for results.
+
+# b.3 goal-conditioned rl
+
+here we detail the procedure used in the goal-conditioned rl experiments on the fetchpush-v1 and slide2 environments.
+
+implementation this experiment uses the same codebase as our batch rl, which provides state-of-the-art baseline her agents and will be released with the paper.
+
+hyperparameters for fetchpush-v1 we use the default hyperparameters from the codebase, which outperform the original her agents of [1, 71] and follow-up works. we do not tune the coda agent (but see additional coda hyperparameters below). they are as follows:
+
+- off-policy algorithm: ddpg [51]  
+- hindsight relabeling strategy: futureactual_2_2 [68], using exclusively future [1] relabeling for the first 25,000 steps  
+- optimizer: adam [38] with default hyperparameters  
+- batch size: 2000  
+- optimization frequency: 1 optimization step every 2 environment steps after the 5000th environment step
+
+- target network updates: update every 10 optimization steps with a polyak averaging coefficient of 0.05  
+discount factor: 0.98  
+action l2 regularization: 0.01  
+networks: 3x512 layer-normalized [4] hidden layers with relu activations  
+- target clipping: (-50, 0)  
+- action noise: 0.1 gaussian noise  
+- epsilon exploration [71]: 0.2, with an initial  $100\%$  exploration period of 10,000 steps  
+- observation normalization: yes  
+- buffer size: 1m
+
+on s1ide2 we tried to tune the baseline hyperparameters somewhat, but note that this is a fairly long experiment (10m timesteps) and so only a few settings were tested due to constraints. in particular, we considered the following modifications:
+
+- expanding the replay buffer to 2m (effective)  
+- reducing the batch size to 1000 (effective)* (used for results)  
+- using the future_4 strategy (agent fails to learn in 10m steps)  
+- reducing optimization step frequency to 1 step every 4 environment steps (about the same performance)
+
+we tried similar adjustments to our coda agent, but found the default hyperparameters (used for results) performed well. we found that the coda agent outperforms the base her agent on all tested settings.
+
+for coda, we used the following additional hyperparameters:
+
+coda buffer size: 3m  
+- make coda data every: 250 environment steps  
+- number of source pairs from replay buffer used to make coda data: 2000  
+number of coda samples per source pair: 2  
+maximum ratio of coda:real data to train on: 3:1
+
+environment on fetchpush-v1 the standard state features include the relative position of the object and gripper, which entangles the two. while this could be dealt with by dynamic relabeling (as used for her's reward), we simply drop the corresponding features from the state.
+
+slide2 has two pucks that slide on a table and bounce off of a solid railing. observations are 40-dimensional (including the 6-dimensional goal), and actions are 4-dimensional. initial positions and goal positions are sampled randomly on the table. during training, the agent gets a sparse reward of 0 (otherwise -1) if both pucks are within  $5\mathrm{cm}$  of their ordered target. at test time we count success as having both picks within  $7.5\mathrm{cm}$  of the target on the last step of the episode. episodes last 75 steps and there is no done signal (this is intended as a continuous task).
+
+![](images/c51afe77e1d796a58f40bd78d6f4d8f77d9f6b7a5361181d7d508c33f7cabf4d.jpg)  
+figure 7: the slide2 environment.
+
+coda heuristic for these experiments we use a hand-coded heuristic designed with domain knowledge. in particular, we assert that the action is always entangled with the gripper, and that gripper/action and objects (pucks or blocks) are disentangled whenever they are more than  $10\mathrm{cm}$  apart. this encodes independence due to physical separation, which we hypothesize is a very generally heuristic that humans implicitly rely on all the time. the pucks have a radius of  $2.5\mathrm{cm}$  and height of  $4\mathrm{cm}$ , and the blocks are  $5\mathrm{cm} \times 5\mathrm{cm} \times 5\mathrm{cm}$ , so this heuristic is quite generous / suboptimal. despite being suboptimal, it demonstrates the ease with which domain knowledge can be injected via the coda mask: we need only a high precision (low false positive rate) heuristic—the recall is not as important. it is likely that an agent could learn a better mask that also takes into account velocity.
+
+# c inferring local factorization
+
+here we present several approaches to inferring the local factorization of subspaces, a crucial subroutine of coda. we note that in many cases where domain knowledge is available, simple heuristics may suffice, e.g. in our goal-conditioned rl experiments discussed in section 4 where a simple distance-based indicator function in the state space was used. however, as such heuristics may not be universally available, the question of whether data-driven approaches can successfully infer local factorization is of general interest. we note that the performance of coda will improve alongside future improvements in this inference task (motivating future work in this area), and that inferring the local factorization in general is an easier task than learning the environment dynamics.
+
+we begin by presenting two methods for inferring local factorization, derived from variants of a next-state prediction task, which we here refer to as sandy for sparse attention neural dynamics. to verify the merits of sandy in the local factorization inference task, we evaluate two sandy variants in controlled settings where the ground truth factorization is known: first in a synthetic markov process (mdp without actions), and second in spriteworld. this label information is used only to evaluate performance, and not to train the sandy parameters. the sandy-transformer model was used for the online rl experiments presented in section 4.
+
+# c.1 methods
+
+we propose two sparse attention for neural dynamics (sandy) models. in each case we seek to learn a function (or mask)  $m(s, a) \rightarrow \{0, 1\}^{(|s| + |a|) \times |s|}$  whose output represents the adjacency matrix of the local causal graph, conditioned on the state and action. we note that  $m(s, a)_{i,j} = 0$  alone is insufficient, in general, to determine the local subspace  $\mathcal{l} \subset s \times \mathcal{a}$ , since there may be multiple disconnected subspaces  $\mathcal{l}_k$  with  $m_k(s, a)_{i,j} = 0$  whose union  $\bigcup_k \mathcal{l}_k$  has  $m_{\cup k}(s, a)_{i,j} = 1$ . this can be resolved by our proposition 1 if we also force the relevant structural equations to be the same. for now, we assume the mask determines the local subspace, and leave exploration of this possibility to future work. empirically, we will see that our assumption is reasonable.
+
+sandy-mixture the first model is a mixture-of-mlps model with an attention mechanism that is computed from the current state. each component of the mixture is a neural dynamics model with sparse local dependencies. for a given component, the key idea is to train a neural dynamics model to predict the next state  $h(s_{t},a_{t})\approx s_{t + 1}$  and approximate the masking function by thresholding the (transpose of the) network jacobian of  $h$ ,  $[ \mathbf{j}(s,a)]_{i,j} = \frac{\delta}{\delta[s,a]_j} [h(s,a)]_i$ . intuitively, we can think of  $\mathbf{j}$  as providing the first-order element-wise dependencies between the predicted next state and the network input. we then derive the local factorization by thresholding the absolute jacobian
+
+$$
+m _ {\tau} (s, a) = \mathbb {1} \left(\left| \mathbf {j} (s, a) \right| > \tau\right), \tag {1}
+$$
+
+where  $\mathbb{1}(\cdot)$  represents the indicator function and  $\tau$  is a threshold hyperparameter.
+
+to estimate the network jacobian, we note that for standard activation functions (sigmoid, tanh, relu), it can be bound from above by the matrix product of its weight matrices. to see this, let  $h_\theta$  be an  $l$ -layer mlp parameterized by  $\theta = (\mathbf{w}^{(1)}, \mathbf{b}^{(1)}, \dots, \mathbf{w}^{(l)}, \mathbf{b}^{(l)})$  with activation  $\sigma$  with bounded derivative  $\sigma'(x) \leq 1$ , and note that for each layer  $\pmb{h}^{(\ell)} = \sigma(\mathbf{w}^{(\ell)}\pmb{h}^{(\ell-1)} + \mathbf{b}^{(\ell)})$  we have:
+
+$$
+\left| \frac {d \boldsymbol {h} _ {j} ^ {(\ell)}}{d \boldsymbol {h} _ {i} ^ {(\ell - 1)}} \right| \leq \left| \mathbf {w} _ {j i} ^ {(\ell)} \right|.
+$$
+
+then, using the chain rule, triangle inequality, and the identity  $|ab| = |a||b|$ , we can compute:
+
+$$
+\begin{array}{l} \left| \frac {d \mathbf {h} _ {j} ^ {(\ell)}}{d \mathbf {h} _ {i} ^ {(\ell - 2)}} \right| \leq \left| \frac {d}{d \mathbf {h} _ {i} ^ {(\ell - 2)}} \mathbf {w} _ {j \cdot} ^ {(\ell)} \mathbf {h} ^ {(\ell - 1)} \right| = \left| \mathbf {w} _ {j \cdot} ^ {(\ell)} \cdot \frac {d \mathbf {h} ^ {(\ell - 1)}}{d \mathbf {h} _ {i} ^ {(\ell - 2)}} \right| \\ \leq \sum_ {k} \left| \mathbf {w} _ {j k} ^ {(\ell)} \frac {d \boldsymbol {h} _ {k} ^ {(\ell - 1)}}{d \boldsymbol {h} _ {i} ^ {(\ell - 2)}} \right| \leq \left| \mathbf {w} _ {j}. ^ {(\ell)} \right| \cdot \left| \mathbf {w} _ {. i} ^ {(\ell - 1)} \right|. \\ \end{array}
+$$
+
+expanding this out to multiple layers, we see that  $\left|\mathbf{j}_{\theta}(s,a)\right| \leq \prod_{\ell \in [l]}|\mathbf{w}^{(\ell)}|$ , as desired. we use this upper bound to approximate the network jacobian of an mlp by setting  $\hat{\mathbf{j}} = \prod_{\ell \in [l]}\left|\mathbf{w}^{(\ell)}\right|$ . a similar idea is used by [25, 44], among others, to control element-wise input-output dependencies.
+
+we use this static approximation  $\hat{\mathbf{j}}$  to facilitate learning a sparse dynamic mask by specifying a mixture model  $h(s,a) = \sum_{i}\alpha_{\phi}^{(i)}(s,a)h_{\theta}^{(i)}(s,a)$  over the environment dynamics (with  $\sum_{i}\alpha_{\phi}^{(i)}(s,a) = 1\forall (s,a)$ ), where each component  $h_\theta^{(i)}$  is an mlp as specified above with a sparsity prior on its jacobian bound  $\hat{\mathbf{j}}^{(i)}$  to encourage sparse (i.e. well-factorized) local solutions. the dynamic mask is computed by first approximating the jacobian,  $\hat{\mathbf{j}} (s,a) = \sum_{i}\alpha_{\phi}^{(i)}(s,a)\hat{\mathbf{j}}^{(i)}$ , then thresholding by  $\tau$  as in equation 1.
+
+note that we assume the mixture components  $\alpha$  are a function of the current state and action alone; in other words the factorization (captured by the network jacobian of each component) can be locally inferred. the next-state prediction is given by  $\hat{\mathbf{s}}_{t + 1} = (h_\theta^{(1)}(\mathbf{s}_t,\mathbf{a}_t),\dots ,h_\theta^{(n)}(\mathbf{s}_t,\mathbf{a}_t))^t\pmb {\alpha}_\phi (\mathbf{s}_t,\mathbf{a}_t)$ . to train the model, we optimize the objective:
+
+$$
+\underset {\theta , \phi} {\text {m i n i m i z e}} \frac {1}{| \mathcal {d} |} \left(\sum_ {\left(\mathbf {s} _ {t}, \mathbf {a} _ {t} \mathbf {s} _ {t + 1}\right) \in \mathcal {d}} \left\| \mathbf {s} _ {t + 1} - h \left(\mathbf {s} _ {t}, \mathbf {a} _ {t}\right) \right\| _ {2} ^ {2}\right) + \lambda_ {1} s (\theta) + \lambda_ {2} r (\phi) + \lambda_ {3} \| (\theta , \phi) \| _ {2} \tag {2}
+$$
+
+where  $s(\theta) = \frac{1}{k}\sum_{i}|\tilde{\mathbf{j}}_{\theta}^{(i)}|_{1}$  puts an  $\ell_1$  prior on each mixture component to induce sparsity, and  $r(\phi)$  encourages high entropy in the attention probabilities
+
+$$
+r (\phi) = \frac {1}{| \mathcal {d} |} \sum_ {\mathbf {s} \in \mathcal {d}} \sqrt {\frac {1}{n} \sum_ {j \in [ n ]} [ a _ {\phi} (\mathbf {s} , \mathbf {a}) ] _ {j}}.
+$$
+
+we note that more sophisticated methods of computing jacobians of neural networks—including architectural changes and optimization strategies [3]—have been proposed, and could in principle be used here as well.
+
+sandy-transformer as an alternative model, we use a transformer-like architecture that applies self-attention between a set of (potentially multi-dimensional) inputs [85, 47]. our architecture is composed of a stacked self-attention blocks. each block accepts a set of inputs  $x = \{x_{i} \in \mathbb{r}^{n}\}$  and composes three functions of each input: query  $q: \mathbb{r}^n \to \mathbb{r}^d$ , key  $k: \mathbb{r}^n \to \mathbb{r}^d$ , and value  $v: \mathbb{r}^n \to \mathbb{r}^m$ . the block returns a set of outputs  $\{y_{i} \in \mathbb{r}^{m}\}$  of size  $|x|$ , each of which is computed as:  $y_{i} = a_{i}^{t}v(x)$ , where  $a_{i} = \text{softmax}\big(\sum_{j}(q(x_{i})_{j}k(x_{j})_{i})\big)$  (note that  $v(x)$  is a matrix of size  $|x| \times m$ ). we approximate the block mask (approximate jacobian) as  $a = [a_1, a_2, \ldots, a_{|x|}] \in \mathbb{r}^{|x| \times |x|}$ , and the full network mask as the product of the block masks (as in the sandy-mixture). we used two-layer mlps for each function  $k, q, v$  in spriteworld and three-layer mlps in pong.
+
+to apply this architecture to our problem, we first embed each state and action component (single feature, or group of features) into  $\mathbb{r}^n$  to produce a set of inputs  $x$  and pass this through each stacked self-attention block to obtain a set of outputs  $y$ . we then discard any output components that correspond to the action features to obtain the next state prediction and mask. the network  $h$  is trained to minimize mean squared error:
+
+$$
+\underset {\theta} {\text {m i n i m i z e}} \frac {1}{| \mathcal {d} |} \sum_ {\left(\mathbf {s} _ {t}, \mathbf {a} _ {t} \mathbf {s} _ {t + 1}\right) \in \mathcal {d}} \left\| \mathbf {s} _ {t + 1} - h \left(\mathbf {s} _ {t}, \mathbf {a} _ {t}\right) \right\| _ {2} ^ {2}. \tag {3}
+$$
+
+unlike the sandy-mixture, no sparsity regularizers are applied, as we found the sparsity induced by the softmax attention mechanism to be sufficient.
+
+# c.2 evaluation environments
+
+synthetic markov processes we investigate the capacity of the sandy-mixture to learn simple factorized transition dynamics under a globally factored markov process (stationarymp). unlike the general mdp setting, no agent/policy is considered. however the ability to train an unconstrained dynamics model to approximate factorized environment dynamics is an important subtask within our overall approach. assuming a spherical gaussian prior over the initial states  $\mathbf{s}^0\in \mathbb{r}^9$ , the
+
+stationarymp is entirely specified by transition distribution  $p(\mathbf{s}^{t + 1}|\mathbf{s}^t)$ . we assume that the state transitions factorize (globally) into three parts. denoting by  $\mathbf{s}_n^t\dots m$  the  $n$ -th through  $m$ -th dimensions of the time  $t$  state  $\mathbf{s}^t$ , we have:
+
+$$
+p (\mathbf {s} _ {1 \dots 9} ^ {t + 1} | \mathbf {s} _ {1 \dots 9} ^ {t}) = p (\mathbf {s} _ {1 \dots 4} ^ {t + 1} | \mathbf {s} _ {1 \dots 4} ^ {t}) p (\mathbf {s} _ {5 \dots 7} ^ {t + 1} | \mathbf {s} _ {5 \dots 7} ^ {t}) p (\mathbf {s} _ {8, 9} ^ {t + 1} | \mathbf {s} _ {8, 9} ^ {t}).
+$$
+
+in other words, we have a block-diagonal transition matrix comprising three blocks with sizes 4, 3, and 2, respectively. in our case, all transition factors are deterministic non-linear mappings, e.g.  $p(\mathbf{s}_{1\dots 4}^{t + 1}|\mathbf{s}_{1\dots 4}^t) = \delta (g_{1\dots 4}(\mathbf{s}_{1\dots 4}^t))$ , with  $g_{1\dots 4}:\mathbb{r}^4\to \mathbb{r}^4$  is a randomly-initialized single-hidden-layer neural network with 32 hidden units and gelu nonlinearity [30]. in this case, we can alternatively express the deterministic dynamics via the transition function
+
+$$
+\begin{array}{l} \mathbf {s} ^ {t + 1} = \left(\mathbf {s} _ {1 \dots 4} ^ {t + 1}, \mathbf {s} _ {5 \dots 7} ^ {t + 1}, \mathbf {s} _ {8, 9} ^ {t + 1}\right) \\ = \left(g _ {1 \dots 4} \left(\mathbf {s} _ {1 \dots 4} ^ {t}\right), g _ {5 \dots 7} \left(\mathbf {s} _ {5 \dots 7} ^ {t}\right), g _ {8, 9} \left(\mathbf {s} _ {8, 9} ^ {t}\right)\right). \quad \text {(s t a t i o n a r y m p)} \\ \end{array}
+$$
+
+we now turn to a more sophisticated mp with locally factored dynamics ( $\epsilon$ -nonstationarymp), and investigate whether the sandy-mixture can learn to recognize local disentanglement.
+
+we refer to the component functions  $g_{1\dots 4}:\mathbb{r}^4\to \mathbb{r}^4$ $g_{5\dots 7}:\mathbb{r}^3\to \mathbb{r}^3$  , and  $g_{8,9}:\mathbb{r}^2\to \mathbb{r}^2$  used in the stationarymp as local transitions. we now introduce global interactions via the global transition functions,  $g_{1\dots 4}:\mathbb{r}^4\to \mathbb{r}^9$ $g_{5\dots 7}:\mathbb{r}^4\to \mathbb{r}^9$  , and  $g_{8,9}:\mathbb{r}^4\to \mathbb{r}^9$  , which respectively map the local state factors onto the global state space'. this allows us to extend the stationarymp by adding global state transitions to the local state transitions whenever the norm of the local state factors exceeds the value of a hyperparameter  $\epsilon$  (lower  $\epsilon$  indicates more global interaction). denoting by  $\mathbb{1}(\cdot)$  the indicator function, we have
+
+$$
+\begin{array}{l} \mathbf {s} ^ {t + 1} = \left[ (\mathbf {s} _ {1} ^ {t + 1}, \mathbf {s} _ {2} ^ {t + 1}, \mathbf {s} _ {3} ^ {t + 1}, \mathbf {s} _ {4} ^ {t + 1}), (\mathbf {s} _ {5} ^ {t + 1}, \mathbf {s} _ {6} ^ {t + 1}, \mathbf {s} _ {7} ^ {t + 1}), (\mathbf {s} _ {8} ^ {t + 1}, \mathbf {s} _ {9} ^ {t + 1}) \right] \\ = \left[ g _ {1 \dots 4} (\mathbf {s} _ {1 \dots 4} ^ {t}), g _ {5 \dots 7} (\mathbf {s} _ {5 \dots 7} ^ {t}), g _ {8, 9} (\mathbf {s} _ {8, 9} ^ {t}) \right] \\ + g _ {1 \dots 4} (\mathbf {s} _ {1 \dots 4} ^ {t}) \mathbb {1} (| | \mathbf {s} _ {1 \dots 4} ^ {t} | | _ {2} > \epsilon) \\ + g _ {5 \dots 7} \left(\mathbf {s} _ {5 \dots 7} ^ {t}\right) \mathbb {1} \left(\left| \left| \mathbf {s} _ {5 \dots 7} ^ {t} \right| \right| _ {2} > \epsilon\right) \\ + g _ {8, 9} \left(\mathbf {s} _ {8, 9} ^ {t}\right) \mathbb {1} \left(\left\| \mathbf {s} _ {8, 9} ^ {t} \right\| _ {2} > \epsilon\right). \quad (\epsilon - n o n s t a t i o n a r y m p) \\ \end{array}
+$$
+
+spriteworld since we extended spriteworld with a ground truth mask renderer, we are able to directly evaluate our sandy models in spriteworld as well. see the main text and appendix b for a description of the spriteworld environment.
+
+# c.3 results
+
+in this subsection we measure ability of the proposed sandy algorithm (in its two variants) to correctly infer local factorization. at each transition we can query the environment for the ground-truth connectivity pattern of the local causal graph: given  $|s| + |a|$  dimensions of current state and action and  $|s|$  dimensions of next state, this corresponds an adjacency matrix  $\mathbf{y} \in \{0,1\}^{|s| + |a| \times |s|}$ . we note that accessing these evaluation labels—which are not used to train sandy—requires a controlled synthetic environment like the ones we consider, and we leave design of an evaluation protocol suitable for real-world environments to future work.
+
+we learn the sandy network parameters using a training dataset of 40,000 transitions, with an additional validation dataset of 10,000 transitions used for early stopping and hyperparameter selection. we used the adam optimizer with learning rate of 0.001 and default hyperparameters. in the  $\epsilon$ -nonstationarymp, we set  $\epsilon = 1.5$ , while in the sprinteworld setting we collect training trajectories by deploying a random-action agent in the environment, and randomly resetting the environment with  $5\%$  probability at every step to increase diversity of experiences. we then evaluate the sandy models by computing local factorizations  $m_{\tau}(s,a):|s|\times |a|\to \{0,1\}^{(|s| + |a|)\times |s|}$  as a function of the threshold  $\tau$  for each transition in a held-out test dataset of 10,000 trajectories. we compute true and false positive rates for various values of  $\tau$  to produce roc plots.
+
+![](images/f3c6d08138770354946604ee0d4eb603bbaa56e875f117467bf93e0ae04302b6.jpg)  
+(a) stationarymp
+
+![](images/32d0c756d726dc8d271a022485e077460256661d5d245c1b995c542814fd4dda.jpg)  
+(b)  $\epsilon$ -nonstationarymp  
+figure 8: roc plots for correct sparsity pattern prediction on the three environments. on held-out test transitions we derive the ground truth local connectivity per step—label information that is not used to train the attention model—and measure (over 5 runs; 1 std. dev. shaded) true and false positive rates while sweeping the mask threshold  $\tau$  over its allowable range. an accurate model generates an area under the curve (auc) close to 1. we observe that while sandy-mixture is sufficient for (nearly) solving the simpler synthetic mp environments, it underperforms in spriteworld. sandy-transformer, which has a stronger inductive bias, is sufficient to (nearly) solve spriteworld.
+
+![](images/3b82556cb1733ec09dd577deae8ebc75f4bdb3eca05994d7c50da0e7e69c9238.jpg)  
+(c) spriteworld
+
+figure 8 shows that while the sandy-mixture is sufficient to solve the simpler synthetic mp settings (with avg auc of 0.96 and 0.91 for the stationary and non-stationary variants), it scales poorly to the spriteworld environment. while the modest inductive bias of sparse local connections and high-entropy mixture components in sandy-mixture makes it widely applicable, we hypothesize that its sensitivity to hyperparameters makes it difficult to tune in complex settings. fortunately, sandy-transformer, performs favorably in spriteworld by incorporating a stronger inductive bias about the state subspace structure. thus we use sandy-transformer to perform local factorization inference in the remaining experiments.
+
+figure 9 provides some qualitative intuition as to how the two variants of sandy differ in their attention strategy in the spriteworld environment.
+
+# d fitting dynamics models to spriteworld
+
+since coda is a data augmentation strategy, it is reasonable to consider an alternative approach to augmenting the experience buffer: sampling from a dynamics model as in model-based rl. here we present some qualitative results from our efforts in fitting dynamics models to the spriteworld environment. we found that while dynamics models achieve a decent error in the next-state prediction task, they fail to produce a diverse set of trajectories when used as autoregressive samplers. in particular, the autoregressive sampling did not model collisions well and often produced trajectories where sprites converged to fixed points in space after a short number of steps. figure 10 shows trajectories sampled autoregressively from linear, mlp, and lstm-based dynamics models, alongside the ground truth trajectory. note that all dynamics models were trained to minimize error in next-state prediction given the current state and action. in other words the lstm auto-regressively predicts successive dimensions of the next state rather than modeling multiple time steps of the trajectory. nevertheless the environment is truly markov because instantaneous velocities are observed, so this information should be sufficient in theory to capture the environment dynamics.
+
+# e sample efficient dynamics modeling with coda
+
+if we had access to the ground truth local factorization, even for a few samples (e.g., we could have humans label them), how much more efficient would it be to train a dynamics model? in figure 11, we sample 2000 transitions from a random policy in spriteworld and use the data to train a forward dynamics model using mse loss. the validation loss throughout training is plotted. our baseline uses only the initial dataset, and quickly overfits the training set, showing increasing error after the initial few epochs. the same applies to a "random" coda strategy, that does coda using an identity attention mask  $(m(s,a) = i\forall (s,a))$  to randomly relabel the components. the random strategy
+
+![](images/e7accb1248bcca34fcff48af41610753ffeee985d9f31ea5035b089deded7a2a.jpg)
+
+![](images/e5c2d19d13190ae982059c477d53bbef32949184c7d94002fe8ddf84de6e5ea3.jpg)
+
+![](images/154788f82e89070bb893b870529f45d2d192d4ab8ed6ae12f3e600664ab4253f.jpg)
+
+![](images/d24c16ae36e4f9f9205ec71d373838ed71cd33343d891b642ef6ea4e14e2b3b2.jpg)
+
+![](images/10b955bca5d3f4a0142639bf09755c552c8175673c9dd10b234ee6089c4c6c42.jpg)
+
+![](images/4714c7d64c2ab4c30582ea218ebdf70f179e4581814701233323f93aaebe8fa7.jpg)
+
+![](images/69eae725a3209ded83a4d13fb987991dd311cf4cff8fffb5c4ffcb0908a01fac.jpg)
+
+![](images/892dbfdead941e07db2f6b0c3cb14455e869d944d25f2baca4f8372f34eed925.jpg)
+
+![](images/3cb8fd76ac33de65b9011b83f6e824378a7027395f492bceee344f296c4c7e46.jpg)  
+(a) sandy-mixture
+
+![](images/84e81aa8e83379a0ecf1181871f0820da6c97367818fce538a8d43f738fdd498.jpg)  
+(b) sandy-transformer  
+figure 9: qualitative comparison of two attention mechanisms on the same spriteworld trajectory. sandy-mixture (left) has a weaker inductive bias as it relies on sparsity regularization alone. accordingly, it can learn a more compact subspace (e.g. grid patterns within a shape indicate that  $x$  and  $y$  coordinates move independently), but is less reliable in attending to collisions between shapes, and completely fails to attend to the action's affect on shapes. sandy-transformer has a stronger inductive bias and can more reliably infer the local interaction pattern between the five subspaces (four shapes and one action).
+
+does a bit better than the no coda strategy, since the randomness acts as a regularizer. finally, we train a model using an additional 35,000 unique counterfactual coda transitions, and find that it significantly improves validation loss and prevents the model from overfitting. note that we could have generated many more coda samples: from 2000 base transitions, if  $80\%$  of them do not involve collisions and there are 4 connected components in each, we could generate as many as  $1600^4$  (6.5 trillion!) counterfactual samples.
+
+![](images/0fcb7dab4c6c0cf129cddc91f36c6f48212fd4c294bb7522922bfc565953978a.jpg)  
+(a) ground truth
+
+![](images/d0f253765265a937e8c9319982a3bfc8943942f2f90565f5c74a84a5c9c04d38.jpg)  
+(b) linear dynamics
+
+![](images/edec7f7b8abbef157680669e2aecf0747cdc623fe1366daa82a5dcb34a738862.jpg)  
+(c) mlp dynamics
+
+![](images/39a32c64f7efe21f0318b30d6a92b40b0a90c99a65f7247b71ef83c872f3033f.jpg)  
+(d) lstm dynamics
+
+![](images/6a0ea029b0995b51dd28d7757e7c92efe9b07dd5deb0eff8d20d02f1bb56f284.jpg)  
+figure 10: auto-regressive model-based rollouts for a variety of dynamics models fit to spriteworld. while the dynamics models were able to achieve relatively low error in the next-state prediction task, they fail to capture collisions and long-term dependencies in the sampled trajectories, and thus were omitted as baselines in the rl experiments. all trajectories share the same initial state.  
+figure 11: learning curves for training a forward dynamics model using data from a random policy. dotted lines indicate training performance, whereas solid lines indicate validation performance. we see that using the ground truth mask prevents overfitting and allows us to achieve much better validation performance.
+
+# f compute infrastructure
+
+experiments were run on a mix of local machines and a compute cluster, with a mix of gtx 1080 ti, titan xp, and tesla p100 gpus. this was solely to run jobs in parallel, and all experiments can be run locally (gpu optional for spriteworld and pong, but recommended for fetch experiments).

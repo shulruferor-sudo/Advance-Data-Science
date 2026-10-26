@@ -1,0 +1,1101 @@
+# discor: corrective feedback in reinforcement learning via distribution correction
+
+aviral kumar*
+
+abhishek gupta
+
+sergey levine
+
+electrical engineering and computer sciences, university of california, berkeley
+
+aviralk@berkeley.edu
+
+abhigupta@berkeley.edu
+
+svlevine@eecs.berkeley.edu
+
+# abstract
+
+deep reinforcement learning can learn effective policies for a wide range of tasks, but is notoriously difficult to use due to instability and sensitivity to hyperparameters. the reasons for this remain unclear. when using standard supervised methods (e.g., for bandits), on-policy data collection provides "hard negatives" that correct the model in precisely those states and actions that the policy is likely to visit. we call this phenomenon "corrective feedback." we show that bootstrapping-based q-learning algorithms do not necessarily benefit from this corrective feedback, and training on the experience collected by the algorithm is not sufficient to correct errors in the q-function. in fact, q-learning and related methods can exhibit pathological interactions between the distribution of experience collected by the agent and the policy induced by training on that experience, leading to potential instability, sub-optimal convergence, and poor results when learning from noisy, sparse or delayed rewards. we demonstrate the existence of this problem, both theoretically and empirically. we then show that a specific correction to the data distribution can mitigate this issue. based on these observations, we propose a new algorithm, discor, which computes an approximation to this optimal distribution and uses it to re-weight the transitions used for training, resulting in substantial improvements in a range of challenging rl settings, such as multi-task learning and learning from noisy reward signals. blog post presenting a summary of this work is available at: https://bair.berkeley.edu/blog/2020/03/16/discor/.
+
+# 1. introduction
+
+reinforcement learning (rl) algorithms, when combined with high-capacity deep neural net function approximators, have shown promise in domains ranging from robotic manipulation [1] to recommender systems [2]. however, current deep rl methods can be difficult to use, due to sensitivity with respect to hyperparameters and inconsistent and unstable convergence. while a number of hypotheses have been proposed to understand these issues [3, 4, 5, 6], and gradual improvements have led to more powerful algorithms in recent years [7, 8], an effective solution has proven elusive. we hypothesize that a major source of instability in reinforcement learning with function approximation and value function estimation, such as q-learning [9, 10, 11] and actor-critic algorithms [12, 13], is a pathological interaction between the data distribution induced by the latest policy, and the errors induced in the learned approximate value function as a consequence of training on this distribution, which then exacerbates the issues for the data distribution at the next iteration.
+
+while a number of prior works have provided a theoretical examination of various approximation dynamic programming (adp) methods - which encompasses q-learning and actor-critic algorithms - prior work has not extensively studied the relationship between the data distribution induced by the latest value function, and the errors in the future value functions obtained by training on this data.
+
+when using supervised learning to train a model, as in the case of contextual bandits or model-based rl, using the resulting model to select the most optimal actions results in a kind of "hard negative" mining: the model collects precisely those transitions that lead to good outcomes according to the model (potentially erroneously). this results in collecting precisely the data needed to fix those errors and improve. we refer to this as "corrective feedback." we argue that adp algorithms (e.g., q-learning and actor-critic), which use bootstrapped targets rather than ground-truth labels, often do not enjoy this sort of corrective feedback. since they regress onto bootstrapped estimates of the current value function, rather than the true optimal value function (which is unknown), simply visiting states with high error and updating the value function at those states does not necessarily correct those errors, since errors in the target value might be due to upstream errors in other states that are visited less often. this absence of corrective feedback can result in severe detrimental consequences on performance.
+
+we demonstrate that naively training a value function on transitions collected either by the latest policy or a mixture of recent policies (i.e., with replay buffers) may not result in corrective feedback. in fact, in some cases, it can actually lead to increasing accumulation of errors, which can lead to poor performance even on simple tabular mdps. we then show how to address this issue by re-weighting the data buffer using a distribution that explicitly optimizes for corrective feedback, which gives rise to our proposed algorithm, discor.
+
+the two main contributions of our work consist of an analysis showing that adp methods may not benefit from corrective feedback, even with online data collection, as well as a proposed solution to this problem based on estimating target value error and resampling the replay buffer to mitigate error accumulation. our method, discor, is general and can be used in conjunction with most modern adp-based deep rl algorithms, such as dqn [11] and sac [7]. our experiments show that discor substantially improves performance of standard rl methods, especially in challenging settings, such as multi-task rl and learning from noisy rewards. we evaluate our approach on both continuous control tasks and discrete-action atari games. on the multi-task mt10 benchmark [14] and several robotic manipulation tasks, our method learns policies with a final success rate that is  $50\%$  higher than that of sac.
+
+# 2. preliminaries
+
+the goal in reinforcement learning is to learn a policy that maximizes the expected cumulative discounted reward in a markov decision process (mdp), which is defined by a tuple  $(s, \mathcal{a}, t, r, \gamma)$ .  $s, \mathcal{a}$  represent state and action spaces,  $t(s'|s, a)$  and  $r(s, a)$  represent the dynamics and reward function, and  $\gamma \in (0, 1)$  represents the discount factor.  $\rho_0(s)$  is the initial state distribution. the infinite-horizon, discounted marginal state distribution of the policy  $\pi(a|s)$  is denoted as  $d^{\pi}(s)$  and the corresponding state-action marginal is  $d^{\pi}(s, a) = d^{\pi}(s)\pi(a|s)$ .
+
+approximate dynamic programming (adp) algorithms, such as q-learning and actor-critic methods, aim to acquire the optimal policy by modeling the optimal state  $(v^{*}(s))$  and state-action  $(q^{*}(s,a))$  value functions. these algorithms are based on recursively iterating the bellman optimality operator,  $\mathcal{b}^*$ , defined as
+
+$$
+(\mathcal {b} ^ {*} q) (s, a) = r (s, a) + \gamma e _ {s ^ {\prime} \sim t} [ \max  _ {a ^ {\prime}} q (s ^ {\prime}, a ^ {\prime}) ].
+$$
+
+the goal is to converge to the optimal value function,  $q^{*}$ , by applying successive bellman projections. with function approximation, these algorithms project the values of the bellman optimality operator  $\mathcal{b}^{*}$  onto a family of q-function approximators  $\mathcal{q}$  (e.g., deep neural nets) under a sampling or data distribution  $\mu$ , such that  $q_{k + 1} \gets \pi_{\mu}(\mathcal{b}^{*}q_{k})$  and
+
+$$
+\pi_ {\mu} (q) \stackrel {{\mathrm {d e f}}} {{=}} \underset {q ^ {\prime} \in \mathcal {q}} {\operatorname {a r g m i n}} \mathbb {e} _ {s, a \sim \mu} \left[ \left(q ^ {\prime} (s, a) - q (s, a)\right) ^ {2} \right]. \tag {1}
+$$
+
+we refer to  $\mathcal{b}^* q$  as the target value for the projection step.  $q$ -function fitting is usually interleaved with additional data collection, which typically uses a policy derived from the latest value function, augmented with either  $\epsilon$ -greedy [11] or boltzmann-style [7] exploration. to simplify analysis, we mainly consider an underlying rl algorithm (appendix c, algorithm 2) that alternates between fitting the action-value function,  $q(s,a)$ , fully with the current data by minimizing bellman error, and then collecting data with the policy derived from this value function. this corresponds to fitted q-iteration.
+
+for commonly used adp methods,  $\mu$  simply corresponds to the on-policy state-action marginal,  $\mu_{k} = d^{\pi_{k}}$  (at iteration  $k$ ) or else a "replay buffer" [7, 11, 15] formed as a mixture distribution over all past policies, such that  $\mu_{k} = \sum_{i=1}^{k} d^{\pi_{i}}$ . however, as we will show in this paper, the choice of the sampling distribution  $\mu$  is of crucial importance for the stability and efficiency of adp algorithms, and that many commonly-used choices of this distribution can lead to convergence to sub-optimal solutions, even with online data collection. we analyze this issue in section 3, and then discuss a potential solution to this problem in section 5.
+
+experiment setup for analysis. for the purposes of the analysis of corrective feedback in section 3, we use tabular mdps from [6], which provide the ability to measure oracle quantities, such as the error against  $q^{*}$ , the ground truth optimal q-function. we remove other sources of error, such as sampling error, by providing all transitions in the mdp to the adp algorithm. we simulate different data distributions by re-weighting these transitions. we use a two hidden layer feed-forward network to represent the q-function. more details on this setup are provided in appendix f.1.
+
+# 3. corrective feedback in q-learning
+
+in this paper, we study how the policies induced by value functions learned via adp result in data distributions that can fail to correct systematic errors in those value functions, in contrast to non-bootstrapped methods (e.g., supervised learning of models). that is, adp methods lack "corrective feedback." to define corrective feedback intuitively and formally, we start with a contextual bandit example, where the goal is to learn the optimal state-action value function  $q^{*}(s,a)$  which, for a bandit, is equal to the reward  $r(s,a)$  for performing action  $a$  in state  $s$ . at iteration  $k$ , the algorithm minimizes the estimation error of the q-function:  $\mathbb{e}_{s\sim \beta (s),a\sim \pi_k(a|s)}[|q_k(s,a) - q^* (s,a)|]$ . using a greedy or boltzmann policy  $\pi_{k}(a|s)$  to collect data for training  $q_{k + 1}$  leads the agent to choose actions  $a$  with over-optimistic  $q_{k}(s,a)$  values at a state  $s$ , and observe the corresponding true  $q^{*}(s,a)$  values as a result. minimizing this estimation error then leads to the errors being corrected, as  $q_{k}(s,a)$  is pushed closer to match the true  $q^{*}(s,a)$  for actions  $a$  with incorrectly high q-values. this constructive interaction between online data collection and error correction is what we refer to as corrective feedback.
+
+in contrast, as we will observe shortly, adp methods that employ bootstrapped target values do not necessarily benefit from such corrective feedback, and therefore can converge to suboptimal solutions. because value functions are trained with target values computed by applying the bellman backup on the previous learned q-function, rather than the true optimal  $q^{*}$ , errors in the previous q-function at the states that serve as backup targets can result in incorrect q-value targets at the current state. in this case, no matter how often the current transition is observed, the error at this transition is not corrected. since adp algorithms typically use data collected using past q-functions for training, thus coupling the data distribution to the learned value function, this issue can make them unable to correct target value errors.
+
+as shown in figure 1 (experiment setup described at the end of section 2), state visitation frequencies of the latest policy in an adp algorithm can often correlate positively with increasing error, suggesting that visiting a state can actually increase error at that state, in contrast to supervised learning in bandit problems, where this correlation is either negative (i.e., the error decreases) or 0.
+
+![](images/99e68f42df0d23214f676099c42aeaedf148e63bc4c8b70ffc6099420e9c1df4.jpg)  
+figure 1: left: return attained by with direct supervised learning of values in a bandit problem ("bandit") and with bootstrapped targets ("adp") on a simple tabular mdp. right: cosine similarity between per-iteration error increase  $\mathcal{e}_{k+1} - \mathcal{e}_k$  and the policy's state visitation frequency  $d^{\pi_k}$  for the two training runs. the adp run performs poorly, and exhibits a positive cosine similarity for prolonged periods during training, suggesting that the policy visitation at least at some states correlates with an increase in error. with ground truth targets ("bandit"), this quantity is negative until convergence (around iteration 25), and then fluctuates around 0, suggesting that this approach does benefit from corrective feedback.
+
+![](images/e1a174bb0dff920724cc4e913fb913833e8ae889605dc802194e6b633987a729.jpg)
+
+thus, naively coupling the choice of data distribution  $\mu$  and the  $q$  function being optimized, by sampling uniformly from a replay buffer collected by policies corresponding to prior q-functions [11], or even just sampling from data collected by the latest policy, can cause an absence of corrective feedback. as we will show in section 3.2, this can lead to several detrimental effects such as sub-optimal convergence, instability, and slow learning progress. to theoretically analyze the lack of corrective feedback, we first define error against the optimal value function as follows:
+
+definition 3.1 the value error is defined as the expected absolute error to the optimal  $q$ -function  $q^{*}$  weighted under the corresponding on-policy  $(\pi_k)$  state-action marginal,  $d^{\pi_k}$ :
+
+$$
+\mathcal {e} _ {k} = \mathbb {e} _ {d ^ {\pi_ {k}}} \left[ | q _ {k} - q ^ {*} | \right].
+$$
+
+a smooth decrease in the value error  $\mathcal{e}_k$  indicates that the algorithm is effectively correcting errors in the q-function. if  $\mathcal{e}_k$  fluctuates or increases, the algorithm may be making poor learning progress. when the value error  $\mathcal{e}_k$  is roughly stagnant at a non-zero value, this may indicate premature, sub-optimal convergence, provided
+
+![](images/93984c4693d39ec94dd5c42c7c5fe6e23a572af634d1a649f943414b66397f52.jpg)  
+figure 2: iterations of q-learning on a tree-structured mdp. trajectories are sampled using the current policy, with each trial (shown as dotted borders around states) starting from the root. function approximation leads to aliasing of box-shaped nodes and circle-shaped nodes, such that updates to one circle-shaped node affect all other circles, and likewise for box-shaped nodes. due to the training distribution and aliasing, this method often backs up incorrect target values. due to aliasing, previously correct values at other states may become incorrect due to these erroneous backups, resulting in non-convergence. this issue is due to each of the leaf nodes (which cause the errors) being sampled less often than the nodes higher in the tree (which suffer from these errors), thus disabling the algorithm from correct erroneous target values.
+
+that the function approximator class is able to support lower-error solutions (which is typically the case for large deep networks). thus, having the learning process monotonically and quickly bring the value error  $\mathcal{e}_k$  down to 0 is desirable for effective learning. by means of a simple didactic example, we now discuss some reasons why corrective feedback may be absent in adp methods. we will then describe several examples that illustrate the negative consequences of absent corrective feedback on learning progress.
+
+# 3.1 a didactic example and theoretical analysis of an absence of corrective feedback
+
+in this section, we first present a diadictic example which provides intuition for why corrective feedback may be absent in rl, and then we generalize this intuition to a more formal result in section 3.1.2.
+
+# 3.1.1 didactic example
+
+we first describe our didactic example which is a tree-structured deterministic mdp (figures 2 and 3) with 7 states and 2 actions,  $a_1$  and  $a_2$ , at each state. the mdp has deterministic transitions, where action  $a_1$  transitions to a node's left child, and  $a_2$  transitions to the right child. at each leaf node, the episode terminates and the agent receives a reward.
+
+we illustrate the learning progress of q-learning (algorithm 2) on this tree-mdp in figure 2 and the learning progress of a method with an optimal distribution in figure 3. in the on-policy setting, q-values at states are updated according to the visitation frequency of these states under the current policy. since the leaf nodes are the least likely in this distribution, the bellman backup is slow to correct errors at the leaves. using these incorrect leaf q-values as target values for nodes higher in the tree then gives rise to incorrect values, even if bellman error is fully minimized for the sampled transitions. thus, most of the bellman updates do not actually bring the updated q-values closer to  $q^{*}$ . if we carefully order the states, such that the lowest level nodes are updated first before proceeding upwards in the tree, as shown in figure 3, the errors are much lower. we will show in section 5 that our proposed approach in this paper aims at performing updates in the manner shown in figure 3 by re-weighting transitions collected by on-policy rollouts via importance sampling.
+
+reasons for the absence of corrective feedback. the above example provides an intuitive explanation for how on-policy or replay buffer distributions may not lead to error correction. updates on states from such distributions may fail to correct q-values at states that are the causes of the errors. in general, bellman backups rely on the correctness of the values at the states that are used as targets, which may mean relying on the correctness of states that occur least frequently in any distribution generated by online data collection. while this is sufficient to guarantee convergence in tabular settings, with function approximation this can lead to an absence
+
+![](images/736ad9de08ba7f4da714be1ab885d14b9910596d8e9ee4d8ea54b5439d17dc28.jpg)  
+figure 3: iterations of q-learning on a tree-structured mdp with an optimal training distribution, where states are sampled starting from the leaf nodes, progressing upwards towards the root node in the tree. note that this method backs up very few incorrect values in any iterations, and takes only a few iterations to converge. our aim will be to approximate such an optimal training distribution.
+
+of corrective feedback, as states with erroneous targets are visited more and more often, while the visitation frequency of the states that cause these errors does not increase.
+
+# 3.1.2 theoretical analysis
+
+we next present a theoretical result that generalizes the didactic example in a formal result. proof for this result can be found in appendix c. our result is a lower-bound on the iteration complexity of on-policy q-learning. we show that, under the on-policy distribution, q-learning may require exponentially many iterations to learn the optimal q-function. this will also provide an explanation for the slow and unstable learning as described in figure 2 and in section 3.2, figure 4c. we state the result next. an extension to the replay buffer setting is given in appendix c.
+
+theorem 3.1 (exponential lower bound for on-policy and replay buffer distributions) there exists a family of mdps parameterized by  $h > 0$ , with  $|\mathcal{s}| = 2^h$ ,  $|\mathcal{a}| = 2$ , such that even with features,  $\phi$  that can represent the optimal  $q$ -function near-perfectly, i.e.,  $||q^{*} - \phi w||_{\infty} \leq \varepsilon$ , on-policy or replay-buffer  $q$ -learning, i.e.  $d_k = d^{\pi_k}$ , or  $d_k = \sum_{i=1}^{k} d^{\pi_i}$  respectively, requires  $\omega(\gamma^{-h})$  exact bellman projection steps for convergence to  $q^{*}$ , if at all the algorithm converges to  $q^{*}$ .
+
+thus, on-policy or replay buffer distributions can induce extremely slow learning in certain environments, even when all transitions are available for training (i.e., without any exploration issues), requiring exponentially many bellman backups. when function approximation is employed, the smaller the frequency of a transition, the less likely q-learning is to correct the q-value of the state-action pair corresponding to this transition. in contrast, we show in appendix c.2.2 that the method we propose in this paper requires only  $\mathrm{poly}(h)$  iterations in this scenario, and it behaves similarly to a method that learns q-values from the leaf nodes, gradually moving upwards toward the root of the tree.
+
+# 3.2 consequences of absent corrective feedback
+
+in this section, we investigate the phenomenon of an absence of corrective feedback in a number of rl tasks. we first plot the value error  $\mathcal{e}_k$  for the q-function by assuming access to  $q^{*}$  for analysis, but this is not available while learning from scratch. we first show that an absence of corrective feedback happens in practice. in figures 4a, 4b and 4c, we plot  $\mathcal{e}_k$  for on-policy and replay buffer sampling. observe that adp methods can suffer from prolonged periods where  $\mathcal{e}_k$  is increasing or fluctuating, and returns degrade or stagnate (figure 4b). next, we empirically analyze a number of pathological outcomes that can occur when corrective feedback is absent.
+
+1. convergence to suboptimal q-functions. we find that on-policy sampling can cause adp to converge to a suboptimal solution, even in the absence of sampling error. this is not an issue with the capacity of the function approximator - even when the optimal q-function  $q^{*}$  can be represented in the function class [6], learning converges to a suboptimal fixed point far from  $q^{*}$ . figure 4a shows that the value error  $\mathcal{e}_k$  rapidly decreases initially, and eventually converges to a value significantly greater than 0, from which the learning process never recovers.
+
+![](images/10935a118f28afd8c266a9590d365cdcd604b6bb75da3341c0dc4eb5f79b3389.jpg)  
+(a) sub-optimal convergence for on-policy distributions: return (dashed) and value error (solid). note that value error decreases rapidly at the start and finally converges to a nonzero value, leading to sub-optimal return.
+
+![](images/f83db0257fbe6fb90f2c58e10dcaba16917d8f5fe789409c25b39e776a940791.jpg)  
+(b) instability for replay buffer distributions: return (dashed) and value error (solid) over training iterations. note the rapid increase in value error at multiple points, which co-occurs with instabilities in returns.
+
+![](images/3d63d728e1bb0122d19b8615450c6cf59a0909cf234241ac3a62fd287b5eee40.jpg)  
+(c) error (left) and returns (right) for sparse reward mdp with replay buffer distributions. note the inability to learn, low return, and highly unstable value error  $\mathcal{e}_k$ , often increasing sharply, destabilizing the learning process.  
+figure 4: experiments showing various detrimental consequences of an absence of corrective feedback.
+
+2. instability in the learning process. q-learning with replay buffers may not converge to sub-optimal solutions as often as on-policy sampling (figure 13). however, we observe that even then (figure 4b), adp with replay buffers can be unstable. for instance, the algorithm is prone to degradation even if the latest policy obtains returns that are very close to optimal returns (figure 4b). this instability is often correlated with a lack of corrective feedback, and exists even with all transitions present in the buffer controlling for sampling error.  
+3. inability to learn with low signal-to-noise ratio. lack of corrective feedback can also prevent adp algorithms from learning quickly in scenarios with low signal-to-noise ratio, such as tasks with sparse or noisy rewards (figure 4c). for efficient learning, q-learning needs to effectively "exploit" the reward signal even in the presence of noise and delay, and we find that the learning becomes significantly worse in the presence of these factors. this is not an exploration issue, since all transitions in the mdp are provided to the algorithm.
+
+# 4. optimal distributions for optimizing corrective feedback
+
+in the previous section, we observed that an absence of corrective feedback can occur when adp algorithms naively use the on-policy or replay buffer distributions for training q-functions. however, if we can compute an "optimal" data distribution that provides maximal corrective feedback, and train q-functions using this distribution, then we can ensure that the adp algorithm always enjoys corrective feedback, and hence makes steady learning progress. in this section, we aim to derive a functional form for this optimal data distribution.
+
+we first present an optimization problem for this optimal data distribution, which we refer to as  $p_k$  (different from  $\mu$ , which refers to the data distribution in the replay buffer, or the on-policy distribution), for any iteration  $k$  of the adp algorithm, and then present a solution to this optimization problem. proofs from this section can be found in appendix a. we will show in this section that the resulting optimization when approximated practically, yields a very simple and intuitive algorithm. a more intuitive description of the resulting algorithm can be found in section 5
+
+our goal is to minimize the value error  $\mathcal{e}_k$  at every iteration  $k$ , with respect to the distribution  $p_k$  used for bellman error minimization at iteration  $k$ . the resulting optimization problem is:
+
+$$
+\min  _ {p _ {k}} \mathbb {e} _ {d ^ {\pi_ {k}}} \left[ \left| q _ {k} - q ^ {*} \right| \right] \tag {2}
+$$
+
+$$
+\text {s . t .} q _ {k} = \arg \min  _ {q} \mathbb {e} _ {p _ {k}} \left[ (q - \mathcal {b} ^ {*} q _ {k - 1}) ^ {2} \right].
+$$
+
+theorem 4.1 an optimal solution  $p_k$  to optimization problem 2 satisfies the following relationship:
+
+$$
+p _ {k} (s, a) \propto \exp \left(- | q _ {k} - q ^ {*} | (s, a)\right) \frac {\left| q _ {k} - \mathcal {b} ^ {*} q _ {k - 1} \right| (s , a)}{\lambda^ {*}} \tag {3}
+$$
+
+where  $\lambda^{*}\in \mathbb{r}^{+}$ , is an optimal lagrange dual variable that ensures  $p_k$  is a valid distribution in problem 2.
+
+proof (sketch) a complete proof is provided in appendix a. here we provide a rough sketch of the steps involved for completeness. we first use the fenchel-young inequality [16] to obtain an upper bound on the true objective, in terms of the "soft-min" of the errors  $|q_k - q^*|$  and then minimize this upper bound. formally, this is given by the rhs of the equation below,  $\mathcal{h}$  denotes shannon entropy.
+
+$$
+\mathbb {e} _ {d ^ {\pi_ {k}}} \left[ | q _ {k} - q ^ {*} | \right] \leq \mathcal {h} \left(d ^ {\pi_ {k}}\right) - \log \left(\sum_ {s, a} \exp (- | q _ {k} - q ^ {*} |)\right).
+$$
+
+then, we solve for  $p_k$  by setting the gradient of the lagrangian for problem 2 to 0, which requires an addition of constraints  $\sum_{s,a} p_k(s,a) = 1$  and  $p_k(s,a) > 0$  to ensure that  $p_k$  is a valid distribution. we then use the implicit function theorem (ift) [17] to compute implicit gradients of  $q_k$  with respect to  $p_k$ . ift is required for this step since  $q_k$  is an output of a minimization procedure that uses  $p_k$  as an input. rearranging the expression gives the above result.
+
+intuitively,  $p_k$ , shown in equation 3, assigns higher probability to state-action tuples with high bellman error  $|q_k - \mathcal{b}^* q_{k-1}|$ , but only when the resulting q-value  $q_k$  is close to  $q^*$ . however, the expression for  $p_k$  contains terms that depend on  $q^*$ . since both  $q_k$  and  $q^*$  are observed only after  $p_k$  is chosen, we need to estimate these quantities using surrogate quantities which we discuss in the following section.
+
+# 4.1 tractable approximation to optimal distribution
+
+the expression for  $p_k$  in equation 3 contains terms dependent on  $q^*$  and  $q_k$ , namely  $|q_k - q^*|$  and  $|q_k - \mathcal{b}^*q_{k-1}|$ . as described previously, since both  $q_k$  and  $q^*$  are observed only after  $p_k$  is chosen, in this section, we develop surrogates to estimate these quantities. for error against  $q^*$ , we show that the cumulative sum of discounted bellman errors over the past iterations of training, denoted as  $\delta_k$ , shown in equation 4, is a valid proxy (equivalent to an upper bound) for  $|q_k - q^*|$ . in fact, theorem 4.2 shows that  $\delta_k$ , offset by a state-action independent constant, is a tractable upper bound on  $|q_k - q^*|$  constructed only from prior q-function iterates,  $q_0, \dots, q_{k-1}$ .
+
+$$
+\begin{array}{l} \delta_ {k} = \sum_ {i = 1} ^ {k} \gamma^ {k - i} \left(\prod_ {j = i} ^ {k - 1} p ^ {\pi_ {j}}\right) \left| q _ {i} - \mathcal {b} ^ {*} q _ {i - 1} \right| \tag {4} \\ \rightarrow \delta_ {k} = \left| q _ {k} - \mathcal {b} ^ {*} q _ {k - 1} \right| + \gamma p ^ {\pi_ {k - 1}} \delta_ {k - 1}. \\ \end{array}
+$$
+
+the following theorem formally states this result.
+
+theorem 4.2 there exists a  $k_0 \in \mathbb{n}$ , such that  $\forall k \geq k_0$  and  $\delta_k$  from equation 4,  $\delta_k$  satisfies the following inequality, pointwise, for each  $s, a$ :
+
+$$
+\delta_ {k} + \sum_ {i = 1} ^ {k} \gamma^ {k - i} \alpha_ {i} \geq | q _ {k} - q ^ {*} |, \alpha_ {i} = \frac {2 r _ {m a x}}{1 - \gamma} \mathrm {d} _ {\mathrm {t v}} (\pi_ {i}, \pi^ {*})
+$$
+
+proof (sketch) a full proof is provided in appendix b. the key insight in this argument is to use a recursive inequality, presented in lemma b.0.1, app. b, to decompose  $|q_k - q^*|$ , which allows us to show that  $\delta_k + \sum_i \gamma^{k-i} \alpha_i$  is a solution to the corresponding recursive equality, and hence, an upper bound on  $|q_k - q^*|$ . note that, the initialization  $|q_0 - q^*|$  matters only infinitesimally once,  $k \geq k_0$ , with  $k_0$  being such that  $\gamma^{k_0} |q_k - q^*| < 1$ , therefore, agnostic to the initialization of  $\delta$ ,  $\delta_0$ , we note that the statement in the theorem holds true for large-enough  $k$ .
+
+estimating  $|q_k - \mathcal{b}^* q_{k-1}|$ . the expression for  $p_k$  in equation 3 also includes an unobserved bellman error multiplier term,  $|q_k - \mathcal{b}^* q_{k-1}|$  as well. with no available information about  $q_k$  – which will only be observed after bellman error minimization under  $p_k$  – a viable approximation is to bound this term  $|q_k - \mathcal{b}^* q_{k-1}|$  between the minimum and maximum bellman errors obtained at the previous iteration,  $c_1 = \min_{s,a} |q_{k-1} - \mathcal{b}^* q_{k-2}|$  and  $c_2 = \max_{s,a} |q_{k-1} - \mathcal{b}^* q_{k-2}|$ . we can simply restrict the support of state-action pairs  $(s,a)$  used to compute  $c_1$  and  $c_2$  to come from transitions observed in the replay buffer used for the q-function update, to ensure that both  $c_1$  and  $c_2$  are finite.
+
+re-weighting the replay buffer  $\mu$ . since it is challenging to directly obtain samples from  $p_k$  via online interaction, a practically viable alternative is to instead perform weighted bellman updates by re-weighting transitions drawn from the a regular replay buffer  $\mu$  using importance weights given by  $w_{k} = \frac{p_{k}(s,a)}{\mu(s,a)}$ . however, naive importance sampling often suffers from high-variance of these importance weights, leading to instabilities in learning. to prevent such issues, instead of directly re-weighting to  $p_k$ , we re-weight samples from  $\mu$  to a projection of  $p_k$ , denoted as  $q_{k}$ , that is still close to  $\mu$  under the kl-divergence metric:  $q_{k} = \arg \min_{q}\mathrm{d}_{\mathrm{kl}}(q||p_{k}) + (\tau -1)\mathrm{d}_{\mathrm{kl}}(q||\mu)$  where  $\tau$  is a scalar,  $\tau >1$ . the equation for weights  $w_{k}$ , in this case, is thus given by:
+
+$$
+w _ {k} (s, a) \propto \exp \left(\frac {- | q _ {k} - q ^ {*} | (s , a)}{\tau}\right) \frac {| q _ {k} - \mathcal {b} ^ {*} q _ {k - 1} |}{\lambda^ {*}} \tag {5}
+$$
+
+a derivation is provided in appendix b. having described all approximations, we now discuss how to obtain a tractable and practically usable data distribution for training the q-function that maximally mitigates error accumulation.
+
+# 4.2 putting it all together
+
+we have noted all practical approximations to the expression for optimal  $p_k$  (equation 3), including estimating surrogates for  $q_k$  and  $q^*$ , and the usage of importance weights to develop a method that can achieve the benefits of the optimal distribution, simply by re-weighting transitions in the replay buffer, rather than altering the exploration strategy. we also discussed a technique to reduce the variance of weights used for this reweighting. we now put these techniques together to obtain the final, practically tractable expression for the weights used for our practical approach.
+
+we note that the term  $|q_k - q^*|$ , appearing inside the exponent in the expression for  $w_k$  in equation 5 can be approximated by the tractable upper bound  $\delta_k$ . however, computing  $\delta_k$  requires the quantity  $|q_k - \mathcal{b}^* q_{k-1}|$  which also is unknown when  $w_k$  is being chosen. combining the upper bound on  $|q_k - \mathcal{b}^* q_{k-1}| \leq c_2$ , theorem 4.2 and equation 4, we obtain the following bound:
+
+$$
+\left| q _ {k} - q ^ {*} \right| \leq \gamma p ^ {\pi_ {k - 1}} \delta_ {k - 1} + c _ {2} + \sum_ {i} \gamma^ {i} \alpha_ {i} \tag {6}
+$$
+
+using this bound in the expression for  $w_{k}$ , along with the lower bound,  $|q_{k} - \mathcal{b}^{*}q_{k - 1}| \geq c_{1}$ , we obtain the following lower bound on weights  $w_{k}$ :
+
+$$
+w _ {k} \propto \exp \left(\frac {- c _ {2} - \gamma [ p ^ {\pi_ {k - 1}} \delta_ {k - 1} ] (s , a)}{\tau}\right) \frac {c _ {1}}{\lambda^ {*}} \tag {7}
+$$
+
+finally, we note that using a worst-case lower bound for  $w_{k}$  (equation 7) will down-weight some additional transitions which in reality lead to low error accumulation, but this scheme will never up-weight a transition with high error, thus providing for a "conservative" distribution. a less conservative expression for getting these weights is a subject of future work. simplifying the constants  $c_{1}, c_{2}$  and  $\lambda^{*}$ , the final expression for the practical choice of  $w_{k}$  is:
+
+$$
+w _ {k} (s, a) \propto \exp \left(- \frac {\gamma [ p ^ {\pi_ {k - 1}} \delta_ {k - 1} ] (s , a)}{\tau}\right). \tag {8}
+$$
+
+# 5. distribution correction (discor) algorithm
+
+in this section, we present the resulting algorithm, that uses weights  $w_{k}$  from equation 8 to re-weight the bellman backup in order to induce corrective feedback. we first present an intuitive explanation of our algorithm, and then describe the implementation details.
+
+intuitive explanation. using weights  $w_{k}$  in equation 8 for weighting bellman backups possess a very clear and intuitive explanation.  $p^{\pi_{k-1}}\delta_{k-1}$  corresponds to the estimated upper bound on the error of the target values for the current transition, due to the backup operator  $p^{\pi_{k-1}}$ . intuitively, this implies that weights  $w_{k}$  downweight those transitions for which the bootstrapped target q-value estimate has a high estimated error to  $q^{*}$ , effectively focusing the learning on samples where the supervision (target value) is accurate, which are precisely the samples that we expect maximally improve the accuracy of the q function. this prevents error accumulation, and hence provides correct feedback. such a scheme also resembles prior methods for learning with noisy labels by "abstention" from training on labels that are likely to be inaccurate [18].
+
+algorithm 1 discor (distribution correction)  
+1: initialize q-values  $q_{\theta}(s,a)$ , initial distribution  $p_0(s,a)$ , a replay buffer  $\mu$ , and an error model  $\delta_{\phi}(s,a)$ .  
+2: for step  $k$  in  $\{1, \dots, n\}$  do  
+3: collect  $m$  samples using  $\pi_k$ , add them to replay buffer  $\mu$ , sample  $\{(s_i, a_i)\}_{i=1}^n \sim \mu$   
+4: evaluate  $q_{\theta}(s,a)$  and  $\delta_{\phi}(s,a)$  on samples  $(s_i, a_i)$ .  
+5: compute target values for  $q$  and  $\delta$  on samples:  
+[ y_i = r_i + \gamma \max_{a'} q_{k-1}(s_i', a') ]  
+[ \hat{a}_i = \arg \max_{a} q_{k-1}(s_i', a) ]  
+[ \hat{\delta}_i = |q_{\theta}(s,a) - y_i| + \gamma \delta_{k-1}(s_i', \hat{a}_i) ]  
+6: compute  $w_k$  using equation 8.  
+7: minimize bellman error for training  $q_{\theta}$  weighted by  $w_k$ .  
+[ \theta_{k+1} \leftarrow \underset{\theta}{\operatorname{argmin}} \frac{1}{n} \sum_{i=1}^{n} w_k(s_i, a_i) \cdot (q_{\theta}(s_i, a_i) - y_i)^2 ]  
+8: minimize adp error for training  $\phi$ .  
+[ \phi_{k+1} \leftarrow \underset{\phi}{\operatorname{argmin}} \frac{1}{n} \sum_{i=1}^{n} (\delta_{\theta}(s_i, a_i) - \hat{\delta}_i)^2 ]  
+9: end for
+
+details. pseudocode for our approach, which we call discor (distribution correction), is presented in algorithm 1, with the main differences from standard adp methods highlighted in red. in addition to a standard q-function, discor trains another parametric model,  $\delta_{\phi}$ , to estimate  $\delta_k(s,a)$  at each state-action pair. the recursion in equation 4 is used to obtain a simple approximate dynamic programming update rule for the parameters  $\phi$  (line 8). the second change is the introduction of a weighted q-function backup with weights  $w_{k}(s,a)$ , as shown in equation 8, on line 7. we also present a practical implementation of the discor algorithm, built on top of standard dqn/sac algorithm pseudocodes in algorithm 3, appendix e.
+
+# 6. related work
+
+prior work has pointed out a number of issues arising when dynamic programming is used with function approximation. some work [19, 20, 21] focused on analysing error induced from the typically used projected bellman operator under the assumption of an abstract error model. further, fully gradient-based objectives for q-learning [22, 23, 24] gave rise to convergent adp algorithms with function approximation. in contrast to these works, which mostly focus on ensuring convergence of the bellman backup, we focus on the interaction between the adp update and the data distribution  $\mu$ . on the other hand, prior work on fully online q-learning from a stochastic approximation viewpoint analyzes time-varying  $\mu$ , but in the absence of function approximation [9, 25, 26], or at the granularity of a single time-step in the environment [27], unlike our setting. our setting involves both a time-varying  $\mu$  depending on the prior and latest q-functions as well as function approximation.
+
+a number of prior works have focused on studying non-convergence and generalization effects in adp methods with deep net function approximators, both theoretically [28] and empirically [6, 29, 30]. in this paper, we study a different issue that is distinct from non-convergence and generalization issues due to the specific choice of deep net function approximators: the interaction between the data distribution and the fitting error in the value function.
+
+in the fully offline setting, prior works have noted that sampling distributions can affect performance of adp methods [6]. this has been generally aimed at resolving what is typically known as the "deadly triad" [31]: divergence caused by an interaction between function approximation, bootstrapped updates and off-policy sampling, resulting in the development of batch rl algorithms that choose sampling schemes [32, 33] for guaranteed convergence. however, we show that sampling distributions can have a drastic impact on the learning process even where the algorithm performs online (on-policy) interaction to collects its own data. [34] studies the interaction between data collection and training for multi-objective policy gradient methods and note the bias towards optimizing only a few components of the objective that arises.
+
+our proposed algorithm weights the transition in the buffer based on an estimate of their error to the true optimal value function. related to our approach, prioritized sampling has been used previously in adp methods, such as per [35], to prioritize transitions with higher bellman error. we show in section 7, that this choice may fail to perform in many cases. recent work [36] has attempted to use a distribution-checking oracle to control the amount of exploration performed. our work aims at ensuring corrective feedback, solely by re-weighting the data distribution for q-learning with bootstrapped backups.
+
+we further discuss the relationship with other prior works in an extended related work section in appendix d.
+
+![](images/d2da4611815921b350f4784605e79f85c397d66fe9e7bc078cec638cfebaec16.jpg)  
+(a) value error  $\mathcal{e}_k$ / return for two runs of discor (blue) and discor(oracle) (red) in exact (left) and sampled (right) settings. observe that (i) discor achieves similar performance as discor (oracle) generally, (ii) discor provides corrective feedback: value error decreases with both discor and discor(oracle).
+
+![](images/130d953683e773ba58444a6d28330d7afb915c09bf9d62baba2f1d91b9d7acca.jpg)
+
+![](images/eed96f1f4f6461ccb07b89111f1b18bf4e33372494b3ead1aeca19d5f2d0ca42.jpg)
+
+![](images/6f77f1bc5497cf2b29e8a4d924e19b76e3c3ade7682b939fc13cc2cadeb9f8d7.jpg)
+
+![](images/80e9d3bb8bbc26be6f8505c21f562e1e067ab14746a618cabda34414c7d7fb6f.jpg)  
+figure 5: performance of discor, discor (oracle), replay buffer, per, on-policy and uniform sampling averaged across tabular domains with (right) and without (middle) sampling error. note that: (1) discor generally ensures corrective feedback, (2) discor is generally comparable to discor (oracle), however, discor (oracle) outperforms discor, as expected, and (3) discor (discor and discor (oracle) generally outperform all distributions. exact setup for these domains is described in appendix f.1.
+
+![](images/f4d00cd4670d9d63c68c3b61825fb02451d44e72dc8072c6423870b7e202467f.jpg)  
+(b) comparative performance on tabular domains
+
+![](images/a1db3f744884f2c29e585be256e35ac525abab05cafff2b9fa7eece3057fd11f.jpg)
+
+![](images/907f0a579165d5b3a3db63567540b01d43609815f82262dd874264c8bed456d0.jpg)
+
+![](images/3e79b72f95806c015f6a637391da415b260f11667199c54b8379bd75f3c1bfb6.jpg)
+
+# 7. experimental evaluation of discor
+
+the goal of our empirical evaluation is to study the following questions:
+
+1. can discor ensure continuous corrective feedback in rl tasks, mitigating the issues raised in section 3.2?  
+2. how does discor compare to prior methods, including those that also reweight the data in various ways?  
+3. can discor attain good performance in challenging settings, such as multi-task rl or noisy reward signals?  
+4. how do approximations from section 4 affect the efficacy of discor in mitigating error accumulation?
+
+we start by presenting a detailed analysis on tabular mdps with function approximation, studying each component of discor in isolation, and then study six challenging robotic manipulation tasks, the multi-task mt10 benchmark from metaworld [14], and three atari games [37].
+
+# 7.1 analysis of discor on tabular environments
+
+we first use the tabular domains from section 3, described in detail in appendix f.1, to analyze the corrective feedback induced by discor and evaluate the effect of the approximations used in our method, such as the upper bound estimator  $\delta_{k}$ . we first study the setting without sampling error, where all transitions in the mdp are added to the training buffer, and then consider the setting with sampling error, where the algorithm also needs to explore the environment and collect transitions.
+
+results. in both settings, shown in figure 5, discor consistently provides correct feedback (figure 5(a)). an oracle version of the algorithm (labeled discor (oracle); equation 5), which uses the true error  $|q_k - q^*|$  in place of  $\delta_k$ , is somewhat better than discor (figure 5(b) histograms, red vs blue), but discor still outperforms on-policy and replay buffer sampling schemes, which often suffer from an absence of corrective feedback as shown in section 3. prioritizing based on high bellman error struggles on domains with sparse rewards (app. f.1, fig. 12).
+
+analysis. while discor (oracle) consistently performs better than discor, as we would expect, the approximate discor method still attains better performance than naive uniform weighting and prioritization similar to per. this shows that the principle behind discor is effective when applied exactly, and that even the approximation that we utilize to make the method practical still improves performance considerably.
+
+![](images/a5837c5abf10cb48a54374efd8c87328de9f3d9cbbc96f884f810661ea9a2315.jpg)  
+hammer  
+push with stick  
+push with wall
+
+![](images/bcc7587075e19a3d8769d37019e4d46c3a6faadf548cf1440c139e32fe93f8a0.jpg)  
+pull with stick  
+turn dial  
+insert peg side
+
+![](images/5b9fd64d4887e76cf942266eb1dd7cfa9181acba19fda1ebba16902d3cbd31c5.jpg)  
+figure 6: visual description of the six metaworld tasks used in our experiments in section 7. figures taken from [14].
+
+![](images/111f5c67384ab21033d7092d8c09ebb34217a17cdce57c68730128274f890179.jpg)
+
+![](images/8dd77a49c00c60c2aca082239a795c27e9c4401008c56694a367e8600485af70.jpg)
+
+![](images/8d85fde571a5259b7a4c84a65e7292cee267e54410a8322ba5dbd862c3ca7c85.jpg)  
+figure 7: evaluation success of discor, unweighted sac and per on six metaworld tasks. from left to right: pull stick, push with wall, push stick, turn dial, hammer and insert peg side. note that discor achieves better final success rates or learns faster on most of the tasks.
+
+![](images/115b0545a3605bf8417a53393b346191d49f7fe32dd3d2c3fd5a3f5dbf8df6f2.jpg)
+
+![](images/4755f5bf54db3a0c98ba14a34bd56684447728121e1c3af2d8cd65e30cc78cfb.jpg)
+
+# 7.2 continuous control experiments
+
+we next perform a comparative evaluation of discor on several continuous control tasks, using six robotic manipulation tasks from the meta-world suite (pull stick, hammer, insert peg side, push stick, push with wall and turn dial). a pictorial description of these tasks is provided in figure 6. these domains were chosen because they are challenging for state-of-the-art rl methods, such as soft actor-critic (sac).
+
+meta-world. we applied discor to these tasks by modifying the weighting of samples in soft actor-critic (sac) [7]. discor does not alter any hyperparameter from sac, and requires minimal tuning. there is only one additional temperature hyperparameter, which is also automatically chosen across all domains. more details are presented in appendix e.2.
+
+we compare discor to standard sac without weighting, as well as prioritized experience replay (per) [35], which uses weights based on the last bellman error. on these tasks, discor often attains better performance, as shown in figures 7 and 16, achieving better success rates than standard sac on several tasks. discor is also more efficient, achieving good performance earlier than the other methods on these tasks. per, on the other hand,
+
+performs poorly, as prioritizing high bellman error states may lead to higher error accumulation if the target values are incorrect.
+
+gym. we also performed comparisons on the conventional openai gym benchmarks, where we see a small but consistent benefit from discor reweighting. since prior methods, such as sac already solves these tasks easily, and have been tuned well for them, the room for improvement is very small. we include these results in appendix f.3 for completeness. we also modified the gym environments to have stochastic rewards, thus lowering the signal-to-noise ratio, and compare different algorithms on these domains. the results, along with a description of the noise added, are shown in appendix f.3. in these experiments, discor generally exhibits better sample efficiency as compared to other methods.
+
+# 7.3 multi-task reinforcement learning
+
+another challenging setting for current rl methods is the multi-task setting. this is known to be difficult, to the point that oftentimes learning completely separate policies for each of the tasks is actually faster, and resulting in better performance, than learning the tasks together [14, 34].
+
+![](images/3a3e02c6c2e8af73144fa427a734da8c5d398a79a85327b6eef451a2ca9bb6c3.jpg)  
+(a) average success rate
+
+![](images/88694ec4d71863ec6c4f40dc810f07d98bb16b5837f70b21b3a4497b89a0e4dd.jpg)  
+(b) per-task return at 500k environment steps  
+figure 8: performance of discor (blue) and unweighted sac (green) on the mt10 benchmark. we observe that: (1) discor outperforms unweighted sac by a factor of 1.5 in terms success rate; (2) discor achieves a non-trivial return on 7/10 tasks after 500k environment steps, as compared to 3/10 for unweighted sac.
+
+mt10 multi-task benchmark. we evaluate on the mt10 metaworld benchmark [14], which consists of ten robotic manipulation tasks to be learned jointly. we follow the protocol from [14], and append task id to the state. as shown in figure 8(a), discor applied on top of sac outperforms standard unweighted sac by a large margin, achieving  $50\%$  higher success rates compared to sac, and a high overall return (fig 19). figure 8(b) shows that discor makes progress on 7/10 tasks, as compared to 3/10 for sac.
+
+mt50 multi-task benchmark. we further compare the performance of discor and sac on the more challenging mt50 benchmark [14], which is shown in figure 20, and observe a similar benefit as compared to mt10, where the standard unweighted sac algorithm tends to saturate at a suboptimal success rate for about 4m environment steps, whereas discor continuously keeps learning, and achieves asymptotic performance faster than sac.
+
+# 7.4 arcade learning environment
+
+our final experiments were aimed at testing the efficacy of discor on stochastic, discrete-action environments. to this end, we evaluated discor on three commonly reported tasks from the atari suite - pong, breakout and asterix. we compare to the baseline dqn [11], all our implementations are built off of dopamine [38] and use the evaluation protocol with sticky actions [39]. we build discor on top of dqn by simply replacing the standard replay buffer sampling scheme in dqn with the discor weighted update. we show in figure 9 that discor usually outperforms unweighted dqn in learning speed and performance.
+
+![](images/47354730d36e8db9c21de577b4bf997497f9269ac8d0559c77255132588e1d7e.jpg)  
+figure 9: dqn vs discor on atari. note that discor generally improves learning speed and asymptotic performance on all three tasks that we evaluated.
+
+![](images/7f5574be7c040f657e778c494cb04ab64d2bea2b6c6f6852daddf8dcbb975fdd.jpg)
+
+![](images/d3a6bddbf70ce7d310a326fe11a0e4639c59d25d80886d0177e262a5cd1728ff.jpg)
+
+# 8. discussion, future work and open problems
+
+in this work, we show that deep rl algorithms suffer from the absence of a corrective feedback mechanism in scenarios with naïve online data collection. this results in a number of problems during learning, including slow convergence and oscillation. we propose a method to compute the optimal data distribution in order to achieve corrective feedback, and design a practical algorithm, discor, that applies this distribution correction by re-weighting the transitions in the replay buffer based on an estimate of the accuracy of their target values. discor yields improvements across a wide range of rl problems, including challenging robotic manipulation tasks, multi-task reinforcement learning and atari games and can be easily combined with a variety of adp algorithms.
+
+as shown through our analysis and experiments, studying the connection between data distributions, function approximation, and approximate dynamic programming can allow us to devise stable and efficient reinforcement learning algorithms. this suggests several exciting directions for future work. first, a characterization of the learning dynamics and their interaction with corrective feedback and data distributions in adp algorithms may lead to even better and more stable algorithms, by better identifying the accuracy of target values. second, our approach is limited by the transitions that are actually collected by the behavior policy, since it only reweights the replay buffer. an exciting direction of future investigation would involve studying how we might directly modify the exploration policy to change which transitions are collected, so as to more directly alter the training distribution and produce large gains in sample efficiency and asymptotic performance. if we can devise rl methods that are guaranteed to enjoy corrective feedback and thus are stable, robust, and effective, then rl algorithms can be reliably scaled to large open-world settings.
+
+# acknowledgements
+
+we thank xinyang geng and aurick zhou for helpful discussions. we thank vitchyr pong, greg kahn, xinyang geng, aurick zhou, avi singh, nicholas rhinehart, and michael janner for feedback on an earlier version of this paper, and all the members of the rail lab for their help and support. we thank tianhe yu, kristian hartikainen, and justin yu for help with debugging and setting up the implementations. this research was supported by: the national science foundation, the office of naval research, and the darpa assured autonomy program. we thank google, amazon and nvidia for providing compute resources.
+
+# references
+
+[1] dmitry kalashnikov, alex irpan, peter pastor, julian ibarz, alexander herzog, eric jang, deirdre quillen, ethan holly, mrinal kalakrishnan, vincent vanhoucke, and sergey levine. qt-opt: scalable deep reinforcement learning for vision-based robotic manipulation. in corl, 2018.  
+[2] guy shani, david heckerman, and ronen i brafman. an mdp-based recommender system. journal of machine learning research, 6(sep):1265-1295, 2005.  
+[3] hado van hasselt. double q-learning. in proceedings of the 23rd international conference on neural information processing systems - volume 2, 2010.
+
+[4] hado van hasselt, yotam doron, florian strub, matteo hessel, nicolas sonnerat, and joseph modayil. deep reinforcement learning and the deadly triad. arxiv, abs/1812.02648, 2018.  
+[5] scott fujimoto, herke van hoof, and david meger. addressing function approximation error in actor-critic methods. in international conference on machine learning (icml), pages 1587-1596, 2018.  
+[6] justin fu, aviral kumar, matthew soh, and sergey levine. diagnosing bottlenecks in deep q-learning algorithms. in proceedings of the 36th international conference on machine learning. pmlr, 2019.  
+[7] tuomas haarnoja, aurick zhou, pieter abbeel, and sergey levine. soft actor-critic: off-policy maximum entropy deep reinforcement learning with a stochastic actor. corr, abs/1801.01290, 2018.  
+[8] matteo hessel, joseph modayil, hado van hasselt, tom schaul, georg ostrovski, will dabney, dan horgan, bilal piot, mohammad azar, and david silver. rainbow: combining improvements in deep reinforcement learning. in thirty-second aaai conference on artificial intelligence, 2018.  
+[9] christopher j.c.h. watkins and peter dayan. q-learning. machine learning, 8:279-292, 1992.  
+[10] martin riedmiller. neural fitted q iteration-first experiences with a data efficient neural reinforcement learning method. in european conference on machine learning, pages 317-328. springer, 2005.  
+[11] volodymyr mnih, koray kavukcuoglu, david silver, andrei a rusu, joel veness, marc g bellemare, alex graves, martin riedmiller, andreas k fidjeland, georg ostrovski, stig petersen, charles beattie, amir sadik, ioannis antonoglou, helen king, dharshan kumaran, daan wierstra, shane legg, and demis hassabis. human-level control through deep reinforcement learning. nature, 518(7540):529-533, feb 2015.  
+[12] tuomas haarnoja, haoran tang, pieter abbeel, and sergey levine. reinforcement learning with deep energy-based policies. in international conference on machine learning (icml), 2017.  
+[13] vijaymohan konda and john n. tsitsiklis. actor-critic algorithms. phd thesis, usa, 2002. aai0804543.  
+[14] tianhe yu, deirdre quillen, zhanpeng he, ryan julian, karol hausman, chelsea finn, and sergey levine. meta-world: a benchmark and evaluation for multi-task and meta reinforcement learning. in conference on robot learning (corl), 2019.  
+[15] timothy p. lillicrap, jonathan j. hunt, alexander pritzel, nicolas heess, tom erez, yuval tassa, david silver, and daan wierstra. continuous control with deep reinforcement learning. international conference on learning representations (iclr), 2015.  
+[16] r. tyrrell rockafellar. convex analysis. princeton mathematical series. princeton university press, princeton, n. j., 1970.  
+[17] steven g. krantz and harold r. parks. the implicit function theorem: history, theory, and applications. 2002.  
+[18] sunil thulasidasan, tanmoy bhattacharya, jeff bilmes, gopinath chennupati, and jamal mohd-yusof. combating label noise in deep learning using abstention. in proceedings of 35th international conference on machine learning, 05 2019.  
+[19] rémi munos. error bounds for approximate value iteration. in aaai conference on artificial intelligence (aaaii), pages 1006-1011. aaai press, 2005.  
+[20] amir-massoud farahmand, csaba szepesvári, and rémi munos. error propagation for approximate policy and value iteration. in advances in neural information processing systems (nips), 2010.  
+[21] rémi munos and csaba szepesvári. finite-time bounds for fitted value iteration. journal of machine learning research, 9(may):815-857, 2008.  
+[22] richard s. sutton, hamid reza maei, and csaba szepesvári. a convergent o(n) temporal-difference algorithm for off-policy learning with linear function approximation. in advances in neural information processing systems (neurips), 2009.
+
+[23] richard s. sutton, hamid reza maei, doina precup, shalabh bhatnagar, david silver, csaba szepesvári, and eric wiewiora. fast gradient-descent methods for temporal-difference learning with linear function approximation. in international conference on machine learning (icml), 2009.  
+[24] hamid r. maei, csaba szepesvári, shalabh bhatnagar, doina precup, david silver, and richard s. sutton. convergent temporal-difference learning with arbitrary smooth function approximation. in proceedings of the 22nd international conference on neural information processing systems, 2009.  
+[25] john n. tsitsiklis. asynchronous stochastic approximation and q-learning. machine learning, 16(3):185-202, sep 1994.  
+[26] adithya m. devraj and sean p. meyn. zap q-learning. in proceedings of the 31st international conference on neural information processing systems, nips'17, page 22322241, red hook, ny, usa, 2017. curran associates inc.  
+[27] john n. tsitsiklis and benjamin van roy. an analysis of temporal-difference learning with function approximation. technical report, ieee transactions on automatic control, 1997.  
+[28] joshua achiam, ethan knight, and pieter abbeel. towards characterizing divergence in deep q-learning. arxiv, abs/1903.08894, 2019.  
+[29] vincent liu, raksha kumaraswamy, lei le, and martha white. the utility of sparse representations for control in reinforcement learning. corr, abs/1811.06626, 2018.  
+[30] aviral kumar, justin fu, george tucker, and sergey levine. stabilizing off-policy q-learning via bootstrapping error reduction. 2019.  
+[31] richard s sutton and andrew g barto. reinforcement learning: an introduction. second edition, 2018.  
+[32] j. zico kolter. the fixed points of off-policy td. in nips, 2011.  
+[33] richard s. sutton, a. rupam mahmood, and martha white. an emphatic approach to the problem of off-policy temporal-difference learning. j. mach. learn. res., 17(1):26032631, january 2016.  
+[34] tom schaul, diana borsa, joseph modayil, and razvan pascanu. ray interference: a source of plateaus in deep reinforcement learning. corr, abs/1904.11455, 2019.  
+[35] tom schaul, john quan, ioannis antonoglou, and david silver. prioritized experience replay. international conference on learning representations (iclr), 2015.  
+[36] simon du, yuping luo, ruosong wang, and hanrui zhang. provably efficient  $q$ -learning with function approximation via distribution shift error checking oracle. in neurips, 06 2019.  
+[37] marc g. bellemare, yavar naddaf, joel veness, and michael bowling. the arcade learning environment: an evaluation platform for general agents. j. artif. int. res., 47(1):253279, may 2013.  
+[38] pablo samuel castro, subhodeep moitra, carles gelada, saurabh kumar, and marc g. bellemare. dopamine: a research framework for deep reinforcement learning. 2018.  
+[39] marlos c. machado, marc g. bellemare, erik talvitie, joel veness, matthew hausknecht, and michael bowling. revisiting the arcade learning environment: evaluation protocols and open problems for general agents. j. artif. int. res., 61(1):523562, january 2018.  
+[40] elad hazan, sham kakade, karan singh, and abby van soest. provably efficient maximum entropy exploration. 2019.  
+[41] zafarali ahmed, nicolas le roux, mohammad norouzi, and dale schuurmans. understanding the impact of entropy on policy optimization. in proceedings of the 36th international conference on machine learning. pmlr, 2019.  
+[42] d. farias and b. roy. on the existence of fixed points for approximate value iteration and temporal-difference learning. journal of optimization theory and applications, 105:589-608, 06 2000.
+
+[43] simon s. du, sham m. kakade, ruosong wang, and lin f. yang. is a good representation sufficient for sample efficient reinforcement learning? in international conference on learning representations, 2020.  
+[44] theodore j. perkins and doina precup. a convergent form of approximate policy iteration. nips02, 2002.  
+[45] rémi munos. error bounds for approximate policy iteration. in proceedings of the twentieth international conference on international conference on machine learning, icml03, page 560567. aaai press, 2003.  
+[46] bruno scherrer, mohammad ghavamzadeh, victor gabillon, boris lesner, and matthieu geist. approximate modified policy iteration and its application to the game of tetris. journal of machine learning research, 16(49):1629-1676, 2015.  
+[47] boris lesner and bruno scherrer. tight performance bounds for approximate modified policy iteration with non-stationary policies. arxiv, abs/1304.5610, 2013.  
+[48] bruno scherrer. approximate policy iteration schemes: a comparison. in proceedings of the 31st international conference on international conference on machine learning - volume 32, icml14, page ii1314ii1322. jmlr.org, 2014.  
+[49] scott fujimoto, david meger, and doina precup. off-policy deep reinforcement learning without exploration. in proceedings of the 36th international conference on machine learning, 2019.  
+[50] yifan wu, george tucker, and ofir nachum. behavior regularized offline reinforcement learning. arxiv preprint arxiv:1911.11361, 2019.  
+[51] arthur jacot, franck gabriel, and clement hongler. neural tangent kernel: convergence and generalization in neural networks. in advances in neural information processing systems 31. 2018.  
+[52] shangtong zhang and richard s sutton. a deeper look at experience replay. arxiv preprint arxiv:1712.01275, 2017.  
+[53] ruishan liu and james zou. the effects of memory replay in reinforcement learning. in 2018 56th annual allerton conference on communication, control, and computing (allerton). ieee, 2018.  
+[54] tianhe yu, saurabh kumar, abhishek gupta, sergey levine, karol hausman, and chelsea finn. gradient surgery for multi-task learning. arxiv preprint arxiv:2001.06782, 2020.  
+[55] kristian hartikainen george tucker sehoon ha jie tan vikash kumar henry zhu abhishek gupta pieter abbeel tuomas haarnoja, aurick zhou and sergey levine. soft actor-critic algorithms and applications. technical report, 2018.
+
+# appendices
+
+# appendix a. detailed proof of theorem 4.1 (section 4)
+
+in this appendix, we present a detailed proofs for the theoretical derivation of discor outlined in section 4. to get started, we mention the optimization problem being solved for convenience.
+
+$$
+\min  _ {p _ {k}} \mathbb {e} _ {d ^ {\pi_ {k}}} [ | q _ {k} - q ^ {*} | ] \tag {9}
+$$
+
+$$
+{ } _ { k } ^ { p _ { k } } \quad \text { s . t . } \quad q _ { k } = \arg \min  _ { q } \mathbb { e } _ { p _ { k } } \left[ ( q - \mathcal { b } ^ { * } q _ { k - 1 } ) ^ { 2 } \right] . \tag {9}
+$$
+
+we break down this derivation in steps marked as relevant paragraphs. the first step is to decompose the objective into a more tractable one via an application of the fenchel-young inequality [16].
+
+step 1: fenchel-young inequality. the optimization objective in problem 9 is the inner product of  $d^{\pi_{k - 1}}$  and  $|q_k - q^*|$ . we can decompose this objective by applying the fenchel-young inequality [16]. for any two vectors,  $x, y \in \mathbb{r}^d$ , and any convex function  $f$  and its fenchel conjugate  $f^*$ , we have that,  $x^t y \leq f(x) + f^*(y)$ . we therefore have:
+
+$$
+\mathbb {e} _ {d ^ {\pi_ {k}}} \left[ \left| q _ {k} - q ^ {*} \right| \right] \leq f \left(\left| q _ {k} - q ^ {*} \right|\right) + f ^ {*} \left(d ^ {\pi_ {k}}\right). \tag {10}
+$$
+
+since minimizing an upper bound leads to minimization of the original objective, we can replace the objective in problem 9 with the upper bound in equation 10. as we will see below, a convenient choice of  $f$  is the soft-min function:
+
+$$
+f (x) = - \log \left(\sum_ {i} e ^ {- x _ {i}}\right), \quad f ^ {*} (y) = \mathcal {h} (y). \tag {11}
+$$
+
+$f^{*}$  in this case is given by the shannon entropy, which is defined as  $\mathcal{h}(y) = -\sum_{j}y_{j}\log y_{j}$ . plugging this back in problem 9, we obtain an objective that dictates minimization of the marginal state-action entropy of the policy  $\pi$ .
+
+in order to make this objective even more convenient and tractable, we upper bound the shannon entropy,  $\mathcal{h}(y)$  by the entropy of the uniform distribution over states and actions,  $\mathcal{h}(\mathcal{u})$ . this step ensures that the entropy of the state-action marginal  $d^{\pi}$  is not reduced drastically due to the choice of  $p$ . we can now minimize this upper bound, since minimizing an upper bound, leads to a minimization of the original problem, and therefore, we obtain the following new optimization problem shown in equation 12 is:
+
+$$
+\min  _ {p _ {k}} - \log \left(\sum_ {s, a} \exp \left(- | q _ {k} - q ^ {*} | (s, a)\right)\right) \tag {12}
+$$
+
+$$
+\mathrm {s . t .} q _ {k} = \arg \min  _ {q} \mathbb {e} _ {p _ {k}} \left[ (q - \mathcal {b} ^ {*} q _ {k - 1}) ^ {2} \right].
+$$
+
+another way to interpret this step is to modify the objective in problem 9 to maximize entropy-augmented  $\mathrm{v}_{\mathrm{cf}}: \mathrm{v}_{\mathrm{cf}}(k) + \mathcal{h}(d^{\pi_k})$  as is common in a number of prior works, albeit with entropy over different distributions such as [40, 7]. this also increases the smoothness of the loss landscape, which is crucial for performance of rl algorithms [41].
+
+step 2: computing the lagrangian. in order to solve optimization problem problem 12, we follow standard procedures for finding solutions to constrained optimization problems. we first write the lagrangian for this problem, which includes additional constraints to ensure that  $p_k$  is a valid distribution:
+
+$$
+\mathcal {l} \left(p _ {k}; \lambda , \mu\right) = - \log \left(\sum_ {s, a} \exp \left(- \left| q _ {k} - q ^ {*} \right| (s, a)\right)\right) + \lambda \left(\sum_ {s, a} p _ {k} (s, a) - 1\right) - \mu^ {t} p _ {k}. \tag {13}
+$$
+
+with constraints  $\sum_{s,a}p_k(s,a) = 1$  and  $p_k(s,a)\geq 0$ $(\forall s,a)$  and their corresponding lagrange multipliers,  $\lambda$  and  $\mu$ , respectively, that ensure  $p_k$  is a valid distribution. an optimal  $p_k$  is obtained by setting the gradient of the lagrangian with respect to  $p_k$  to 0. this requires computing the gradient of  $q_{k}$ , resulting from bellman error minimization, i.e. computing the derivative through the solution of another optimization problem, with respect to the distribution  $p_k$ . we use the implicit function theorem (ift) [17] to compute this gradient. we next present an application of ift in our scenario.
+
+step 3: ift gradient used in the lagrangian. we derive an expression for  $\frac{\partial q_k}{\partial p_k}$  which will be used while computing the gradient of the lagrangian equation 13 which involves an application of the implicit function theorem. the ift gradient is given by:
+
+$$
+\left. \frac {\partial q _ {k}}{\partial p _ {k}} \right| _ {q _ {k}, p _ {k}} = - \left[ \operatorname {d i a g} \left(p _ {k}\right) \right] ^ {- 1} \left[ \operatorname {d i a g} \left(q _ {k} - \mathcal {b} ^ {*} q _ {k - 1}\right) \right]. \tag {14}
+$$
+
+to get started towards showing equation 14, we consider a non-parametric representation for  $q_{k}$  (a table), so that we can compute a tractable term without going onto the specific calculations for jacobian or inverse-hessian vector products for different parametric models. in this case, the hessians in the expression for ift and hence, the implicit gradient are given by:
+
+$$
+\begin{array}{l} h _ {q} = 2 \operatorname {d i a g} \left(p _ {k}\right) \quad h _ {q, p _ {k}} = 2 \operatorname {d i a g} \left(q _ {k} - \mathcal {b} ^ {*} q _ {k - 1}\right) \\ \frac {\partial q _ {k}}{\partial p _ {k}} = - \left[ h _ {q} \right] ^ {- 1} h _ {q, p _ {k}} = - \operatorname {d i a g} \left(\frac {q _ {k} - \mathcal {b} ^ {*} q _ {k - 1}}{p _ {k}}\right) \tag {15} \\ \end{array}
+$$
+
+provided  $p_k \geq 0$  (which is true, since we operate in a full coverage regime, as there is no exploration bottleneck when all transitions are provided). this quantity is 0 only if the bellman residuals  $q_k - \mathcal{b}^* q_{k-1}$  are 0, however, that is rarely the case, hence this gradient is non-zero, and intuitively quantifies the right relationship: bellman residual errors  $q_k - \mathcal{b}^* q_{k-1}$  should be higher at state-action pairs with low density  $p_k$ , indicating a roughly inverse relationship between the two terms – which is captured by the ift term.
+
+step 4: computing optimal  $p_k$ . now that we have the equation for ift (equation 14) and an expression for the lagrangian (equation 13), we are ready to compute the optimal  $p_k$  via an application of the kkt conditions. at an optimal  $p_k$ , we have,
+
+$$
+\frac {\partial \mathcal {l} \left(p _ {k} ; \lambda , \mu\right)}{\partial p _ {k}} = 0 \rightarrow \frac {\operatorname {s g n} \left(q _ {k} - q ^ {*}\right) \exp \left(- \left| q _ {k} - q ^ {*} \right| (s , a)\right)}{\sum_ {s ^ {\prime} , a ^ {\prime}} \exp \left(- \left| q _ {k} - q ^ {*} \right| \left(s ^ {\prime} , a ^ {\prime}\right)\right)} \cdot \frac {\partial q _ {k}}{\partial p _ {k}} + \lambda - \mu_ {s, a} = 0. \tag {16}
+$$
+
+now, re-arranging equation 16 and plugging in the expression for  $\frac{\partial q_k}{\partial p_k}$  from equation 14 in this equation to obtain an expression for  $p_k(s,a)$ , we get:
+
+$$
+p _ {k} (s, a) \propto \exp \left(- | q _ {k} - q ^ {*} | (s, a)\right) \frac {\left| q _ {k} - \mathcal {b} ^ {*} q _ {k - 1} \right| (s , a)}{\lambda^ {*}}. \tag {17}
+$$
+
+provided, each component of  $p$  is positive, i.e.  $p_k(s,a) \geq 0$  for all  $s,a$ , the optimal dual variable  $\mu_{s,a}^{*} = 0$ , satisfies  $\mu^{*}(s,a)p_{k}(s,a) = 0$  by kkt-conditions, and  $\mu^{*} \geq 0$  (since it is a lagrange dual variable), thus implying that  $\mu^{*} = 0$ .
+
+intuitively, the expression in equation 17 assigns higher probability to state-action tuples with high bellman error  $|q_{k} - \mathcal{b}^{*}q_{k - 1}|$ , but only when the post-update q-value  $q_{k}$  is close to  $q^{*}$ . hence we obtain the required theorem.
+
+summary of the derivation. to summarize, our derivation for the optimal  $p_k$  consists of the following key steps:
+
+- use the fenchel-young inequality to get a convenient form for the objective.  
+- compute the lagrangian, and use the implicit function theorem to compute gradients of the q-function  $q_{k}$  with respect to the distribution  $p_k$ .  
+- compute the expression for optimal  $p_k$  by setting the lagrangian gradient to 0.
+
+# appendix b. proofs for tractable approximations in section 4.1
+
+here we present the proofs for the arguments behind each of the approximations described in section 4.1.
+
+computing weights  $w_{k}$  for re-weighting the buffer distribution,  $\mu$ . since sampling directly from  $p_k$  may not be easy, we instead choose to re-weight samples transitions drawn from a replay buffer  $\mu$ , using weights  $w_{k}$  to make it as close to  $p_k$ . how do we obtain the exact expression for  $w_{k}(s,a)$ ? one option is to apply importance sampling: choose  $w_{k}$  as the importance ratio,  $w_{k}(s,a) = \frac{p_{k}(s,a)}{\mu(s,a)}$ , however this suffers from two problems - (1)
+
+importance weights tend to exhibit high variance, which can be detrimental for stochastic gradient methods; and (2) densities  $\mu(s,a)$ , needed to compute  $w_k$  are unknown.
+
+in order to circumvent these problems, we solve a different optimization problem, shown in problem 18 to find the optimal surrogate projection distribution  $q_{k}$ , which is closest to  $p_k$ , and at the same time closest to  $\mu$  as well, trading off these quantities by a factor  $\tau - 1$ .
+
+$$
+q _ {k} ^ {*} = \arg \min  _ {q _ {k}} \mathrm {d} _ {\mathrm {k l}} \left(q _ {k} \| p _ {k}\right) + (\tau - 1) \mathrm {d} _ {\mathrm {k l}} \left(q _ {k} \| \mu\right) \tag {18}
+$$
+
+where  $\lambda$  is a temperature hyperparameter that trades of bias and variance. the solution to the above optimization is shown in equation 19, where the second statement follows by using a tractable approximation of setting  $\mu^{1 - \frac{1}{\tau}}$  to be equal to  $\mu$ , which can be ignored if  $\tau$  is large, hence  $1 - \frac{1}{\tau} \approx 1$ . the third statement follows by an application of equation 17 and the fourth statement denotes the importance ratio,  $\frac{q_k(s,a)}{\mu_k(s,a)}$ , as the weights  $w_{k}$ .
+
+$$
+q _ {k} ^ {*} (s, a) \propto (\mu_ {k}) ^ {1 - \frac {1}{\tau}} \cdot \exp \left(\frac {\log p _ {k} (s , a)}{\tau}\right)
+$$
+
+$$
+\therefore q _ {k} ^ {*} (s, a) \propto (\mu_ {k}) \cdot \exp \left(\frac {\log p _ {k} (s , a)}{\tau}\right) \tag {19}
+$$
+
+$$
+\therefore \frac {q _ {k} ^ {*}}{\mu_ {k}} \propto \exp \left(\frac {- | q _ {k} - q ^ {*} | (s , a)}{\tau}\right) \frac {| q _ {k} - \mathcal {b} ^ {*} q _ {k - 1} | (s , a)}{\lambda^ {*}} \tag {19}
+$$
+
+$$
+\therefore w _ {k} \propto \exp \left(\frac {- | q _ {k} - q ^ {*} | (s , a)}{\tau}\right) \frac {| q _ {k} - \mathcal {b} ^ {*} q _ {k - 1} | (s , a)}{\lambda^ {*}}.
+$$
+
+our next proof justifies the usage of the estimate  $\delta_k$ , which is a worst-case upper bound on  $|q_k - q^*|$  in equation 19.
+
+proof of theorem 4.2. we now present a lemma b.0.1 which proves a recursive inequality for  $|q_k - q^*|$ , then show that the corresponding recursive estimator upper bounds  $|q_k - q^*|$  pointwise in lemma b.0.2, and then finally show that our chosen estimator  $\delta_k$  is equivalent to this recursive estimator in theorem b.1 therefore proving theorem 4.2.
+
+lemma b.0.1 for any  $k \in \mathbb{n}$ ,  $|q_k - q^*|$  satisfies the following recursive inequality, pointwise for each  $s, a$ :
+
+$$
+| q _ {k} - q ^ {*} | \leq | q _ {k} - \mathcal {b} ^ {*} q _ {k - 1} | + \gamma p ^ {\pi_ {k - 1}} | q _ {k - 1} - q ^ {*} | + \frac {2 r _ {m a x}}{1 - \gamma} \max _ {s} \mathrm {d} _ {\mathrm {t v}} (\pi_ {k - 1}, \pi^ {*}).
+$$
+
+proof our proof relies on a worst-case expansion of the quantity  $|q_k - q^*|$ . the proof follows the following steps. the first few steps follow common expansions/inequalities operated upon in the work on error propagation in q-learning [19].
+
+$$
+\begin{array}{l} \left| q _ {k} - q ^ {*} \right| \stackrel {(a)} {=} \left| q _ {k} - \mathcal {b} ^ {*} q _ {k - 1} + \mathcal {b} ^ {*} q _ {k - 1} - q ^ {*} \right| \\ \stackrel {(b)} {\leq} \left| q _ {k} - \mathcal {b} ^ {*} q _ {k - 1} \right| + \left| \mathcal {b} ^ {*} q _ {k - 1} - \mathcal {b} ^ {*} q ^ {*} \right| \\ \stackrel {(c)} {=} \left| q _ {k} - \mathcal {b} ^ {*} q _ {k - 1} \right| + \left| r + \gamma p ^ {\pi_ {k - 1}} q _ {k - 1} - r - \gamma p ^ {\pi^ {*}} q ^ {*} \right| \\ \stackrel {(d)} {=} \left| q _ {k} - \mathcal {b} ^ {*} q _ {k - 1} \right| + \gamma \left| p ^ {\pi_ {k - 1}} q _ {k - 1} - p ^ {\pi_ {k - 1}} q ^ {*} + p ^ {\pi_ {k - 1}} q ^ {*} - p ^ {\pi^ {*}} q ^ {*} \right| \\ \stackrel {(e)} {\leq} \left| q _ {k} - \mathcal {b} ^ {*} q _ {k - 1} \right| + \gamma p ^ {\pi_ {k - 1}} \left| q _ {k - 1} - q ^ {*} \right| + \gamma \left| p ^ {\pi_ {k - 1}} - p ^ {\pi^ {*}} \right| | q ^ {*} | \\ \stackrel {(f)} {\leq} \left| q _ {k} - \mathcal {b} ^ {*} q _ {k - 1} \right| + \gamma p ^ {\pi_ {k - 1}} \left| q _ {k - 1} - q ^ {*} \right| + \frac {2 r _ {\max}}{1 - \gamma} \max  _ {s} \mathrm {d} _ {\mathrm {t v}} \left(\pi_ {k - 1}, \pi^ {*}\right) \\ \end{array}
+$$
+
+where (a) follows from adding and subtracting  $\mathcal{b}^* q_{k-1}$ , (b) follows from an application of triangle inequality, (c) follows from the definition of  $\mathcal{b}^*$  applied to two different  $q$ -functions, (d) follows from algebraic manipulation, (e) follows from an application of the triangle inequality, and (f) follows from bounding the maximum difference in transition matrices  $|p^{\pi_{k-1}} - p^*|$  by maximum total variation divergence between policy  $\pi_{k-1}$  and  $\pi^*$ , and bounding the maximum possible value of  $q^*$  by  $\frac{r_{\max}}{1-\gamma}$ .
+
+we next show that an estimator that satisfies the recursive equality corresponding to lemma b.0.1 is a pointwise upper bound on  $|q_k - q^*|$ .
+
+lemma b.0.2 for any  $k \in \mathbb{n}$ , an vector  $\delta_k'$  satisfying
+
+$$
+\delta_ {k} ^ {\prime} := \left| q _ {k} - \mathcal {b} ^ {*} q _ {k - 1} \right| + \gamma p ^ {\pi_ {k - 1}} \delta_ {k - 1} ^ {\prime}. \tag {20}
+$$
+
+with  $\alpha_{k} = \frac{2r_{\mathrm{max}}}{1 - \gamma}\max_{s}\mathrm{d}_{\mathrm{tv}}(\pi_{k},\pi^{*})$  , and an initialization  $\delta_0^{\prime}\coloneqq |q_0 - q^* |$  , pointwise upper bounds  $|q_k - q^*|$  with an offset depending on  $\alpha_{i}$  , i.e.  $\delta_k^\prime +\sum_i\alpha_i\gamma^{k - i}\geq |\bar{q}_k - q^* |.$
+
+proof let  $\delta_k^\prime$  be an estimator satisfying equation 20. in order to show that  $\delta_k^\prime +\sum_i\gamma^{k - i}\alpha_i\geq |q_k - q^* |$  , we use the principle of mathematical induction. the base case,  $k = 0$  is satisfied, since  $\delta_0^\prime +\alpha_0\geq |q_0 - q^* |$  . now, let us assume that for a given  $k = m$ $\delta_m^\prime +\sum_i\gamma^{m - i}\alpha_i\geq |q_m - q^* |$  pointwise for each  $(s,a)$  . now, we need to show that a similar relation holds for  $k = m + 1$  , and then we can appeal to the principle of mathematical induction to complete the argument. in order to show this, we note that,
+
+$$
+\begin{array}{l} \delta_ {m + 1} ^ {\prime} = \left| q _ {m + 1} - \mathcal {b} ^ {*} q _ {m} \right| + \gamma p ^ {\pi_ {m}} \delta_ {m} ^ {\prime} + \sum_ {i} ^ {m + 1} \gamma^ {m + 1 - i} \alpha_ {i} (21) \\ = \left| q _ {m + 1} - \mathcal {b} ^ {*} q _ {m} \right| + \gamma p ^ {\pi_ {m}} \left(\delta_ {m} ^ {\prime} + \sum_ {i = 0} ^ {m} \gamma^ {m - i} \alpha_ {i}\right) + \alpha_ {m + 1} (22) \\ \geq \left| q _ {m + 1} - \mathcal {b} ^ {*} q _ {m} \right| + \gamma p ^ {\pi_ {m}} \left| q _ {m} - q ^ {*} \right| + \alpha_ {m} (23) \\ \geq \left| q _ {m + 1} - q ^ {*} \right| (24) \\ \end{array}
+$$
+
+where (21) follows from the definition of  $\delta_k^\prime$ , (22) follows by rearranging the recursive sum containing  $\alpha_{i}$ , for  $i\leq m$  alongside  $\delta_m$ , (23) follows from the inductive hypothesis at  $k = m$ , and (24) follows from lemma b.0.1.
+
+thus, by using the principle of mathematical induction, we have shown that  $\delta_k' + \sum_i \gamma^{k-i} \alpha_i \geq |q_k - q^*|$  pointwise for each  $s, a$ , for every  $k \in \mathbb{n}$ .
+
+the final piece in this argument is to show, that the estimator  $\delta_k$  used by the discor algorithm (algorithm 1), which is initialized randomly, i.e. not initialized to  $\delta_0 = |q_0 - q^*|$ , still satisfies the property from lemma b.0.2, possibly for certain  $k \in \mathbb{n}$ .
+
+therefore, we now show why:  $\delta_k + \sum_{i=1}^k \alpha_i \gamma^{k-i} \geq |q_k - q^*|$  point-wise for a sufficiently large  $k$ . we restate a slightly modified version of theorem 4.2 for convenience.
+
+theorem b.1 (formal version of theorem 4.2) for a sufficiently large  $k \geq k_0 = \frac{\log(1 - \gamma)}{\log\gamma}$ , the error estimator  $\delta_k$  pointwise satisfies:
+
+$$
+\delta_ {k} + \sum_ {i = 0} ^ {k} \gamma^ {i} \alpha_ {k - i} \geq | q _ {k} - q ^ {*} |
+$$
+
+where  $\alpha_{i}$ 's are scalar constants independent of any state-action pair. (note that theorem 4.2 has a typo  $\gamma^i$  instead of  $\gamma^{k - i}$ , this theorem presents the correct inequality.)
+
+# proof
+
+main idea/ sketch: as shown in algorithm 1, the estimator  $\delta_k$  is initialized randomly, without taking into account  $|q_0 - q^*|$ . therefore, in this theorem, we want to show that irrespective of the initialization of  $q_0$ , a randomly initialized  $\delta_k$  eventually satisfies the inequality shown in theorem 4.2. now, we present the formal proof.
+
+consider  $k_{0}$  to be the smallest  $k$ , such that the following inequality is satisfied:
+
+$$
+\gamma^ {k} \max  _ {q _ {0}, q ^ {*}} | q _ {0} - q ^ {*} | \leq 1 \tag {25}
+$$
+
+thus,  $k_{0} \geq \frac{\log(1 - \gamma)}{\log\gamma}$ , assuming  $r_{\mathrm{max}} = 1$  without loss of generality. for a different reward scaling, the bound can be scaled appropriately. to see this, we substitute  $|q_0 - q^*|$  as an upper-bound  $r_{\mathrm{max}} / (1 - \gamma)$ , and bound  $r_{\mathrm{max}}$  by 1.
+
+let  $\delta_k^{\prime}$  correspond to the upper-bound estimator as derived in lemma b.0.2. for each  $k\geq k_0$ , the contribution of the initial error  $|q_0 - q^*|$  in  $|q_{k} - q^{*}|$  is upper-bounded by 1, and gradually decreases with a rate  $\gamma$  as more
+
+backups are performed, i.e., as  $k$  increases. thus we can construct another sequence  $\delta_1, \dots, \delta_k, \dots$  which chooses to ignore  $|q_0 - q^*|$ , and initializes  $\delta_0 = 0$  (or randomly) and the sequences  $\delta$  and  $\delta_k'$  satisfy:
+
+$$
+\left| \delta_ {k} ^ {\prime} - \delta_ {k} \right| <   1, \forall k \geq k _ {0} \tag {26}
+$$
+
+furthermore, the difference  $|\delta_k' - \delta_k|$  steadily shrinks to 0, with a linear rate  $\gamma$ , so the overall contribution of the initialization sub-optimality  $|q_0 - q^*|$  drops linearly with a rate of  $\gamma$ . hence,  $\delta'$  and  $\delta$  converge to the same sequence beyond a fixed  $k = k_0$ . since  $\delta_k'$  is computed using the rhs of lemma b.0.1, it is guaranteed to be an upper bound on  $|q_k - q^*|$ :
+
+$$
+\left| \left(\delta_ {k} + \sum_ {i = 1} ^ {k} \gamma^ {k - i} \alpha_ {i}\right) - \left(\delta_ {k} ^ {\prime} + \sum_ {i = 1} \gamma^ {k - i} \alpha_ {i}\right) \right| \leq 1. \tag {27}
+$$
+
+since,  $\delta_k' + \sum_i \gamma^{k-i} \alpha_i \geq |q_k - q^*|$ , we get  $\forall k \geq k_0$ , using 27, that
+
+$$
+\delta_ {k} + \sum_ {i = 1} ^ {k} \gamma^ {k - i} \alpha_ {i} \geq | q _ {k} - q ^ {*} | - \gamma^ {k - k _ {0}}. \tag {28}
+$$
+
+hence,  $\delta_k + \sum_{i=1}^k \gamma^{k-i} \alpha_i \geq |q_k - q^*|$  for large  $k$ .
+
+a note on the value of  $k_{0}$ . for a discounting of  $\gamma = 0.95$ , we get that  $k_{0} \approx 59$  and for  $\gamma = 0.99$ ,  $k_{0} \approx 460$ . in practical instances, an rl algorithm takes a minimum of about  $\geq 1\mathrm{m}$  gradient steps, so this value of  $k_{0}$  is easy achieved. even in the gridworld experiments presented in section 7.1,  $\gamma = 0.95$ , hence, the effects of initialization stayed significant only until about 59 iterations during training, out of a total of 300 or 500 performed, which is a small enough percentage.
+
+summary of proof for theorem 4.2.  $\delta_{k}$  in discor is given by the quantity  $\delta_{k} = |q_{k} - \mathcal{b}^{*}q_{k - 1}| + \gamma p^{\pi_{k - 1}}\delta_{k - 1}$ , is an upper bound for the error  $|q_{k} - q^{*}|$ , and we can safely initialize the parametric function  $\delta_{\phi}$  using standard neural network initialization, since the value of initial error will matter only infinitesimally after a large enough  $k$ .
+
+as  $k\to \infty$  , the following is true:
+
+$$
+\begin{array}{l} \lim  _ {k \rightarrow \infty} \left|\left| \delta_ {k} - \left| q _ {k} - q ^ {*} \right|\right| \leq \lim  _ {k \rightarrow \infty} \sum_ {i = 1} ^ {k} \gamma^ {k - i} \alpha^ {i} \right. (29) \\ = \lim  _ {k \rightarrow \infty} \sum_ {i = 1} ^ {k} \gamma^ {k - i} \mathrm {d} _ {\mathrm {t v}} \left(\pi_ {i}, \pi^ {*}\right) (30) \\ \end{array}
+$$
+
+also, note that if  $\pi_k$  is improving, i.e.  $\pi_k \to \pi^*$ , then, we have that  $\mathrm{d}_{\mathrm{tv}}(\pi_k, \pi^*) \to 0$ , and since limit of a sum is equal to the sum of the limit, and  $\gamma < 1$ , therefore, the final inequality in equation 30 tends to 0 as  $k \to \infty$ .
+
+# appendix c. missing proofs from section 3
+
+in this section, we provide omitted proofs from section 3 of this paper. before going into the proofs, we first describe notation and prove some lemmas that will be useful later in the proofs.
+
+we also describe the underlying adp algorithm we use as an ideal algorithm for the proofs below.
+
+# algorithm 2 generic adp algorithm
+
+1: initialize q-values  $q_0$ .  
+2: for step  $t$  in  $\{1, \dots, \mathrm{n}\}$  do  
+3: collect trajectories using  $\pi_t$  
+4: choose distribution  $d_{t}$  for projection.  
+5:  $q_{t + 1}\gets \prod_{d_t}\mathcal{b}^* q_t$
+
+$$
+\prod_ {d _ {t}} \mathcal {b} ^ {*} = \arg \min  _ {q} \mathbb {e} _ {d _ {t}} \left[ (q (s, a) - \mathcal {b} ^ {*} q _ {t - 1} (s, a)) ^ {2} \right]
+$$
+
+6: end for
+
+assumptions. the assumptions used in the proofs are as follows:
+
+- q-function is linearly represented, i.e. given a set of features,  $\phi(s,a) \in \mathbb{r}^d$  for each state and action, concisely represented as the matrix  $\phi \in \mathbb{r}^{|s||a| \times d}$ , q-learning aims to learn a d-dimensional feature vector  $w$ , such that  $q(s,a) = w^t \phi(s,a)$ . this is not a limiting factor as we will prove in assumption c.1, for problems with sufficiently large  $|s|$  and  $|a|$ .
+
+# c.1 suboptimal convergence of on-policy q-learning
+
+we first present a result that describes how q-learning can converge sub-optimally when performed with on-policy distributions, thus justifying our empirical observation of suboptimal convergence with on-policy distributions.
+
+theorem c.1 ([42]) projected bellman optimality operator under the on-policy distribution  $\mathcal{h} = \prod_{d_{\pi}}\mathcal{b}^{*}$  with a boltzmann policy,  $\pi \propto \exp (q / \tau)$ , where  $0 < \tau$  always has one or more fixed points.
+
+proof this statement was proven to be true in [42], where it was shown the projection operator  $\mathcal{h}$  has the same fixed points as another operator,  $f_{\alpha}$  given by:
+
+$$
+f _ {\alpha} (x) := x + \alpha \phi^ {t} d _ {\pi} \left(\mathcal {b} ^ {*} \phi x - \phi x\right) \tag {31}
+$$
+
+where  $\alpha \in (0,1)$  is a constant. they showed that the operator  $f_{\alpha}$  is a contraction for small-enough  $\alpha$  and used a compact set argument to generalize it to other positive values of  $\alpha$ . we refer the reader to [42] for further reference.
+
+they then showed a 2-state mdp example (example 6.1, [42]) such that the bellman operator  $\mathcal{h}$  has 2 fixed points, thereby showing the existence of one or more fixed points for the on-policy bellman backup operator.
+
+# c.2 proof of theorem 3.1
+
+we now provide an existence proof which highlights the difference in the speeds of learning accurate q-values from online or on-policy and replay buffer distributions versus a scheme like discor. we first state an assumption (assumption c.1) on the linear features parameterization used for the q-function. this assumption ensures that the optimal q-function exists in the function class (i.e. linear function class) used to model the q-function. this assumption has also been used in a number of recent works including [43]. analogous to [43], in our proof, we show that this assumption is indeed satisfied for features lying in a space that is logarithmic in the size of the state-space. for this theorem, we present an episodic example, and operate in a finite horizon setting with discounting  $\gamma$  and  $h$  denotes the horizon length. an episode terminates deterministically as soon as the run reaches a terminal node - in our case a leaf node of the tree mdp, i.e. a node at level  $h - 1$  - as we will see next.
+
+assumption c.1 there exists  $\delta \geq 0$ , and  $w \in \mathbb{r}^d$ , such that for any  $(s, a) \in s \times \mathcal{a}$ , the optimal  $q$ -function satisfies:  $|q^{*}(s, a) - w^{t}\phi(s, a)| \leq \delta$ .
+
+we first prove an intermediate property of  $\phi$  satisfying the above assumption that will be crucial for the lower bound argument for on-policy distributions.
+
+corollary c.1.1 there exists a set of features  $\phi \in \mathbb{r}^{2^h\times o(h^2 /\varepsilon^2)}$  satisfying assumption c.1, such that the following holds:  $||i_{2^h} - \phi \phi^t ||_\infty \leq \epsilon$ .
+
+proof this proof builds on the existence argument presented in [43]. using the  $\varepsilon$ -rank property of the identity matrix, one can show that there exists a feature set  $\phi \in \mathbb{r}^{2^h \times o(h / \varepsilon^2)}$  such that  $||i_{2^h} - \phi \phi^t||_\infty \leq \epsilon$ . thus, we can choose any such  $\phi$ , for a sufficiently low threshold  $\varepsilon$ . in order to assign features  $\phi$  to a state, we can simply perform an enumeration of nodes in the tree via a standard graph search procedure such as depth first search and assign a node  $(s,a)$  a feature vector  $\phi(s,a)$ . to begin with, let's show how we can satisfy assumption c.1 by choosing a different weight vector  $w_h$  for each level  $h$ , such that we obtain  $|q_h(s,a) - w_h^t \phi(s,a)| \leq \epsilon$ . since for each level  $h$  exactly one state satisfies  $q^*(s_j,a_j) = \gamma^{h-j+1}$ , so we can just let  $w_j = \gamma^{h-j+1} \phi(s_j,a_j)$  and thus we are able to satisfy assumption c.1. this is the extent of the argument used in [43].
+
+now we generalize this argument to find a single  $w \in \mathbb{r}^d$ , unlike different weights  $w_h$  for different levels  $h$ . in order to do this, we create a new  $\phi'$ , of size  $\phi' \in \mathbb{r}^{2^h \times o(h^2 / \epsilon^2)}$  (note  $h^2$  versus  $h$  dimensions for  $\phi'$  and  $\phi$ ) given
+
+![](images/aff3a78a2a04a34f05a4158e82be18b0b544c8f6cd86b833304b1dc74485ca74.jpg)  
+figure 10: example element of the tree family of mdps used to prove the lower bound in theorem c.2. here, the depth of the tree  $h = 2$ .  $r(s) = 0$  implies that executing any action  $a_1$  or  $a_2$ , a reward of 0 is obtained as state  $s$ . ( $s^*, a^*$ ) is given by state marked  $\mathrm{r}(\mathrm{s}, a_1) = 1$ .
+
+any  $\phi$  satisfying the argument in the above paragraph, such that
+
+$$
+\phi^ {\prime} (s, a) = \left[ \underbrace {0 , \dots , 0} _ {h \times \dim (\phi (s , a))}, \underbrace {\phi (s , a)} _ {\dim (\phi (s, a))}, 0, \dots , 0 \right] \tag {32}
+$$
+
+essentially, we pad  $\phi$  with zeros, such that for  $(s,a)$  belonging to a level  $h$ ,  $\phi'$  is equal to  $\phi$  in the  $h$ -th,  $\dim(\phi(s,a))$ -sized block.
+
+a choice of a single  $w \in \mathbb{r}^{\dim(\phi'(s,a))}$  for  $\phi'$  is given by simply concatenating  $w_1, \dots, w_h$  found earlier for  $\phi$ .
+
+$$
+w = \left[ w _ {1}, w _ {2}, \dots , w _ {h} \right] \tag {33}
+$$
+
+it is easy to see that  $w^t \phi'$  satisfies assumption c.1. a fact that will be used in the proof for theorem c.2, is that this construction of  $\phi'$  also satisfies:  $||i_{2^h} - \phi' \phi'^t||_\infty \leq \epsilon$ .
+
+we now restate the theorem from section 3 and provide a proof below.
+
+theorem c.2 (exponential lower bound for on-policy distributions) there exists a family of mdps parameterized by  $h > 0$ , with  $|\mathcal{s}| = 2^h$ ,  $|\mathcal{a}| = 2$  and a set of features satisfying assumption c.1, such that on-policy sampling distribution, i.e.  $d_k = d^{\pi_k}$ , requires  $\omega(\gamma^{-h})$  exact fixed-point iteration steps in the generic algorithm (algorithm 2) for convergence, if at all, the algorithm converges to an  $\varepsilon$ -accurate  $q$ -function.
+
+# proof
+
+tree construction. consider the family of tree mdps like the one shown in figure 10. both the transition function  $t$  and the reward function  $r$  are deterministic, and there are two actions at each state:  $a_1$  and  $a_2$ . there are  $h$  levels of states, thereby forming a full binary tree of depth  $h$ . executing action  $a_1$  transitions the state to its left child int he tree and executing action  $a_2$  transitions the state to its right child. there are  $2^h$  states in level  $h$ . among the  $2^{h-1}$  states in level  $h-1$ , there is one state,  $s^*$ , such that action  $a^*$  at this state yields a reward of  $r(s^*, a^*) = 1$ . for other states of the mdp,  $r(s, a) = 0$ . this is a typical example of a sparse reward problem, generally used for studying exploration [43], however, we re-iterate that in this case, we are primarily interested in the number of iterations needed to learn, and thereby assume that the algorithm is given infinite access to the mdp, and all transitions are observed, and the algorithm just picks a distribution  $d_k$ , in this case, the on-policy state-action marginal for performing backups.
+
+main argument. now, we are equipped with a family of the described tree mdps and a corresponding set of features  $\phi$  which can represent an  $\varepsilon$ -accurate q-function. our aim is to show that on-policy q-learning takes steps, exponential in the horizon for solving this task.
+
+for any stochastic policy  $\pi(a|s)$ , and  $\bar{p}$  defined as  $\bar{p} = \min_{s \in s, a \in a} \pi(a|s)$ ,  $0 < \bar{p} < 0.5$ , the marginal state-action distribution satisfies:
+
+$$
+d ^ {\pi} \left(s ^ {*}, a ^ {*}\right) \leq \gamma^ {h} \cdot \left(1 - \bar {p}\right) ^ {h + 1} \tag {34}
+$$
+
+since  $d^{\pi}$  is a discounted state-action marginal distribution, another property that it satisfies is that:
+
+$$
+c \leq | | d ^ {\pi} | | _ {2} \leq \frac {1}{1 - \gamma} 2 ^ {h} \tag {35}
+$$
+
+where  $c$  is a constant  $c > 0$ . the above is true, since, there are  $2^h$  states in this mdp, and the maximum values of any entry in  $d^\pi$  can be  $\frac{1}{1 - \gamma}$  since,  $1 - \gamma$  is the least eigenvalue of  $(i - \gamma p^\pi)$  for any policy  $\pi$ , since  $||p^\pi||_2 = 1$ .
+
+now, under an on-policy sampling scheme and a linear representation of the q-function as assumed, the updates on the weights for each iteration of algorithm 2 are given by  $(d_{\pi_k}$  represents  $\mathrm{diag}(d^{\pi_k}))$
+
+$$
+w _ {k + 1} = \left(\phi^ {t} d _ {\pi_ {k}} \phi\right) ^ {- 1} \phi^ {t} d _ {\pi_ {k}} \left(r + \gamma p ^ {\pi_ {k}} \phi w _ {k}\right) \tag {36}
+$$
+
+now,  $||d_{\pi_k}r|| \leq \gamma^h (1 - \bar{p})^{h + 1}||\phi (s^*,a^*)||$  from the property equation 34. hence, the maximum 2-norm of the updated  $w_{k + 1}$  is given by:
+
+$$
+\begin{array}{l} \left| \left| w _ {k + 1} \right| \right| _ {2} \leq \left| \left| \left(\phi^ {t} d _ {\pi_ {k}} \phi\right) ^ {- 1} \phi^ {t} d _ {\pi_ {k}} r \right| \right| _ {2} + \gamma \left| \left| \left(\phi^ {t} d _ {\pi_ {k}} \phi\right) ^ {- 1} \phi^ {t} d _ {\pi_ {k}} p ^ {\pi_ {k}} \phi w _ {k} \right| \right| _ {2} \\ \leq \frac {\gamma^ {h} (1 - \bar {p}) ^ {h + 1}}{| | d _ {\pi_ {k}} | | _ {f} \cdot (1 - \varepsilon) \cdot 2 ^ {h - 1}} + \gamma | | w _ {k} | | _ {2} \\ \leq \frac {\gamma^ {h} (1 - \bar {p}) ^ {h + 1} c}{(1 - \varepsilon) \cdot 2 ^ {h - 1}} + \| w _ {k} \| _ {2} \tag {37} \\ = (\gamma) ^ {h} \cdot c \cdot \frac {(1)}{(1 - \varepsilon) \cdot 2 ^ {h - 1}} + | | w _ {k} | | _ {2}. \\ \end{array}
+$$
+
+where the first inequality follows by an application of the triangle inequality, the second inequality follows by using the minimum value of the frobenius norm of the matrix  $\phi$  to be  $(1 - \varepsilon) \cdot 2^{h - 1}$  (using the  $\varepsilon$ -rank lemma used to satisfy assumption c.1) in the denominator of the first term, bounding  $||d_{\pi_k}r||$  by equation 34, and finally bounding the second term by  $\gamma ||w_k||_2$ , since the maximum eigenvalue of the entire matrix in front of  $w_k$  is  $\leq 1$ , as it is a projection matrix with a discount  $\gamma$  valued scalar multiplier. the third inequality follows from lower bounding  $d_{\pi_k}$  by  $c$  using equation 35.
+
+the optimal  $w^{*}$  is given by the fixed point of the bellman optimality operator, and in this case satisfies the following via cauchy-schwartz inequality,
+
+$$
+\begin{array}{l} (i - \gamma p ^ {*}) \phi w ^ {*} = r \\ \longrightarrow | | \phi | | _ {f} \cdot | | w ^ {*} | | _ {2} \geq | | (i - \gamma p ^ {*}) ^ {- 1} r | | \geq \frac {1}{1 + \gamma} | | r | | _ {2} \\ \longrightarrow (1 + \varepsilon) \cdot 2 ^ {h - 1} \cdot | | w ^ {*} | | _ {2} \geq \frac {1}{1 + \gamma} \tag {38} \\ \longrightarrow | | w ^ {*} | | _ {2} \geq \frac {1}{1 + \gamma} \cdot 2 ^ {- h + 1} \cdot (1 + \varepsilon) ^ {- 1} \\ \end{array}
+$$
+
+thus, in order for  $w_{k}$  to be equal to  $w^{*}$ , it must satisfy the above condition (equation 38). if we choose an initialization  $w_{0} = \mathbf{0}$  (or a vector sufficiently close to 0), we can compute the minimum number of steps it will take for on-policy adp to converge in this setting by using 37 and 38:
+
+$$
+\begin{array}{l} k \geq \frac {(1 + \gamma) ^ {- 1} \cdot 2 ^ {- h + 1} \cdot (1 + \varepsilon) ^ {- 1}}{(\gamma) ^ {h} \cdot (1 - \bar {p}) ^ {h} \cdot \frac {(c)}{(1 - \varepsilon) \cdot 2 ^ {h - 1}}} \tag {39} \\ \longrightarrow k \approx \omega (\gamma^ {- h}) \\ \end{array}
+$$
+
+for sufficiently small  $\varepsilon$ . hence, the bound follows.
+
+a note on the bound. since typically rl problems usually assume discount factors  $\gamma$  close to 1, one might wonder the relevance is this bound in practice. we show via an example that this is indeed relevant. in particular, we compute the value of this bound for commonly used  $\gamma, \bar{p}$  and  $h$ . for a discount  $\gamma = 0.99$ , and a minimum probability of  $\bar{p} = 0.01$  (as it is common to use entropy bonuses that induce a minimum probability of taking each action), this bound is of the order of
+
+$$
+\left(\gamma \cdot (1 - \bar {p})\right) ^ {h} \approx 1 0 ^ {9} \quad \text {f o r h = 1 0 0 0} \tag {40}
+$$
+
+for commonly used horizon lengths of 1000 (example, on the gym benchmarks).
+
+corollary c.2.1 (extension to replay buffers) there exists a family of mdps parameterized by  $h > 0$ , with  $|\mathcal{s}| = 2^h$ ,  $|\mathcal{a}| = 2$  and a set of features  $\phi$  satisfying assumption c.1, such that adp with replay buffer distribution takes  $\omega(\gamma^{-h})$  many steps of exact fixed-point iteration for convergence of adp, if at all convergence happens to an  $\epsilon$ -accurate  $q$ -function.
+
+proof for replay buffers, we can prove a similar statement as previously. the steps in this proof follow exactly the steps in the proof for the previous theorem.
+
+with replay buffers, the distribution for the projection at iteration  $k$  is given by:
+
+$$
+d _ {k} (s, a) = \frac {1}{k} \sum_ {i = 1} ^ {k} d _ {\pi_ {k}} (s, a) \tag {41}
+$$
+
+therefore, we can bound the probability of observing any state-action pair similar to equation 34 as:
+
+$$
+d _ {k} \left(s ^ {*}, a ^ {*}\right) \leq \frac {1}{k} \sum_ {i = 1} ^ {k} \gamma^ {h} \cdot \left(1 - \bar {p}\right) ^ {h + 1} \tag {42}
+$$
+
+with  $\bar{p}$  as defined previously. note that this inequality is the same as the previous proof, and doesn't change. we next bound the 2-norm of the state-visitation distribution, in this case, the state-distribution in the buffer.
+
+$$
+c \leq | | d _ {k} | | _ {2} \leq \frac {1}{1 - \gamma} \cdot 2 ^ {h} \tag {43}
+$$
+
+where  $c > 0$ . the two main inequalities used are thus the same as the previous proof. now, we can simply follow the previous proof to prove the result.
+
+practical implications. in this example, both on-policy and replay buffer q-learning suffer from the problem of exponentially many samples need to reach the optimal q-function. even in our experiments in section 3, we find that on-policy distributions tend to reduce errors very slowly, at a rate that is very small. the above bound extends this result to replay buffers as well.
+
+in our next result, however, we show that an optimal choice of distribution, including discor, can avoid the large iteration complexity in this family of mdps. specifically, using the errors against  $q^{*}$ , i.e.  $|q_{k} - q^{*}|$  can help provide a signal to improve the q-function such that this optimal distribution / discor will take only  $\text{poly}(h)$  many iterations for convergence.
+
+corollary c.2.2 (optimal distributions / discor) in the tree mdp family considered in theorem 3.1, with linear function approximation for the  $q$ -function, and with assumption c.1 for the features  $\phi$ , discor takes poly  $(h)$  many exact iterations for  $\varepsilon$ -accurate convergence to the optimal  $q$ -function.
+
+proof we finally show that the discor algorithm, which prioritizes states based on the error in target values, will take  $\mathrm{poly}(h)$  many steps for convergence. assume that q-values are initialized randomly, for example via a normal random variable with standard deviation  $\sigma$ , i.e.,  $q_0(s,a) \sim \mathcal{n}(0,\sigma^2)$ , however,  $\sigma$  is very small, but is more than 0 ( $\sigma > 0$ ) (this proof is still comparable to the proof for on-policy distributions, since q-values can also be initialized very close to 0 even in that case, and the proof of theorem c.2 still remains valid.).
+
+now we reason about a run of discor in this case.
+
+iteration 1. in the first iteration, among all nodes in the mdp, the leaf nodes (depth  $h - 1$ ) have 0 error at the corresponding target values, since an episode terminates once a rollout reaches a leaf node. hence, the algorithm will assign equal mass to all leaf node states, and exactly update the q-values for nodes in this level (upto  $\varepsilon$ -accuracy).
+
+iteration 2. in the second iteration, the leaf nodes at level  $h - 1$  have accurate q-values, therefore, the algorithm will pick nodes at the level  $h - 2$ , for which the target values, i.e. q-values for nodes at level  $h - 1$ , have 0 error along with nodes at level  $h - 1$ . the algorithm will update q-values at these nodes at level  $h - 2$ , while ensuring that the incurred error at the nodes at level  $h - 1$  isn't beyond  $\varepsilon$ , since nodes at both levels are chosen. since, the optimal value function  $q^{*}$  can be represented upto  $\varepsilon$ -accuracy, we can satisfy this criterion.
+
+iteration  $k$ . in iteration  $k$ , the algorithm updates q-values for nodes at level  $h - k$ , while also ensuring q-values for all nodes at a level higher than  $h - k$  are estimated within the range of  $\varepsilon$ -allowable error, since all the nodes below level  $h - k$  are updated. this is feasible since,  $q^{*}$  is expressible with  $\varepsilon$ -accuracy within the linear function class chosen.
+
+this iteration process continues, and progress level by level, from the leaves (level  $h - 1$ ) to the root (level 0). at each iteration q-values for all states at the same level, and below are learned together. since learning progresses in a "one level at-a-time" fashion, with guaranteed correct target values (i.e. target values are equal to the optimal q-function  $q^{*}$ ) for any update that the algorithm performs, it would take at most poly(  $h$  ) many iterations (for example, multiple passes through the depth of the tree) for  $\varepsilon$ -accurate convergence to the optimal  $q$ -function.
+
+# appendix d. extended related work
+
+error propagation in adp. a number of prior works have analysed error propagation in adp methods. most work in this area has been devoted to analysing how errors in bellman error minimization propagate through the learning process of the adp algorithm, typically focusing on methods such as fitted q-iteration (fqi) [10] or approximate policy iteration [44]. prior works in this area assume an abstract error model, and analyze how errors propagate. typically these prior works only limitedly explore reasons for error propagation or present methods to curb error propagation. [45] analyze error propagation in approximate policy iteration methods using quadratic norms. [19] analyze the propagation of error across iterations of approximate value iteration (avi) for  $l_{p}$ -norm  $p = (1,2)$ . [21] provide finite sample guarantees of avi using error propagation analysis. similar ideas have been used to provide error bounds for a number of different methods - [20, 46, 47, 48] and many more. in this work, we show that adp algorithms suffer from an absence of corrective feedback, which arises because the data distribution collected by an agent is insufficient to ensure that error propagation is eventually corrected for. we further propose an approach, discor, which can be used in conjunction with modern deep rl methods.
+
+offline / batch reinforcement learning. our work bears similarity to the recent body of literature on batch, or offline reinforcement learning [30, 49, 50]. all of these works exploit the central idea of constraining the policy to lie in a certain neighborhood of the behavior, data-collection policy. while [30] show that this choice can be motivated from the perspective of error propagation, we note that there are clear differences between our work and such prior works in batch rl. first, the problem statement of batch rl requires learning from completely offline experience, however, our method learns online, via on-policy interaction. while error propagation is a reason behind incorrect q-functions in batch rl, we show that such error accumulation also happens in online reinforcement, which results in a lack of corrective feedback.
+
+generalization effects in deep q-learning. there are a number of recent works that theoretically analyze and empirically demonstrate that certain design decisions for neural net architectures used for q-learning, or adp objectives can prove to be significant in deep q-learning. for instance, [29] point out that sparse representations may help q-learning algorithms, which links back to prior literature on state-aliasing and destructive interference. [28] uses an objective inspired from the neural tangent kernel (ntk) [51] to "cancel" generalization effects in the q-function induced across state-action pairs to mimic tabular and online q-learning. our approach, discor, can be interpreted as only indirectly affecting generalization via the target q-values for state-action pairs that will be used as bootstrap targets for the bellman backup, which are expected to be accurate with discor, and this can aid generalization, similar to how generalization can be achieved via abstention from training on noisy labels in supervised learning [18].
+
+replay buffers and generalization. there are some prior works performing analytical studies on the size of the replay buffer [52, 53], which propose that larger replay buffers might hurt training with function approximation. partly this problem goes away if smaller buffers are used, or if the algorithm chooses to replay recent experience more often. our work indicates an absence of corrective feedback problem - online data collection might not be able to correct errors in the q-function - which is distinct from the size of the replay buffer.
+
+# appendix e. experimental details
+
+in this section, we provided experimental details, such as the discor algorithm in practice (section e.1), and the hyperparameter choices (section e.2).
+
+# algorithm 3 discor: deep rl version
+
+1: initialize online q-network  $q_{\theta}(s,a)$ , target q-network,  $q_{\bar{\theta}}(s,a)$ , error network  $\delta_{\phi}(s,a)$ , target error network  $\delta_{\bar{\phi}}$ , initial distribution  $p_0(s,a)$ , a replay buffer  $\beta$  and a policy  $\pi_{\psi}(a|s)$ , number of gradient steps  $g$ , target network update rate  $\eta$ , initial temperature for computing weights  $w_k$ ,  $\tau_0$ .  
+2: for step  $k$  in  $\{1, \dots, \}$  do  
+3: collect  $m$  samples using  $\pi_{\psi}(a|s)$ , add them to replay buffer  $\beta$ , sample  $\{(s_i, a_i)\}_{i=1}^n \sim \beta$  
+4: evaluate  $q_{\theta}(s,a)$  and  $\delta_{\phi}(s,a)$  on samples  $(s_i,a_i)$ .  
+5: compute target values for  $q$  and  $\delta$  on samples:
+
+$$
+y _ {i} = r _ {i} + \gamma \mathbb {e} _ {a ^ {\prime} \sim \pi_ {\psi} (a ^ {\prime} | s ^ {\prime})} [ q _ {\bar {\theta}} (s _ {i} ^ {\prime}, a ^ {\prime}) ]
+$$
+
+$$
+\hat {\delta} _ {i} = \left| q _ {\theta} (s, a) - y _ {i} \right| + \gamma \mathbb {e} _ {\tilde {a} _ {i} \sim \pi \left(a _ {i} \mid s ^ {\prime}\right)} \left[ \delta_ {\tilde {\phi}} \left(s _ {i} ^ {\prime}, \hat {a} _ {i}\right) \right]
+$$
+
+6: compute  $w_{k}$  using equation 8 with temperature  $\tau_{k}$  
+7: take  $g$  gradient steps on the bellman error for training  $q_{\theta}$  weighted by  $w_{k}$ .
+
+$$
+\theta \leftarrow \theta - \alpha \nabla_ {\theta} \frac {1}{n} \sum_ {i = 1} ^ {n} w _ {k} \left(s _ {i}, a _ {i}\right) \cdot \left(q _ {\theta} \left(s _ {i}, a _ {i}\right) - y _ {i}\right) ^ {2}
+$$
+
+8: tale  $g$  gradient steps to minimize unweighted (regular) bellman error for training  $\phi$ .
+
+$$
+\phi \leftarrow \phi - \alpha \nabla_ {\phi} \frac {1}{n} \sum_ {i = 1} ^ {n} \left(\delta_ {\theta} \left(s _ {i}, a _ {i}\right) - \hat {\delta} _ {i}\right) ^ {2}
+$$
+
+9: update the policy  $\pi_{\psi}$  if it is explicitly modeled.
+
+$$
+\psi \leftarrow \psi + \alpha \nabla_ {\psi} \mathbb {e} _ {s \sim \beta , a \sim \pi_ {\psi} (a | s)} \left[ q _ {\theta} (s, a) \right]
+$$
+
+10: update target networks using soft updates (sac), hard updates (dqn)
+
+$$
+\bar {\theta} \leftarrow (1 - \eta) \bar {\theta} + \eta \theta
+$$
+
+$$
+\bar {\phi} \leftarrow (1 - \eta) \bar {\phi} + \eta \phi
+$$
+
+11: update temperature hyperparameter for discor:
+
+$$
+\tau_ {k + 1} \leftarrow (1 - \eta) \tau_ {k} + \eta \text {b a t c h - m e a n} \left(\delta_ {\phi} \left(s _ {i}, a _ {i}\right)\right)
+$$
+
+12: end for
+
+# e.1 discor in practice
+
+in this section, we provide details on the experimental setup and present the pseudo-code for the practical instantiation of our algorithm, discor.
+
+the pseudocode for the practical algorithm is provided in algorithm 3. like any other adp algorithm, such as dqn or sac, our algorithm maintains a pair of q-functions - the online q-network  $q_{\theta}$  and a target network  $q_{\bar{\theta}}$ . for continuous control domains, we use the clipped double q-learning trick [5], which is also referred to as the "twin-q" trick, and it further parametrizes another pair of online and target q-functions, and uses the minimum q-value for backup computation. in addition to q-functions, in a continuous control domain, we parametrize a separate policy network  $\pi_{\psi}$  similar to sac. in a discrete action domain, the policy is just given by a greedy maximization of the online q-network.
+
+discor further maintains a model for accumulating errors  $\delta_{\phi}$  parameterized by  $\phi$  and the corresponding target error network  $\delta_{\bar{\phi}}$ . in the setting with two q-functions, discor models two networks, one for modelling error in each q-function. at every step, a few (depending upon the algorithm) gradient steps are performed on  $q$  and  $\delta$ , and  $\pi$  - if it is explicitly modeled, for instance in continuous control domains. this is a modification of generalized adp algorithm 2 and the corresponding discor version (algorithm 1), customized to modern deep rl methods.
+
+# e.2 experimental hyperparameter choices
+
+we finally specify the hyperparameters we used for our experiments. these are as follows:
+
+- temperature  $\tau$ : discor mainly introduces one hyperparameter, the temperature  $\tau$  used to compute the weights  $w_{k}$  in equation 8. as shown in line 11 of algorithm 3, discor maintains a moving average of the temperatures and uses this average to perform the weighting. this removes the requirement for tuning the temperature values at all. for initialization, we chose  $\tau_0 = 10.0$  for all our experiments, irrespective of the domain or task.  
+- architecture for  $\delta_{\phi}$ : for the design of the error network,  $\delta_{\phi}$ , we utilize a network with 1 extra hidden layer than the corresponding q-network. for instance, in metaworld domains, the standard q-network used was [256, 256, 256] in size, and thus we used an error network of size: [256, 256, 256, 256], and for mt10 tasks we used [160, 160, 160, 160, 160, 160] sized q-networks [54] and 1-extra layer error networks  $\delta_{\phi}$ .  
+- target net updates: we performed target net updates for  $\delta_{\bar{\phi}}$  in the same manner as standard q-functions, in all domains. for instance, in metaworld, we update the target network  $\delta_{\bar{\phi}}$  with a soft update rate of 0.005 at each environment step, as is standard with sac [55], whereas in dqn [11], we use hard target resets.  
+- learning rates for  $\delta_{\phi}$ : these were chosen to be the same as the corresponding learning rate for the q-function, which is  $3e - 4$  for sac and 0.0025 for dqn.  
+- official implementation repositories used for our work:
+
+1. soft-actor-critic: https://github.com/rail-berkeley/softlearning/  
+2. dopamine [38]: official dqn implementation https://github.com/google/dopamine, and the baseline dqn numbers were reported from the logs available at: https://github.com/google/dopamine/tree/master/baselines  
+3. tabular environments [6]: https://github.com/justinjfu/diagnosing_qlearning
+
+- we perform self-normalized importance sampling across a batch, instead of regular importance sampling, since that gives rise to more stable training, and suffers less from the curse of variance in importance sampling.
+
+- seeds: in all our experiments, we implemented our methods on top of the official repositories, ran each experiment for 4 randomly chosen seeds from the interval, [10, 10000], in meta-world, openai gym and tabular environments. for dqns on atari, we were only able to run 3 seeds for each game for our method, however, we found similar performances, and less variance across seeds, as is evident from the variance bands in the corresponding results. for baseline dqn, we just used the log files provided by the dopamine repository for our results.
+
+# appendix f. additional experiments
+
+we now present some additional experimental results which could not have been presented in section 7.
+
+# f.1 tabular environment analysis
+
+environment setup. we used the suite of tabular environments from [6], which provides a suite of 8 tabular environments and a suite of algorithms based on fitted q-iteration [10], which forms the basis of modern deep rl algorithms based on adp. we evaluated performance on different variants of the (16,16) gridworld provided, with different reward styles (sparse, dense), different observation functions (one-hot, random features, locally smooth observations), and different amounts of entropy coefficients (0.01, 0.1). we evaluated on five different kinds of environments: grid16randomobs, grid16onehot, grid16smoothobs, grid16smoothsparse, grid16randomsparse - which cover a wide variety of combinations of feature and reward types. we also evaluated on cliffwalk, sparsegraph and mountaincar mdps in figures 11 and 12.
+
+sampling modes. we evaluated in two modes - (1) exact mode, in the absence of sampling error, where an algorithm is provided with all transitions in the mdp and simply chooses a weighting over the states rather than sampling transitions from the environment, and (2) sampled mode, which is the conventional rl paradigm, where the algorithm performs online data collection to collect its own data.
+
+setup for figures 1 and 4a. for figures 1 and 4a, we used the grid16randomobs mdp (which is a  $16 \times 16$  gridworld with randomly initialized vectors as observations), with an entropy penalty of 0.01 to the policy. for figure 4b we used the grid16smoothobs mdp with locally smooth observations, with an entropy penalty of 0.01 as well, and for figure 4c, we used grid16smoothsparse environment, with sparse reward and smooth features.
+
+results. we provide some individual environment performance curves showing the smoothed normalized return achieved at the end of 300 steps of training in both exact (figure 11) and sampled (figure 12) settings. we also
+
+![](images/52c606e5db25299ba2eff867c412e6d03aaede3f318b44d3f2d3a3661d31e84f.jpg)  
+figure 11: performance of different methods: discor (blue), discor (oracle) (red), replay buffer q-learning (green, on-policy (grey) and prioritized updates (orange), across different environments measured in terms of smooth normalized returns in the exact setting with all transitions. note that discor and discor (oracle) generally tend to perform better.
+
+![](images/2dabf05fe803899931f59268e69014cf5012a0900d9ee809b215e1d1ac48fc9b.jpg)  
+figure 12: performance of different methods: discor (blue), discor (oracle) (red), replay buffer q-learning (green) and prioritized updates (orange). across different environments measured in terms of smooth normalized return with sampled transitions. note that discor and discor (oracle) generally tend to perform better.
+
+present some individual-environment learning curves for these environments comparing different methods in both exact (figure 13) and sampled (figure 14).
+
+# f.2 metaworld tasks
+
+in this section, we first provide a pictorial description of the six hard tasks we tested on from meta-world, where sac usually does not perform very well. figure 15 shows these tasks. we provide the trends for average return achieved during evaluation (not the success rate as shown in figure 7 in section 7) for each of the six tasks. note that discor clearly outperforms both the baseline sac and the prior method per in all six cases, achieving nearly  $50\%$  more than the returns achieved by sac.
+
+figure 13: learning curves for different algorithms in the exact setting. note that discor (blue) and discor (oracle) (red) are generally the best algorithms in these settings. replay buffers (green) help over on-policy (pink) distributions. prioritizing transitions based on high bellman error (orange) is performant in some cases, but hurts in the other cases - it is especially slow in cases with sparse rewards, note the speed of learning on grid16randomsparse and grid16smoothsparse (right of the vertical line) environments.  
+![](images/9e30e4789e4db9fb747b5b259b18e3156e40fa9e63eb000f4a0e93271ca0295e.jpg)  
+per buffer discor discor (oracle) on-policy uniform
+
+![](images/c7b53c6c4ded851754d20e6f4420fbdb5feca03206406e0bfae7f95304c026ff.jpg)
+
+![](images/21bd8a0ed64e31c7067f9a64d7fa558797314721e45d89ae393e2114b6b4ebec.jpg)
+
+![](images/dd4ec7a41b239df5336ecdc9386abc2af0baba96813137178133432ea7d90401.jpg)
+
+![](images/4683ae26e50ffc79ce70ec07b87b3313e8fe5ec15f12d593936f5b0d9a89ae2a.jpg)
+
+![](images/615b9a00c10c731e67916eecf7720ccf69e6e43db66a79122e06b64265702915.jpg)  
+figure 14: learning curves for different algorithms in the sampled setting. note that discor and discor (oralce) are generally the best algorithms in these settings. replay buffers (green) help over on-policy (gray) distributions, but may the algorithm may still fail to reach optimal return. prioritizing for high bellman error (per) may fail to learn in sparse-reward tasks as is evident from the curves for sparse reward environments (right of the vertical line).
+
+![](images/35f49382ac5238796206656f4ad5d6485e34dbb722cb8c64f89cf33d18252ba6.jpg)  
+per buffer discor discor (oracle)
+
+![](images/a3f3d15b41a3f5625e4abb08f9b777fb7f36a144b1d5d42f1af8ca02a09f3287.jpg)
+
+![](images/443dba2572dc997262060e3a5c03c8da7e81f2c8460ba3d47a6fa90007c4e8a6.jpg)
+
+![](images/652a2ef702cdf4f7cc18dc9600d94426a5e9bd298f82e70fe3114083ef2cadda.jpg)
+
+![](images/2ea75e5feb5e07eca8df79dac9fd28cd27612fe4e53c25123ca52cc1bc670289.jpg)  
+hammer
+
+![](images/72e841981fac2747f209482f211cf975ef36181ba4f4fa9dcb545711066fc557.jpg)  
+push with stick
+
+![](images/0b7a21f3c095c294fb04adce5a78e898cea514da81ff177d668dfd7dc3edb0f1.jpg)  
+push with wall
+
+![](images/b8fd0ca3d4c3b807c56f46b5d9758f72d1d23b4719a23a2131efc7db89932fbe.jpg)  
+pull with stick
+
+![](images/28bd55155c00db09758bce24afd87805486d29e5c3716230c47835fdfd816218.jpg)  
+turn dial
+
+![](images/3f4be42866f4ff8a260901983ce1f5809c8ff8ba616989b420e1d52aa4a3dfd0.jpg)  
+insert peg side  
+figure 15: visual description of the six metaworld tasks used in our experiments in section 7. figures taken from [14].
+
+# f.3 openai gym benchmarks
+
+here we present an evaluation on the standard openai continuous control gym benchmark environments. modern adp algorithms such as sac can already solve these tasks easily, without any issues, since these algorithms have been tuned on these tasks. a comparison of the three algorithms discor, sac and per, on three of these benchmark tasks is shown in figure 17. we note that in this case, all the algorithms are roughly comparable to each other. for instance, discor performs better than sac and per on walker2d, however, is outperformed by sac on ant.
+
+stochastic reward signals. that said, we also performed an experiment to verify the impact of stochasticity, such as noise in the reward signal, on the discor algorithm as compared to other baseline algorithms like sac and per. analogous the diagnostic tabular experiments on low signal-to-noise ratio environments, such as those with sparse reward, we would expect a baseline adp method to be impacted more due to an absence of corrective feedback in tasks with stochastic reward noise, since a noisy reward effectively reduces the signal-to-noise ratio. we would also expect a method that ensures corrective feedback to perform better.
+
+in order to test this hypothesis, we created stochastic reward tasks out of the openai gym benchmarks. we modified the reward function  $r(s,a)$  in these gym tasks to be equal to:
+
+$$
+r ^ {\prime} (s, a) = r (s, a) + z, \quad z \sim \mathcal {n} (0, 1) \tag {44}
+$$
+
+and the agent is only provided these noisy rewards during training. however, we only report the deterministic ground-truth reward during evaluation. we present the results in figure 18. observe that in this scenario, discor
+
+![](images/026aa710be5f93c81a70a3a8d628a1109e563682e4210ad59a2421d1d677caab.jpg)
+
+![](images/94b4f46e3d3ec86130043ed46b9d17650783b8cf239d89f9cfc0dbfefa074617.jpg)
+
+![](images/b4cc3b5c383dc3a7d7fbb9c186ba6f411c32bb51f41b63a9636ad47b2841656a.jpg)
+
+![](images/b319e3a25f13f253a4c26503e4110e96b1e21776843445e2559f4220ab955619.jpg)  
+figure 16: evaluation average return achieved by discor (blue), sac (green) and per (orange) on six metaworld benchmarks. from left to right: pull stick, push with wall, push with stick, turn dial, hammer and insert peg side tasks. note that discor clearly achieves better returns or learns faster in most of the tasks.
+
+![](images/d616a9a377cd4b18be54933c032873ccfb56950169c9849a42ad5a0659fedfa3.jpg)
+
+![](images/6d4980cd7f2994aec6376dd41b33a0a4b6f50f89d27123a717ce06e38f6440c6.jpg)
+
+emerges as the best performing algorithm on these tasks, and outperforms other baselines sac and per both in terms of asymptotic performance (example, halfcheetah) and sample efficiency (example, ant).
+
+![](images/06539277468aaf9077a7c0a4be245ff86b543d8887d880dbed17088bdd9c2fc0.jpg)  
+figure 17: performance of discor, sac and per on gym benchmarks. on an average, all methods perform roughly similarly on these settings.
+
+![](images/3e9c67e47ef1ddcf0b561a1f1a0c77f683e1b81cffd1cfe9ccfa30f45eaa886c.jpg)
+
+![](images/cfaac666f0852765123f1c96da93bed94fe0075b2049e0e10b23e01ee157b26c.jpg)
+
+![](images/e6d1c9921a9a88f36848c8e44d45b1405c716e0dd77f0dfc02d9d9d65ff01853.jpg)  
+figure 18: performance of discor, sac and per on continuous control gym benchmarks with stochastic reward noise. note that discor learns slightly faster and performs better than sac and per on these stochastic problems.
+
+![](images/ab342c89e39e2ad1f882368927b9da9f481a44bb87de78ef2cbbf03c55f737db.jpg)
+
+![](images/354b28c932ef51ff6e060c51759eb7d34a56e666399a270b9a3b43a1b2b07329.jpg)
+
+# f.4 mt10 multi-task experiments
+
+in this section, we present the trend of returns, as a learning curve and as a comparative histogram (at 1m environment steps of training) for the multi-task mt10 benchmark, extending the results shown in section 7.3, figure 8. these plots are shown in figure 19. observe that discor achieves more than  $30\%$  of the return of sac, and obtains an individually higher value of return on more tasks.
+
+![](images/5c34ece384aa43950ee63d035f3e91ee37e3e65d7b1e634ab826c8a3fe444107.jpg)  
+(a) average task return
+
+![](images/b6ca172a5663d4c2bbcf71a34286063c023a62e075e9d12515a958a7a41c2643.jpg)  
+(b) per-task return at 1m steps  
+figure 19: performance of discor and sac on the mt10 benchmark. returns for discor are higher than sac by around  $30\%$ ; (2) discor achieves a non-trivial return on 7/10 tasks after 1000k steps, as compared to 3/10 for unweighted sac, similar to the trend at 500k steps shown in figure 8.
+
+# f.5 mt50 multi-task experiments
+
+we further evaluated the performance of discor on the multi-task mt50 benchmark [14]. this is an extremely challenging benchmark where the task is to learn a single policy that can solve 50 tasks together, with the same evaluation protocol as previously used in the mt10 experiments (section 7.3 and appendix f.4). we present the results (average task return and average success rate) in figures 20. note that while sac tends to saturate/plateau in between 4m - 8m steps, accounting for corrective feedback via the discor algorithm makes the algorithm continue learning in that scenario too.
+
+<table><tr><td>game</td><td>n-step dqn (n = 3)</td><td>discor (regular)</td><td>n-step discor (n = 3)</td></tr><tr><td>pong</td><td>17</td><td>17</td><td>19</td></tr><tr><td>breakout</td><td>37</td><td>175</td><td>47</td></tr></table>
+
+table 1: average performance of dqn + 3-step returns, discor and discor + 3-step returns on pong and breakout at 60m steps into training, rounded off to the nearest integer. note that discor clearly outperforms dqn with multi-step returns. we also find that adding n-step returns to discor can hurt, for instance, on breakout, where the same hurts with dqn as well (for comparison, see figure 9 in the main paper), however, we still observe that discor, when applied with multi-step returns performs better than dqn with multi-step returns as well, indicating the benefits of discor even when methods such as multi-step returns are used.
+
+![](images/73fbdfe10626bd81540d572cd55bc44c6cac535712e26c94c4fade01a8ec974e.jpg)  
+(a) average task return
+
+![](images/8484f8bc90cbf07d88c2d9af53a21963604967d48a85c514e3a8688859505094.jpg)  
+(b) average success rate  
+figure 20: performance of discor and sac on the mt50 benchmark. note that, discor clearly keeps learning unlike sac which tends to plateau for about 3m steps in the middle (the stretch between 4m and 7m steps on the x-axis, where sac exhibits a small gradient in the learning progress, whereas discor continuously keeps learning).
+
+# f.6 comparison with afm
+
+in this section, we present a comparison of discor and afm [6], a prior method similar to prioritized experience replay on the mujoco gym benchmarks. we find that discor clearly outperforms afm in these scenarios. we present these results in figure 21 where the top row presents results in the case of regular gym benchmarks, and the bottom row presents results in the case of gym benchmarks with stochastic reward noise.
+
+# f.7 dqn with multi-step returns
+
+n-step returns with dqn are hypothesized to stabilize learning since updates to the q-function now depends on reward values spanning multiple steps, and the coefficient of the bootstrapped q-value is  $\gamma^t$ , which is exponentially smaller than  $\gamma$  used conventionally in bellman backups, implying that the error accumulation process due to incorrect targets is reduced. thus, we perform a comparison of discor and dqn with n-step backups, where  $n$  was chosen to be 3,  $n = 3$ , in accordance with commonly used multi-step return settings for atari games. we present the average return obtained by discor and dqn (+n-step), with sticky actions, in table 1. we clearly observe that discor outperforms dqn with 3-step returns in all three games evaluated on. we also observe that n-step returns applied with discor also outperform n-step returns applied with dqn, indicating the benefits of using discor even when other techniques, such as n-step returns are used.
+
+![](images/c0d349a59f4d722b551b5df0276af689683308ae62540b2dc4d388446c91c93e.jpg)
+
+![](images/d04469879997d193d98c4665b05da9fdafb0b5fdfc4e59277ad24a0b7d5dc523.jpg)
+
+![](images/6b1aa9fa5c1e3b8e9cf8b97d5d98f653cad6abb25172a7ca5066469b2ea2e368.jpg)
+
+![](images/511ae00a2095fdb67e84df92aaebb86f3de4094ac9b886fad7aab99156129329.jpg)  
+figure 21: performance of discor, sac, per and afm on continuous control gym benchmarks (top row) and gym benchmarks with stochastic reward noise (bottom row). note that discor clearly out-performs afm in both scenarios, on all three benchmarks tested on.
+
+![](images/8deb7430dfad29797b0d017036331882e53bc9244468979cdbd5233f0bb1e4c4.jpg)
+
+![](images/dcf136e171c65ebedce693095bc6ad2278a0f97775aa5d22e19f977590d2c98b.jpg)
+
+# f.8 code for the method
+
+the code is shown in figure 22. it is a simplified version of the code from our implementation of discor on top of the official sac repository [55].
+
+```python
+def _init_critic_update_with_dist(self):
+    '''update critic with distribution weighting, and update \delta1a\phi using recursive update.''
+    next_actions = self._policyactions([self._next observations_ph])
+    ## compute errors at next state, and an action from the policy
+    qf_pred_errs = self._error_fns([self._next observations_ph, next_actions])
+    ## error_model_tau_ph: moving mean of the error values over batches
+    err_logits = -tf.stop_gradient(   self._discount * qf_pred_errs / self._error_model_tau_ph)
+    q_target = tf.stop_gradient(self._get_q_target())
+    q_values = self._q([self._observations_ph, self._actions_ph])
+    ## compute importance sampled loss, also perform self-normalized sampling
+    loss, weights = importance_sampled_loss(
+        labels=q_target, predictions=q_values,
+        weights=err_logits, weight_options='self_normalized')
+    ## train q-function
+    q_training ops = tf.contrib.layersoptimizer_loss(loss, learning_rate= self._q_lr,
+                    optimizer= self._q_optimizer, variables= self._q.trainable_variables)
+    training ops.update({'q': tf.group(q_training ops)})
+    ## training the error function
+    err_values = self._error_fns([self._observations_ph, self._actions_ph])
+    ## mean bellman error used to compute target values for error
+    bellmanerrors = tf.abs(q_values - q_target)
+    err_targets = tf.stop_gradient(self._get_error_target(bellmanerrors))
+    ## this is used to update the moving mean, self._error_model_tau_ph
+    self._mean_error_values = tf.reduce_mean(err_values)
+    ## simple mean squared error loss for \delta1a\phi
+    err losses = tf.losses.mean_squared_error(
+        labels=err_targets, predictions=err_values, weights=0.5)
+    ## update error function: \delta1a\phi
+    err_training ops = tf.contrib.layersoptimizer_loss(err_losses,
+                     learning_rate= self._dist_lr,
+                        optimizer= self._erroptimizer, variables= self._error_fns.
+trainable_variables)
+    training ops.update({'error': tf.group(err_training ops)})
+```
+
+figure 22: code for training the error function  $\delta_{\phi}$ , and modified training for the q-function  $q(s,a)$  using  $\delta_{\phi}$  to get weights  $w(s,a)$  for training. code written in convention with regular tensorflow guidelines, in the same style as the official sac implementation [55].

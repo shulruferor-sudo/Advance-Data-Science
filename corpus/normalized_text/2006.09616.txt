@@ -1,0 +1,849 @@
+# dynamic tensor rematerialization
+
+marisa kirisame,\* steven lyubomirsky,\* altan haan;\* jennifer brennan, mike he, jared roesch, tianqi chen, and zachary tatlock
+
+{jerry96, sssyu, altanh, jrb, dh63, jroesch}@cs.washington.edu, tqchen@cmu.edu, ztatlock@cs.washington.edu
+
+# abstract
+
+checkpointing enables the training of deep learning models under restricted memory budgets by freeing intermediate activations from memory and recomputing them on demand. current checkpointing techniques statically plan these recomputations offline and assume static computation graphs. we demonstrate that a simple online algorithm can achieve comparable performance by introducing dynamic tensor rematerialization (dtr), a greedy online algorithm for checkpointing that is extensible and general, is parameterized by eviction policy, and supports dynamic models. we prove that dtr can train an  $n$ -layer linear feedforward network on an  $\omega(\sqrt{n})$  memory budget with only  $\mathcal{o}(n)$  tensor operations. dtr closely matches the performance of optimal static checkpointing in simulated experiments. we incorporate a dtr prototype into pytorch merely by interposing on tensor allocations and operator calls and collecting lightweight metadata on tensors.
+
+# 1 introduction
+
+as state-of-the-art deep learning (dl) models continue to grow, training them within the constraints of on-device memory becomes increasingly challenging. the memory demands of emerging models prevent their training on memory-limited devices (such as specialized accelerators, low-powered embedded devices, or older gpus) and limit researchers' ability to explore memory-intensive architectures and training techniques. checkpointing is one technique that enables training with models and batches that exceed on-device memory without modifying the model's design. it is achieved by freeing some activations from memory and recomputing them on demand. adapted from techniques in automatic differentiation (baydin et al., 2015; griewank & walther, 2000; siskind & pearlmutter, 2018), checkpointing in the dl context exploits the fact that intermediate activations for backpropagation dominate memory usage during training (sohoni et al., 2019) but can be easily recomputed by replaying parts of the forward pass. current dl checkpointing techniques (chen et al., 2016; jain et al., 2020; kumar et al., 2019; gruslys et al., 2016) statically plan which activations to recompute offline, requiring an initial stage of model analysis.
+
+in this paper, we demonstrate that static planning is unnecessary for dl checkpointing. we present dynamic tensor rematerialization (dtr), a greedy online algorithm for heuristically checkpointing arbitrary dl models. dtr operates like a tensor-level cache: it collects metadata on tensors and operators as a model is trained and uses it to guide heuristics that choose which activations to free and later recompute. as a runtime system, dtr can utilize dynamically gathered information (e.g., measured operator costs). additionally, its simple, cache-like approach requires no advance knowledge of the model or application, letting it immediately support arbitrarily dynamic models and applications featuring higher-order differentiation. for example, given a model with data-dependent control flow like treelstm (tai et al., 2015), dtr's runtime can simply evict tensors when memory runs out and rematerialize them as needed. by contrast, static planning techniques assume a static dataflow graph, which requires "unrolling" dynamic models and performing (potentially expensive) planning for every distinct input.
+
+# performop(op, args):
+
+note: performs op(args), rematerializing any evicted arguments. wraps every operator invocation.
+
+exclude members of args from eviction
+
+for any evicted arg in args:
+
+# rematerialize(arg)
+
+buf := allocatebuffer(size(op(args)))
+
+res := call op(args), store into buf
+
+permit eviction for members of args again
+
+update metadata for args and res
+
+# urn res
+
+# performeviction():
+
+free the tensor chosen by the heuristic
+
+# rematerialize(t):
+
+op, args := operator and arguments that
+
+produced t (from metadata)
+
+return performop(op, args)
+
+# allocatebuffer(b):
+
+note: wraps every memory allocation.
+
+while available memory  $<  \mathbf{b}$  ..
+
+performeviction()
+
+return new buffer of size b
+
+# deallocate(t):
+
+note: wraps every tensor deallocation.
+
+heuristic decides policy for t (e.g., free
+
+permanently or simply evict)
+
+# execution trace
+
+computing  $t_7$  with memory budget 4:
+
+$t_7 = \text{performop}(\text{op}_7, t_5, t_6)$
+
+$\left[t_{5}, t_{6} \text{ become unevictable}\right]$
+
+rematerialize  $(t_{5})$
+
+$t_5 = \text{performop}(\text{op}_5, t_3)$
+
+$\left[t_{3}\right.$  becomes unevictable]
+
+allocatebuffer(t5.size)
+
+performeviction() #eg,  $t_2$
+
+$\left[t_{3}\right]$  becomes evictable]
+
+allocatebuffer(t7.size)
+
+performeviction() #eg, t3
+
+![](images/f7c349e621d2d00ba8357814e101e01c36b194976358b95713ab63d3871f0d5f.jpg)
+
+![](images/07447d0da105eff3ddb2e9a7a8bdb45e940a77027128aeb5f7ffe2e5fd2ccfb7.jpg)  
+figure 1: (top) pseudocode for dtr's basic logic (independent of heuristic), and (bottom) dtr's sequence of events in an operator call. note that performop() may make further recursive calls in order to rematerialize arguments.
+
+this paper describes dtr's design (sec. 2) and makes the following contributions:
+
+- we prove that dtr can train an  $n$ -layer linear feedforward network on an  $\omega(\sqrt{n})$  memory budget with only  $\mathcal{o}(n)$  tensor operations (sec. 3), which is within a constant factor of optimal and matches the offline bound of the chen et al. (2016) static checkpointing technique.  
+- we formalize dl model checkpointing as an online rematerialization problem and define a greedy algorithm parameterized by caching-inspired heuristics. in simulated trials our heuristic attains near-optimal performance on a variety of dl models (sec. 4).  
+- we implement a dtr prototype by making only modest modifications to the pytorch framework, enabling training under restricted memory budgets for both static and dynamic models and demonstrating the ease with which our algorithm can be incorporated into an existing dl framework (sec. 5).
+
+note that techniques other than checkpointing, such as swapping tensors between devices, can also enable training under limited memory. in sec. 6, we discuss these approaches and how they could operate with dtr.
+
+# 2 dynamic tensor rematerialization
+
+we introduce dynamic tensor rematerialization (dtr), a thin runtime layer that intercepts tensor allocations, accesses, and deallocations and eliminates the need for ahead-of-time model analysis to support checkpointing. figure 1 shows dtr's high-level approach. when a tensor allocation occurs (allocatebuffer), dtr first checks if sufficient memory is available. if so, it generates a fresh tensor identifier, initializes its metadata for future recomputation, allocates the requested memory, and returns a new tensor. if not, dtr heuristically selects and evicts resident tensors until the requested allocation can be accommodated. constant tensors (loaded from external data) cannot be evicted since no corresponding operation rematerializes them. upon tensor access, dtr first checks if the tensor is resident in memory. if so, it updates tensor metadata before returning the requested tensor. if the tensor has been evicted, dtr rematerializes it by replaying the parent operation that originally produced the tensor. crucially, rematerialization can be recursive: if the arguments to an evicted tensor's parent operation have also been evicted, then they must first be
+
+rematerialized. rematerialization may trigger more evictions if memory is exhausted during the potentially recursive process. upon tensor deallocation (other than by evictions), the runtime is invoked again (deallocate), letting it update tensor metadata and eagerly perform profitable evictions.
+
+assumptions. this description of dtr assumes that: tensors are accessed only by opaque operators; tensors are either constants or produced by operators; operators produce individual tensors; and operators are pure (deterministic functions of their arguments). under this model, a training epoch is simply a sequence of tensor operations without any inherent requirement to recognize training-specific structure, like the transition to the backward pass. dtr will evict as many tensors as necessary to avoid running out of memory. if all inputs and outputs of a single operation cannot fit into available memory, rematerialization will fail; therefore, on a given model and input, there may be a threshold for the lowest budget dtr can support. the choice of heuristic can affect the likelihood of failure since different eviction choices can result in deeply nested rematerializations that require many tensors to remain in memory.
+
+heuristics. dtr is parameterized by heuristics that guide its eviction choices. as in caching, dtr's eviction heuristic dynamically predicts which resident tensors are least valuable. the choice of heuristic determines what metadata (additional runtime facts) must be tracked for each tensor and operator and thus affects dtr's runtime overhead. in our evaluation, we consider a runtime system that tracks the following metadata for each tensor  $t$ : staleness,  $s(t)$ , the time since last access; memory,  $m(t)$ , the size of the tensor; and cost,  $c_0(t)$ , the time required to compute  $t$  from its parent tensor(s). we observe that dtr's metadata overhead is low relative to the cost of typical dl tensor operations.
+
+we propose a rematerialization-specific heuristic that balances staleness, memory, and cost, evicting the tensor  $t$  that is stalest (least likely to be needed soon), largest (saves the most space), and cheapest (requires the least additional rematerialization if  $t$  is needed again). to capture the total amount of rematerialization required if  $t$  is evicted, we sum the costs over the tensor's evicted neighborhood  $e^{*}(t)$ , i.e., the set of evicted tensors that would either need to be rematerialized to recompute  $t$  or would need  $t$  to be resident to be recomputed. we define the projected cost,  $c(t)$ , of rematerializing tensor  $t$  as  $c_{0}(t) + \sum_{t^{\prime} \in e^{*}(t)} c_{0}(t^{\prime})$ . using this definition, we define our heuristic, which evicts the tensor minimizing  $h_{\mathrm{dtr}}(t) = c(t) / [m(t) \cdot s(t)]$ . by including both forward and backward dependencies of  $t$  in  $e^{*}(t)$ ,  $h_{\mathrm{dtr}}$  penalizes creating long chains of evicted tensors (and hence potential recursive rematerializations) that could arise from  $t$ 's eviction.
+
+to illustrate evicted neighborhoods, suppose dtr is checkpointing the network shown in figure 1, where the resident tensors are  $\{t_0,t_2,t_3,t_6\}$ . before node  $t_7$  is computed, we have  $e^{*}(t_{2}) = \{t_{1},t_{4}\}$  and  $e^{*}(t_{3}) = \{t_{1},t_{4},t_{5}\}$ . since each new eviction can expand a given tensor's evicted neighborhood and each rematerialization can shrink it, dynamically tracking evicted neighborhoods can introduce further costs at run time. to decrease runtime overhead, we developed an approximation of  $e^{*}$  using an undirected relaxation tracked by a union-find data structure that uses a constant-time approximation for splitting. we use this approximation to define  $h_{\mathrm{dtr}}^{\mathrm{eq}}$  analogously (sec. 4.1 and appendix c.3 contain details), which performs nearly as well as  $h_{\mathrm{dtr}}$  in our evaluation (sec. 4) but requires up to 2 orders of magnitude fewer metadata accesses per batch (appendix d.3).
+
+we compare  $h_{\mathrm{dtr}}$  to other heuristics inspired by recent work in our simulated evaluation (sec. 4) and discuss an even broader class of heuristics in appendix d. our heuristic formalization in terms of  $s$ ,  $m$ , and  $c_0$  is sufficiently general to express several existing heuristics for caching and checkpointing. for example, the common lru heuristic is "minimize  $1 / s(t)$ ," the greedyremat heuristic from kumar et al. (2019) is "minimize  $1 / m(t)$ ," and the msps heuristic from peng et al. (2020) is "minimize  $c_r(t) / m(t)$ " (where  $c_r(t)$  sums  $c_0$  over  $t$ 's evicted ancestors).
+
+deallocation. deallocation policies present further tradeoffs since tensors marked as deallocated by the original program are still potential dependencies for rematerializations. in principle, dtr could simply disregard deallocations by the original program, but this would ignore potentially useful information about the deallocated tensors (viz., that the original program will not use them again). banishing (permanently freeing) deallocated tensors can save memory immediately and is the only way to free constants (which cannot be evicted); however, it can prevent possible future evictions since the children of a banished tensor cannot be rematerialized. by contrast, evicting deallocated tensors does not prevent potential evictions, though it increases the runtime's management overhead and keeps constants in memory. in the heuristics we examined, we implemented an eager eviction
+
+mechanism, which evicts a tensor as soon as all external references to it are freed. this lets dtr adhere to the garbage collection pattern of the underlying framework, preempting desirable evictions, which further reduces future runtime overhead. (see appendix d.2 for a comparison of deallocation policies.)
+
+# 3 formal bounds
+
+following chen et al. (2016), we prove a bound on dtr's checkpointing overhead (for a particular eviction heuristic) on a linear feedforward network of  $n$  nodes. even without the ability to inspect the model, dtr requires only  $\mathcal{o}(n)$  tensor operations under a  $\sqrt{n}$  memory budget, the same bound (up to constant factors) as the chen et al. (2016) static checkpointing technique and the optimal  $\theta(n)$  required by a memory-unconstrained algorithm. we also establish that dtr's dynamic approach cannot always match the overhead of static checkpointing: given  $n$  tensor operations and a memory budget of  $b$ , under any deterministic heuristic, an adversary could always construct a network where dtr would perform a factor of  $\omega(n/b)$  more tensor operations than a (potentially expensive, see jain et al. (2020)) optimal static checkpointing algorithm.
+
+linear feedforward overhead. we assume that tensor computations dominate runtime and, as in prior work (griewank & walther, 2000; chen et al., 2016; binder et al., 1997; beaumont et al., 2019b), that each tensor is of unit space and time cost. for the proof below, we use the heuristic  $h_{e^*}$  which evicts a resident tensor  $t$  with minimal  $|e^*(t)|$ .
+
+theorem 3.1. given an  $n$  node linear feedforward network and a memory budget  $b = \omega(\sqrt{n})$ , dtr with heuristic  $h_{e^*}$  can execute one forward and one backward pass in  $\mathcal{o}(n)$  operations.
+
+proof sketch. during the forward pass, dtr performs exactly  $n$  tensor operations: since each node of the linear feedforward network depends only on the previous node, no rematerialization is necessary. our heuristic  $h_{e^*}$ , which evicts tensors with the smallest evicted neighborhoods, ensures that the  $b$  tensors resident at the conclusion of the forward pass are evenly spaced throughout the network. in turn, these evenly spaced checkpoints ensure that dtr never has to successively rematerialize too many tensors. as the backward pass proceeds and checkpoint tensors are freed, the overhead to compute all gradients between the checkpoints  $k$  and  $k + 1$  shrinks as  $\log (k) / k^2$ , which sums to a constant. the full proof of theorem 3.1 is provided in appendix a.
+
+adversarial overhead. using a simple heuristic, dtr can match the performance of static checkpointing on linear feedforward networks despite lacking advance knowledge of the architecture. however, dtr cannot always match the performance of optimal static checkpointing on an arbitrary network because it cannot access or reorder the network.
+
+theorem 3.2. for any deterministic heuristic  $h$ , there exists an  $n$ -node network on which dtr with budget  $b \leq n$  requires  $\omega(n / b)$  times more tensor computations than optimal static checkpointing.
+
+proof sketch. generate an adversarial network  $g$  of  $b$  linear feedforward networks joined by a common parent tensor. using  $h$ , schedule  $g$ 's operations such that, at each step of dtr, the next operation is taken from the end of an entirely evicted path through  $g$ , forcing dtr to rematerialize the entire path. dtr can thus be forced to perform at least  $\omega(n^2 / b)$  operations. by contrast, an optimal static algorithm can reorder  $g$  to compute each feedforward network sequentially, requiring only  $n$  computations. the full proof of theorem 3.2 is provided in appendix b.
+
+theorems 3.1 and 3.2 illustrate how dtr's performance, from optimal to poor, depends on interactions between heuristics and models. we next explore dtr design tradeoffs empirically.
+
+# 4 heuristic evaluation
+
+we simulated dtr on a variety of models to empirically evaluate its checkpointing performance across different heuristics and compare it to the static checkpointing schemes examined in jain et al. (2020). dtr enables training under restricted memory budgets and closely matches the performance of an optimal baseline.
+
+# 4.1 heuristics examined
+
+we examine variants of the evicted neighborhood-based  $h_{\mathrm{dtr}}$  heuristic described in sec. 2 (on which we establish formal bounds) as well as heuristics inspired by past work in caching and checkpointing. all following heuristics are defined as a score function in terms of the metadata  $m(t)$ ,  $s(t)$ , and  $c_0(t)$ , where the tensor with the minimum score is evicted.
+
+in addition to  $h_{\mathrm{dtr}}$ , we consider  $h_{\mathrm{dtr}}^{\mathrm{eq}}$ , which uses an equivalence class-based approximation  $\tilde{e}^{*}$  for  $e^{*}$ , and  $h_{\mathrm{dtr}}^{\mathrm{local}}$ , which only uses individual tensors' costs instead of costs over evicted neighborhoods. we compare against other variants of  $h_{\mathrm{dtr}}$  in appendix d, but here we focus on these in particular because (1)  $h_{\mathrm{dtr}}^{\mathrm{local}}$  lets us assess the importance of tracking evicted neighborhoods at run time, and (2)  $h_{\mathrm{dtr}}^{\mathrm{eq}}$  lets us evaluate how well  $\tilde{e}^{*}$  approximates  $e^{*}$  in practice. we define the  $h_{\mathrm{dtr}}$  variants as:
+
+$$
+h _ {\mathrm {d t r}} \stackrel {\text {d e f}} {=} \frac {c _ {0} (t) + \sum_ {t ^ {\prime} \in e ^ {*} (t)} c _ {0} \left(t ^ {\prime}\right)}{m (t) \cdot s (t)}, \quad h _ {\mathrm {d t r}} ^ {\text {e q}} \stackrel {\text {d e f}} {=} \frac {c _ {0} (t) + \sum_ {t ^ {\prime} \in \tilde {e} ^ {*} (t)} c _ {0} \left(t ^ {\prime}\right)}{m (t) \cdot s (t)}, \quad h _ {\mathrm {d t r}} ^ {\text {l o c a l}} \stackrel {\text {d e f}} {=} \frac {c _ {0} (t)}{m (t) \cdot s (t)}.
+$$
+
+rather than using directed dependencies,  $\tilde{e}^{*}(t)$  treats the dependency graph of tensors as undirected (thus admitting some spurious dependencies), letting us decompose the graph into a set of disjoint evicted components. we can track these evicted components efficiently using a union-find data structure with a running sum for each component. when a tensor  $t$  is evicted, its component is united with those of any evicted neighbors and  $c_{0}(t)$  is added to the component's running sum. though this enables near-constant-time merging between components (by unioning and adding the sums), union-find does not support splitting. to efficiently split components, we make another approximation: when a tensor  $t$  is rematerialized, we simply subtract  $c_{0}(t)$  from its component's running sum and map  $t$  to a new (empty) union-find component. since this approach removes no connections, it produces "phantom dependencies" between some tensors. in practice, we find that despite these additional dependences,  $h_{\mathrm{dtr}}^{\mathrm{eq}}$  closely matches the performance of  $h_{\mathrm{dtr}}$  (figures 2 and 3) but requires fewer operations per eviction and rematerialization. see appendix c.3 for a more detailed description of  $\tilde{e}^{*}(t)$ .
+
+we also consider the following heuristics inspired by past work:
+
+$$
+h _ {\mathrm {l r u}} (t) \stackrel {{\mathrm {d e f}}} {{=}} \frac {1}{s (t)}, \quad h _ {\mathrm {s i z e}} (t) \stackrel {{\mathrm {d e f}}} {{=}} \frac {1}{m (t)}, \quad h _ {\mathrm {m s p s}} (t) \stackrel {{\mathrm {d e f}}} {{=}} \frac {c _ {0} (t) + \sum_ {t ^ {\prime} \in e _ {r} (t)} c _ {0} (t ^ {\prime})}{m (t)},
+$$
+
+where  $e_{r}(t)$  is the set of evicted tensors that would have to be rematerialized in order to rematerialize  $t$ .  $h_{\mathrm{lru}}$  is based on the common "least-recently used" policy for caching,  $h_{\mathrm{size}}$  is based on greedyremat from kumar et al. (2019) (used in tensorflow xla), and  $h_{\mathrm{msps}}$  is based on the msps heuristic from peng et al. (2020). we also include a random baseline,  $h_{\mathrm{rand}}(t) \stackrel{\mathrm{def}}{=} x \sim u(0,1)$ , to assess how well a heuristic using no metadata whatsoever performs.
+
+# 4.2 comparing dtr across heuristics
+
+experimental setup. to model a realistic execution setting for dtr, we instrumented pytorch (paszke et al., 2019) to log operations performed, metadata on tensors and operators (including sizes, compute times, and parent tensors), and deallocations during the execution of various models. we replayed the logs in a simulator that models the behavior of dtr in the style shown in figure 1. the simulator tracks the tensors in memory at any given time, chooses tensors to evict per the heuristic when the memory budget is exceeded, and sums the total cost of the model operators and rematerializations. for verisimilitude, the simulator also models the semantics of various low-level pytorch implementation details, including tensor aliasing, in-place mutation, and multi-output operations. we gathered logs from several static models examined in recent work, such as jain et al. (2020) and peng et al. (2020), in addition to three dynamic models (lstm, treelstm, and unrolled gan); each log corresponds to an execution of the forward pass, computing the loss, and performing the backward pass. the simulator also enforces the additional condition that gradients for all trainable weights be resident at the end of the simulation in order to model the requirements for performing a full training step. appendix c gives a full technical specification of the simulator and log format.
+
+results. for all models in figure 2, dtr executed a training step using a small fraction of the normal memory required with limited compute overhead. furthermore, unlike existing static approaches,
+
+![](images/89cbf023d68134bb90ba5dd82c450684192b3b1737be646a3314ef9877130c79.jpg)  
+figure 2: simulated results comparing different heuristics on various models, showing the rate of computational slowdown for different budgets (fractions of the original peak memory usage). the black area in each graph corresponds to the memory required to store inputs and weights, while the gray area denotes the single operator requiring the most memory to be live at once. the dashed and dotted lines represent the last ratio before thrashing  $(\geq 2\times$  slowdown) and out-of-memory errors, respectively. all logs were produced by running each model 50 times on a single input on a machine with an nvidia titan v gpu (cuda 10.1, cudnn 7.6.4) and a 16-core amd ryzen threadripper 1950x on ubuntu 18.04, logging the final "warmed-up" run.
+
+![](images/1a86b5602a6c431d65feb5b6293fc1357a83e0ff85a12d03708cbd2b510cf914.jpg)
+
+![](images/3c57e896a5d7949eb5059197dca89f30e0ebbc837edce87df4a7b50ed7b9c8b2.jpg)
+
+![](images/1a94c635b1a7a9910c8343637e5cb1d63334b1fdaad519a386a39ba08ccd3b3d.jpg)
+
+dtr automatically supports models with arbitrary dynamism. in all cases, results show that heuristics incorporating more information about chain rematerializations ( $h_{\mathrm{dtr}}$ ,  $h_{\mathrm{dtr}}^{\mathrm{eq}}$ , and  $h_{\mathrm{msps}}$ ) can operate on lower budgets and perform fewer rematerializations than heuristics using less information. however, these complex heuristics also introduce more runtime overhead, which must be considered when implementing dtr. in particular, our simulations showed that  $h_{\mathrm{dtr}}$  incurred up to 2 orders of magnitude more metadata accesses per batch compared to  $h_{\mathrm{dtr}}^{\mathrm{eq}}$ , and up to 3 orders of magnitude more compared to  $h_{\mathrm{dtr}}^{\mathrm{local}}$  (see appendix d.3). the fact that  $h_{\mathrm{dtr}}^{\mathrm{eq}}$  closely matches the performance of  $h_{\mathrm{dtr}}$  while incurring much less runtime overhead suggests that it would be more effective in practice. note that even simple heuristics like  $h_{\mathrm{lru}}$ , which require only modest runtime overhead, typically enabled training with  $30\%$  less memory.
+
+# 4.3 comparing dtr to static techniques
+
+we compared the performance of dtr using  $h_{\mathrm{dtr}}$ ,  $h_{\mathrm{dtr}}^{\mathrm{eq}}$ , and (as a simple baseline)  $h_{\mathrm{lru}}$  against static checkpointing techniques, including the optimal checkmate tool of jain et al. (2020). as figure 3 shows, dtr's  $h_{\mathrm{dtr}}$  and  $h_{\mathrm{dtr}}^{\mathrm{eq}}$  heuristics obtain performance remarkably close to checkmate's optimal solutions; even the much simpler  $h_{\mathrm{lru}}$  heuristic obtains superior performance relative to the static baselines. while checkmate requires full ahead-of-time knowledge of the model and seconds or minutes per budget to compute guaranteed-optimal solutions using an integer linear programming (ilp) solver, dtr finds comparable solutions dynamically and in milliseconds without ahead-of-time knowledge of the model.
+
+# 5 prototype implementation
+
+we implemented a dtr prototype<sup>1</sup> in pytorch and evaluated its performance on a variety of models. we chose pytorch because its eager mode of execution ("define by run") accommodates arbitrary control flow in models but makes static analysis more difficult; hence, it is a setting where dtr's online nature is an asset. per the results in sec. 4, we implemented  $h_{\mathrm{dtr}}^{\mathrm{eq}}$  as the prototype's heuristic. the core system was implemented in only 1,161 lines of code and made no deep modifications to pytorch's memory management internals or tensor abstractions, illustrating the simplicity of our system. the remaining 2,647 lines of changes were primarily boilerplate operator overloads used to dispatch tensor operations through dtr's core logic (appendix e.1 describes our prototype implementation's structure).
+
+![](images/5ce328685eeacae975758a2ccfa22146ac875c71647d597748c92111359ae132.jpg)  
+figure 3: dtr's overhead from operators is competitive with checkmate's, which uses ilp to produce an optimal rematerialization schedule. this comparison extends figure 5 in jain et al. (2020) by adding the dtr simulator as a "solver" that translates checkmate's keras-based graph representation into the dtr simulator's representation. to produce this comparison, we modified jain et al. (2020)'s evaluation artifact because the pytorch logs from sec. 4.1 did not contain some information that past checkpointing techniques require (such as which backward operators correspond to which forward ones). also included in the comparison (from the original experiment) are the griewank & walther (2000) treeverse algorithm and variants of the chen et al. (2016) checkpointing algorithm (modified to handle skip connections like those in resnet).
+
+![](images/42323b863224b572a706cdd2242886ce1acc6430d456ca69a5d53fcbc8deb5f9.jpg)
+
+![](images/87d0625eac68600baea9e4e3aee63f3ff6b86f19034c023b5cf03c6eb5cd7b84.jpg)
+
+![](images/a4e05639c236ebbab266a0625971b4334acae0f6bec480399dfe71a82c71c1d1.jpg)
+
+![](images/9a9ade9c4c6daa65045736aa889051747d9963dcab28fb9a1a373b0f831edf71.jpg)
+
+![](images/6107e1fd512dfb15e80fa75493bd17fc1ce703bb09593167a91262afd1aa0bc4.jpg)
+
+![](images/70d8a26c19fe6817b7163def5f20c1ce017cefdec5949fb9684344f6c2ec7d89.jpg)
+
+![](images/0ec6d3ed8938ed788119f4a2a2d3bd25d099a5b4f2abf8549b2540b4d452ad1f.jpg)
+
+figure 4: we profiled the running time of our prototype for various models and memory budgets on a machine with an nvidia titan v gpu (cuda 10.1, cudnn 7.6.4) and a 16-core amd ryzen threadripper 1950x on ubuntu 18.04. the red dotted lines correspond to trials that either ran out of memory or thrashed ( $\geq 2 \times$  unmodified pytorch's time). model batch sizes are given in parentheses. to ensure the accuracy of the dtr prototype's profiling, we used pytorch's synchronous computation mode (see appendix e.1). results (mean of 100 trials) are compared against unmodified pytorch. "cost compute" (computing heuristic scores) and "eviction loop" (comparing scores over tensors) correspond to overhead from the dtr runtime itself, which can be reduced by a more efficient implementation. "unprofiled time" is the remainder of the time per batch; it may be due to runtime overhead from parts of pytorch not modified in the prototype, like the operator dispatch system. the large proportion of unprofiled time in unrolled gan is likely due to its extensive use of python reflection. the budgets with asterisks were run with the random sampling optimization (see appendix e.2) disabled, as sampling caused occasional failures at those budgets.  
+![](images/3827bd1245af8c28a49cdf5d1c89bbeba8b368bb32da899df2e28517b3d28dbe.jpg)  
+modeloperator
+
+![](images/4bf4277fccbf1b8eb8689e1d27dfe559985ef3143d753c7b20d8e2f7631bd0fe.jpg)  
+cost compute
+
+![](images/85721a1a29e599b0b11d9baa77bbd5da4337c62920a4d4bbf0436d4be1caa427.jpg)  
+eviction loop  
+rematerialization  
+unprofiled
+
+![](images/cc199a8a4c9876339a231cf2fde6d50055d10c0a1ac31b48ebd6e39b2fbd7e0c.jpg)  
+unmodified pytorch
+
+our empirical evaluation demonstrates that dtr can efficiently train models under restricted memory budgets using the  $h_{\mathrm{dtr}}^{\mathrm{eq}}$  heuristic. we used the same models and experimental setup as in section 4, timing the forward pass, loss computation, and backward pass. table 1 presents several cases where dtr trains models on much larger input sizes than unmodified pytorch, including a dynamic model,
+
+<table><tr><td rowspan="2"></td><td colspan="4">resnet-1202 (batch size)</td><td colspan="4">transformer (batch size)</td><td colspan="4">unet (batch size)</td><td colspan="4">treelstm (tree nodes)</td></tr><tr><td>64</td><td>100</td><td>120</td><td>140</td><td>30</td><td>70</td><td>80</td><td>90</td><td>7</td><td>8</td><td>9</td><td>10</td><td>2^6-1</td><td>2^7-1</td><td>2^8-1</td><td>2^9-1</td></tr><tr><td>dtr</td><td>0.974s</td><td>1.18s</td><td>1.28s</td><td>1.39s</td><td>367ms</td><td>830ms</td><td>950ms</td><td>1079ms*</td><td>566ms</td><td>684ms</td><td>822ms*</td><td>1170ms*</td><td>0.486s</td><td>1.05s</td><td>2.50s</td><td>7.89s*</td></tr><tr><td>pt</td><td>0.712s</td><td>x</td><td>x</td><td>x</td><td>331ms</td><td>x</td><td>x</td><td>x</td><td>481ms</td><td>x</td><td>x</td><td>x</td><td>0.431s</td><td>x</td><td>x</td><td>x</td></tr></table>
+
+table 1: median execution times per batch (out of 100 runs) for various models, giving both the largest input size that unmodified pytorch ("pt") could support on our gpu and larger input sizes dtr could support. input sizes are as in figure 4, except for treelstm (complete binary trees with nodes of size  $1024 \times 1024$ ) and transformer (sequence length 256). asterisks indicate inputs on which the random sampling optimization was disabled due to occasional failed trials. even without sampling, dtr still occasionally failed on unet (see appendix e.3 for details). this behavior may be due to pytorch memory allocator implementation details or poor rematerialization decisions influenced by variance in individual operator times.
+
+treelstm. this highlights that dtr enables exploration of models that push the boundaries of existing deep learning architectures. while the simulated trials in sec. 4.2 consider the slowdown due only to rematerializations but not overhead from managing metadata and computing heuristics, figure 4 measures the time per batch required to train eight dl models on a variety of restricted memory budgets, profiling the time spent by the runtime system. among the models is unrolled gan, which uses higher-order partial derivatives and python reflection extensively; the dtr prototype supported these unusual features, underscoring its generality. despite our prototype's simplicity — it merely loops through all tensors when searching for an eviction candidate and recomutes the heuristic scores from scratch each time — on most models, its overhead due to searching and computing heuristics remains low for most memory budgets. in appendix e.2, we discuss two approximate optimizations we included in the prototype to reduce the overhead of searching over tensors and additional ways to reduce dtr's runtime overhead.
+
+# 6 related work
+
+checkpointing in reverse-mode automatic differentiation (ad). checkpointing in dl takes inspiration from checkpointing in reverse-mode ad (baydin et al., 2015). the latter reduces the number of values stored in the "tape" by recomputing segments of the tape (demarcated by "checkpoints"). treeverse (griewank, 1994; griewank & walther, 1997; 2000) uses a binomial partitioning scheme to mark checkpoints, achieving logarithmic growth in space in exchange for a logarithmic grown in computation. later works, such as hascoet & pascual (2013) and siskind & pearlmutter (2018), extend treeverse's approach to handle arbitrary control flow by inserting code at compile time to mark checkpoints according to policies (e.g., "checkpoint every  $k$  iterations" for a statically unbounded loop). unlike dtr, these techniques do not use dynamically gathered information.
+
+checkpointing in dl. many dl models can be represented as static dataflow graphs, enabling the straightforward application of treeverse-like partitioning approaches. chen et al. (2016) apply this approach by dividing the network into segments to be recomputed during backpropagation, presenting schemes that allow for training an  $n$ -layer feedforward network in  $\mathcal{o}(\sqrt{n})$  memory with one extra forward pass  $(\mathcal{o}(n)$  tensor operations) or in  $\mathcal{o}(\log n)$  memory with  $\mathcal{o}(n\log n)$  additional tensor operations. gruslys et al. (2016) present a similar segmenting approach for recurrent neural networks, thereby supporting some dynamism beyond static computation graphs. other recent work rematerializes individual activations rather than entire segments, attaining better bounds than chen et al. (2016); kusumoto et al. (2019), kumar et al. (2019), and beaumont et al. (2019a) apply graph-theoretic analyses to make rematerialization plans, while jain et al. (2020) apply integer linear programming (ilp) to find optimal solutions.
+
+dtr differs fundamentally from those approaches because it handles arbitrary dynamic control flow in models (making no assumptions about the model's structure) and operates online, giving it access to dynamically gathered information. in principle, a static checkpointing technique could be applied to a dynamic model "just in time" by unrolling the model on the fly, but some static analyses (like an ilp solver) can be too expensive to run each epoch. unlike static approaches, however, dynamic planning introduces overhead at run time, which limits the analyses that dtr's heuristics can feasibly perform. note that the chen et al. (2016) greedy scheme and the greedyremat baseline in kumar et al. (2019) are similar to dtr in that they greedily place checkpoints using a heuristic (albeit statically). however, their heuristics only use the sizes of tensors.
+
+dl memory managers. other work has enabled the training of dl models on lower memory budgets by swapping tensors between gpus or to host ram. huang et al. (2020) use a genetic algorithm to plan swaps between devices on static computation graphs. capuchin by peng et al. (2020) and superneurons by wang et al. (2018), like dtr, use runtime systems and incorporate checkpointing as well. capuchin's checkpointing phase, which resembles dtr's, uses dynamically gathered information for checkpointing; it performs a single batch without checkpointing (only swapping) and uses the costs it measures to determine where to set checkpoints. however, capuchin's and superneurons's checkpointing schemes assume a static model architecture (inferred from an initial profiling batch), which they use to plan recomputations in advance. swapping systems like capuchin rely on interleaving communication and computation at a low level for performance, which may be difficult to apply in an online setting.
+
+these works highlight that swapping and rematerialization are complementary approaches, raising the question of whether dtr can be combined with swapping without disrupting existing methods' overlapping of computation and communication. one possibility would be to assume a fixed swapping schedule and use dtr to replace the rematerialization schemes used by systems like capuchin (perhaps given a constraint like treating values to be swapped out as unequiviable). another intriguing possibility would be to use swapping as a form of "eviction" in dtr, where the "cost" for swapped-out values would be the communication time. swapping presents interesting tradeoffs with rematerializations since it may scale better than some tensor operators. however, incorporating swapping into dtr's online approach presents the problem of efficiently overlapping computation and communication since the runtime would need to guarantee that a computation scheduled concurrently with a swap would not need to swap values back in. this could greatly complicate planning (e.g., requiring some lookahead to avoid missed swapping opportunities) and would be fertile ground for future work.
+
+memory-efficient dl model designs. some recent work manually modifies dl models to perform similar computations using less memory, which may be used alongside checkpointing and swapping approaches. one example is the use of reversible layers, which enable recomputing a forward value during backpropagation using the result of the following layer. gomez et al. (2017) and kitaev et al. (2020) employ reversible layers to create versions of resnet and transformer, respectively, that can train using less memory.
+
+# 7 conclusion
+
+dtr provides a simple, customizable approach to checkpointing for dl models. it supports a broad range of applications without the need for any ahead-of-time analyses, manual annotations, or modifications. our formal results establish that dtr can match the same asymptotic bounds as recent static checkpointing approaches for linear feedforward networks. in simulation, it enables training for a range of both static and dynamic models under various restricted memory budgets and closely matches the performance of optimal checkpointing. the dtr prototype in pytorch demonstrates how our approach can be incorporated into existing frameworks with modest, non-invasive changes by simply interposing on tensor allocations and operator calls and collecting lightweight metadata on tensors. our results also open several avenues for future work. for example, dtr could easily be extended to leverage additional information that may further reduce runtime overhead, such as learning from past batches.
+
+# acknowledgements
+
+this work was supported by the applications driving architectures (ada) research center, a jump center co-sponsored by src and darpa. the titan v used for this research was donated by the nvidia corporation. we thank paras jain and aniruddha nrusimha for assistance in setting up and running the checkmate mlsys 2020 artifact and providing helpful additional information about the checkmate tool. we are grateful to edward z. yang for helpful advice on modifying pytorch. we acknowledge yonghao zhuang for drawing our attention to an omission in our description of the  $h_{\mathrm{dtr}}^{\mathrm{eq}}$  splitting approximation in section 4.1, which we have corrected in this version. we also thank sandy kaplan, eunice jun, josh m. pollock, samuel ainsworth, and sam kaufman for providing feedback and useful comments on various drafts of this work.
+
+# references
+
+atilim gunes baydin, barak a. pearlmutter, alexey andreyevich radul, and jeffrey mark siskind. automatic differentiation in machine learning: a survey. corr, abs/1502.05767, 2015. url http://arxiv.org/abs/1502.05767.  
+olivier beaumont, lionel eyraud-dubois, julien herrmann, alexis joly, and alena shilova. optimal checkpointing for heterogeneous chains: how to train deep neural networks with limited memory. research report rr-9302, inria bordeaux sud-ouest, november 2019a. url https://hal.inria.fr/hal-02352969.  
+olivier beaumont, julien herrmann, guillaume pallez, and alena shilova. optimal memory-aware backpropagation of deep join networks. philosophical transactions of the royal society a: mathematical, physical and engineering sciences, 378, 01 2019b. doi: 10.1098/rsta.2019.0049.  
+john binder, kevin murphy, and stuart russell. space-efficient inference in dynamic probabilistic networks. in proceedings of the fifteenth international joint conference on artificial intelligence - volume 2, ijcai'97, pp. 1292-1296, san francisco, ca, usa, 1997. morgan kaufmann publishers inc. isbn 15558604804.  
+tianqi chen, bing xu, chiyuan zhang, and carlos guestrin. training deep nets with sublinear memory cost. corr, abs/1604.06174, 2016. url http://arxiv.org/abs/1604.06174.  
+aidan n gomez, mengye ren, raquel urtasun, and roger b grosse. the reversible residual network: backpropagation without storing activations. in i. guyon, u. v. luxburg, s. bengio, h. wallach, r. fergus, s. vishwanathan, and r. garnett (eds.), advances in neural information processing systems 30, pp. 2214-2224. curran associates, inc., 2017.  
+andreas griewank. achieving logarithmic growth of temporal and spatial complexity in reverse automatic differentiation. optimization methods and software, 1, 04 1994. doi: 10.1080/10556789208805505.  
+andreas griewank and andrea walther. treeverse: an implementation of checkpointing for the reverse or adjoint mode of computational differentiation. acm trans. math. software, 26:200-0, 1997.  
+andreas griewank and andrea walther. algorithm 799: revolve: an implementation of checkpoint for the reverse or adjoint mode of computational differentiation. acm transactions on mathematical software, 26(1):19-45, mar 2000. issn 0098-3500. url http://doi.acm.org/10.1145/347837.347846.  
+audrunas gruslys, rémi munos, ivo danihelka, marc lanctot, and alex graves. memory-efficient backpropagation through time. corr, abs/1606.03401, 2016. url http://arxiv.org/abs/1606.03401.  
+laurent hascoet and valérie pascual. the tapenade automatic differentiation tool: principles, model, and specification. acm trans. math. softw., 39(3), may 2013. issn 0098-3500. doi: 10.1145/2450153.2450158. url https://doi.org/10.1145/2450153.2450158.  
+chien-chin huang, gu jin, and jinyang li. swapadvisor: pushing deep learning beyond thegpu memory limit via smart swapping. in proceedings of the twenty-fifth international conference on architectural support for programming languages and operating systems, asplos '20, pp. 1341-1355, new york, ny, usa, 2020. association for computing machinery. isbn 9781450371025. doi: 10.1145/3373376.3378530. url https://doi.org/10.1145/3373376.3378530.  
+paras jain, ajay jain, aniruddha nrusimha, amir gholami, pieter abbeel, joseph gonzalez, kurt keutzer, and ion stoica. checkmate: breaking the memory wall with optimal tensor rematerialization. in proceedings of machine learning and systems 2020, pp. 497-511, 2020.  
+nikita kitaev, lukasz kaiser, and anselm levskaya. reformer: the efficient transformer. in international conference on learning representations, 2020. url https://openreview.net/forum?id=rkgnkkhtvb.
+
+ravi kumar, manish purohit, zoya svitkina, erik vee, and joshua wang. efficient rematerialization for deep networks. in h. wallach, h. larochelle, a. beygelzimer, f. d alché-buc, e. fox, and r. garnett (eds.), advances in neural information processing systems, volume 32. curran associates, inc., 2019. url https://proceedings.neurips.cc/paper/2019/file/ ffe10334251de1dc98339d99ae4743ba-paper.pdf.  
+mitsuru kusumoto, takuya inoue, gentaro watanabe, takuya akiba, and masanori koyama. a graph theoretic framework of recomputation algorithms for memory-efficient backpropagation. in h. wallach, h. larochelle, a. beygelzimer, f. d'alché buc, e. fox, and r. garnett (eds.), advances in neural information processing systems, volume 32. curran associates, inc., 2019. url https://proceedings.neurips.cc/paper/2019/file/e555ebe0ce426f7f9b2bef0706315e0c-paper.pdf.  
+adam paszke, sam gross, soumith chintala, gregory chanan, edward yang, zachary devito, zeming lin, alban desmaison, luca antiga, and adam lerer. automatic differentiation in pytorch. 2017. url https://openreview.net/pdf?id=bjjsrmfcz.  
+adam paszke, sam gross, francisco massa, adam lerer, james bradbury, gregory chanan, trevor killeen, zeming lin, natalia gimelshein, luca antiga, alban desmaison, andreas köpf, edward yang, zach devito, martin raison, alykhan tejani, sasank chilamkurthy, benoit steiner, lu fang, junjie bai, and soumith chintala. pytorch: an imperative style, high-performance deep learning library, 2019. url https://arxiv.org/abs/1912.01703.  
+xuan peng, xuanhua shi, hulin dai, hai jin, weiliang ma, qian xiong, fan yang, and xuehai qian. capuchin: tensor-basedgpu memory management for deep learning. in proceedings of the twenty-fifth international conference on architectural support for programming languages and operating systems, asplos '20, pp. 891-905, new york, ny, usa, 2020. association for computing machinery. isbn 9781450371025. doi: 10.1145/3373376.3378505. url https://doi.org/10.1145/3373376.3378505.  
+nadav rotem, jordan fix, saleem abdulrasool, summer deng, roman dzhabarov, james hegeman, roman levenstein, bert maher, satish nadathur, jakob olesen, jongsoo park, artem rakhov, and misha smelyanskiy. glow: graph lowering compiler techniques for neural networks. corr, abs/1805.00907, 2018. url https://arxiv.org/abs/1805.00907.  
+jeffrey mark siskind and barak a. pearlmutter. divide-and-conquer checkpointing for arbitrary programs with no user annotation. optimization methods and software, 33(4-6):1288-1330, sep 2018. issn 1029-4937. doi: 10.1080/10556788.2018.1459621. url http://dx.doi.org/10.1080/10556788.2018.1459621.  
+nimit sharad sohoni, christopher richard aberger, megan leszczyński, jian zhang, and christopher ré. low-memory neural network training: a technical report. corr, abs/1904.10631, 2019. url http://arxiv.org/abs/1904.10631.  
+kai sheng tai, richard socher, and christopher d. manning. improved semantic representations from tree-structured long short-term memory networks. proceedings of the 53rd annual meeting of the association for computational linguistics and the 7th international joint conference on natural language processing (volume 1: long papers), 2015. doi: 10.3115/v1/p15-1150. url http://dx.doi.org/10.3115/v1/p15-1150.  
+linnan wang, jinmian ye, yiyang zhao, wei wu, ang li, shuaiwen leon song, zenglin xu, and tim kraska. superneurons. proceedings of the 23rd acm sigplan symposium on principles and practice of parallel programming, feb 2018. doi: 10.1145/3178487.3178491. url http://dx.doi.org/10.1145/3178487.3178491.
+
+# a proof of theorem 3.1
+
+in this section, we provide a proof of the  $\mathcal{o}(n)$  runtime of dtr on a linear feed-forward network with uniform operator compute and memory cost, under a reduced heuristic. we begin with a thorough treatment of the network architecture, and then motivate our reduced heuristic  $h_{e^{*}}$  in this simplified setting. finally, we prove theorem 3.1.
+
+# a.1 network definition
+
+we assume the network consists of operators  $f_{1},\ldots ,f_{n}$ , where the tensor computed by the  $i$ th operator is given by  $f_{i}(t_{i - 1})$ , with  $t_j$  denoting the tensor computed by the  $j$ th operator. note that we consider  $t_0$  to be the input tensor, which for simplicity will always reside in memory and not contribute to the active memory consumption. for this reason, we may consider  $f_{1}$  to be a nullary operator. additionally, we assume that the size of each tensor (denoted  $m(t)$ ) is 1, and likewise for the compute time  $c_{0}(f_{i})$  for each operator  $f_{i}$ . note that we may write  $c_{0}(f_{t})$  to mean the same as  $c_{0}(f_{i})$  for  $t = t_i$ , when the index  $i$  is not convenient.
+
+for backpropagation, we assume each operator  $f_{i}$  has an associated gradient operator  $\hat{f}_{i}$ , which computes the result  $\hat{t}_i = \hat{f}_i(t_{i - 1},\hat{t}_{i + 1})$ . we may consider  $\hat{t}_{n + 1} = 1$  to be an unevictable unit tensor, as is the case in automatic differentiation, but for simplicity we define  $\hat{t}_1 = \hat{f}_1(\hat{t}_2)$  and  $\hat{t}_n = \hat{f}_n(t_{n - 1})$ . as above, we assume unit memory and compute for each  $\hat{f}_i$ .
+
+![](images/5f9b03b62215e4585200eab4be69cf7a28d7597c0300e2a412d7936f955b521e.jpg)
+
+# a.2 liveness and banishing
+
+to optimize memory usage during computation, we introduce the notion of liveness and banishing. at a high level, liveness allows us to determine when a given tensor is no longer required for subsequent network computations, which in turn allows us to permanently free (banish) tensors to regain memory when certain conditions are met.
+
+to be more precise, we formalize the network as a program:
+
+let  $t_1 \coloneqq f_1($ ;
+
+let  $t_2 \coloneqq f_2(t_1)$ ;
+
+中
+
+let  $t_n := f_n(t_{n-1})$ ;
+
+// backpropagate.
+
+let  $\hat{t}_n := \hat{f}_n(t_{n-1})$ ;
+
+let  $\hat{t}_{n - 1} := \hat{f}_{n - 1}(t_{n - 2},\hat{t}_n)$
+
+.
+
+let  $\hat{t}_2 := \hat{f}_2(t_1, \hat{t}_3)$ ;
+
+let  $\hat{t}_1\coloneqq \hat{f}_1(\hat{t}_2)$
+
+we say a tensor  $t$  is live when there is a pending operation in the program that takes  $t$  as an input. when  $t$  is no longer live, and every tensor directly computed using  $t$  is in memory or banished, then we say  $t$  is banished and we reclaim the memory used by  $t$ . banishing a tensor additionally makes its children unevictable.
+
+thus for example,  $t_n$  can be immediately banished after computing,  $t_{n-1}$  can be banished after  $\hat{t}_n$ , both  $t_{n-2}$  and  $\hat{t}_n$  after  $\hat{t}_{n-1}$ , and so on. this will become important in the proof.
+
+the analysis of liveness can be done statically for static models, and by reference counting for models with dynamism. in both cases, liveness information is fed to dtr online through deallocation events.
+
+# a.3 heuristic definition
+
+heuristic  $h_{e^*}$  is a reduced form of the dtr heuristic, as it does not account for tensor staleness. here, we provide a detailed motivation of its definition.
+
+recall the evicted neighborhood  $e^{*}(t)$  of tensor  $t$ , as described in section 2 and further formalized in appendix c.2.
+
+definition a.1 (projected cost). for a given tensor  $t$ , the projected cost of  $t$  is the value
+
+$$
+c (t) = \sum_ {t ^ {\prime} \in e ^ {*} (t)} c _ {0} \left(f _ {t ^ {\prime}}\right)
+$$
+
+now, we define the reduced heuristic in full generality; the definition of  $h_{e^*}$  will be a consequence of the simplified setting we analyze.
+
+definition a.2 (compute-memory heuristic (general)). the compute-memory heuristic score for a resident tensor  $t$  is defined as
+
+$$
+h _ {e ^ {*}} (t) = \frac {c (t) + c _ {0} (f _ {t})}{m (t)}
+$$
+
+corollary a.1. under our simplified compute and memory constraints,  $h_{e^*}(t) = |e^*(t)| + 1$ . since the heuristic is only used to rank tensors, the common additive constant 1 is unimportant. the heuristic  $|e^*(t)|$  will have the same behavior as  $|e^*(t)| + 1$ .
+
+note importantly that uncomputed tensors are not considered in any of the above definitions (as we do not know about their existence yet, from a dynamic execution perspective).
+
+# a.4 proof of theorem 3.1
+
+now we prove theorem 3.1, which bounds the overhead of dtr on a linear feedforward network with  $n$  nodes and  $\sqrt{n}$  memory by a constant factor of the runtime required by an algorithm with unlimited memory.
+
+proof. to prove this claim, we will consider the forward pass and the backward pass separately. in the forward pass, we show that our algorithm only performs  $n$  computations, matching that of an algorithm with unlimited memory. furthermore, upon completion of the forward pass, we tightly characterize the  $b$  tensors that remain in memory. we show that a set of evenly spaced checkpoint tensors remain in memory throughout the backward pass, until banishment. the presence of these checkpoint tensors allows us to argue that the algorithm never has to rematerialize too many tensors in a row. furthermore, as the algorithm computes additional gradients, it banishes checkpoint tensors that are no longer needed, freeing more space for additional checkpoints. the overhead incurred by the algorithm can therefore be kept to a constant factor of the required  $\theta(n)$  time. this checkpointing behavior can be seen in the trace of the algorithm, visualized in figure 5.
+
+we now analyze each of the phases in detail.
+
+# phase 1: forward pass
+
+recall that in a feed-forward network, every computation depends only on the preceding one. thus in our simplified network, we only ever need  $b = 2$  units of memory to compute the forward pass without any rematerializations (furthermore, this is the minimum required memory). for this reason, the forward pass requires  $n$  computations.
+
+![](images/cc93c614b8f33cbb3806973eba17103409d780120cfc1119531ae7dd031d68cd.jpg)  
+figure 5: visualization of the state of memory for dtr with  $n = 200$ ,  $b = 2\lceil \sqrt{n} \rceil$ , and heuristic  $h_{e^{*}}$ . a value of 0 (black) indicates the tensor is evicted or banished, 1 (red) indicates the tensor is a forward value in memory, and 1.5 (white) denotes an in-memory gradient tensor corresponding to the forward tensor. the backward pass begins at the red vertical line; note the presence of evenly spaced checkpoint tensors (red horizontal lines) that persist in memory throughout the backward pass. note also the recursive checkpointing behavior visible in the early gaps of the backward pass, and finally the completely red triangles of the later gaps, when there is enough free memory to avoid repeated rematerialization altogether.
+
+after completing the forward pass, we can tightly characterize the tensors remaining in memory. in particular, lemma a.1 tells us that the maximum gap between resident tensors is bounded by
+
+$$
+l \leq \frac {2 (n - 2)}{b - 1}
+$$
+
+we note that this bound is tight in an asymptotic sense: if we can keep  $b$  tensors in memory, and the forward pass is of length  $n$ , then the maximum gap must be at least  $n / b$ .
+
+next, we will analyze the backward pass. key to this analysis is the claim that "not too many" of the tensors in memory at the beginning of the forward pass are evicted before banishment during the backward pass. the existence of these "checkpoint tensors" allows us to argue that we do not do too much rematerialization work.
+
+# phase 2: backward pass
+
+during the backward pass, our algorithm computes gradients  $\hat{t}_i$ . each gradient computation relies on two inputs:  $\hat{t}_{i + 1}$  and  $t_{i - 1}$ . we show that neither input incurs too much rematerialization cost -  $\hat{t}_{i + 1}$  because it is pinned in memory, and  $t_{i - 1}$  because the paths of evicted tensors are not "too long." the first condition follows from the fact that  $t_i$  is banished after computing  $\hat{t}_{i + 1}$ , therefore forcing  $\hat{t}_{i + 1}$  to remain in memory until it is banished. the second condition is formalized in the following lemma, proved later in this section.
+
+lemma a.1 (checkpointing). consider an execution of the dtr algorithm with  $b$  units of memory and heuristic  $h_{e^{*}}$ , applied to the graph described in section a.1. let  $s$  be the set of tensors in memory after computation of  $t_n$  in the forward pass. then,  $\mathcal{c} \subseteq s$  is a set of "checkpoint" tensors from the forward pass with the following properties:
+
+1. during the backward pass, each  $c \in \mathcal{c}$  stays in memory until it is banished.
+
+2. the gap between neighboring tensors in  $\mathcal{c}$  satisfies
+
+$$
+l \leq \frac {4 (n - 2)}{b - 1}
+$$
+
+these  $|\mathcal{c}|$  checkpoint tensors divide the  $n$  forward tensors into  $|\mathcal{c}|$  groups, indexed by  $k$ , each of length  $l_{k} \leq \frac{4(n - 2)}{b - 1}$ . the total computational cost of the backward pass is equal to the sum of the computational cost for each group,
+
+$$
+c = \sum_ {k = 1} ^ {| \mathcal {c} |} c _ {k}.
+$$
+
+the second key insight in the analysis of the backward pass is that, for every group that is processed, the algorithm banishes a checkpoint tensor  $c \in \mathcal{c}$  and receives a unit of extra memory. in particular, at the start of processing group  $|\mathcal{c}| - k$ , the algorithm has  $2 + k$  pieces of extra memory (two from banishing the most recently used gradient and forward tensor, and  $k$  from the banished checkpoint tensors). we can leverage this extra memory to process the gradients in later groups with less rematerialization overhead, using the  $k$  extra units of memory to create intermediate checkpoint tensors. the following lemma describes how the cost of computing all the gradients in a group decreases as we free more memory.
+
+lemma a.2. suppose we have  $2 + k$  pieces of free memory to compute all of the gradients associated with an evicted forward tensor path of length  $l_{k}$ . then the number of rematerializations needed to compute all the gradients is of order
+
+$$
+c _ {k} = \mathcal {o} \left(l _ {k} + \frac {l _ {k} ^ {2}}{k ^ {2}} \log k\right)
+$$
+
+applying this lemma, the total cost of the backward pass becomes
+
+$$
+\begin{array}{l} c = \sum_ {k = 1} ^ {| \mathcal {c} |} c _ {k} \\ \lesssim \sum_ {k = 1} ^ {| c |} \left(l _ {k} + \frac {l _ {k} ^ {2}}{k ^ {2}} \log k\right) \\ \leq \sum_ {k = 1} ^ {| c |} l _ {k} + \sum_ {k = 1} ^ {| c |} \frac {\log k}{k ^ {2}} l _ {k} ^ {2} \\ \leq | \mathcal {c} | \left(\frac {4 (n - 2)}{b - 1} + 1\right) + \sum_ {k = 1} ^ {| \mathcal {c} |} \frac {\log k}{k ^ {2}} \left(\frac {4 (n - 2)}{b - 1} + 1\right) ^ {2} \\ \lesssim | \mathcal {c} | \left(\frac {n}{b}\right) + \frac {n ^ {2}}{b ^ {2}} \sum_ {k = 1} ^ {| \mathcal {c} |} \frac {\log k}{k ^ {2}} \\ \end{array}
+$$
+
+where  $\lesssim$  hides constant factors. note that  $|\mathcal{c}|\leq b$ , since  $\mathcal{c}\in s$  where  $s$  is the set of tensors in memory at the end of the forward pass. also note that  $\frac{\log k}{k^2}$  is a convergent sequence, so its partial sums are bounded. therefore, we can simplify the bound to
+
+$$
+c \lesssim n + \frac {n ^ {2}}{b ^ {2}}
+$$
+
+since  $b = \omega(\sqrt{n})$ , we conclude that the total cost of the backward pass is  $\mathcal{o}(n)$ . adding this to the  $\mathcal{o}(n)$  cost of the forward pass, we see the total compute is  $\mathcal{o}(n)$ , as desired.
+
+![](images/4fc761761d578ee1fa5f3d2056f4bbad1ad488e2c8ff8f9563b9fa1bb3992481.jpg)
+
+# a.5 proofs of intermediate results
+
+here, we present intermediate results that we used in the proof of our main result.
+
+lemma a.3. consider the dtr algorithm operating with heuristic  $h_{e^*}$ . suppose we seek to (re)materialize forward tensor  $t_k$  for  $k \leq n$ , where the resident tensor preceding  $t_k$  is denoted by  $t_j$  (with  $j < k$ ). suppose also that  $t_j$  is not evicted during the computation of  $t_k$ . then, if the algorithm begins with  $t_j$  in memory and with  $m$  units of memory, and runs until computing  $t_k$ , then the maximum length  $l$  of any evicted sequence of tensors between  $t_j$  and  $t_k$  is bounded by
+
+$$
+l \leq 2 ((k - j) - 1) / (m - 1)
+$$
+
+proof. proof by induction. we will show that, when the algorithm computes tensor  $j + i$ , for  $i = 1, 2, \ldots, k - j$ , the maximum length of an evicted sequence of tensors between  $t_j$  and  $t_{j+i}$  satisfies
+
+$$
+l _ {i} \leq 2 (i - 1) / (m - 1)
+$$
+
+base case. when  $i = 1$ , both  $t_j$  and  $t_{j + 1} = t_k$  are resident tensors, so the gap is  $l_{1} = 0$ .
+
+inductive step. consider the contents of memory after computing  $t_{j + i}$ . we begin by partitioning tensors  $t_j,\ldots ,t_{j + i}$  into  $m$  segments  $s_{1},\ldots ,s_{m}$ , each ending in a resident tensor (note, the last segment must end on a resident tensor, since  $t_{j + i}$  was just computed). if  $i < m$  so that there are not  $m$  resident tensors, then the length of each segment is zero and we are done. otherwise, each segment corresponds to an evicted sequence of zero or more tensors (i.e., the tensors preceding the resident tensor). let  $s_i$  denote the resident tensor that ends segment  $i$ .
+
+now, consider all adjacent pairs of segments  $(s_{l}, s_{l + 1})$  for  $1 \leq l \leq m - 1$ . the average length of the pairs is given by
+
+$$
+\begin{array}{l} \bar {l} = \sum_ {l = 1} ^ {m - 1} \frac {\left| s _ {l} \right| + \left| s _ {l + 1} \right|}{m - 1} \\ = \left(2 \sum_ {l = 1} ^ {m} \frac {\left| s _ {l} \right|}{m - 1}\right) - \frac {\left| s _ {1} \right| + \left| s _ {m} \right|}{m - 1} \\ = \frac {2}{m - 1} \left(\sum_ {l = 1} ^ {m} | s _ {l} |\right) - \frac {| s _ {1} | + | s _ {m} |}{m - 1} \\ = \frac {2 i}{m - 1} - \frac {\left| s _ {1} \right| + \left| s _ {m} \right|}{m - 1} \\ \leq \frac {2 (i - 1)}{m - 1}. \\ \end{array}
+$$
+
+let  $(s_{l'}, s_{l' + 1})$  be the pair of adjacent segments with minimum combined length. since the average length is bounded by the inequality above, it follows that the length of  $(s_{l'}, s_{l' + 1})$  is also less than or equal to  $2(i - 1) / (m - 1)$ .
+
+since the heuristic evicts the tensor that results in the smallest gap, we conclude that the eviction will create a gap no larger than  $2(i - 1) / (m - 1)$ . by the inductive hypothesis, the largest previous gap was no larger than  $2(i - 2) / (m - 1)$ , so we conclude that the largest gap after this computation is no more than  $2(i - 1) / (m - 1)$ .
+
+![](images/8611d7df5a06a29a2ddfcdd30474892065a848cab215e8f24ad11b8a051e2996.jpg)
+
+# proof of lemma a.1
+
+proof. we will prove this lemma by dividing the backward pass into two phases. in the first phase, the first two gradient computations of the backward pass, we may be forced to evict some element of  $s$ . in the absence of further information on the evicted tensor, we upper bound the resulting gap by twice the maximum gap between tensors in  $s$ . this gives us the upper bound in item 2 of the lemma.
+
+in the second phase, the remaining  $n - 2$  gradient computations of the backward pass, we show that heuristic  $h_{e^*}$  never leads us to evict a tensor that would lead to a gap of more than  $\frac{4(n - 2)}{b - 1}$  among the tensors in memory. this allows us to conclude that the checkpoint tensors  $\mathcal{c}$  remain in memory until eviction, as claimed.
+
+we now elaborate on the two phases, as discussed above.
+
+# phase 1: the first two gradient computations of the backward pass.
+
+we present a detailed treatment of the first two gradient computations in the backward pass,  $\hat{t}_n$  and  $\hat{t}_{n - 1}$ . we will show that, during the course of these two computations, at most one tensor from  $s$  is evicted from memory. since lemma a.3 tells us that the maximum gap in  $s$  satisfies  $l_{s} \leq \frac{2(n - 2)}{b - 1}$ , we conclude that removing a single tensor results in a gap in  $c$  of no more than  $2l_{s}$ . additionally, we will show that after the computation of the first two gradients, there are at least two non-checkpoint tensors in memory. since only two free units of memory are required to rematerialize a path of tensors, this sets us up for the analysis of the remaining gradient computations.
+
+we begin by noting that, after the forward pass completes,  $t_n$  and  $t_{n-1}$  are both in memory (since  $t_n$  has just been computed, which requires  $t_{n-1}$ ). since  $t_n$  is no longer needed in subsequent computations, it is immediately banished. assuming  $b \leq n$ , this leaves us with exactly one unit of free memory (if  $b > n$ , no elements of  $s$  are banished in the first two computations, and the  $2l_s$  bound is trivial). this single unit of memory is then filled by the computation of  $\hat{t}_n$ , which only depends on  $t_{n-1}$ .
+
+now,  $t_{n-1}$  is no longer needed, so it is banished, and we have exactly one unit of free memory. to compute  $\hat{t}_{n-1}$ , we require  $t_{n-2}$  and  $\hat{t}_n$  to be in memory. since  $\hat{t}_n$  was just computed, it is clearly in memory. however,  $t_{n-2}$  may or may not be in memory. we consider the two cases separately.
+
+if  $t_{n - 2}$  is in memory, then we immediately compute  $\hat{t}_{n - 1}$ . next, tensors  $t_{n - 2}$  and  $\hat{t}_n$  are banished, leaving us with the desired two free units of memory.
+
+if, on the other hand,  $t_{n-2}$  is not in memory, we must rematerialize it. let  $t_j$  be the resident tensor that terminates the evicted path of tensors containing  $t_{n-2}$ . we need to perform the sequence of computations  $\{t_{j+1}, t_{j+2}, \ldots, t_{n-2}\}$ . however, we only have one unit of free memory, so after computing  $t_{j+1}$  we will need to evict some tensor from memory. the evicted tensor must be  $t_i$  for some  $i \leq j$ , as neither  $t_{j+1}$  nor  $\hat{t}_n$  can be evicted (the former will be used for the next computation, and the latter is pinned in memory).
+
+regardless of which tensor  $t_i$  is evicted, the length of the evicted path it creates cannot exceed  $2l_s$ , where  $l_s$  is the length of the longest path in  $s$ . lemma a.3 bounds  $l_s \leq \frac{2(n - 2)}{b - 1}$ , so this step of the algorithm maintains item 2 of the lemma.
+
+it remains to show that the maximum gap in  $\mathcal{c}$  does not become larger than  $2l_{s}$  during the remaining steps of rematerialization, and that the computation of  $\hat{t}_{n - 1}$  ends with at least two units of free memory. to show the first claim, we note that the number of evicted tensors on the path to  $\hat{t}_{n - 1}$  does not exceed  $2l_{s}$  (this is the maximum length possible, if  $t_j$  was evicted and its adjacent evicted paths were both of length  $l_{s}$ ). therefore, when performing the intermediate rematerializations necessary to rematerialize  $t_{n - 2}$ , it is always possible to evict a tensor between  $t_j$  and  $t_{n - 2}$ , with a heuristic value of less than  $2l_{s}$ . since we evict the tensor with the smallest heuristic value, we will never create an evicted path of length greater than  $2l_{s}$ .
+
+finally, we note that, after computing  $\hat{t}_{n - 1}$ , both  $t_{n - 2}$  and  $\hat{t}_n$  will be banished. this leaves us with the desired two units of free memory.
+
+we have shown that, after computing  $\hat{t}_{n - 1}$ , the algorithm has two units of free memory, and the checkpoint set  $\mathcal{c}$  has a maximum gap of no more than  $2l_{s}$ . next, we show that this set  $\mathcal{c}$  is maintained throughout the remainder of the backward pass.
+
+# phase 2: the remaining  $n - 2$  gradient computations.
+
+the analysis for the remainder of the backward pass follows via induction, using the argument for rematerializing  $t_{n - 2}$  above.
+
+we have already shown a base case; we can maintain the desired properties of  $\mathcal{c}$  when computing  $\hat{t}_{n - 2}$ . for the inductive step, consider the computation of  $\hat{t}_i$  for  $1 < i < n - 1$ . suppose we have at least two units of free memory, and  $\hat{t}_{i + 1}$  in memory. furthermore, suppose that the set  $\mathcal{c}$  satisfies the properties of the lemma. we need to rematerialize  $t_{i - 1}$ , which terminates a path of evicted tensors of length no more than  $2l_{s}$ . as we rematerialize this path, it may require evicting tensors from memory. however, by the same logic we applied above, we know that the algorithm may always choose to evict a tensor resulting in a path of less than  $2l_{s}$ . the algorithm will always choose this option in favor of creating a longer evicted path. we conclude that the upper bound of  $2l_{s}$  is preserved when computing  $\hat{t}_i$ . furthermore, after  $\hat{t}_i$  is computed, we may evict  $\hat{t}_{i + 1}$  and  $t_{i - 1}$ , giving us two units of free memory. this proves the inductive step.
+
+note that, in the case that  $i = 1$ , the computation requires no rematerializations, as  $\hat{t}_1$  only depends on  $\hat{t}_2$ , and the latter is in memory at the time of computing  $\hat{t}_1$ .
+
+# proof of lemma a.2
+
+proof. let  $c_{i,k}$  denote the cost of processing gradient  $i$  in this group. since there are  $l_{k}$  associated gradients, the total cost is
+
+$$
+c _ {k} = \sum_ {i = 1} ^ {l _ {k}} c _ {i, k}.
+$$
+
+to compute each  $c_{i,k}$  we note that computation of the gradients proceeds in phases. when the first gradient is computed (at cost  $c_{0,k} = l_k$ ), two units of memory must be devoted to the current tensor computation, while the remaining  $k$  units of memory are used for intermediate rematerialized tensors. applying the intermediate checkpointing lemma, a.4, we conclude that some of these intermediate tensors will remain as checkpoints (indexed by  $j$ , with  $j = 1$  indicating the highest-indexed tensor), with adjacent checkpoints separated by a distance at most  $l_{k,j} = \frac{4(l_k - 2)}{k - 1}$ . we can express the total cost of computing the gradients in this gap as
+
+$$
+c _ {k} = l _ {k} + \sum_ {j} \sum_ {i \in \text {g r o u p} j} c _ {i, k}
+$$
+
+we begin by considering the first group to be processed,  $j = 1$ , associated with the last path between checkpoints. since it is the first group to be processed, it has no spare memory for intermediate checkpoints. therefore, computing the first gradient requires rematerializing the entire group (with at most  $l_{k,j}$  intermediate tensors), computing the second gradient requires rematerializing at most  $l_{k,j} - 1$  tensors, and so on. this gives a total cost bounded as follows (using  $\lesssim$  to denote inequality up to constant factors).
+
+$$
+\begin{array}{l} \sum_ {i \in \text {g r o u p} 1} c _ {i, k} \leq \sum_ {l = 0} ^ {l _ {k, j}} l _ {k, j} - l \\ \lesssim \left(l _ {k, j}\right) ^ {2} \\ = \left(\frac {4 (l _ {k} - 2)}{k - 1} + 1\right) ^ {2} \\ \lesssim \frac {l _ {k} ^ {2}}{k ^ {2}} \\ \end{array}
+$$
+
+next, we compute the total cost of calculating all the gradients between checkpoints  $j$  and  $j + 1$ . when the algorithm begins to compute group  $j$ , it has  $j$  pieces of extra memory, allowing it to further subdivide group  $j$  into  $j + 1$  intervals. by the intermediate checkpointing lemma, each of these
+
+intervals is of length at most  $\frac{4(l_{k,j} - 2)}{j - 1} + 1$ . we have
+
+$$
+\begin{array}{l} \sum_ {i \in \text {g r o u p} j} c _ {i, k} \leq j \sum_ {l = 0} ^ {\frac {4 (l _ {k , j} - 2)}{j - 1} + 1} \frac {4 (l _ {k , j} - 2)}{j - 1} + 1 - l \\ \lesssim j \left(\frac {4 (l _ {k , j} - 2)}{j - 1} + 1\right) ^ {2} \\ \lesssim \frac {l _ {k , j} ^ {2}}{j}. \\ \end{array}
+$$
+
+summing over the at most  $k$  checkpoints  $j$ , we conclude
+
+$$
+\begin{array}{l} c _ {k} \lesssim l _ {k} + \sum_ {j = 1} \frac {l _ {k , j} ^ {2}}{j} \\ = l _ {k} + l _ {k, j} ^ {2} h _ {k} \\ \lesssim l _ {k} + \frac {l _ {k} ^ {2}}{k ^ {2}} \log k \\ \end{array}
+$$
+
+where  $h_{k}$  is the  $k^{th}$  harmonic number.
+
+![](images/f64cc32e3ac1976734659863e80c5de611fe80e0c19db0fc5995881dbedfc065.jpg)
+
+lemma a.4 (intermediate checkpointing). consider the behavior of the dtr algorithm using the heuristic  $h_{e^*}$ , when computing gradients for the backward pass. suppose, immediately prior to the computation of gradient  $\hat{t}_i$ , we have  $2 + k$  pieces of free memory ( $k \geq 0$ ), and that  $\hat{t}_{i+1}$  is in memory. suppose also that forward tensor  $t_j$  is the first resident ancestor of  $\hat{t}_i$ , so that we will rematerialize  $t_{i-1}$  starting from  $t_j$  to compute  $\hat{t}_i$ . finally, suppose that  $t_j$  is never evicted until it is banished.
+
+then, immediately after computing  $\hat{t}_i$ , memory contains a set of "checkpoint" tensors  $\mathcal{c}$  with the following properties:
+
+1. the tensors in  $\mathcal{c}$  remain in memory until they are banished.  
+2. the gap between neighboring tensors in  $\mathcal{c}$  satisfies
+
+$$
+l \leq \frac {2 ((i - j) - 1)}{k + 1}
+$$
+
+proof. we begin by analyzing the state of memory after computing  $\hat{t}_i$ . since we started with  $2 + k$  pieces of free memory, and rematerialized  $t_{i - 1}$  starting from  $t_j$ , lemma a.3 tells us that, after rematerializing  $t_{i - 1}$ , the gaps in memory between  $t_j$  and  $t_{i - 1}$  are all bounded by
+
+$$
+l \leq \frac {2 ((i - j) - 1)}{k + 1}.
+$$
+
+we need to evict one additional item from memory, in order to compute  $\hat{t}_i$ . after this single eviction, the maximum gap is no more than doubled. we conclude that, after computing the first gradient, the maximum gap is no more than  $2l$ .
+
+it remains to show that the maximum gap in  $\mathcal{c}$  does not become larger than  $2l$  during the remaining steps of rematerialization. to show this, we first note that the computation of the next gradient,  $\hat{t}_{i-1}$ , begins with two units of free memory (having just banished  $\hat{t}_{i+1}$  and  $t_i$ ). we also note that the number of evicted tensors that need to be rematerialized for this gradient computation does not exceed  $2l$ . therefore, when performing the intermediate rematerializations necessary to rematerialize  $t_{i-2}$ , it is always possible to evict a tensor with a heuristic value less than  $2l$ . since we evict the tensor with the smallest heuristic value, we will never create an evicted path of length greater than  $2l$ .
+
+this argument can be applied for every gradient computed between  $\hat{t}_i$  and  $\hat{t}_{j + 1}$ , which shows that the desired properties of  $\mathcal{c}$  are maintained.
+
+![](images/5ec5b4e0bdbb85362a95a61bd0fde65816b3573a746b417242c7c671dffc1e58.jpg)  
+figure 6: an example construction of an adversarial graph. gray tensors are in memory ( $t_0$  must always be in memory). the initial tensor  $t_0$  has  $b$  paths descending from it, so there is always some path from  $t_0$  with no resident tensors. the adversarial construction chooses to place the next node at the end of such an entirely evicted path.
+
+# b proof of theorem 3.2
+
+in this section, we provide a proof of theorem 3.2, which lower bounds the number of tensor computations required by dtr under any deterministic heuristic, compared to an optimal checkpointing algorithm.
+
+proof. we will prove this theorem by designing an adversarially generated graph that forces dtr to repeatedly rematerialize evicted tensors. our architecture simultaneously leverages the static planner's ability to reorder computations, to avoid repeated computation of evicted tensors.
+
+since dtr is a dynamic algorithm, it must choose which tensor to evict at time  $t$  based only on the portion of the graph computed up to time  $t$ . our adversarial architecture generator builds the network one node at a time, choosing the next node based on the previous choice of the dtr algorithm. the construction is as follows:
+
+1. the graph begins with tensor  $t_0$ , which, by the behavior of dtr, must remain in memory.  
+tensor  $t_0$  has  $b$  children,  $t_1$  through  $t_b$ .  
+2. after step  $b$  of the computation, one of  $t_0$ 's children must no longer be in memory. call this evicted child  $t_*$ . the next node revealed by the adversary is the child of  $t_*$ , causing dtr to rematerialize  $t_*$ .  
+3. the adversary continues to repeat this construction. since  $t_0$  has  $b$  children, but there are only  $b - 1$  units of memory to allocate among its descendants, there must be some path from  $t_0$  that contains no resident tensors. the adversary reveals the next resident tensor on the end of that path, causing dtr to rematerialize the entire path. this repeats until we have revealed all  $n$  nodes of the graph.
+
+an example construction of the adversarial architecture is given in figure 6.
+
+next, we analyze the computation of dtr on this graph. to do this, we sum the cost of computing each tensor  $t_1$  through  $t_n$ . consider the architecture of the final revealed network, and let  $l_j$  denote the length of the path starting from  $t_j$ , where  $j = \{1, \dots, b\}$  so that  $t_j$  is a direct child of  $t_0$ . since our adversary places the next node such that the entire path must be rematerialized, the total cost of computing this graph dynamically is
+
+$$
+\begin{array}{l} c = \sum_ {j = 1} ^ {b} \sum_ {i = 1} ^ {l _ {j}} i \\ = \sum_ {j = 1} ^ {b} \frac {1}{2} l _ {j} (l _ {j} + 1) \\ \approx \sum_ {j = 1} ^ {b} l _ {j} ^ {2} \\ \end{array}
+$$
+
+where  $\approx$  hides constant factors. this sum is minimized when the  $l_{j}$  are all equal, which gives  $l_{j} = (n - 1) / b$ . the cost of computing all the tensors is therefore at least
+
+$$
+\begin{array}{l} c \gtrsim \sum_ {j = 1} ^ {b} n ^ {2} / b ^ {2} \\ = n ^ {2} / b \\ \end{array}
+$$
+
+to finish the proof, we upper bound the cost of the optimal static algorithm on this adversarial graph by exhibiting one static checkpointing algorithm and analyzing its behavior. the static algorithm may observe the entire structure of the  $n$  nodes, and rearrange the computation in any equivalent order.
+
+consider the static algorithm that computes the entire graph one path at a time. that is, the algorithm first computes  $t_1$  and all its children (requiring only two units of memory, with no rematerializations), then computes  $t_2$  and all its children (again, reusing the same two units of memory), until all  $b$  paths are computed. the total cost is therefore  $\theta(n)$ .
+
+we see that dtr requires  $\omega(n^2/b)$  computations to compute the tensors in this graph, whereas a static checkpointing algorithm would only require  $\theta(n)$  computations. we conclude that when dtr is run with a deterministic heuristic, there exists an architecture on which it requires at least  $\omega(n/b)$  times the runtime of a statically checkpointed evaluation.
+
+# c simulator specification
+
+in this section, we provide a detailed technical specification of the dtr simulator. this includes fundamental abstractions, formal definitions of heuristics, pseudocode, runtime optimizations, and details about the log-replaying mechanism.
+
+# c.1 fundamental abstractions
+
+we designed the simulator to support computations logged from pytorch (see sec. c.6). in pytorch, a tensor is a view (containing metadata) of a buffer; multiple tensors can point to a single buffer. this allows us to model the various aliasing relations between tensors in pytorch (paszke et al., 2017); other dl frameworks likely also use a similar representation.
+
+storage. at its core, dtr is a runtime system for reducing memory usage. as such, storages (i.e., buffers of memory) are the underlying unit which dtr operates on. they support the following operations:
+
+- size: storage  $\rightarrow \mathbb{n}$ : the size of the storage in bytes;  
+- root: storage  $\rightarrow$  tensor: the tensor whose parent operation computes the contents of the storage (there is exactly 1 for each storage);  
+- tensors: storage  $\rightarrow$  list[tensor]: all tensors which view the storage;  
+- resident: storage  $\rightarrow$  bool: true iff the storage is in memory;  
+- locks: storage  $\rightarrow \mathbb{n}$ : the number of locks on the storage held internally by dtr (indicating the storage is needed for pending rematerializations);  
+- refs: storage  $\rightarrow \mathbb{n}$ : the number of external references to the storage, i.e., those held by user code.
+
+we say a storage  $s$  is evictable if and only if  $\operatorname{resident}(s) \wedge \operatorname{locks}(s) = 0$ .
+
+tensor. each tensor  $t$  has an associated "parent" operation  $op(t)$  which computes it (potentially along with  $storage(t)$ , its underlying storage).
+
+each tensor  $t$  also has an external reference count  $refs(t)$ ; in particular, each storage  $s$  has  $refs(s) = \sum_{t \in \text{tensors}(s)} refs(t)$ . the external reference count is used to track whether a tensor is still live in the source program or whether it should be treated as having been deallocated by the source
+
+program. additionally,  $t$  is an alias iff  $t \neq \text{root}(\text{storage}(t))$ , meaning that  $t$  is a view of a storage created by a different parent operator. for convenience, we define  $\text{size}(t)$  to be 0 if  $t$  is an alias and  $\text{size}(\text{storage}(t))$  otherwise (since the metadata will likely be on cpu).
+
+unlike storages, a tensor  $t$  is resident when  $storage(t)$  is resident and  $op(t)$  has been performed after  $storage(t)$  last became resident. this condition is denoted as defined(t), and models the behavior of our pytorch prototype implementation where the whole tensor object is destroyed upon storage eviction (including metadata about the view, like striding and offset). thus, before an operation depending on  $t$  can be executed, defined(t) must be satisfied, given our assumption that views of a storage must be evicted once the underlying storage has been evicted. note that for a non-alias tensor  $t$ , we have resident(storage(t)) if and only if defined(t).
+
+operator. an operator represents a fundamental unit of computation in dtr. operators are assumed to be pure functions of their arguments, not depending on any other external state (see sec. c.6 for our handling of mutation). as such, each operator  $f$  has an associated compute cost  $cost(f) \in \mathbb{n}$ . we assume each  $f$  has type  $\text{list[tensor]} \to \text{list[tensor]}$  and define  $inputs(f)$  and  $outputs(f)$  to be the input and output tensors of  $f$ , respectively.
+
+# c.2 formal metadata definitions
+
+while our abstract description of dtr in figure 1 is over tensors, the simulator operates over storages rather than tensors. thus we must define the metadata our heuristics use over storages, providing notions of cost, staleness, and data dependencies for storages rather than for tensors.
+
+cost. for a given storage  $s$ , we define the compute cost of  $s$  as
+
+$$
+\operatorname {c o s t} (s) := \sum_ {t \in \text {t e n s o r s} (s)} \operatorname {c o s t} (\operatorname {o p} (t)).
+$$
+
+this is a worst-case estimation: it represents the compute cost which is incurred when every tensor view of  $s$  needs to be rematerialized. an alternative definition is simply  $cost(op(root(s)))$ , which may be acceptable as aliasing operations are typically much cheaper than non-aliasing.
+
+staleness. we estimate the staleness of  $s$  by tracking the last access time of each  $t \in \text{tensors}(s)$ . the last access time  $\text{last_access}(t)$  is defined as the most recent time when  $t$  was referenced by a queued operation. naturally, we define  $\text{last_access}(s) = \max_{t \in \text{tensors}(s)} \text{last_access}(t)$ . staleness, given the current time  $\mathcal{t}$ , is then defined as  $\text{stale}_{\mathcal{t}}(s) := \mathcal{t} - \text{last_access}(s)$ .
+
+data dependencies. the dependencies of  $s$  are the set of storages
+
+$$
+d e p s (s) := \left\{s t o r a g e (u) \mid \exists t. t \in t e n s o r s (s) \wedge u \in i n p u t s (o p (t)) \right\} \setminus \{s \}.
+$$
+
+note that we exclude  $s$  since it is not a true dependency (each alias tensor in  $\text{tensors}(s)$  technically "depends" on  $s$ ). another possible approximation of the above is to simply take the dependencies of  $\text{root}(s)$ ; although this ignores potential dependencies of aliasing operations, it is precise if all aliasing operations depend only on  $s$ .
+
+we now define the dependents of  $s$  as the set  $\text{deps}^\top(s)$  consisting of all  $t$  with  $s \in \text{deps}(t)$ . with this definition, dtr can operate over the dependency graph  $(v, e)$  where  $v$  is the set of storages and  $(s, t) \in e$  iff  $s \in \text{deps}(t)$ . note that  $(v, e)$  is implicitly indexed by time  $\mathcal{t}$ , with  $v$  being the set of non-banished but at-least-once computed storages at  $\mathcal{t}$  and  $e$  being the dependency relations at  $\mathcal{t}$ .
+
+evicted neighborhood. the evicted neighborhood  $e^{*}$ , as defined in section 2, works without modification over the storage dependency graph. we define it here for completeness. let  $dep_{e}(s)$
+
+be the evicted subset of  $dep_{e}(s)$ , and likewise for  $dep_{e}^{\top}(s)$ . now, let  $d_{e}$  and  $d_{e}^{\top}$  be the transitive closures of the relations
+
+$$
+\left\{\left(t, s\right) \mid t \in d e p s _ {e} (s) \right\} \quad \text {a n d} \quad \left\{\left(s, t\right) \mid t \in d e p s _ {e} ^ {\top} (s) \right\},
+$$
+
+respectively. then,  $e^{*}(s) \coloneqq \{t \mid (t, s) \in d_{e}\} \cup \{t \mid (s, t) \in d_{e}^{\top}\}$ . intuitively,  $e^{*}(s)$  is the set of evicted storages that must be resident to compute all  $t \in \text{tensors}(s)$ , together with the set of evicted storages  $t$  that need  $s$  to be resident before all  $t \in \text{tensors}(t)$  can be computed.
+
+relaxed (union-find) evicted neighborhood. actually tracking  $e^{*}(s)$  can be computationally expensive due to the directed and changing nature of the graph. for each  $s$ ,  $e^{*}(s)$  depends on its specific ancestors and descendants, which can vary as tensors are evicted and rematerialized. an exact solution would likely involve a dynamic graph connectivity data structure, which would greatly increase the complexity of the simulator's implementation.
+
+we find an approximate solution by relaxing the definition of the evicted neighborhood. at a high level, our solution works as follows: given a storage dependency graph  $g = (v,e)$ , we first forget edge directions to obtain the undirected dependency graph  $\tilde{g}$ . now, let  $\tilde{g}_e$  be the subgraph obtained by removing all resident storages (and any edges including them). each connected component of  $\tilde{g}_e$  is then an evicted component, with each evicted  $t \in v$  belonging to exactly one component  $\epsilon^*(t)$ .
+
+importantly, we track these evicted components using a union-find (uf) data structure, which efficiently supports merging and obtaining static set metadata. each component tracks the sum of the compute costs of its elements (with the union of two components having the sum of each constituent cost). we denote the associated uf set for a storage  $t$  by  $t$ .set, which is mutable state.
+
+we can now define the relaxed evicted neighborhood for a resident storage  $s$  as
+
+$$
+\tilde {e} ^ {*} (s) := \left(\bigcup_ {t \in d e p s _ {e} (s)} t. s e t\right) \cup \left(\bigcup_ {t \in d e p s _ {e} ^ {\top} (s)} t. s e t\right).
+$$
+
+note that in practice, no uf unions are performed when querying this approximation. instead, we collect and merge the set metadata separately, as otherwise we would erroneously merge evicted components during heuristic evaluation. this approximation reduces the worse-case time complexity of querying compute costs over the neighborhood to be linear in the number of adjacent storages, as opposed to all ancestor and descendant storages.
+
+however, rematerializing a tensor in an evicted component creates a split in the component and splitting is not a supported operation on uf data structures. approaches to splitting would also need to recover the original compute costs of each set, which may require traversing the whole set if done naively. to handle splitting more efficiently, we use the following approximation: when a (previously) evicted storage  $s$  is rematerialized, we first set  $s.set.cost := s.set.cost - cost(s)$ , and then assign  $s.set := \emptyset$  (i.e., assign  $s$  to a new empty uf set). note that when a storage is first computed, its evicted component is also initialized to be empty. while resident storages thus never count towards the compute cost of a component, "phantom connections" between evicted storages may accumulate over time (likely depending on the connectedness of the underlying dependency graph). despite this limitation, this approximation worked well in practice, as seen in the simulated and prototype results.
+
+# c.3 formal heuristic definitions
+
+having defined the metadata above, we can now formally define the  $h_{\mathrm{dtr}}$  variants used in sec. 4. (recall that  $h_{\mathrm{dtr}}$  heuristics compute a score using measures of size, computational cost, and staleness and evict the tensor with the smallest score, corresponding to the intuition that the tensor evicted should be large, unlikely to be rematerialized, and cheap to rematerialize if it does need to be rematerialized.)
+
+$$
+h _ {\mathrm {d t r}} (s) := \frac {\operatorname {c o s t} (s) + \sum_ {t \in e ^ {*} (s)} \operatorname {c o s t} (t)}{\operatorname {s i z e} (s) \cdot \operatorname {s t a l e} _ {\mathcal {t}} (s)}.
+$$
+
+$$
+h _ {\mathrm {d t r}} ^ {\mathrm {e q}} (s) := \frac {c o s t (s) + \sum_ {t \in \tilde {e} ^ {*} (s)} c o s t (t)}{s i z e (s) \cdot s t a l e _ {\mathcal {t}} (s)} \approx \frac {c o s t (s) + c o s t ^ {*} (s)}{s i z e (s) \cdot s t a l e _ {\mathcal {t}} (s)}
+$$
+
+note that the simulator implementation uses the splitting approximation described above, with  $\tilde{e}^{*}(s)$  depending on the specific sequence of evictions and rematerializations.  $cost^{*}(s)$  in the second expression is used to denote this statefulness.
+
+$$
+h _ {\mathrm {d t r}} ^ {\text {l o c a l}} (s) := \frac {\operatorname {c o s t} (s)}{\operatorname {s i z e} (s) \cdot \operatorname {s t a l e} _ {\mathcal {t}} (s)}.
+$$
+
+# c.4 implementation details
+
+runtime state. in what follows, we denote the collective runtime state of the dtr simulator as  $r$ , and use the dot notation to indicate stateful reads and writes of runtime values. the simulator tracks the following runtime state:
+
+-  $r$ -heuristic: (storage, metadata)  $\rightarrow \mathbb{r}$ , the eviction heuristic, interpreted as a score (the lowest-scored storage is evicted);  
+-  $r$  .budget : n, the memory budget in bytes;  
+-  $r$  .memory :  $\mathbb{n}$  ,the current memory usage in bytes;  
+-  $r.\mathcal{t}:\mathbb{n}$ , the current clock time in some unit of granularity, such as nanoseconds;  
+-  $r$ .pool : list[storage], list of all currently evictable storages.
+
+eviction and banishing. to evict a given storage  $s$ , we set all tensors in  $s$  to be undefined, remove  $s$  from the pool, and decrease  $r$ . memory by  $size(s)$ . cached metadata are also updated as necessary.
+
+banishing (permanent eviction) is slightly more subtle; in particular, it can only be done for  $s$  when  $\text{deps}_e^\top(s) = \emptyset$ . banishing then proceeds by evicting  $s$  as above, but with the additional effect of removing  $s$  entirely from the dependency graph. each  $t \in \text{deps}^\top(s)$  is then locked (and effectively becomes an non-rematerializable constant). storages locked in this way are said to be pinned (and have a special flag in the simulator), to distinguish them from those locked during rematerialization, and we permit them to be banished in the future. note that banishing can be performed on evicted  $s$  when the above condition is met, in which case the eviction is skipped.
+
+(re)materialization. when a tensor  $t$  is to be (re)materialized, its parents' storages are first locked by incrementing the lock count (so that they don't get evicted while they are still needed) and undefined parents are recursively rematerialized. we then increment  $r$ .memory by  $\sum_{u \in outputs(op(t))} size(u)$  (performing evictions as necessary), and move  $r$ .t forward by  $cost(op(t))$ . multi-output operations must be handled carefully so as to not leak memory: we make sure to decrease  $r$ .memory by  $size(u')$  for each  $u' \in outputs(op(t))$  that was defined prior to the rematerialization. this models the immediate freeing of doubly-computed ephemeral tensors in the pytorch implementation. lastly, locks on parent storages are freed and unlocked storages (including any newly rematerialized ones) are added back into  $r$ .pool1.
+
+constants. the simulator models non-rematerializable constants like weights and inputs by creating dummy "constant" tensors using nullary operators with 0 cost and pinning the resulting storage. this allows the simulator to have a full picture of the computation graph. furthermore, log-accurate banishing requires knowledge of constants (as pytorch reference-counts constants).
+
+# c.5 additional runtime optimizations
+
+banishing and eager eviction. when the final external reference to a storage  $s$  is lost, we know that the underlying dl framework would have reclaimed the memory used by  $s$ . to utilize this information as opposed to doing nothing, dtr can either banish  $s$  or simply evict  $s$  normally. when banishing, the runtime must first check that  $s$  has no evicted dependents; if it does, then we retry
+
+banishing each time a dependent is rematerialized. banishing has the ability to free constants, but at the downside of pinning potentially exploding amounts of memory. the alternative (eager eviction) is easier to implement and simply involves evicting  $s$  normally (if possible). this prevents the problem of over-pinning memory, but with the downside that constants can never be evicted. in practice, eager evictions have allowed us to support lower budgets by pinning fewer values (see sec. d.2 for details).
+
+caching metadata. to avoid costly recomputations of metadata during heuristic evaluations, we cache the local cost  $cost(s)$  for each  $s$ , as it only changes when new aliases are made. additionally, for the  $h_{\mathrm{dtr}}$  heuristic, we avoid recomputing  $e^{*}(s)$  at each evaluation by caching and only recomputing it after evictions or rematerializations that directly affect  $e^{*}(s)$ . such recomputations are further optimized by tracking the evicted ancestors and descendants separately (allowing them to be recomputed independently, depending on the position of the affected storage).
+
+# c.6 log-replaying mechanism
+
+log format. we logged pytorch operations as a sequence of abstract instructions corresponding to the semantics of the actions we were easily able to instrument in the framework. every pytorch tensor is given a unique identifier string upon creation, which is recorded and used in the log. in this section, each pytorch tensor  $t$  corresponds to a simulator tensor  $[[t]]$ .
+
+the log contains the following instructions:
+
+-  $\text{memory}(t, \text{size})$ : logs that  $t$  uses size memory; treated as 0 if  $[[t]]$  is an alias.  
+- alias  $(t_o, t_i)$ : logs that  $\llbracket t_o\rrbracket$  is an alias of  $\llbracket t_i\rrbracket$ , i.e., two different views of the same storage.  $t_i$  can either be a tensor identifier or  $\perp$ ; if  $t_i = \perp$ , then  $t_o$  does not alias another tensor ( $t_o$ 's parent operation created its storage).  
+- call(inputs, outputs, cost, op): logs the operator call outputs = op(inputs) with compute cost cost. this instruction is followed by |outputs| memory and alias instructions to log information about each output. each call corresponds to a simulator operator [[op]] with inputs {{[i]} | i ∈ inputs} and new simulator tensor outputs {{[o]} | o ∈ outputs}.  
+- mutate(inputs, inputs', cost, op): logs the in-place (mutating) operator call op(inputs) with compute cost cost, which modifies inputs'  $\subseteq$  inputs.  
+- constant  $(t)$ : logs that  $\llbracket t\rrbracket$  is a constant, and is followed by a memory instruction.  
+-  $\mathsf{copy}(t_o, t_i)$ : logs a new identifier  $t_o$  with  $\mathbb{[}t_o\mathbb{]} = \mathbb{[}t_i\mathbb{]}$ . this increments refs( $\mathbb{[}t_i\mathbb{]}$ ). this happens when python code like “x = y” is called where y is a pytorch tensor and x is a fresh variable; this action neither creates a new storage nor a new view but only has x point to the same view as y.  
+- copyfrom  $(t_o, t_i)$ : logs the pytorch code  $t_o = t_i$  where each side is an existing tensor. this decrements refs([[[t]]]), increments refs([[ti]], and updates [[t]]  $\mapsto$  [[ti]]. intuitively, this corresponds to python code like “x = y” where y is a pytorch tensor and x was already assigned to a pytorch tensor; in pytorch, x is mutated to match y.  
+-  $\text{release}(t)$ : logs the destructor of the pytorch tensor  $t$ . this decrements  $\text{refs}([\tilde{t}])$ .
+
+supporting mutation. to support mutation from in-place operators, the simulator adds a "reference layer" that mutates cloned tensors, allowing for a uniform interface for all operators. given a mutation instruction mutate(inputs, inputs', cost, op), let  $i_{new}$  be a new unique identifier for each  $i \in inputs'$ , and let  $inputs_{new}' = \{i_{new} \mid i \in inputs'\}$ . we then proceed by treating  $op$  as a pure operator from  $inputs$  to  $inputs_{new}'$ , where each newly created simulated tensor  $[[i_{new}]]$  is non-aliasing and has size  $size(storage([[i]])$ . lastly, we decrement  $refs([[i]])$  and update the mapping  $[[i]] \mapsto [[i_{new}]]$ . intuitively, we are modeling the transformation
+
+$$
+o p (t) \rightsquigarrow \text {t e n s o r} t ^ {\prime} = c o p y (t); o p (t ^ {\prime}); t = t ^ {\prime}.
+$$
+
+note that in our prototype implementation, a mutation of  $i$  may produce incorrect results when  $[[i]]$  is an alias, since the mutation layer would create a clone but aliases would still point to the old storage. potential solutions in real implementations would be to propagate the above rewrite to all aliases of a storage (costly) or to mutate storage pointers (which would have increased the complexity of our modifications to pytorch).
+
+output condition. all live tensors at the end of a log (i.e. all  $t$  with  $\text{refs}(t) > 0$ ) are treated as necessary outputs (namely, gradients, the loss value, and the prediction). they are thus rematerialized (if evicted) and locked to ensure they persist. this prevents the simulator from incorrectly reporting better results by evicting computed weight gradients and never rematerializing them. this permits the user to perform the weight update step outside of dtr immediately after the backward pass ends. based on our observations of pytorch's optimizer gradient updates, we could also support performing these updates within dtr, since a parameter update simply performs in-place mutating additions (add_) of scaled gradients to the parameters.
+
+# d ablation study
+
+in this section, we present an ablation study comparing the impacts of different sources of information for the  $h_{\mathrm{dtr}}$  heuristic. in addition to comparing the overhead in terms of additional tensor computations, we also consider the runtime overhead of different  $h_{\mathrm{dtr}}$  configurations in terms of the number of tensor accesses by heuristic computations and metadata updates. we also compare different eviction policies for the  $h_{\mathrm{dtr}}$  heuristics: ignoring deallocations, eager eviction, and banishing. these trials were performed using the same logs as in sec. 4.
+
+# d.1 data sources
+
+first, we will analyze the three sources of information (metadata) for the  $h_{\mathrm{dtr}}$  heuristic. let us consider a parameterized version of  $h_{\mathrm{dtr}}$  defined as  $h_{\mathrm{dtr}}'(s, m, c)(t) = c(t) / [m(t) \cdot s(t)]$ , where  $s$  is a measure of staleness,  $m$  is a measure of size, and  $c$  is a measure of compute cost. for this study, we take  $s$  and  $m$  to be the staleness and size functions defined in appendix c. for compute cost  $c$ , we compare the following alternatives (see appendix c for definitions): the full  $e^*$ , the approximation  $\tilde{e}^*$ , and the local cost (cost of the parent operator only). we allow each measure to be entirely ablated (e.g.,  $s(t) = 1$ , which we denote  $s = \mathrm{no}$ ).
+
+in the following figures, we specifically have  $s, m \in \{\text{yes, no}\}$  and  $c \in \{e^*, \text{eqclass}, \text{local}, \text{no}\}$ . each figure fixes a choice of  $c$ , varying  $s$  and  $m$ .
+
+![](images/3c673a157d89733d9601f9495e86f89636812e1680e5484030d203ba87524684.jpg)  
+figure 7: results for fixed  $c = e^*$ , varying  $s$  and  $m$ .
+
+![](images/ef4f8b0582f6923b3e02c92dcc7662b726c8db8f24b022a1facd1d82ee32aa8f.jpg)
+
+![](images/4c1cde45af35168fc5a8ad8a92cbb38aafd9c7e4a1377126542af0f54cf8ec65.jpg)
+
+![](images/5b04c8bc5cfded1f5d3acc46ad415e9a464751cabc21ffbd1940e0555458623d.jpg)
+
+the general trend shown in figures 7, 8, 9, 10 is that higher metadata complexity (corresponding to more precise notions of the evicted neighborhood) enables more savings, while staleness and size are required for acceptable computational overhead. it is interesting to note that the importance of staleness and size depends on the specific model architecture. for example, cost and size alone each do far better than using both cost and staleness for the static models (densenet, resnet, unet), whereas the opposite is true for the dynamic models. this may be due to model depth or the distribution of tensor sizes or to the increasing impact of individual checkpoints at lower budgets; further research may shed more light on the influence of model-specific characteristics like these. additionally, we may note that the  $\tilde{e}^*$  approximate cost performs comparably to the  $e^*$  exact cost while requiring less information, validating our claim that the equivalence classes are a useful approximation.
+
+![](images/3a24b627f9e366a3805c507da9efa04a7f67f269320b2a9ade2a097ed8141fd0.jpg)  
+figure 8: results for fixed  $c = \mathrm{eqclass}$ , varying  $s$  and  $m$ .
+
+![](images/1c563fc6b7fa58e3e0dff58c90446ca12b43905ed6adba107da8afcbd6ad42b3.jpg)
+
+![](images/a597e906af7ae7075af7599f492cca779838997abc5e50a3ad4f7d4983d21992.jpg)
+
+![](images/5cb51b00a1fc9cdc401957d26e94aa35d3d135ee33429ecd4cc022b24c99cf3e.jpg)
+
+![](images/7121a779cf2324f4af4090733f4c86b9d2ea7910b0b517c9b227412cb7422132.jpg)  
+figure 9: results for fixed  $c =$  local, varying  $s$  and  $m$ .
+
+![](images/96de79bda288003a2f96f9eae96379eb16a376fd1e07d8919fcaba492410c8cc.jpg)
+
+![](images/eb46c13d4256cc59b4e34758f143f456a8248d786758e027cbec1a47d669b16f.jpg)
+
+![](images/314d98790f1cdc85cb29b3d18eafc1e9071ce3672ff5c5cd9c10818b2739eb48.jpg)
+
+![](images/af779dffe5cf292f6362dde27a77c55853eb0bb0e31c692958576c3644c74e12.jpg)  
+figure 10: results for fixed  $c = \mathrm{no}$ , varying  $s$  and  $m$ .
+
+![](images/eb5deff5709e2201340870dd3242fa0192e2b889393bd1fa53f8f76b6a0c2636.jpg)
+
+![](images/f1363e102a9a377f89578974e34909fbba3499c2ed98ada86ce65ed090e415a6.jpg)
+
+![](images/038401142304fa992f21dd71d0d7e047d43b00d2a10c6021d28d0feaeeb6cf3e.jpg)
+
+in general, the best-performing of these heuristics were those with non-ablated choices of  $s$ ,  $m$ , and  $c$ , hence our choosing the  $h_{\mathrm{dtr}}'$  variants with  $e^*$ ,  $\tilde{e}^*$ , and local cost ( $h_{\mathrm{dtr}}$ ,  $h_{\mathrm{dtr}}^{\mathrm{eq}}$ , and  $h_{\mathrm{dtr}}^{\mathrm{local}}$ , respectively) for the evaluation in sec. 4.
+
+# d.2 banishing and deallocations
+
+for the following trial, we compared the  $h_{\mathrm{dtr}}$  heuristic with banishing (permanent removal) against that with eager evictions, as described in appendix c.5. we also compare both deallocation-aware approaches against simply ignoring deallocations. we only used  $e^*$  cost because it performed much better than local cost and because it would have been more complicated to update the definition of  $\tilde{e}^*$  to account for banished neighbors.
+
+the results are shown in figure 11.
+
+![](images/4579d6deb203edb98aa11af08b86d4824b3d15633f511ccff9e57abacf4b5647.jpg)  
+figure 11: results for the  $h_{\mathrm{dtr}}$  heuristic, comparing banishing and eager evictions.
+
+![](images/f722fa9e0763ae8814090cc34fa2519f3283da4ca0e9863c4a2807b5c0b4aa0a.jpg)  
+memory ratio banishing eager eviction no deallocations
+
+![](images/7cc9429f4ab98b6d99eb350789d9063989f14b50026d82b2866e7013d29a0c41.jpg)
+
+![](images/54b99ab3ca2c4a2ff93234fa3401170eddd5acde4b1950f65525634d991accfa.jpg)
+
+as the curves show, banishing is not able to achieve the same budgets across most models tested as eager eviction. for unet, the difference is large: banishing can only support  $90\%$  of the baseline budget (and ooms at 0.8 ratio), while eager eviction can support  $50\%$  of the baseline budget. however, banishing still attains low budgets on most models, even obtaining better computational overhead under the same budget and savings for resnet. since banishing potentially allows for greatly lowered runtime overhead, implementations of dtr can consider conditionally enabling it in situations where the tradeoff is more desirable.
+
+compared to ignoring deallocations, both banishing and eager eviction obtain noticeably lower rematerialization overhead. this shows that valuable information is captured by deallocations, and that dtr can make good use of it.
+
+# d.3 runtime overhead
+
+for this experiment, we tracked the number of storage (see appendix c.1) accesses made during evaluations of heuristics and maintenance of metadata. we chose this metric over wall-clock time, since our python implementation of the simulator is not heavily optimized and may not accurately correspond to the real performance of the runtime. storage accesses, on the other hand, do reflect operations that would be performed by a real implementation. for the  $h_{\mathrm{dtr}}$  heuristic, this included each storage visited during the updating and rebuilding procedures for maintaining  $e^*$  for resident storages. for the  $h_{\mathrm{dtr}}^{\mathrm{eq}}$  heuristic, this included each storage visited whenever the union-find data structure was traversed for each evicted component (which occurs mainly during merging and when reading the compute cost). the  $h_{\mathrm{dtr}}^{\mathrm{local}}$  heuristic does not need to maintain any non-local metadata. for all heuristics, each heuristic evaluation counted as one storage access.
+
+![](images/2f7ddd5e92da5245d72b056582a07196d044f6ff04c680ae8db6f7b3e8ce3e06.jpg)  
+figure 12: total storages accesses incurred by heuristic evaluations and metadata maintenance, compared across different memory ratios, for the 3 main  $h_{\mathrm{dtr}}'$  variants.
+
+![](images/78a1f0544cc43b994e4debe73b0dff5d54fe7188ce4401f0126da8a5d191f706.jpg)
+
+![](images/0170975505063c958fa7f9b04caca45f476775bf1a4804a7d917fa61a4e65ac9.jpg)  
+memory ratio hdtr hdtr hdtr
+
+![](images/08c86b114d1a1c3614435e058ec537668c9fdf0e8898416050bfb6cfac6bcef7.jpg)
+
+as figure 12 shows, the accesses made by each heuristic are generally separated by at least an order of magnitude. this confirms our intuitions about the runtime overhead of each heuristic, and supports
+
+our choice of  $h_{\mathrm{dtr}}^{\mathrm{eq}}$  as a good middle ground (in terms of both runtime and computational overhead). however, these overhead figures could be improved with better-optimized implementations of the heuristics, as our implementation recomputes heuristics often, even when it may be possible to store the scores for tensors and maintain them in a sorted order. (reformulating staleness to avoid having to use the current time might help.) using persistent data structures that can be incrementally updated and maintain a sorted order will make these heuristics much more efficient, though this would also increase the complexity of the implementation.
+
+# e prototype implementation
+
+# e.1 integration into pytorch
+
+to avoid modifying pytorch's core systems, our dtr prototype is implemented as a wrapper over pytorch's existing tensor implementations. namely, we add a new tensor representation into pytorch called a checkpointtensor, which is simply a wrapper over an existing pytorch tensor that additionally tracks the tensor's parent operation and other metadata (such as the last access time and the cost of the parent operation, which is timed when the tensor is first created) and registers the tensor in the dtr runtime system. timing operators for metadata purposes simply use the system clock, hence to guarantee the correctness of these operator times, we force pytorch into synchronous execution mode (which ensures that gpu operators are performed synchronously); we found that dtr was still able to execute models on greatly reduced memory budgets without turning on synchronous execution mode, even though this should skew dtr's recorded operator times.
+
+for evictions, checkpointtensors are capable of freeing their underlying tensor representation from memory; they keep a closure for replaying the parent operation, which the runtime can invoke when the tensor must be rematerialized. to handle deallocations by the original program, checkpointtensors also report increments and decrements to the reference count of the underlying tensor to the dtr runtime. we add a method to tensors called "checkpoint() that lifts any tensor into a checkpointtensor and a method "decheckpoint") that extracts the underlying tensor from a checkpointtensor, rematerializing it if necessary (we use the latter in our trials to ensure the loss and output are in memory at the end).
+
+our modified version of pytorch dispatches any operation involving a checkpointtensor to a specific implementation for checkpointtensors; this is the same mechanism that pytorch uses, for example, to dispatch operations on gpu-managed tensors to cuda implementations. specifically, whenever pytorch encounters an operator where an argument is a checkpointtensor, its dispatch mechanism searches for a specific overload of that operator for checkpointtensors. since a checkpointtensor simply wraps the underlying pytorch tensor, adding checkpointtensor implementations for operators simply requires invoking the operator's existing implementation for the underlying tensor and wrapping the result in a checkpointtensor. these overloads were essentially boilerplate code and it is likely possible to generate them automatically. as far as pytorch's dispatch system is concerned, all tensor accesses occur through operators, so updating metadata like access time only requires invoking the dtr runtime inside the checkpointtensor operator overloads.
+
+the dtr runtime is simply a singleton that keeps a pool of all checkpointtensors created since the start of the program. the runtime is also responsible for maintaining the equivalence class data structure needed for  $h_{\mathrm{dtr}}^{\mathrm{eq}}$ , described in appendix c.1 (updated each time a checkpointtensor is evicted or rematerialized). before each checkpointtensor operation, the dtr runtime checks whether the memory budget has been exceeded; if it has, the runtime searches over the pool of checkpointtensors, computing the heuristic score ( $h_{\mathrm{dtr}}^{\mathrm{eq}}$ ) for each using their metadata, and evicting the least-scoring until either it is not possible to evict any more tensors or the budget has been met. (n.b., this means that the prototype permits exceeding the budget by exactly one tensor allocation. in principle, we can correct this by inserting a callback into pytorch's gpu memory manager to call the dtr runtime as soon as an allocation is requested; we did not do this to simplify our implementation.) this method of searching is very simplistic; it is likely that redundant heuristic computations can be removed using data structures to keep checkpointtensors in a sorted order and incrementally update metadata, but the optimizations discussed below in appendix e.2 were very simple and helped to reduce some of the overhead from this naive method. the dtr runtime is also responsible for implementing the logging mechanism described in appendix c.6; this is
+
+accomplished by simply writing json records of events intercepted by the runtime (operator calls, reference count increments and decrements, etc.) to a file.
+
+the dtr prototype supports pytorch's implementation details like in-place mutations, aliasing, and multiple operator outputs, which are all discussed in paszke et al. (2017), using the same methods as the dtr simulator (see appendix c). as in appendix c.6, the dtr prototype supports pytorch operators that perform in-place mutations by introducing a copy-on-write mutation layer: the mutating operator is made pure (and therefore infinitely replayable) by copying the source tensor for the mutation and mutating the copy. (similarly, impure operators like batchnorm and dropout are made pure by treating state like the prng seed as part of the input to the operators and the updated state as part of their output.) the dtr runtime performs these copies for checkpointtensor operator overloads to mutating operators. to support operators whose results are aliases of their arguments, the dtr runtime groups together all checkpointtensors whose underlying tensors are aliases of each other into alias pools. when a member of an alias pool is evicted, all members of the alias pool are treated as evicted; aliases are, however, rematerialized separately, only as they are needed. for checkpointtensors produced by multi-output operations, the dtr runtime allows them to be evicted separately but ensures that they are rematerialized together.
+
+# e.2 runtime optimizations
+
+searching for tensors to evict is a significant source of overhead for dtr's runtime because the runtime recomputes each tensor's staleness and equivalence class cost upon each eviction, rather than storing and incrementally updating this information. in principle, we could reduce this portion of the overhead by using more complex data structures to maintain an ordering of the tensors to avoid searching, though this would greatly increase the complexity of our implementation. as a simpler means of reducing the dtr runtime's overhead from searching and computing heuristic scores, we added two approximate optimizations to reduce the search space: ignoring small tensors (less than  $1\%$  of the average size) and only searching over a random sample of  $\sqrt{n}$  tensors from the pool of  $n$  evictable tensors. this greatly reduces the number of tensors that the runtime needs to check upon evicting. even though this improves the search overhead considerably, searching and computing costs still present considerable dtr-specific overhead, as the profiling breakdown in figure 4 shows. additionally, random sampling caused occasional failures at low budgets or very large inputs due to excluding good eviction candidates from the search space, which led us to deactivate that optimization in certain trials. (at low budgets, individual eviction choices are very impactful, so removing tensors from the search space completely at random can dramatically affect the results.)
+
+there are also several possible sources of runtime overhead that could potentially be improved by making deeper modifications to pytorch's core systems. for example, we introduced an overload layer that results in many more layers of callbacks. the mutation layer also clones tensors (even though it frees the necessary space immediately), resulting in additional overhead. further modifications to the framework could allow for more optimizations, particularly by reducing the number of heap allocations and conversions between tuples and lists. pytorch's define-by-run nature and shallow embedding into python also meant that much of dtr's metadata, such as the parent operator of a tensor, needed to be computed at run time (such as by creating a closure). in other frameworks that feature a compilation step, such as glow (rotem et al., 2018), it may be possible to eliminate much of this overhead by generating these structures in a compiler pass. we may also note that all the bookkeeping for dtr takes place on cpu while operators are generally offloaded to other devices, so an implementation could interleave these updates with gpu operations.
+
+# e.3 handling errors in trials
+
+as discussed in table 1 and figure 4, the dtr prototype encountered errors on certain models when running on low budgets or on large input sizes. these errors were primarily cuda out-of-memory errors (ooms), but in some cases, the trial simply hung, neither crashing nor terminating. for cuda ooms, disabling the random sampling optimization described in appendix e.2 eliminated the errors in most cases, suggesting that the ooms were due to excluding useful eviction candidates. for the hanging trials, we were not able to determine whether the root cause was dtr thrashing (being trapped in a very deep recursive rematerialization, as occurred in some of the simulated trials on certain heuristics) or an infinite loop or deadlock elsewhere in pytorch; we can investigate the cause
+
+by further instrumenting the implementation, but we have been unable to consistently reproduce hanging trials and they seem to occur less frequently than ooms.
+
+in the largest two batch sizes for unet in table 1, disabling sampling did not eliminate all ooms or hanging trials. thus, for the large-input trials in table 1, we employed a procedure for retrying upon encountering an oom or a hang. first (as with all other gpu measurements), we perform some untimed "warm-up" trials to allow for cuda initialization and caches to be populated and then begin timing the trials. if a trial raises a cuda oom or hangs (which we define as taking twice as long as the trial before it), we keep the measured times from that point in the trial and then restart (doing another warm-up), collecting the remaining number of measurements. restarting the measurement run was the only way to ensure that all memory allocated during the trial would be collected in the event of an oom (attempts to proceed simply by resetting the pytorch allocator's cache resulted in memory accumulating between trials regardless). our experimental setup automates this process of retrying failed trials and reports the total number of retries. note that we treat failures during warm-up runs the same as failures in timed runs, since recovering from an oom would require exiting the process running pytorch and reinitializing cuda. in the table 1 results, there was 1 failed run for unet on batch size 9 and 10 failures on batch size 10; most of the latter were during warm-up runs.
+
+a possible reason for the occasional failed trails in unet may be variance in operator timings, which affect the metadata and may be influencing rematerialization decisions. one way to control for this possibility in a static model like unet would be to use a dtr simulation to produce a static rematerialization schedule and therefore have a known, safe execution schedule for operators. for a dynamic model, a static plan is not an option, but variations in operator timings could be reduced by using a fixed cost model for operators instead of timing them dynamically. that is, the dtr heuristics employed could be defined to use proxy measures that are less subject to variation (e.g., defining staleness in terms of a counter incremented by operations rather than wall-clock time) or less likely to be influenced by specific system implementation details in order to have more predictable and reproducible behavior.

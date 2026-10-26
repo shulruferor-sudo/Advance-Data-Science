@@ -1,0 +1,761 @@
+# retrofitting fine grain isolation in the firefox renderer extended version
+
+shravan narayan $^{\dagger}$  craig desselkoen $^{\dagger}$  tal garfinkel\* nathan froyd\* eric rahm\* sorin lerner $^{\dagger}$  hovav shacham\*, deian stefan $^{\dagger}$  uc san diego \*stanford \*mozilla \*ut austin
+
+# abstract
+
+firefox and other major browsers rely on dozens of third-party libraries to render audio, video, images, and other content. these libraries are a frequent source of vulnerabilities. to mitigate this threat, we are migrating firefox to an architecture that isolates these libraries in lightweight sandboxes, dramatically reducing the impact of a compromise.
+
+retrofitting isolation can be labor-intensive, very prone to security bugs, and requires critical attention to performance. to help, we developed rlbox, a framework that minimizes the burden of converting firefox to securely and efficiently use untrusted code. to enable this, rlbox employs static information flow enforcement, and lightweight dynamic checks, expressed directly in the  $\mathrm{c + + }$  type system.
+
+rlbox supports efficient sandboxing through either software-based-fault isolation or multi-core process isolation. performance overheads are modest and transient, and have only minor impact on page latency. we demonstrate this by sandboxing performance-sensitive image decoding libraries (libjpeg and libpng), video decoding libraries (libtheora and libvpx), the libvorbis audio decoding library, and the zlib decompression library.
+
+rlbox, using a webassembly sandbox, has been integrated into production firefox to sandbox the libgraphite font shaping library.
+
+# 1 introduction
+
+all major browsers today employ coarse grain privilege separation to limit the impact of vulnerabilities. to wit, they run renderers—the portion of the browser that handles untrusted user content from html parsing, to javascript execution, to image decoding and rendering—in separate sandboxed processes [3, 33, 39]. this stops web attackers that manage to compromise the renderer from abusing local os resources to, say, install malware.
+
+unfortunately, this is no longer enough: nearly everything we care about today is done through a website. by compromising the renderer, an attacker gets total control of the current site and, often, any other sites the browser has credentials for [14]. with services like dropbox and google drive, privilege separation is insufficient even to protect local files that sync with the cloud [24].
+
+browser vendors spend a huge amount of engineering effort trying to find renderer vulnerabilities in their own
+
+code [28]. unfortunately, many remain—frequently in the dozens of third-party libraries used by the renderer to decode audio, images, fonts, and other content. for example, an out-of-bounds write in libvorbis was used to exploit firefox at pwn2own 2018 [7]. both chrome and firefox were vulnerable to an integer-overflow bug in the libvpx video decoding library [10]. both also rely on the skia graphics library, which had four remote code execution bugs until recently [12, 36].
+
+to appreciate the impact of these vulnerabilities and the difficulty of mitigating them, consider a typical web user, alice, that uses gmail to read email in her browser. suppose an intruder, trudy, sends alice an email that contains a link to her malicious site, hosted on sites.google.com. if alice clicks on the link, her browser will navigate her to trudy's site, which can embed an .ogg audio track or .webm video to exploit vulnerabilities in libvorbis and libvpx and compromise the renderer of alice's browser. trudy now has total control of alice's gmail account. trudy can read and send emails as alice, for example, to respond to password reset requests from other sites alice belongs to. in most cases, trudy can also attack cross site [14], i.e., she can access any other site that alice is logged into (e.g., alice's amazon.com account).
+
+recent version of chrome (and upcoming versions of firefox) support site isolation [40], which isolates different sites from each other (e.g., *.google.com from *.amazon.com) to prevent such cross-site attacks. unfortunately, trudy might still be able to access {drive, pay, cloud}.google.com, which manage alice's files, online payments, and cloud infrastructure—since the renderer that loads the malicious .ogg and .webm content might still be running in the same process as those origins.
+
+for many sites, trudy might not even need to upload malicious content to the (trusted) victim origin (sites.google.com in our example). most web applications load content, including images, fonts, and video, from different origins. of the alexa top 500 websites, for example, over  $93\%$  of the sites load at least one such cross-origin resource (§7.1). and the libraries handling such content are not isolated from the embedding origin, even with site isolation [40].
+
+to mitigate these vulnerabilities, we need to harden the renderer itself. to this end, we extend the firefox renderer to isolate third party libraries in fine grain sandboxes. using this,
+
+we can prevent a compromised library from gaining control of the current origin or any other origin in the browser.
+
+making this practical poses three significant challenges across three dimensions. first, engineering effort—we need to minimize the upfront work required to change the renderer to use sandboxing, especially as this is multiplied across dozens of libraries; minimizing changes to libraries is also important as this can significantly increase the burden of tracking upstream changes. second, security—the renderer was not built to protect itself from libraries; thus, we have to sanitize all data and regulate control flow between the library and renderer to prevent libraries from breaking out of the sandbox. in our experience, bugs at the library-renderer boundary are not only easy to overlook, but can nullify any sandboxing effort—and other developers, not just us, must be able to securely sandbox new libraries. finally, efficiency—the renderer is performance critical, so adding user-visible latency is not acceptable.
+
+to help us address these challenges, we develop a framework called rlbox that makes data- and control-flow at the library-renderer interface explicit, using types. unlike prior approaches to sandbox automation that rely on extensive custom analysis frameworks (§8), rlbox is simply a library<sup>1</sup> that leverages the c++ type system and is easy to incorporate into firefox's predominantly c++ codebase.
+
+using type information, rlbox can identify where security checks are needed, automatically insert dynamic checks when possible, and force compiler errors for any security checks that require additional user intervention. our type-driven approach enables a systematic way to migrate firefox's renderer to use sandboxed libraries and allows rlbox to support secure and efficient sharing of data structures between the renderer and library (e.g., by making shared memory operations safe and by lazily copying data out of the sandbox).
+
+to enable efficient sandboxing, we adapt and evaluate two isolation mechanisms for library sandboxing: software-based fault isolation (sfi) leveraging google's native client (nacl) [48, 64] and a multi-core process-based approach. we also explore applying sandboxing at different granularities (e.g., per-origin and per-library sandboxing) to find the appropriate balance between security and sandboxing overhead.
+
+to evaluate rlbox, we sandbox several libraries in firefox: the libjpeg and libpng image decoding libraries, the libvpx and libtheora video decoding libraries, the libvorbis audio decoding library, and the zlib decompression library. browsing a representative sample of both popular and unpopular websites ( $\s 7$ ), we find the end-to-end memory overhead of rlbox to be modest— $25\%$  with sfi,  $18\%$  with process isolation—and transient, appearing only at content load time. the impact on page latency is small:  $3\%$  and  $13\%$  with sfi and process isolation, respectively. our sandboxing does not noticeably impact the video frame rates nor audio decoding bitrate.
+
+our evaluation shows that retrofitting fine grain isolation, especially using sfi, is practical—and we've been integrating rlbox into production firefox [50].<sup>2</sup> since nacl has been deprecated [17] in favor of webassembly (wasm) [20], our production sandbox also uses wasm. we used rlbox with this wasm-based sandbox to isolate the libgraphite font shaping library and are in the process of migrating several others [15, 50]. we describe this effort in section 9.
+
+though we developed rlbox to sandbox libraries in firefox, rlbox is a general library-sandboxing framework that can be used outside firefox. to demonstrate this, we use rlbox to sandbox libraries in two different contexts: the apache web server and node.js runtime. for apache, we sandbox the libmarkdown library that is used in the mod_markdown module [31]; we find that rlbox with the sfi sandbox increases the tail latency of the apache server by  $10\%$  (4ms) and decreases the throughput by  $27\%$  (256 requests/second). for node.js, we sandbox the c bcrypt library that is used by the javascript bcrypt module [37]; we measure rlbox with sfi to impose an overhead of  $27\%$  on hashing throughput.
+
+contributions. we present the case for sandboxing third party libraries in the browser renderer, and potential architectural trade-offs, including our approach ( $\s 2$ ). we offer a taxonomy of security pitfalls encountered while migrating the firefox code base to this architecture that were largely overlooked by previous work ( $\s 3$ ), and rlbox, a framework we developed to prevent these pitfalls that leverages the  $\mathrm{c}++$  type system to enforce safe data and control flow ( $\s 4$ ), and enables an incremental compiler-driven approach to migrating code to a sandboxed architecture ( $\s 5$ ). we describe our implementation, including our software fault isolation and multi-core process-based isolation mechanisms ( $\s 6$ ), and evaluate the performance of rlbox ( $\s 7$ ). we close with a discussion of related work ( $\s 8$ ) and our effort upstreaming rlbox into production firefox ( $\s 9$ ).
+
+availability. all work presented in this paper, including our modified firefox builds, the rlbox library, and benchmarks are available and open source.<sup>3</sup>
+
+# 2 fine grain sandboxing: how and why
+
+renderers rely on dozens of third-party libraries to support media decoding and other tasks (e.g., decompression, which sites use to optimize page load times and bandwidth consumption). these are written almost exclusively in c and tasked with parsing a wide range of complex inputs. unsurprisingly, exploitable vulnerabilities in this code are relatively frequent, even after years of scrutiny.
+
+these libraries are a compelling place to employ sandboxing inside the renderer for several reasons. first, media content such as images and video are rich attack vectors, as web applications allow them to be shared pervasively. over  $93\%$
+
+of the alexa top 500 websites load such content cross-origin (§7.1). and nearly all forms of social media and peer-to-peer messaging platforms enable the sharing of images and video.
+
+next, content libraries can be effectively sandboxed, as they require little privilege to operate, i.e., once these libraries are memory isolated, the harm they can inflict is minimal. for example, an attacker that compromises an image decoding library could at worst change how images display. in contrast, sandboxing a highly privileged component like the javascript engine is largely ineffectual. an attacker with control over the javascript engine can run arbitrary javascript code and thus already has complete control of the web application.
+
+finally, the existing library-renderer interface provides a natural place to partition code. compared to coarse grain techniques like privilege separation or site isolation, which spin up entire new renderer processes, spinning up a sandbox for a library is very cheap (§7). moreover, because library sandboxes are only needed during content decoding, their memory overhead is transient.
+
+isolation strategies. a key question remains: what grain of isolation should be employed? in particular, different architectures have different implications for performance and security. prior to rlbox, firefox was largely exploring a coarse grain approach to library sandboxing, placing certain media libraries into a single sandboxed media process [33]. this approach has some benefits for performance as there is only one sandbox, but trades off security.
+
+first, the assurance of the sandbox is reduced to that of the weakest library. this is less than ideal, especially when we consider the long tail of infrequently used media libraries required to preserve web compatibility (e.g., theora) which often contain bugs. next, the attacker gains the power of the most capable library. some libraries handle active content— zlib, for example, is used to decompress http requests that could contain html or javascript—as opposed to passive content such as images or fonts. thus compromising a passive library like libvorbis, could still enable powerful attacks—e.g., modify the javascript decompressed by zlib. when multiple renderers share a common library sandbox, an intruder can attack across tabs, browsing profiles, or sites. finally, coarse grain sandboxing does not scale to highly performance-critical libraries, such as libjpeg and libpng ( $\s 7.5.2$ ).
+
+rlbox lets us employ more granular sandboxing policies that can address these shortcomings. its flexibility lets us explore the performance implications of various sandboxing architectures with different isolation mechanisms ( $\s 7.4$ ).
+
+in this paper, we largely employ a unique sandbox per <renderer, library, content-origin, content-type>. this mitigates many of the problems noted above, while still offering modest memory overheads. per-renderer sandboxing prevents attacks across tabs and browsing profiles. per-library ensures that a weakness in one library does not impact any other library. per-content-origin sandboxing prevents cross origin (and thus cross site) attacks on content. for
+
+example, a compromise on sites.google.com as discussed in our example in section 1, should not impact content from pay.google.com. per-content-type sandboxing addresses the problem of passive content influencing active content.
+
+both finer and coarser grain policies are practically useful, though. in production firefox, for example, we create a fresh sandbox for each graphite font instance (§9). but, we also foresee libraries where, say, same-origin is sufficient.
+
+attacker model. we assume a web attacker that serves malicious (but passive) content—from an origin they control or by uploading the content to a trusted origin—which leads to code execution (e.g., via a memory safety vulnerability) in a rlbox sandbox. rlbox ensures that such an attacker can only affect (corrupt the rendering of and potentially leak) content of the same type, from the same origin. per-object (or per-instance) sandboxing can further reduce the damage of such attacks. we, however, only use this policy when sandboxing audio, videos, and font shaping—we found the overheads of doing this for images to be prohibitive.
+
+we consider side channels out-of-scope, orthogonal challenges. with side channels, an attacker doesn't need to exploit renderer vulnerabilities to learn cross-origin information, as browsers like firefox largely do not prevent cross-origin leaks via side channels. fuzzyfox [27] and cross-origin read blocking [40] are promising ways to tackle these channels.
+
+for the same reason, we consider transient execution attacks (e.g., spectre [26]) out of scope. we believe that our sfi and our process-based isolation mechanisms make many of these attacks harder to carry out—e.g., by limiting transient reads and control flow to the sandbox memory and code, respectively—much like site isolation [40]. but, in general, this is not enough: an attacker could potentially exploit code in the renderer to transiently leak sensitive data. we leave the design of a spectre-robust sandbox to future work.
+
+the protections offered by rlbox are only valid if the firefox code that interfaces with the sandboxed library code is retrofitted to account for untrusted code running in the library sandbox. as we discuss next, this is usually notoriously difficult to get right. rlbox precisely reduces this burden to writing a series of validation functions. in our attacker model, we assume these functions to be correct.
+
+# 3 pitfalls of retrofitting protection
+
+the firefox renderer was written assuming libraries are trusted. to benefit from sandboxing requires changing our threat model to assume libraries are untrusted, and modify the renderer-library interface accordingly (e.g., to sanitize untrusted inputs).
+
+while migrating to this model we made numerous mistakes—overlooking attack vectors and discovering many bugs only after building rlbox to help detect them. we present a brief taxonomy of these mistakes, with examples drawn from the code snippet illustrating the interface
+
+between the renderer's jpeg decoder and libjpeg<sup>4</sup> shown in figure 1. we discuss how rlbox helps prevent these attacks in section 4.
+
+for the rest of this section, we assume that libjpeg is fully sandboxed or memory isolated, i.e., libjpeg code is restricted from accessing arbitrary memory locations in the renderer process, and may only access memory explicitly dedicated to the sandbox—the sandbox memory. the renderer itself can access any memory location including sandbox memory.
+
+# 3.1 insecure data flow
+
+failing to sanitize data. failing to sanitize data received from libjpeg including function return values, callback parameters, and data read from sandbox shared memory can leave the renderer vulnerable to attack. for example, if the renderer uses the num_bytes parameter to the skip_input_data() callback on line 25 of figure 1 without bounds checking it, an attacker-controlled libjpeg could could force it to overflow or underflow the src->next_input_byte buffer.
+
+pointer data is particularly prone to attack, either when pointers are used directly (with c++'s  $\star$  and -> operators) or indirectly (via memory functions such as memcpy()) and memmove(), array indexing operations, etc.). for example, if the parameter jd of fill_input_buffer() is not sanitized (line 35), the read of jd->src on line 36 becomes an arbitrary-read gadget. in the same callback, if both jd and src are unsanitized, the write to src->next_input_byte on line 39 becomes an arbitrary-write gadget. similar attacks using the memmove() on line 50 are possible.
+
+missing pointer swizzles. some sandboxing mechanisms—e.g., nacl (\$6.2) and wasm (\$9)—use alternate pointer representations. some sandboxing tools e.g., nacl (\$6.2) and wasm (\$9) use alternate pointer representations for efficiency.
+
+though this is often done for performance, in wasm's case this is more fundamental: wasm pointers are 32-bit whereas firefox pointers are 64-bit. we must translate or swizzle pointers to and from these alternate representations when data is transferred between the renderer and the sandboxed libjpeg.
+
+we found that doing this manually is both tedious and extremely error prone. this is largely because pointers can be buried many levels deep in nested data structures. overlooking a swizzle either breaks things outright, or worse, silently introduces vulnerabilities. for instance, failing to swizzle the nested pointer minfo.err on line 44 prior to dereferencing, can result in a write gadget (whose write-range depends on the precise pointer representation).
+
+leaking pointers. leaking pointers from the firefox renderer to the sandboxed libjpeg can allow an attacker to derandomize aslr [49] or otherwise learn locations of code pointers (e.g., c++ virtual tables). together with an
+
+```c
+// initinternal() registers callbacks  
+ $\rightarrow$  for libjpeg to call while decoding an image  
+nsresult nsjpegdecoder::initinternal() {  
+...  
+minfo.client_data = (void*)this;  
+...  
+// callbacks invoked by libjpeg  
+merr.pub.error_exit = my_error_exit;  
+msourcemgr fills_input_buffer = fill_input_buffer;  
+msourcemgr.skip_input_data = skip_input_data;  
+...  
+}  
+// adjust output buffers for decoded pixels  
+void nsjpegdecoder::outputscanlines (...) {  
+...  
+while (minfo.output_scanline < minfo.output_height) {  
+...  
+imagerow = ... +  
+ $\rightarrow$  (minfo.output_scanline * minfo.output_width);  
+...  
+}  
+...  
+}  
+// invoked if some input bytes are not needed  
+void skip_input_data (..., long num_bytes) {  
+...  
+if (num_bytes > (long) src->bytes_in_buffer) {  
+...  
+} else {  
+src->next_input_byte += num_bytes;  
+}  
+}  
+// invoked repeatedly to get input as it arrives  
+void fill_input_buffer (j_decompress_ptr jd) {  
+struct jpeg_source_mgr* src = jd->src;  
+nsjpegdecoder* decoder = jd->client_data;  
+...  
+src->next_input_byte = new_buffer;  
+...  
+if (/* buffer is too small *) {  
+joctet* buf = (joctet*) realloc(...);  
+if (!buf) {  
+decoder->minfo.err->msg_code = jerr_out_of_memory;  
+...  
+}  
+...  
+}  
+memmove(decoder->mbackbuffer + decoder->mbackbufferlen,  
+ $\leftrightarrow$  src->next_input_byte, src->bytes_in_buffer);  
+}  
+}  
+// invoked on a decoding error  
+void my_error_exit (j_common_ptr cinfo) {  
+decoder_error_mgr* err = cinfo->err;  
+...  
+longjmp(err->setjmp_buffer, error_code);
+```
+
+figure 1: the renderer-library interface: this code snippet illustrates the renderer's interface to the jpeg decoder and is used as a running example. the decoder uses libjpeg's streaming interface to decode images one pixel-row at a time, as they are received. receiving and decoding concurrently is critical for responsiveness.
+
+arbitrary-write gadget, this can allow an attacker-controlled libjpeg to execute arbitrary code in the renderer.
+
+in our example, the renderer saves pointers to nsjpegdecoder objects in libjpeg structs (line 4), which alone allows an attacker to locate code pointers—the nsjpegdecoder class is derived from the decoder class, which defines virtual methods and thus has a virtual table pointer as the first field. even initializing callbacks (line 8) could leak pointers to functions and reveal the location of firefox's code segment<sup>5</sup>.
+
+double fetch bugs. rlbox uses shared memory (§4) to efficiently marshal objects between the renderer and the sandboxed libraries. this, unfortunately, introduces the possibility of double fetch bugs [46, 61, 63].
+
+consider the minfo object used in figure 1. since this object is used by both libjpeg and the renderer, rlbox stores it in shared memory. now consider the bounds check of minfo.output_scanline on line 16 prior to the assignment of output buffer imagerow. in a concurrent libjpeg sandbox thread, an attacker can modify minfo.output_scanline after the check (line 16), and before the value is fetched (again) and used on line 18. this would bypasses the bounds check, leading to an arbitrary-write gadget. while this example is obvious, double-flycatch bugs often span function boundaries and are much harder to spot.
+
+# 3.2 insecure control flow
+
+isolation prevents arbitrary control transfers from the sandbox into the renderer. thus, out of necessity, callbacks for libjpeg must be explicitly exposed. but this alone is not sufficient to prevent attacks.
+
+corrupted callback state. callbacks may save state in the sandboxed library. an attacker-controlled libjpeg can abuse the control flow of callbacks by corrupting this state. for example, on line 4 of figure 1, the renderer stores a pointer to the nsjpegdecoder object into the client_data field of minfo. inside fill_input_buffer() this pointer is used to access the nsjpegdecoder object (line 37). failing to sanitize client_data before using it allows an attacker to set the pointer to a maliciously crafted object and hijack control flow when firefox invokes a virtual method on this object.
+
+unexpected callback invocation. security bugs can also occur if an attacker controlled libjpeg invokes a permitted callback at unexpected times. consider the my_error_exit() callback function, which uses longjmp() to implement error handling. on line 58, longjmp() changes the instruction pointer of the renderer based on information stored in setjmp_buffer. if an attacker invokes my_error_exit() before setjmp_buffer is initialized, they can (again) hijack the renderer control flow.
+
+callback state exchange attacks. threading introduces another vector to attack callback state. when firefox decodes two images in parallel, two decoder threads make calls to libjpeg. firefox expects libjpeg to invoke the fill_input_buffer() callback on each thread with the corresponding nsjpegdecoder object. but, an attacker could supply the same nsjpegdecoder object to both threads when calling fill_input_buffer(). if the first thread reallocates the source buffer (line 42), while the second thread is using it to get input bytes, this can induce a data race and use-after-free vulnerability in turn.
+
+# 4 rlbox: automating secure sandboxing
+
+modifying the firefox jpeg decoder to guard against all the attacks discussed in section 3 requires substantial code additions and modifications. doing this manually is extremely error prone. moreover, it also makes the code exceedingly fragile: anyone making subsequent changes to the decoder must now have an intimate knowledge of all the necessary checks to have any hope of getting it right. multiply this by the number of libraries firefox supports and number of developers working on the renderer, and the problem becomes intractable.
+
+we built the rlbox framework to tackle these challenges. rlbox helps developers migrate and maintain code in the firefox renderer to safely use sandboxed libraries. we designed rlbox with the following goals in mind:
+
+1. automate security checks: adding security checks un-assisted is labor intensive and error prone, as discussed (§3). however, most of the sandboxing pitfalls can be detected and prevented through static checks, i.e., through compile-time errors indicating where code needs to be manually changed for security, or eliminated with dynamic checks and sanitizations (e.g., pointer swizzling and bounds checking).  
+2. no library changes: we want to avoid making changes to libraries. when libraries come from third parties we do not necessarily understand their internals, nor do we want to. additionally, any changes we make to libraries increases the effort required to track upstream changes.  
+3. simplify migration: firefox uses dozens of libraries, with occasional additions or replacements. consequently, we want to minimize the per-library effort of using rlbox, and minimize changes to the firefox renderer source.
+
+in the rest of the section we give an overview of the rlbox framework and describe how rlbox addresses the pitfalls of section 3 while preserving these goals.
+
+# 4.1 rlbox overview
+
+rlbox makes data and control flow at the renderer-sandbox interface explicit through its type system and apis in order to mediate these flows and enforce security checks across the trust boundary.
+
+rlbox mediates data flow with tainted types that impose a simple static information flow control (ifc) discipline [41]. this ensures that sandbox data is validated before any potentially unsafe use. it also prevents pointer leaks into the sandbox that could break aslr.
+
+rlbox mediates control flow through a combination of tainted types and api design. tainting, for example, allows rlbox to prevent branching on tainted values that have not been validated. api design, on the other hand, is used to restrict control transfers between the renderer and sandbox. for instance, the renderer must use sandbox.invoke() to invoke functions in the sandbox; any callback into the renderer by the sandbox must first be registered by the renderer using the sandbox_callback(callback_fn) api.
+
+mediating control and data flow allows rlbox to:
+
+$\triangleright$  automate security checks: swizzling operations, performing checks that ensure sandbox-supplied pointers point to sandbox memory, and identifying locations where tainted data must be validated is done automatically.  
+- minimize renderer changes: tainted data validation is enforced only when necessary. thus, benign operations such as adding or assigning tainted values, or writing to tainted pointers (which are checked to ensure they point into the sandbox at creation time) are allowed by rlbox's type system. this eliminates needless changes to the renderer, while still ensuring safety.  
+efficiently share data structures: static checks ensure that shared data is allocated in sandbox memory and accessed via tainted types. data structures received by the renderer sandbox are marshaled lazily; this allows code to access a single field in a shared struct without serializing a big object graph. finally, rlbox provides helper apis to mitigate double fetches [46, 61] when accessing this data.  
+$\triangleright$  assist with code migration: compile-time type and interface errors (§5) guide the developer through the process of migrating a library into a sandbox. each compile error points to the next required code change—e.g., data that needs to be validated before use, or control transfer code that needs to be changed to use rlbox apis.  
+$\triangleright$  bridge machine models: sandboxing mechanisms can have a different machine model from the application (e.g., both native client and webassembly use 32-bit pointers and 32-bit longs regardless of the platform); by intercepting all data and control flow we can also automatically translate between the application and sandbox machine models—and for wasm we do this (\$9).
+
+in the rest of this section, we discuss how tainting is used to mediate data flow (§4.2) and control flow (§4.4). we then describe how the renderer can validate and untaint data (§4.3). we detail our implementation as a c++ library later (§6.1).
+
+# 4.2 data flow safety
+
+all data originating from a sandbox begins life tainted. tainting is automatically applied by wrapping data with the tainted<t> constructor. tainting does not change the memory layout of a value, only its type. once applied, though, tainting cannot be removed. the only way to remove a taint is through explicit validation (§4.3).
+
+in general, rlbox propagates taint following a standard ifc discipline. for example, we propagate taint to any data derived from tainted values such as data accessed through a tainted pointer, or arithmetic operations when one or more operands are tainted. we detail how rlbox implements tainted types and taint tracking in the  $\mathrm{c}++$  type system in section 6.1. in the rest of this section we show how rlbox uses tainting to ensure data flow safety.
+
+data flow into the renderer. to protect the renderer from malicious inputs, all data flows from the sandbox into the renderer are tainted. data primarily flows out of the sandbox through two interfaces. first, sandbox.invoke (), the only way to call into the sandbox, taints its return value. second, the use of sandbox_callback (), which permits callbacks into the renderer from the sandbox, statically forces the parameters of callbacks to be tainted. any code failing to follow either of these rules would cause a compilation error.
+
+as an example, consider the jpeg decoder code that calls libjpeg'sjpeg_read_header() to parse headers shown below:
+
+```c
+jpeg_decompress_struct minfo;  
+int status =jpeg_read_header(&minfo,true);
+```
+
+with rlbox, the second line must be modified to use sandbox.invoke(), and status must be declared as tainted:
+
+```txt
+tainted<int> status = sandbox.invoke(mrlbox,  $\rightarrow$ jpeg_read_header，&minfo，true);
+```
+
+in addition to the invoke and callback interfaces, data can flow into the renderer via pointers to sandboxed memory. rlbox, however, forces both these pointers and any data derived from them (e.g., via pointer arithmetic or pointer dereferencing) to be tainted—and, as we discuss shortly, using tainted pointers in the renderer is always safe.
+
+data flow into the sandbox. rlbox requires data flowing into sandbox from the renderer to either have a simple numeric type or a tainted type. untainted pointers, i.e., pointers into renderer memory, are not permitted. this restriction enforces a code correctness requirement—sandboxed code only gets pointers it can access, i.e., pointers into sandbox memory—and, moreover, preserves the renderer's aslr: any accidental pointer leaks are eliminated by construction.
+
+compile-time errors are used to guide the code changes necessary to use a sandboxed library. to demonstrate this, we continue with the example of jpeg header parsing
+
+shown above. to start, note that the true parameter tojpeg_read_header() can remain unchanged as it has a simple numeric type (in  $\mathrm{c}++$ ). on the other hand, the parameter &minfo points to a struct in renderer memory, which libjpeg cannot access; rlbox thus raises a compile-time error.
+
+to address this compilation error, rlbox requires such shared data structures to be allocated in sandbox memory using sandbox_malloc():
+
+```c
+tainted<jpeg_decompress_struct  $\star >$  p_minfo   
+ $\rightarrow =$  sandbox_malloc<jpeg_decompress_struct>(mrlbox);   
+tainted<int> status  $=$  sandbox invoke(mrlbox,   
+ $\leftrightarrow$  :jpeg_read_header,p_minfo，true);
+```
+
+placing shared data structures in sandboxed memory in this way simplifies data marshaling of pointer parameters during function calls—rlbox simply marshals pointers as numeric types, it does not eagerly copy objects. indeed, this design allows rlbox to automatically generate the marshaling code without any user annotations or pointer bounds information (as required by most rpc-based sandboxing tools). moreover, rlbox can do all of this without compromising the renderer's safety—renderer code can only access shared sandbox memory via tainted pointers.
+
+while rlbox does not allow passing untainted pointers into libjpeg, pointers to callback functions, such as fill_input_buffer(), need to be shared with the sandbox—these can be shared either as function call parameters to libjpeg functions, return values from callbacks, or by directly writing to sandbox memory. rlbox permits this without exposing the raw callback pointers to libjpeg, through a level of indirection: trampoline functions. specifically, rlbox automatically replaces each firefox callback passed to libjpeg with a pointer to a trampoline function and tracks the mapping between the two. when the trampoline function is invoked, rlbox invokes the appropriate firefox callback on libjpeg's behalf.
+
+benefits of tainted pointers. by distinguishing pointers to renderer memory from pointers to sandbox memory at the type level with tainted, rlbox can automatically enforce several important security requirements and checks. first, rlbox does not permit firefox to pass untainted pointers to libjpeg. second, rlbox automatically swizzles and unswizzles pointers appropriately when pointers cross the renderer-library boundary, including pointers in deeply nested data structures. (we give a more detailed treatment of pointer swizzling in appendix a.) third, rlbox automatically applies pointer-bounds sanitization checks when tainted pointers are created to ensure they always point to sandboxed memory. together, these properties ensure that we preserve the renderer's aslr—any accidental pointer leaks are eliminated by construction—and that the renderer cannot be compromised by unsanitized pointers—all tainted pointers point to sandbox memory.
+
+# 4.3 data validation
+
+rlbox disallows computations (e.g., branching) on tainted data that could affect the renderer control and data flow. the firefox renderer, however, sometimes needs to use data produced by library code. to this end, rlbox allows developers to unwrap tainted values, i.e., convert a tainted<t> to an untainted t, using validation methods. a validation method takes a closure  $(\mathrm{c} + + \lambda \mathrm{m}$  bda) that unwraps the tainted type by performing necessary safety checks and returning the untainted result. unfortunately, it is still up to the user to get these checks correct; rlbox just makes this task easier.
+
+rlbox simplifies the burden on the developer by offering different types of validation functions. the first, verifyverify_fn), validates simple tainted value types that have already been copied to renderer memory (e.g., simple values), as shown in this example:
+
+```txt
+tainted<int> status = sandbox.invoke(mrlbox,  $\nrightarrow$ jpeg_read_header，p_minfo，true）;   
+int untaintedstatus  $=$  status.confirm([](int val){ if(val  $= =$  jpeg_suspended|| val  $= =$  jpegheader_tables_only|val  $= =$  jpegheader_ok）{return val;} else{/\*die!*/}）;   
+if(untaintedstatus  $= =$  jpeg_suspended）{...}
+```
+
+not all tainted data lives in renderer memory, though. validating shared tainted data structures that live in sandbox memory is unsafe: a concurrent sandbox thread can modify data after it's checked and before it's used. the copyandverify (verify_fn, arg) validator addresses this by copying its arguments into renderer memory before invoking the verify_fn closure. to prevent subtle bugs where a verify () function is accidentally applied to data in shared memory, rlbox issues a compile-time error—notifying the developer that copyandverify () is needed instead.
+
+the unsafeunverified() function removes tainting without any checks. this obviously requires care, but has several legitimate uses. for example, when migrating a codebase to use sandboxing, using unsafeunverified() allows us to incrementally test our code before all validation closures have been written ( $\s 5$ ). furthermore, unsafeunverified() is sometimes safe and necessary for performance—e.g., passing a buffer of libjpeg-decoded pixel data to the firefox renderer without copying it out of sandbox memory. this is safe as pixel data is simple byte arrays that do not require complex decoding.
+
+validation in the presence of double fetches. though our safe validation functions ensure that sandbox code cannot concurrently alter the data being validated, in practice we must also account for double fetch vulnerabilities.
+
+consider, for example, migrating the following snippet from the nsjpegdecoder::outputscanlines function:
+
+```txt
+while (minfo.output_scanline < minfo.output_height) {
+```
+
+```txt
+3 imagerow  $=$  reinterpret_cast<uint32_t  $\star >$  (mimagedata）+   
+4  $\hookrightarrow$  (minfo.output_scanline \* minfo.output_width);   
+5 ...   
+6}
+```
+
+here, minfo is a structure that lives in the sandbox shared memory. buffer imagerow is a pointer to a decoded pixel-row that firefox hands off to the rendering pipeline and thus must not be tainted. to modify this code, we must validate the results on lines 1 and 4 which are tainted as they rely on minfo. unfortunately, validation is complicated by the double fetch: a concurrent sandbox thread could change the value of output_scanline between its check on line 1 and its use on line 4, for example. unsafely handling validation would allow the sandbox to control the value of imagerow (the destination buffer) and thus perform arbitrary out-of-bounds writes.
+
+we could address this by copying output_scanline to a local variable, validating it once, and using the validated value on both lines. but, it's not always this easy—in our port of firefox we found numerous instances of multiple reads, interspersed with writes, spread across different functions. using local variables quickly became intractable.
+
+to address this, rlbox provides a freeze() method on tainted variables and struct fields. internally, this method makes a copy of the value into renderer memory and ensures that the original value (which lives in sandbox memory), when used, has not changed. to prevent accidental misuse of freezable variables, rlbox disallows the renderer from reading freezable variables and fields until they are frozen. rlbox does, however, allow renderer code to write to frozen variables—an operation that modifies the original value and its copy. finally, the unfreeze() method is used to restore the sandbox's write access.
+
+unlike most other rlbox features, ensuring that a variable remains frozen imposes some runtime overhead. this is thus a compile-time, opt-in feature that is applied to select variables and struct fields.
+
+writing placeholders. we identify two primary styles of writing placeholders in our porting firefox to use sandboxed libraries: we can focus on either preserving application invariants or on preserving library invariants when crossing the trust boundary. we demonstrate these two alternate styles, using the above outputscanlines example.
+
+1. maintaining application invariants: the first focuses on invariants expected by firefox. to do this, we observe that imagerow is a pointer into the mimagedata buffer and is used as a destination to write one row of pixels. thus, it is sufficient to ensure that the result of output_scanline * output_width is between 0 and mimagedatasize -rowsize. this means that the imagerow pointer has room for at least one row of pixels.  
+2. checking library invariants: the second option focuses on invariants provided by libjpeg. this option assumes that the firefox decoder behaves correctly when libjpeg
+
+is well-behaved. hence, we only need to ensure that libjpeg adheres to its specification. in our example, the libjpeg specification states that output_scanline is at most the height of the image: we thus only need to freeze output_scanline and then validate it accordingly.
+
+# 4.4 control flow safety
+
+as discussed in section 3, a malicious sandbox could attempt to manipulate renderer control flow in several ways. while data attacks on control flow are prevented by tainting (e.g., it's not possible to branch on a tainted variable), supporting callbacks requires additional support.
+
+control transfers via callbacks. it's unsafe to allow sandboxes to callback arbitrary functions in the renderer. it's also important to ensure they can only call functions which use tainted appropriately. thus, rlbox forces application developers—via compile-time errors—to explicitly register callbacks using the sandbox_callback() function. for instance, line 8 in figure 1, must be rewritten to:
+
+```txt
+msourcemgr fills_input_buffer
+```
+
+```txt
+$\hookrightarrow$  = sandbox_callback(mrlbox, fill_input_buffer);
+```
+
+statically whitelisting callbacks alone is insufficient—an attacker-controlled sandbox could still corrupt or hijack the control flow of the renderer by invoking callbacks at unexpected times. to address this class of attacks, rlbox supports unregistering callbacks with the unregister() method. moreover, the framework provides raii (resource acquisition is initialization) [54] semantics for callback registration, which allows useful code patterns such as automatically unregistering callbacks after completion of an invoked libjpeg function.
+
+to deal with callback state exchange attacks (§3), rlbox raises a compile-time error when renderer pointers leak into the sandbox. for example, the jpeg decoder saves its instance pointer with libjpeg and retrieves it in the fill_input_buffer() callback, as shown on line 37 of figure 1. rlbox requires the application developer to store such callback state in the application's thread local storage (tls) instead of passing it to libjpeg. thus, when fill_input_buffer() is invoked, it simply retrieves the decoder instance from the tls, preventing any pointer leaks or callback state modifications.
+
+non-local control transfers. a final, but related concern is protecting control flow via setjmp()/longjmp(). these functions are used for exception handling (e.g., my_error_exit() in figure 1). they work like a non-local goto, storing various registers and cpu state in a jmp_buf on setjmp() and restoring them on longjmp().
+
+naively porting libjpeg and libpng would store jmp_buf in sandboxed memory. unfortunately, this doesn't work--there is no easy way to validate a jmp_buf that is portable across different platforms. we thus instead place such sensitive state in the renderer's tls and avoid validation altogether. with libjpeg this is straightforward since the jmp_buf is only
+
+used in the my_error_exit() callback. libpng, however, calls longjmp() itself. since we can't expose longjmp() directly, when sandboxing libpng, we expose a longjmp() trampoline function that calls back to the renderer and invokes longjmp() on libpng's behalf, using the jmp_buf stored in the tls.
+
+# 5 simplifying migration
+
+rlbox simplifies migrating renderer code to use sandboxed libraries while enforcing appropriate security checks. rlbox does this by removing error-prone glue code (e.g., for data marshaling) and by reducing the security-sensitive code required for migration. the resulting reduction in developer effort is evaluated in detail in section 7.3.
+
+the rlbox framework helps automate porting by (1) allowing firefox developers to incrementally port application code—the entire application compiles and runs with full functionality (passing all tests) between each step of porting—and (2) guiding the porting effort with compiler errors which highlight what the next step should be. we illustrate how rlbox minimizes engineering effort using this incremental, compiler-directed approach using our running example.
+
+to start, we assume a standard firefox build that uses a statically linked libjpeg.
+
+step 1 (creating the sandbox). we start using rlbox by creating a sandbox for libjpeg using the none sandboxing architecture. as the name suggests, this sandbox does not provide isolation; instead it redirects all function calls back to the statically linked, unsandboxed libjpeg. however, rlbox still fully enforces all of its type-level guarantees such as tainting untrusted data. thus, we can start using rlbox while still passing functional tests.
+
+step 2 (splitting data and control flow). next, we migrate each function call to libjpeg to use the sandbox.invoke () api. rlbox flags calls passing pointers to the sandbox as compile-time errors after this conversion, as the sandbox will be unable to access the (application) memory being pointed to. to resolve this, we also convert the allocations of objects being passed to libjpeg to instead use sandbox_malloc(). for example, in section 3, we rewrote:
+
+```txt
+tainted<int> status = sandbox.invoke(mrlbox,  $\rightarrow$ jpeg_read_header，&minfo，true);
+```
+
+to, instead, allocate the minfo object in the sandbox:
+
+```c
+tainted<jpeg_decompress_struct  $\star >$  p_minfo  $=$  sandbox_malloc<jpeg_decompress_struct>(mrlbox); tainted<int> status  $=$  sandbox.invoke(mrlbox,  $\rightarrow$ jpeg_read_header，p_minfo，true）;
+```
+
+at this point, we need to re-factor the rest of this function and several other jpeg decoder functions—minfo is a data member of the nsjpegdecoder class. doing this in whole is exhausting and error-prone. instead, we remove the minfo data member and add one extra line of code in each member function before minfo is first used:
+
+```txt
+jpeg_decompress_struct&  $\rightarrow$  minfo  $=$ $\star$  (p_minfo_unsafeunverified());
+```
+
+this unsafe alias pattern allows the remainder of the function body to run unmodified, i.e., the alias defined in this pattern can be used everywhere the original minfo variable is needed, albeit unsafely, as unsafeunverified() temporarily suppresses the need for validation functions.
+
+we also need to deal with return values from sandbox.invoke() which are tainted, either by writing validation functions to remove the taint or deferring this till the next step and using unsafeunverified() to satisfy the type checker. again, the entire application should now compile and run as normal.
+
+step 3 (hardening the boundary). our next goal is to gradually remove all instances of the unsafe alias pattern, moving firefox to a point where all data from the sandbox shared memory and all tainted return values are handled safely.
+
+we can do this incrementally, checking our work as we go by ensuring the application still compiles and runs without errors. to do this, we simply move each unsafe-alias pattern downwards in the function source; as it moves below a given statement, that statement is no longer able to use the alias and must be converted to use the actual tainted value. this may involve writing validation functions, registering callbacks, or nothing (e.g., for operations which are safe to perform on tainted values). we can compile and test the application after any or all such moves. at the end, shared data is allocated appropriately, and all tainted values should be validated—no instances of unsafeunverified() should remain.
+
+step 4 (enabling enforcement). our final task is to replace the none sandbox with one that enforces strong isolation. to start, we remove the statically-linked libjpeg and change the sandbox type from none to none_dynlib. in contrast to the none sandbox, the none_dynlib sandbox dynamically loads libjpeg. any remaining calls to libjpeg made without the sandbox.invoke() will fail with a symbol resolution error at compile time. we resolve these and finish by changing the sandbox type to process, nacl sandbox types that enforce isolation. we discuss these isolation mechanisms in more detail in section 6.2.
+
+# 6 implementation
+
+our implementation consists of two components: (1) a  $\mathrm{c}++$  library that exposes the apis that developers use when sandboxing a third-party library, and (2) two isolation mechanisms that offer different scaling-performance trade-offs. we describe both of these below, and also describe a third approach in section 9.
+
+# 6.1 rlbox c++ api and type system
+
+the rlbox api is implemented largely as a pure c++ library. this library consists of functions like sandbox.invoke() that are used to safely transfer control between the application
+
+and library. these functions return tainted values and can only be called with tainted values or primitives. the library's wrapped types (e.g., tainted<t>) are used to ensure dataflow safety (e.g., when using a value returned by sandbox.invoke)). since the implementation of the control flow functions is mostly standard, we focus on our implementation of tainted values.
+
+the tainted<t> wrapper. we implement tainted<t> as a simple wrapper that preserves the memory layout of the unwrapped t value, i.e., tainted<int> is essentially struct tainted<int> { int val; }. the only distinction between tainted and untainted values is at the type-level. in particular, we define methods and operators on tainted<t> values that (1) ensure that tainted values cannot be used where untainted values are expected (e.g., branch conditions) without validation and (2) allow certain computations on tainted data by ensuring their results are themselves tainted.
+
+in general, we cannot prevent developers from deliberately abusing unsafe  $\mathrm{c + + }$  constructs (e.g., reinterpret_cast) to circumvent our wrappers. our implementation, however, guards against common  $\mathrm{c + + }$  design patterns that could inadvertently break our tainted abstraction. for example, we represent tainted pointers as tainted<t\*> and not tainted<t>\*. this ensures that developers cannot write code that inadvertently unwraps tainted pointers via pointer decay—since all  $\mathrm{c + + }$  pointers can decay to void\*. we also use template meta-programming and sfinae to express more complex type-level policies. for example, we disallow calls to verify () on pointer types and ensure that callback functions have wrapped all parameters in tainted.
+
+operators on tainted data. for flexibility, we define several operators on tainted types. operations which are always safe, such as the assignment (operator=) of a tainted<int>, simply forward the operation to the wrapped int. other operators, however, require return types to be tainted. still others require runtime checks. we give a few illustrative examples.
+
+$\triangleright$  wrapping returned values: we allow arithmetic operators (e.g., operator+) on, say, tainted<int>s, or a tainted<int> and an untainted int, but wrap the return value.  
+runtime checks: we allow array indexing with both ints and tainted<int>s by defining a custom array indexing operator operator[]. this operator performs a runtime check to ensure the array indexing is within sandbox memory.  
+$\triangleright$  pointer swizzling: we also allow operations such as operator  $=$ , operator  $\star$ , and operator  $\rightarrow$  on tainted pointers, but ensure that the operators account for swizzling (in addition to the runtime bounds check) when performing these operations. as with the others, these operators return tainted values. in appendix a, we describe the subtle details of type-driven automatic pointer swizzling.
+
+**wrappered structures.** our library can automatically wrap primitive types, pointer types, function pointers, and static array types. it cannot, however, wrap arbitrary user-defined structures without some added boilerplate definitions. this is because  $\mathrm{c}++$  (as of  $\mathrm{c}++17$ ) does not yet support reflection on struct field names. we thus built a ~100loc clang plugin that automatically generates a header file containing the required boilerplate for all struct types defined in the application source.
+
+other wrapped types. in addition to the tainted wrapper type, rlbox also relies on several other types for both safety and convenience. as an example of safety, our framework distinguishes registered callbacks from other function pointers, at the type level. in particular, sandbox_callback returns values of type callback<...>. this allows us to ensure that functions that expect callbacks as arguments can in fact only be called with callbacks that have been registered with sandbox_callback. as an example of convenience, rlbox provides rall types such as stack.arr<t> and heap arr<t> which minimize boilerplate. with these types, developers can for instance invoke a function with an inline string: sandbox.invoke(sbox, png_error, stackarr("...").
+
+# 6.2 efficient isolation mechanisms
+
+the rlbox api provides a plugin approach to support different, low-level sandboxing mechanisms. we describe two sandboxing mechanisms which allow portable and efficient solutions for isolating libraries in this section. in section 9 we describe a third mechanism, based on webassembly, that we recently integrated in production firefox.
+
+the first mechanism uses software-based fault isolation (sfi) [59] extending google's native client (nacl) [48, 64], while the second uses os processes with a combination of mutexes and spinlocks to achieve performance. these approaches and trade-offs are described in detail below.
+
+sfi using nacl. sfi uses inline dynamic checks to restrict the memory addressable by a library to a subset of the address space, in effect isolating a library from the rest of an application within a single process. sfi scales to many sandboxes, has predictable performance, and incurs low overhead for context switching (as isolation occurs within a single process). the low context-switch overhead (about  $10 \times$  a normal function call) is critical for the performance of streaming libraries such as libjpeg, which tend to have frequent control transfers. we explore this in more detail later ( $\s 7$ ).
+
+to support library sandboxing with sfi, we extend the nacl compiler toolchain [48, 64]. nacl was originally designed for sandboxing mobile code in the browser, not library sandboxing. hence, we made significant changes to the compiler, optimization passes, elf loader, machine model and runtime; we give a thorough description of these changes in appendix b. to ensure that our changes do not affect security, we always verify the code produced by our toolchain with the unmodified nacl binary code verifier.
+
+we use our modified nacl compiler toolchain to compile
+
+libraries like libjpeg along with a custom runtime component. this runtime component provides symbol resolution and facilitates communication with the renderer.
+
+process sandboxing. process sandboxing works by isolating a library in a separate sandbox process whose access to the system call interface is restricted using seccomp-bpf [33]. we use shared memory between the two processes to pass function arguments and to allocate shared objects. compared to sfi, process sandboxing is simpler and does not need custom compiler toolchains. when used carefully, it can even provide performance comparable to sfi (§7).
+
+as with sfi, process sandboxing also includes a custom runtime that handles communication between the library and renderer. unlike sfi, though, this communication is a control transfer that requires inter-process synchronization. unfortunately, using a standard synchronization mechanism—notably, condition variables—is not practical: a simple cross-process function is over  $300 \times$  slower than a normal function call.
+
+our process sandbox uses both spinlocks and condition variables, allowing users to switch between to address application needs. spinlocks offer low control-transfer latency ( $20 \times$  a normal function call), at the cost of contention and thus scalability. condition variables have higher latency (over  $300 \times$  a normal function call), but minimize contention and are thus more scalable. in the next section we detail our firefox integration and describe how we switch between these two process sandboxing modes.
+
+# 6.3 integrating rlbox with firefox
+
+to use the sfi or process sandbox mechanisms efficiently in firefox, we must make several policy decisions about when to create and destroy sandboxes, how many sandboxes to keep alive, and for the process sandbox when to switch synchronization modes. we describe these below.
+
+creating and destroying sandboxes. we build firefox with rlbox sandboxing web page decompression, image decoding, and audio and video playback. we apply a simple policy of creating a sandbox on demand—a fresh sandbox is required when decoding a resource with a unique <renderer, library, content-origin, content-type> as discussed in section 2. we lazily destroy unused sandboxes once we exceed a fixed threshold. we determine this threshold experimentally. most webpages have a large number of compressed media files as compared to the number of images ( $\s 7.1$ ). since we can only reasonably scale to 250 sandboxes ( $\s 7.5.3$ ), we conservatively use a threshold 10 sandboxes for jpeg and png image decoding, and 50 sandboxes for webpage decompression. browsers do not typically play multiple audio or video content simultaneously—we thus simply create a fresh sandbox for each audio and video file that must be decoded and destroy the sandbox immediately after.
+
+switching synchronization modes. for the process sandbox, we switch between spinlocks and conditional variables
+
+according to two policies. first, we use spinlocks when the renderer performs a latency sensitive task, such as decoding an image using a series of synchronous libjpeg function calls and callbacks. but, when the renderer requests more input data, we switch to the condition variables; spinlocks would create needless cpu contention while waiting for this data (often from the network). second, for large media decoding such as 4k images, we use condition variables: each function call to the sandbox process takes a large amount of time (relative to the context switch) to perform part of the decoding. though we can use more complex policies (e.g., that take load into effect), we find these two simple policies to perform relatively well ( $\s 7$ ).
+
+leveraging multiple cores. since  $95\%$  of devices that run firefox have more than 1 core, we can use multiple cores to optimize our sandbox performance. $^{7}$  in particular, our process sandbox implementation pins the sandboxed process on a separate cpu core from the renderer process to avoid unnecessary context switches between the renderer and sandboxed process. this is particularly important when using spinlocks since the sandbox process's spinlock takes cpu cycles even when "not in use"; pinning this process to a separate core ensures that the sandbox process does not degrade the renderer performance. in our evaluation ( $\s 7$ ), we reserve one of the system's cores exclusively for the processes created by our sandboxing mechanism, when comparing against the stock and sfi builds (which use all cores for the renderer process' threads).
+
+# 7 evaluation
+
+we present the following results:
+
+$\triangleright$  cross origin resources that could compromise the renderer are pervasive, and could even be used to compromise websites like gmail. we present measurements of their prevalence in the alexa top 500 websites in section 7.1.  
+$\triangleright$  library sandboxing overheads are modest: section 7.2 breaks down the individual sources of sandboxing overhead, section 7.4, shows end-to-end page latencies and memory overheads for popular websites are modest with both isolation mechanisms(§6.2)—even on media heavy websites, section 7.5, shows that the cpu overhead of web page decompression and image decoding in the renderer process are modest, and that cpu and memory overheads scale well up to our current maximum of 250 concurrent sandboxes.  
+migrating a library into rlbox typically takes a few days with modest effort, as shown in section 7.3.  
+- rlbox is broadly useful for library sandboxing beyond firefox, as demonstrated in 7.6, where we discuss our experience apply rlbox to sandboxing native libraries in apache and node.js modules.
+
+machine setup. all benchmarks run on an intel i7-6700k
+
+![](images/2f0894ddbba06e3ce22547bc7b5d7769a757a56abf6a9c14b020f338a6b584b7.jpg)  
+figure 2: cross-origin resource inclusion in the alexa top-500.
+
+(4 ghz) machine with 64 gb of ram, and hyperthreading disabled, running 64-bit ubuntu 18.04.1. firefox builds run pinned on two isolated cpu cores (i.e., no other process is allowed to run on these cpus), to reduce noise. as discussed in section 6.3, with the process sandbox build, the renderer process is pinned to one core, while the sandbox process uses the other core.
+
+# 7.1 cross-origin content inclusion
+
+to evaluate how often web sites include content (e.g., images, audio, and videos) cross-origin, we crawled the alexa top 500 websites. our crawler—a simple firefox extension—logs all cross-origin resource requests made by the website for 10 seconds after page load (allowing some dynamic content to be loaded). figure 2 shows our measurements, categorized by the resource mime type.
+
+we find that  $93\%$  of the sites load at least one cross-origin media resource (primarily images), with mean of 48 and median of 30, cross-origin media resources loaded. many of the resource loads (median 35 and mean 17) are not just cross-origin but also cross-site. in the presence of media parsing library bugs, such loads would undermine site isolation protections.
+
+the pervasive use of cross-origin resources inclusion indicates that sandboxing libraries at the <renderer, library, content-origin, content-type> granularity can significantly reduce the renderer attack surface. although not all cross-origin content is necessarily untrusted, the origin is nevertheless an important trust boundary in practice—and many websites do consider cross-origin media untrusted. for instance, google allows users to freely upload content to sites.google.com, but serves such media content from googleusercontent.com. google even re-encodes images, another sign that such images are untrusted.
+
+unfortunately, they do not re-encode video or audio files. to test this, we created a page on sites.google.com in which we embedded both the vpx video proof of concept exploit of cve-2015-4506 [10] and the ogg audio proof of concept exploit of cve-2018-5148 [11]. in both cases the files were unmodified. for vpx, we modified firefox and chrome (with site isolation) to re-introduce the vpx bug and visited our malicious website: in both browsers the video successfully triggered the bug.
+
+we found we could include such malicious content as part
+
+of an email to a gmail address. gmail re-encodes images, but does not re-encode the video and audio files. the gmail preview feature even allows us to play the audio track—which surprisingly, we found was hosted on mail.google.com.
+
+# 7.2 baseline rlbox overhead
+
+to understand the overhead of different parts of the rlbox framework in isolation we perform several micro-benchmarks.
+
+sandbox creation overhead. the overhead of sandbox creation is  $\approx 1\mathrm{ms}$  for sfi sandboxes and  $\approx 2\mathrm{ms}$  for process sandboxes. these overheads do not affect page latency for any realistic website, and can be hidden by pre-allocating sandboxes in a pool. for this reason, we don't include sandbox creation time in the remaining measurements.
+
+control transfer overhead. to understand the overhead of a control transfer, we measure the elapsed time for an empty function call with different isolation mechanisms. for reference, an empty function call without sandboxing takes about  $0.02\mu s$  in our setup. with sandboxing, we measured this to be  $0.22\mu s$  for sfi sandboxes,  $0.47\mu s$  for process sandboxes using spinlocks, and  $7.4\mu s$  for process sandboxes using conditional variables. sfi and process sandboxes using spinlocks are an order of magnitude slower than a normal function call, but over  $10\times$  faster than processes using condition variables, and are thus better suited for workloads with frequent control transfers.
+
+overhead of rlbox dynamic checks. the rlbox api introduces small overheads with its safety checks (e.g., pointer bounds checks, swizzling, and data validation functions). to measure these, we compare the overhead of rendering .jpeg and .png images on firefox with sandboxed libraries with and without rlbox enabled. we find the difference to be negligible ( $< 1\%$ ). this is unsurprising: most of rlbox's checks are static and our dynamic checks are lightweight masks.
+
+overhead of sfi dynamic checks. unlike process-based sandboxing, sfi incurs a baseline overhead (e.g., due to inserted dynamic checks, padding etc.) [64]. to understand the overhead of our nacl sfi implementation, we implement a small .jpeg image decoding program and measure its slowdown when using a sandboxed libjpeg. we find the overhead to be roughly  $22\%$ .
+
+# 7.3 migrating firefox to use rlbox
+
+in this section, we evaluate the developer effort required to migrate firefox to use sandboxed libraries. in particular, we report the manual effort required by rlbox developers and the manual effort saved by using the rlbox api. figure 3 gives a breakdown of the effort. on average, we find that it takes a bit over two days to sandbox a library with rlbox and roughly 180 loc (25% code increase); much of this effort is mechanical (following section 5).
+
+figure 3 also shows the tasks that rlbox automates away.
+
+<table><tr><td></td><td>task</td><td>jpeg decoder</td><td>png decoder</td><td>gzip decompress</td><td>theora decoder</td><td>vpx decoder</td><td>ogg-vorbis decoder</td></tr><tr><td rowspan="5">effort saved by rlbox automation</td><td>generated marshaling code</td><td>133 loc</td><td>278 loc</td><td>38 loc</td><td>39 loc</td><td>60 loc</td><td>59 loc</td></tr><tr><td>automatic pointer swizzles for function calls</td><td>30</td><td>96</td><td>5</td><td>36</td><td>46</td><td>34</td></tr><tr><td>automatic nested pointer swizzles</td><td>17</td><td>5</td><td>6</td><td>8</td><td>9</td><td>5</td></tr><tr><td>automatic pointer bounds checks</td><td>64 checks</td><td>25 checks</td><td>8 checks</td><td>12 checks</td><td>15 checks</td><td>14 checks</td></tr><tr><td>number of validator sites found</td><td>28</td><td>51</td><td>10</td><td>5</td><td>2</td><td>4</td></tr><tr><td rowspan="4">manual effort</td><td>number of person-days porting to rlbox</td><td>-</td><td>-</td><td>1 day</td><td>3 days</td><td>3 days</td><td>2 days</td></tr><tr><td>application loc before/after port</td><td>720 / 1058</td><td>847 / 1317</td><td>649 / 757</td><td>220 / 297</td><td>286 / 368</td><td>328 / 395</td></tr><tr><td>number of unique validators needed</td><td>11</td><td>14</td><td>3</td><td>3</td><td>2</td><td>2</td></tr><tr><td>average loc of validators</td><td>3 loc</td><td>4 loc</td><td>2 loc</td><td>3 loc</td><td>2 loc</td><td>2 loc</td></tr></table>
+
+![](images/02621f8ea91a8c0edad517ce0d8b37973eb5db6f1ad582069063d8d2302c67a0.jpg)  
+figure 3: manual effort required to retrofit firefox with fine grain isolation, including the effort saved by rlbox's automation. we do not report the number of days it took to port the jpeg and png decoders since we ported them in sync with building rlbox.  
+figure 4: impact of sandboxing on page load latencies and peak memory usage overheads. firefox with sfi sandboxes incurs a  $3\%$  page latency and  $25\%$  memory overhead while firefox with process isolation incurs a  $13\%$  page latency and a  $18\%$  memory overhead.
+
+![](images/4f2ddf9e4cfbd6f010159465260c04faf7207d468f5b0b2a503d9ef433329674.jpg)
+
+first, rlbox eliminates 607 lines of glue-code needed by both the process and sfi sandboxes to marshal function parameters and return values for each cross-boundary function call; rlbox automatically generates this boilerplate through  $\mathrm{c + + }$  templates and meta-programming. second, rlbox automatically swizzles pointers. this is necessary for any sandbox functions or callbacks that accept pointers; it's also necessary when handling data-structures with nested pointers that are shared between the application and the sandbox. this is a particularly challenging task without rlbox, as manually identifying the 297 locations where the application interacts with such pointers would have been tedious and error-prone. third, rlbox automatically performs bounds checks (§4.2); the number of required pointer bounds checks that were automatically performed by rlbox are again in the hundreds (138).
+
+finally, rlbox identifies the (100) sites where we must validate tainted data ( $\s 4.3$ ). though rlbox cannot automate the validators, we find that we only need 35 unique validators—all less than 4 lines of code. in practice, we found this to be the hardest part of migration since it requires understanding the domain-specific invariants.
+
+# 7.4 rlbox overhead in firefox
+
+we report the end-to-end overheads of firefox with library sandboxing by measuring page latencies of webpages, memory overheads in firefox as well as audio video playback rates.
+
+experimental setup. we evaluate end-to-end performance with six sandboxed libraries: libjpeg-turbo 1.4.3, libpng 1.6.3,
+
+zlib 1.2.11, libvpx 1.6.1, libtheora 1.2, and libvorbis as used in firefox 57.0.4. we report performance for two firefox builds that use libraries sandboxed with sfi and process mechanisms respectively. both builds create fresh sandboxes for each <renderer, library, origin, content-type> combination as described in §2. we measure impact on page load times for both these builds.
+
+# 7.4.1 end-to-end impact on real-world websites
+
+benchmark. we report the overhead of page load latency and memory overheads in firefox with the six sandboxed libraries by measuring latencies of the 11 websites used to measure the overhead of site isolation [40]. these websites are a representative sample of both popular and slightly-less-popular websites, and many of them make heavy use of media resources. we measure page load latency using firefox's talos test harness [32]. we measure memory overheads with cgmemtime [45]—in particular, the peak resident memory and cache usage during a run of firefox. we run the test 10 times and report the median values of page latency and memory overheads.
+
+results. as shown in figure 4, the page latency and cpu utilization overheads are modest. our sfi build incurs a  $3\%$  overhead in page latency while the process sandbox incurs an overhead of  $13\%$ . as a comparison point, the overhead of naively using process sandboxes (using only conditional variables without any cpu pinning) incurs an overhead of  $167\%$ .
+
+we find the average peak renderer memory overhead
+
+to be  $25\%$  and  $18\%$  for the sfi and process sandboxes, respectively. this overhead is modest and, more importantly, transient: we can destroy a sandbox after the media has been decoded during page load.
+
+# 7.4.2 sandboxing video and audio decoding
+
+to understand the performance overhead of rlbox on video and audio decoding, we measure the performance of firefox when decoding media from two video formats (theora and vpx) and one audio format (ogg-vorbis).
+
+benchmark. our benchmark measures decoding performance on the sintel sequence in xiph.org's media test suite<sup>8</sup>. as this sequence is saved as lossless video, we setup the benchmark by first converting this to ultra hd videos of 4k resolution in the theora and vp9 formats; we similarly convert the lossless audio to a high resolution ogg-vorbis audio file with a sample rate of  $96\mathrm{khz}$  and a bit rate of  $500\mathrm{kb/s}$  using the suggested settings for these formats [56, 58]. our benchmark then measures the frame-rate and bit-rate of the video and audio playback—by instrumenting the decoders with timers—when using the sandboxed libraries. we run the test 5 times and report the median values of frame-rate and bit-rate.
+
+results. we find that neither the sfi nor the process sandboxing mechanism visibly degrades performance. in particular, our sandboxed firefox are able to maintain the same frame-rate (24 fps for the vpx video and 60 fps for the theora video) and bit-rate (478 bits per second) as stock firefox for these media files.
+
+# 7.5 microbenchmarks of rlbox in firefox
+
+to understand the performance impact of rlbox on the different libraries, we perform several microbenchmarks that specifically measure the impact of sandboxing webpage decompression, image decoding and sandbox scaling in firefox.
+
+# 7.5.1 sandboxing webpage decompression
+
+firefox uses zlib to decompress webpages. since webpage decompression is done entirely before the page is rendered, we report the overhead of sandboxing zlib by measuring the slowdown in page load time.
+
+benchmark. we create a webpage whose html content (excluding media and scripts) is 1.8 mb, the size of an average web page<sup>9</sup>, and measure the page load time with talos. we use the median page load time from 1000 runs of this test.
+
+results. for both sfi and process sandboxing mechanisms, the overhead of sandboxing zlib is under  $1\%$ . in other words, the overhead of sandboxing zlib is largely offset by other computations needed to render a page.
+
+# 7.5.2 sandboxing image decoding
+
+to understand performance impact of sandboxing on image rendering, we measure per-image execution time for the .jpeg and .png decoders, with different forms of sandboxing, and compare our results to stock firefox. decoder execution time is a better metric for image rendering performance than page load time because firefox decodes and renders images asynchronously; the usual test harness would notify us that a page has been loaded before images have actually been decoded and displayed in full—and this might be visible to the user.
+
+**benchmarks.** we use the open image compression benchmark suite $^{10}$  to measure sandboxed image decoding overheads. to capture the full range of possibilities for performance overhead, we measure overheads of images at 3 sizes (135p, 320p, and 1280p) and three compression levels (best, default, and none) for each image in the benchmark suite. we run this test 4000 times for each image and compare the median decoder code execution times.
+
+results. since all images in the suite produce similar results, we give the results of one 8-bit image in figure 5. we start with three high-level observations. first, both sfi and process based sandboxes have reasonable overheads—23-32% and  $< 41\%$  respectively for most jpegs, 2-49% and  $< 15\%$  respectively for pngs. second, process sandbox sometimes has negative overheads. this is because the process sandbox dedicates one of the two available cores exclusively for execution of sandboxed code ( $\s 6.3$ ) including the sandboxed image rendering code, while the stock and sfi firefox builds use all cores evenly. third, for jpegs at the best compression, the overhead relative to stock firefox is high—roughly 80% for sfi and 140% for process sandboxes. this is because decoding high compression images have low absolute decode times ( $\sim 650\mu s$ ), and thus have larger overheads as control transfer overheads between firefox and the sandbox image libraries cost are not effectively amortized. however, in absolute terms, the differences are less than 1.5ms and have no impact on end-user experience.
+
+# 7.5.3 sandbox scaling characteristics
+
+web pages often contain tens of images of different types from multiple origins. thus, the scaling properties of different isolation mechanisms are an important consideration.
+
+benchmark. we evaluate sandbox scaling by rendering pages with an increasing number of jpeg images from unique origins. each image thus creates a new sandbox which incurs both cpu and memory costs. cpu costs are measured by measuring the total amount of time executing image decoding functions. we measure memory overhead as before, but don't destroy any sandbox; this allows us to estimate the worst case scenario where memory usage is not transient. as before
+
+![](images/1adcc83975f3c6e5b2629563c15e089fd68d0f510aaf090dbe075caf7b0df11e.jpg)  
+(a) jpeg rendering overhead
+
+![](images/e3525e8c06b5975aec3a9783d6dde22b3177e56df1edd24fd78fde48f53a31a3.jpg)  
+(b) png rendering overhead
+
+![](images/951fd77db14430ffb47c98f81273f0779ea209621f61eee46e24cf2db12a3ba2.jpg)  
+figure 5: per-image decoding overhead for images at 3 compression levels and 3 resolutions, normalized against stock firefox. for most jpegs, the sfi and process sandbox overhead is  $23 - 32\%$ , and  $< 41\%$  respectively. for pngs, the sfi and process sandbox overhead is  $2 - 49\%$  and  $< 15\%$  respectively. we also observe some negative overheads and pathological cases where overhead is as high as  $140\%$ . the reasons for this are explained in section 7.5.2.  
+figure 6: performance overhead of image decoding with increasing the number of sandboxes (each image is rendered in a fresh sandbox).
+
+$(\s 7.5.2)$ , we measure the decoder execution time for 4000 image loads at each scale, and report the median overhead.
+
+results. figure 6 shows the cpu overhead of image rendering as we increase the number of sandboxes for both large (1280p) and small (135p) jpeg images using default compression. this experiment allows us to make several observations. we can run up to 250 concurrent sfi sandboxes before we run into limitations like exhausting pre-allocated thread local storage or finding aligned free virtual memory. these limitations can be overcome with more engineering effort. we never came close to these limits browsing real websites, including those of section 7.4.1. both the sfi and the process sandbox similarly scale well on both small and large images, with cpu overheads between  $20\%$  and  $40\%$  for most sandbox counts. the process sandbox, however, scales only because we use multiple synchronization modes described ( $\s 6$ ).
+
+extra sandboxes add memory overhead for two reasons. first, each sandbox uses a private copy of code (e.g., libjpeg and libc for each libjpeg sandbox). second, each sandbox has its own stack and heap. in this experiment, we observed that memory consumption increases linearly with the number of images (which corresponds to the number of sandboxes created). on average, an sfi sandbox consumes 1.6 mb, while process sandboxing consumes 2.4 mb for
+
+each sandbox. several optimizations to reduce memory consumption exist that we have not yet implemented. for example, the sfi sandbox currently loads a fresh copy of the code for each sandbox instance. we could optimize this by sharing code pages between sandboxes—and, indeed, we do this in production for our wasm sandbox.
+
+# 7.6 rlbox outside firefox
+
+rlbox is a general-purpose sandboxing framework that can be used in any  $\mathrm{c}++$  application. to demonstrate its utility beyond firefox, we applied it in two different contexts: the apache web server and node.js runtime.
+
+apache allows developers to write c modules that extend its base functionality. these modules often depend on third-party libraries. for example, the mod markdown [31] module uses the libmarkdown library to transform markdown to html on the fly to support serving markdown files.
+
+to protect apache from bugs in libmarkdown we modify mod markdown to run libmarkdown in an rlbox sfi sandbox. the change required a single person-day, and added or modified roughly 300 lines of code. we measured the average and tail latency as well as throughput of the webserver using the autocannon 4.4.0 benchmarking tool [2] with default configurations (1 minute runtime, 10 parallel connections) serving a 16k markdown file. the unmodified webserver's average latency, tail latency and throughput were  $10.5\mathrm{ms}$ ,  $36\mathrm{ms}$  and  $940$  requests/second, respectively; the sandboxed server's average latency, tail latency and throughput were  $14\mathrm{ms}$ ,  $40\mathrm{ms}$  and  $684$  requests/second. though the average latency and throughput overhead is modest, we observe that the tail latency—arguably the most important metric—is within  $10\%$  of baseline.
+
+node.js is a javascript runtime system written in c++, largely used for web applications. like apache, node.js allows developers to expose new functionality implemented in native plugins to the javascript code. for example, the bcrypt [37] password hashing library relies on native code—indeed the javascript code largely wraps provos' c bcrypt library. to protect the runtime from memory-safety
+
+bugs in the c library, we modify the  $\mathrm{c + + }$  code in bcrypt to run the bcrypt c library in an rlbox sfi sandbox-a change that required roughly 2 person hours, adding or modifying 75 lines of code. we measured--using the benchmark.js library-the overhead in average hashing throughput (hashing a random 32-byte password) to be modest:  $27\%$
+
+# 8 related work
+
+isolation in the browser. modern browsers since chrome [3] rely on coarse grain privilege separation [38] to prevent browser compromises from impacting the local os [39]. however, a compromised renderer process can still use any credentials the browser has for other sites, enabling extremely powerful universal cross-site scripting (uxss) attacks [14].
+
+in response to uxss attacks and recent spectre attacks, chrome introduced site isolation [40]. site isolation puts pages and iframes of different sites into separate processes. unfortunately, as discussed in section 1, this does not prevent uxss attacks across related sites (e.g., mail.google.com and pay.google.com). firefox's project fission [34] proposes to go further and isolate at the origin boundary, similar to previous research browsers [18, 43, 60], but this still does not protect the renderer when loading cross-origin resources such as images.
+
+an unpublished prototype using sfi called minsfi [47] was developed at google in 2013 to protect the chrome renderer from compromise of zlib library; however, it was missing several features necessary for compatibility and efficiency, including threading and callback support. additionally, the project was primarily focused on improving the efficiency of sfi rather than the integration challenges tackled by rlbox including handling tainted data, migration of code bases, etc.
+
+in some parts of the renderer, there is no substitute for strong memory safety to prevent attacks. servo [1] is an ongoing project to rewrite much of the firefox rendering stack in rust. however, for the foreseeable future, firefox and other browsers will continue to rely on libraries written in  $\mathrm{c} / + +$ . this makes sandboxing the most viable approach to containing vulnerabilities.
+
+sandboxing. there has been some related work on providing apis to simplify using sandboxed libraries (e.g., codejail [62] and google sandboxing apis [5]). however, these efforts do not provide the type-driven automation of rlbox (e.g., pointer swizzling and migration assistance) nor the safety of tainted types—leaving developers to manually deal with attacks of section 3. sammler et al. [42] formal model addresses some of these attacks using a type-direct approach, but require applications to be formally verified correct (in contrast to our local validators) to give meaningful guarantees.
+
+there is a long line of work on sandboxing mechanisms with different performance trade-offs [20, 47, 48, 57, 59]. recent, excellent surveys [51, 55] present a comprehensive overview of these mechanisms. rlbox makes it easy for developers to use such mechanisms without modifying
+
+the application or library (\$6.2). in production we use webassembly; webassembly stands out as a principled approach with wide adoption [20].
+
+data sanitization and leaks. there is a large body of work on static and dynamic approaches to preventing or mitigating missed sanitization errors; see the survey by song et al. [52]. these tools are orthogonal to rlbox. developers could use them to check their data validation functions for bugs.
+
+gui detector [22] uses runtime trace analysis to identify missing pointer sanitizations in user code. other work has looked at sanitizing user pointers in the kernel [9]. for example, type annotations [25] have been used to distinguish between untrusted user pointers and trusted pointers in os kernel code. in contrast, rlbox automatically applies such pointer sanitizations by leveraging the  $\mathrm{c}++$  type system.
+
+one approach to avoid double-fetch bugs is to marshal all shared data before using it. but, this comes at a cost. marshaling tools and apis typically require array bounds annotations, which is tedious and demands in-depth knowledge of the sandboxed library's internal data structures. automatic marshaling tools like c-strider [44] and ptrsplit [29] address this limitation; however, these tools either impose a significant overhead or lack support for multi-threading. rlbox uses shared memory and statically enforces that shared data is placed in shared memory, avoiding the need for custom marshaling tools or annotations. the use of shared memory, however, introduces possible double-fetch bugs. while rlbox provides apis to assist with double-fetches, the possibility of unhandled double-fetch bugs still remain. several recent techniques detect double-fetches from shared memory [46, 61, 63] and can be used alongside rlbox.
+
+previous efforts have also sought to prevent leaking pointers that could compromise aslr [6, 13, 30]. rlbox prevents pointer leaks by disallowing pointers to renderer memory to pass into the sandboxed library via the type system.
+
+porting assistance. several privilege separation tools provide assistance when migrating to a sandboxed architecture. wedge (crowbar) [4] uses dynamic analysis to guide the migration, and also supports an incremental porting mode that disables isolation so that developers can test the partial port and identify the next step. soaap [19] uses code annotations and a custom compiler to guide the developer. privtrans [8] uses code annotations and automatic source code rewriting to separate code and data into separate components. in contrast, rlbox assists with porting without any custom tooling, purely through the use of compile-time errors, by identifying code that must be modified for security and shared data that must be migrated to sandbox memory ( $\s 5$ ).
+
+# 9 using rlbox in production
+
+over the last 6 months we’ve been integrating rlbox into production firefox. in this section, we describe the difference between our research prototype and the production rlbox, and our migration of the libgraphite font shaping library to
+
+use rlbox. we are in the process of migrating several other libraries and adding support for firefox on windows [15, 50].
+
+# 9.1 making rlbox production-ready
+
+to make rlbox production-ready we adapt a new isolation mechanism based on webassembly and rewrite the rlbox api, using our prototype implementation as a reference.
+
+sfi using webassembly. in production, we use wasm instead of nacl to isolate library code from the rest of firefox within a single process. though wasm's performance and feature-set is not yet on par with nacl's [23], nacl has been deprecated in favor of wasm [17] and maintaining a separate toolchain for library sandboxing is prohibitive. moreover, these limitations are likely to disappear soon: as part of the bytecode alliance, multiple companies are working together to build robust wasm compilation toolchains, a standard syscall interface, simd extensions, etc.
+
+since our goal is to reap the benefits of these efforts, we need to minimize the changes to these toolchains. in particular, this means that we cannot adjust for differences between the firefox and wasm machine model as we did for nacl [35]—by intrusively modifying the compiler, loader, runtime, etc. (§6.2). we, instead, take advantage of the fact that rlbox intercepts all data and control flow to automatically translate between the firefox and wasm machine models in the rlbox api.
+
+our only modification to the lucet wasm runtime is an optimized trampoline, which we are working on upstream [66]. since wasm is well-typed and has deterministic semantics, our trampolines safely eliminate the context-and stack-switching code, reducing the cost of a cross-boundary crossing to a function call. this optimization was key to our shipping the sandboxed libgraphite (\$5)—it reduced the overhead of rlbox by  $800\%$ . the details and formalization of these zero-cost trampolines will be presented in a separate paper.
+
+meaningful migration error-messages. we re-implement rlbox in c++ 17 and use new features—in particular if constexpr—to customize the error messages that guide developers during migration (§5). meaningful error messages (as opposed to a wall of generic, template failures) is key to making rlbox usable to other developers. although implementing custom error messages in our c++ 11 prototype is possible, it would make the implementation drastically more complex; c++ 17 allows us to keep the rlbox api implementation concise (under 3k lines of code) and give meaningful error messages.
+
+# 9.2 isolating libgraphite
+
+we use rlbox to isolate the libgraphite font shaping library, creating a fresh sandbox for each graphite font instance. we choose libgraphite largely because the graphite fonts are not widely used on the web, but nevertheless firefox needs to support it for web compatibility. this means that the library is
+
+part of firefox attack surface—and thus memory safety bugs in libgraphite are security vulnerabilities in firefox [53, 65].
+
+evaluation to measure the overhead of our sandboxing, we use a micro-benchmark that measures the page render time when reflowing text in a graphite font ten times, adjusting the font size each time, so font caches aren't used.11 we find that wasm sandboxing imposes a  $85\%$  overhead on the libgraphite code, which in turn slows down firefox's font rendering component (which uses libgraphite internally) by  $50\%$ . we attribute this slowdown largely to the nascent wasm toolchains, which don't yet support performance optimization on par with, say llvm [21, 23]. nevertheless, this overhead is not user-perceptible; in practice page rendering is slowed down due to the network and heavy media content, not fonts.
+
+to measure memory overhead, we use cgmemtime to capture the peak resident memory and cache used by firefox on the same micro-benchmark. we find the memory overhead to be negligible—the median peak memory overhead when loading the micro-benchmark ten times is  $0.68\%$  (peak memory use went from 431460 kb to 434426 kb).
+
+deployment. the rewritten rlbox library as well as the modifications to firefox to use a sandbox libgraphite have been merged into the firefox code base [50]. our retrofitted firefox successfully tested on both the firefox nightly and beta channels, and ships in stock firefox 74 to linux users and in firefox 75 to mac users [15].
+
+# 10 conclusion
+
+third party libraries are likely to remain a significant source of critical browser vulnerabilities. our approach to sandboxing code at the library-renderer interface offers a practical path to mitigating this threat in firefox, and other browsers as well.
+
+rlbox shows how a type-driven approach can significantly ease the burden of securely sandboxing libraries in existing code, through a combination of static information flow enforcement, dynamic checks, and validations. rlbox is not dependent on firefox and is useful as a general purpose sandboxing framework for other  $\mathrm{c + + }$  applications.
+
+# acknowledgements
+
+we thank the anonymous reviewers for their insightful feedback. we thank our collaborators at mozilla (especially bobby holley, jonathan kew, eric rescorla, tom ritter, and ricky stewart), fastly (especially pat hickey and tyler mcmullen), and tor (especially georg koppen) for fruitful discussions and help integrating rlbox into production. this work was supported in part by gifts from cisco, fastly, and mozilla, and by the conix research center, one of six centers in jump, a semiconductor research corporation (src) program sponsored by darpa.
+
+# references
+
+[1] b. anderson, l. bergstrom, m. goregaokar, j. matthews, k. mcallister, j. moffitt, and s. sapin. engineering the servo web browser engine using rust. in ics 2016: seip. acm, 2016.  
+[2] autocannon: fast http/1.1 benchmarking tool written in node.js. https://github.com/mcollina/autocannon, 2016.  
+[3] a. barth, c. jackson, c. reis, and the google chrome team. the security architecture of the chromium browser. technical report, 2008.  
+[4] a. bittau, p. marchenko, m. handley, and b. karp. wedge: splitting applications into reduced-privilege compartments. in *nsdi*. usenix, 2008.  
+[5] c. blichmann, r. swiecki, and ise sandboxing team. open-sourcing sandboxed api. https://security.googleblog.com/2019/03/open-sourcing-sandboxed-api.html, 2019.  
+[6] k. braden, l. davi, c. liebchen, a.-r. sadeghi, s. crane, m. franz, and p. larsen. leakage-resilient layout randomization for mobile devices. in ndss. internet society, 2016.  
+[7] c. brook. firefox, safari, edge all fall at pwn2own 2018. https://digitalguardian.com/blog/firefox-safari-edge-all-fall-pwn2own-2018, 2018.  
+[8] d. brumley and d. song. privtrans: automatically partitioning programs for privilege separation. in security. usenix, 2004.  
+[9] s. bugrara and a. aiken. verifying the safety of user pointer dereferences. in s&p. ieee, 2008.  
+[10] bug 1192226 (cve-2015-4506) vp9 init context buffers. https://bugzilla.mozilla.org/show_bug.cgi?id=1192226, 2015.  
+[11] bug 1446062 (cve-2018-5146) zdi-can-5822 - mozilla firefox audio driver out of bounds. https://bugzilla.mozilla.org/show_bug.cgi?id=1446062, 2018.  
+[12] security: stack-buffer-overflow in break. https://bugs.chromium.org/p/chromium/issues/detail?id=850350, 2019.  
+[13] s. crane, c. liebchen, a. homescu, l. davi, p. larsen, a.-r. sadeghi, s. brunthaler, and m. franz. readacter: practical code randomization resilient to memory disclosure. in s&p. ieee, 2015.  
+[14] s. di paola and g. fedon. subverting ajax. presented at 23c3, 2006.  
+[15] n. froyd. securing firefox with webassembly. https://hacks.mozilla.org/2020/02/securing-firefox-with-webassembly/, 2020.  
+[16] georg koppen. use rlbox for sandboxing third-party libraries. https://trac.torproject.org/projects/tor/ticket/32379.  
+[17] google chrome team. (p)nacl deprecation announcements. https://developer.chrome.com/native-client/migration# p-nacl-deprecation-announcements, 2017.  
+[18] c. grier, s. tang, and s. t. king. designing and implementing the op and op2 web browsers. acm transactions on the web, 5(2), 2011.  
+[19] k. gudka, r. n. watson, j. anderson, d. chisnall, b. davis, b. laurie, i. marinos, p. g. neumann, and a. richardson. clean application compartmentalization with soap. in ccs. acm, 2015.  
+[20] a. haas, a. rossberg, d. l. schuff, b. l. titzer, m. holman, d. gohman, l. wagner, a. zakai, and j. bastien. bringing the web up to speed with webassembly. in pldi. acm, 2017.  
+[21] l. t. hansen. cranelift: performance parity with baldr on x86-64. https://bugzilla.mozillia.org/show_bug.cgi?id=1539399, 2019.  
+[22] h. hu, z. l. chua, z. liang, and p. saxena. identifying arbitrary memory access vulnerabilities in privilege-separated software. in *esorics*, volume 9326 of lncs. springer, 2015.  
+[23] a. jangda, b. powers, e. d. berger, and a. guha. not so fast: analyzing the performance of webassembly vs. native code. in atc. usenix, 2019.  
+[24] y. jia, z. l. chua, h. hu, s. chen, p. saxena, and z. liang. the "web/local" boundary is fuzzy: a security study of chrome's process-based sandboxing. in ccs. acm, 2016.  
+[25] r. johnson and d. wagner. finding user/kernel pointer bugs with type inference. in security. usenix, 2004.  
+[26] p. kocher, j. horn, a. fogh, d. genkin, d. gruss, w. haas, m. hamburg, m. lipp, s. mangard, t. prescher, m. schwarz, and y. yarom. spectre attacks: exploiting speculative execution. in s&p. ieee, 2019.  
+[27] d. kohlbrenner and h. shacham. trusted browsers for uncertain times. in security. usenix, 2016.  
+[28] g. kwong. javascript fuzzing in mozilla, 2017. presented at coscup 2017. https://nth10sd.github.io/js-fuzzing-in-mozlibra/, 2017.  
+[29] s. liu, g. tan, and t. jaeger. *ptrsplit: supporting general pointers in automatic
+
+program partitioning. in ccs. acm, 2017.  
+[30] k. lu, c. song, b. lee, s. p. chung, t. kim, and w. lee. aslr-guard: stopping address space leakage for code reuse attacks. in ccs. acm, 2015.  
+[31] markdown filter module for apache httpd server. https://github.com/hamano/apache-mod-markdown, 2011.  
+[32] performance sherifing/talos. https://wiki.mozilla.org/performance_sherifing/talos, 2018.  
+[33] security/sandbox. https://wiki.mozilla.org/security/sandbox, 2018.  
+[34] project fission. https://wiki.mozilla.org/project_fission, 2019.  
+[35] s. narayan, t. garfinkel, s. lerner, h. shacham, and d. stefan. gobi: webassembly as a practical path to library sandboxing, 2019.  
+[36] s. nichols. it's 2019, and a png file can pwn your android smartphone or tablet: patch me if you can. https://www.theregister.co.uk/2019/02/07/android_juneuary_patches/, 2019.  
+[37] bcrypt for nodejs. https://github.com/kelektiv/node.bcrypt.js, 2010.  
+[38] n. provos, m. friedl, and p. honeyman. preventing privilege escalation. in security. usenix, 2003.  
+[39] c. reis and s. d. gribble. isolating web programs in modern browser architectures. in eurosys. acm, 2009.  
+[40] c. reis, a. moshchuk, and n. oskov. site isolation: process separation for web sites within the browser. in usenix security symposium. usenix association, 2019.  
+[41] a. sabelfeld and a. c. myers. language-based information-flow security. ieee journal on selected areas in communications, 21(1), 2003.  
+[42] m. sammler, d. garg, d. dreyer, and t. litak. the high-level benefits of low-level sandboxing. in popl. acm, 2019.  
+[43] r. sasse, s. t. king, j. meseguer, and s. tang. ibos: a correct-by-construction modular browser. in facs, volume 7684. springer, 2013.  
+[44] k. saur, m. hicks, and j. s. foster. c-strider: type-aware heap traversal for c. software: practice and experience, 46(6), 2016.  
+[45] g. sauthoff. cgmemetime. https://github.com/gsauthof/cgmemtime, 2012.  
+[46] m. schwarz, d. gruss, m. lipp, c. maurice, t. schuster, a. fogh, and s. mangard. automated detection, exploitation, and elimination of double-dropy bugs using modern cpu features. in asiaccs. acm, 2018.  
+[47] m. seaborn. sandboxing libraries in chrome using sfi: zlib proof-of-concept. https://docs.google.com/presentation/d/1rd3bxsbftz0ifr1q7hzgmsyqphgb61atetdeiiyours/, 2013.  
+[48] d. sehr, r. muth, c. biffle, v. khimenko, e. pasko, k. schimpf, b. yee, and b. chen. adapting software fault isolation to contemporary cpu architectures. in security. usenix, 2010.  
+[49] h. shacham, m. page, b. pfaff, e.-j. goh, n. modadugu, and d. boneh. on the effectiveness of address-space randomization. in ccs. acm, 2004.  
+[50] shravan narayan. use wasm sandboxed libraries in firefox to reduce attack surface. https://bugzilla.mozilla.org/show_bug.cgi?id=1562797.  
+[51] r. shu, p. wang, s. a. gorski, iii, b. andow, a. nadkarni, l. deshotels, j. gionta, w. enck, and x. gu. a study of security isolation techniques. acm computing surveys, 49(3), 2016.  
+[52] d. song, j. lettner, p. rajasekaran, y. na, s. volckaert, p. larsen, and m. franz. sok: sanitizing for security. in ieee security and privacy 2019, 2019.  
+[53] stefan marsiske, pierre pronchery, marcus bointon. penetration test report: graphite font system. https://wiki.mozilla.org/images/9/98/graphite-report.pdf, 2017.  
+[54] b. stroustrup. exception handling (and raii). in the  $c++$  programming language, chapter 13. addison-wesley, 4th edition, 2013.  
+[55] g. tan. principles and implementation techniques of software-based fault isolation. foundations and trends in privacy and security, 1(3), 2017.  
+[56] a brief theora and vorbis encoding guide. https://trac.ffmpeg.org/wiki/theoravorbisencodingguide, 2019.  
+[57] a. vahldiek-oberwagner, e. elnikety, n. o. duarte, m. sammler, p. druschel, and d. garg. erim: secure, efficient in-process isolation with protection keys (mpk). in security. usenix, 2019.  
+[58] vp9 bitrate modes in detail. https://developers.google.com/media/vp9/bitrate-modes/, 2019.  
+[59] r. wahbe, s. lucco, t. e. anderson, and s. l. graham. efficient software-based fault isolation. in sosp. acm, 1993.  
+[60] h. j. wang, c. grier, a. moshchuk, s. t. king, p. choudhury, and h. venter. the multi-principal os construction of the gazelle web browser. in security usenix, 2009.  
+[61] p. wang, j. krinke, k. lu, g. li, and s. dodier-lazaro. how double-flyer
+
+situations turn into double-fetch vulnerabilities: a study of double fetches in the linux kernel. in security. usenix, 2017.
+
+[62] y. wu, s. sathyanarayan, r. h. yap, and z. liang. codejail: applicationtransparent isolation of libraries with tight program interactions. in esorics, volume 7459 of lncs. springer, 2012.  
+[63] m. xu, c. qian, k. lu, m. backes, and t. kim. precise and scalable detection of double-dropless bacteria in os kernels. in s&p. ieee, 2018.  
+[64] b. yee, d. sehr, g. dardyk, j. b. chen, r. muth, t. ormandy, s. okasaka, n. narula, and n. fullagar. native client: a sandbox for portable, untrusted x86 native code. in s&p. ieee, 2009.  
+[65] yves younan. vulnerability spotlight: libgraphite font processing vulnerabilities. https://blog.talosintelligence.com/2016/02/vulnerability-spotlight-libgraphite.html, 2016.  
+[66] optimized transitions for lucet compiler. https://github.com/bytecodealliance/cranelift/issues/1083, 2019.
+
+# a automated pointer swizzling
+
+applications represent pointers as full 64-bit addresses (on 64-bit systems), however sandboxes such as the nacl and wasm sfi sandboxes, represents pointers as 32-bit offsets from the sandbox base address. thus pointers must be swizzled to share data structures between the application and sandboxed library.
+
+the tainted_volatile type. to automate pointer swizzling, rlbox internally adds an additional type, tainted_volatile, that it uses when dereferencing a tainted pointer. like tainted wrappers, the tainted_volatile wrapper also refers to data from the sandboxed library, with the distinction that tainted_volatile data is stored in sandbox memory (memory accessible by sandboxed code) rather than application memory. these tainted_volatile types are primarily used as rvalue types and automatically convert into tainted types when copied into application memory, meaning that the programmer would never create a variable of tainted_volatile type and need not know of the type's existence. distinguishing between tainted and tainted_volatile types allow rlbox to automate swizzling. by inspecting types, rlbox can swizzle pointers appropriately any time we write tainted pointer to a tainted_volatile location or vice-versa.
+
+context free swizzling. a further complication of implementing pointer swizzling is that rlbox needs to swizzle pointers without knowledge of the sandbox to which data belongs to or the location of sandbox memory! for instance, consider the following program.
+
+1 auto mrlbox = createsandbox(...);  
+2 tainted<int\*\*> foo  $=$  sandbox.invoke(mrlbox，...）;  
+3 tainted<int\*>bar  $=$  sandbox.invoke(mrlbox，...）;  
+4  $\star$  foo = bar;  
+5 bar = *foo;
+
+on line 4, we write bar to the location pointed to by foo. however, as foo is a tainted variable, foo points to a location in sandbox memory. thus dereferencing foo results in a tainted_volatile reference (which points to sandboxed memory). so we must swizzle bar from the application pointer representation to the sandboxed pointer representation, prior to updating  $\star$  foo. the swizzling occurs in the overloaded  $=$  operator of the tainted_volatile type which in c++
+
+has a fixed type signature and is only permitted to take a reference to the assigned value—it does not include a reference to mrlbox. the reverse problem occurs on line 5 where the expression on the right is a tainted_volatile, while the expression on the left is a tainted. an easy albeit ugly solution could use a specific api for dereferencing, i.e. replacing  $*$  foo with dereference (foo, mrlbox), however, such approaches changes the natural syntax expected by a c++ programmer.
+
+implementing context free swizzling. rlbox instead implements swizzling without knowledge of the sandbox base address by leveraging the structure of pointer representations. this approach is applicable for any sandbox whose base memory is sufficiently aligned, as is the case in our sfi implementation which is aligned to 4gb. converting from an application pointer representation to sandboxed pointer representation required on line 4 can be easily performed by clearing the top 32-bits of pointer bar in the overloaded equality operator. however, the second case which is the conversion of a sandboxed pointer representation to an application pointer representation on line 5 is more challenging.
+
+to solve this, we make the observation that we can successfully learn the sandbox base address by inspecting the first 32-bits of any example pointer which is (1) not null (2) is in the same sandbox as the pointer we wish to convert and (3) is stored in the application pointer format (as a 64-bit pointer). the implementation of swizzling below shows how to find such an example pointer below.
+
+```cpp
+define top32 0xffffff00000000
+#define bot32 0xfffffffff
+tainted<t>& operator=(tainted_volatile<t2>& rhs) {
+uintptr_t exampleappptr = & (rhs.val);
+uintptr_t base = exampleappptr & top32;
+this->val = base + (rhs.val & bot32);
+return *this;
+}
+```
+
+line 4 constructs an example pointer in the body of operator $\equiv$ , with the expression & (rhs.field). this expression points to the same memory location as the variable foo on line 5 in the original program. importantly, foo may be used as an example pointer as it is located in the same sandbox as  $\star$  foo, is stored in the application pointer representation, and is not null as we successfully dereferenced it on line 5, prior to the call of the operator $\equiv$  also on line 5. this solution is also used to solve similar problems when supporting pointer arithmetic on tainted types.
+
+# b native client tooling changes
+
+nacl was originally designed for sandboxing mobile code in the browser, rather than libraries. we thus had to make significant modifications to the compiler, optimization passes, elf loader, machine model and runtime prior to it being usable for library sandboxing. we list these changes below.
+
+loader and runtime. the nacl loader does not support libraries. we thus modify the loader and runtime to save the
+
+elf symbol table from when the library is loaded, to provide symbol resolution.
+
+**threading.** on 64-bit platforms, nacl relies on each sandbox having unique os threads due to some design choices in the use of thread-local storage. however, for library sandboxing, the same application thread may invoke code from different sandboxes; therefore we had to modify the nacl to operate without this requirement.
+
+function invocation. nacl uses a "springboard"—a piece of code which enables memory isolation prior to starting sandbox code—to invoke main with no function parameters. for library sandboxing, we modify the springboard to allow arbitrary function invocations with any parameters. we implemented callback support using the default syscall mediation mechanism in nacl to correctly redirect callbacks.
+
+simd. nacl custom compilation toolchain does not support handwritten simd and assembly instructions found in libraries such as libjpeg-turbo. to mitigate this, we modify the nasm assembler to assemble this hand-written assembly to object files that pass nacl verifier checks. we measured that this allowing handwritten simd instructions provided a  $48\%$  speedup for the sfi based sandboxing on a simple benchmark rendering a libjpeg image.
+
+machine model. the machine model of a platform dictates the size of various types such as int, long, or pointers. to maximize performance, nacl uses a custom machine model—for example, nacl uses 32-bit pointers, even in its 64-bit machine model. however, this can introduce incompatibilities during library sandboxing when data structures are transferred between the application and library
+
+to remedy this, we modified the nacl tooling to ensure the machine model is consistent with the firefox application code. this required making significant changes to the nacl clang toolchain, the nacl instruction set in llvm, nacl's implementation of libc and the nacl runtime. we implemented these changes carefully such that nacl verifier (the tool used to determine the safety of a nacl binary) would not require any modifications, giving us confidence that our changes do not affect security.
+
+the wasm toolchains also exhibit similar differences in the machine model. rather than make relying on similar large changes in the wasm compiler toolchain, we use rlbox feature to automatically adjust for machine model differences (§9) to ensure compatibility.

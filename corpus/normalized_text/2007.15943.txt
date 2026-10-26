@@ -1,0 +1,601 @@
+# muzz: thread-aware grey-box fuzzing for effective bug hunting in multithreaded programs
+
+hongxu chen\* shengjian guo yinxing xue\* yulei sui
+
+cen zhang† yuekang li† hajjun wang# yang liu†
+
+†nanyang technological university ‡baidu security †university of technology sydney
+
+$^{\s}$ university of science and technology of china #ant financial services group
+
+# abstract
+
+grey-box fuzz testing has revealed thousands of vulnerabilities in real-world software owing to its lightweight instrumentation, fast coverage feedback, and dynamic adjusting strategies. however, directly applying grey-box fuzzing to input-dependent multithreaded programs can be extremely inefficient. in practice, multithreading-relevant bugs are usually buried in the sophisticated program flows. meanwhile, existing grey-box fuzzing techniques do not stress threadinterleavings that affect execution states in multithreaded programs. therefore, mainstream grey-box fuzzers cannot adequately test problematic segments in multithreaded software, although they might obtain high code coverage statistics.
+
+to this end, we propose muzz, a new grey-box fuzzing technique that hunts for bugs in multithreaded programs. muzz owns three novel thread-aware instrumentations, namely coverage-oriented instrumentation, thread-context instrumentation, and schedule-intervention instrumentation. during fuzzing, these instrumentations engender runtime feedback to accentuate execution states caused by thread interleavings. by leveraging such feedback in the dynamic seed selection and execution strategies, muzz preserves more valuable seeds that expose bugs under a multithreading context.
+
+we evaluate muzz on twelve real-world multithreaded programs. experiments show that muzz outperforms afl in both multithreading-relevant seed generation and concurrency-vulnerability detection. further, by replaying the target programs against the generated seeds, muzz also reveals more concurrency-bugs (e.g., data-races, thread-leaks) than afl. in total, muzz detected eight new concurrency-vulnerabilities and nineteen new concurrency-bugs. at the time of writing, four reported issues have received cve ids.
+
+# 1 introduction
+
+multithreading has been popular in modern software systems since it substantially utilizes the hardware resources to boost
+
+software performance. a typical computing paradigm of multithreaded programs is to accept a set of inputs, distribute computing jobs to threads, and orchestrate their progress accordingly. compared to sequential programs, however, multithreaded programs are more prone to severe software faults. on the one hand, the non-deterministic thread-interleavings give rise to concurrency-bugs like data-races, deadlocks, etc [32]. these bugs may cause the program to end up with abnormal results or unexpected hangs. on the other hand, bugs that appear under specific inputs and interleavings may lead to concurrency-vulnerabilities [5, 30], resulting in memory corruptions, information leakage, etc.
+
+there exist a line of works on detecting bugs and vulnerabilities in multithreaded programs. static concurrency-bug predictors [2, 40, 45, 50] aim to approximate the runtime behaviors of a program without actual concurrent execution. however, they typically serve as a complementary solution due to the high percentage of false alarms [19]. dynamic detectors detect concurrency-violations by reasoning memory read/write and synchronization events in a particular execution trace [5, 12, 21, 41, 42, 49, 58]. several techniques like threadsanitizer (a.k.a., tsan) [42] and helgrind [49] have been widely used in practice. however, these approaches by themselves do not automatically generate new test inputs to exercise different paths in multithreaded programs.
+
+meanwhile, grey-box fuzzing is effective in generating test inputs to expose vulnerabilities [34, 36]. it is reported that grey-box fuzzers (gbfs) such as afl [63] and libfuzzer [31] have detected more than 16,000 vulnerabilities in hundreds of real-world software projects [16, 31, 63].
+
+despite the great success of gbfs in detecting vulnerabilities, there are few efforts on fuzzing user-space multithreaded programs. general-purpose gbfs usually cannot explore thread-interleaving introduced execution states due to their unawareness of multithreading. therefore, they cannot effectively detect concurrency-vulnerabilities inherently buried in sophisticated program flows [30]. in a discussion in 2015 [64], the author of afl, michal zalewski, even suggests that "it's generally better to have a single thread". in fact, due
+
+to the difficulty and inefficiency, the fuzzing driver programs in google's continuous fuzzing platform oss-fuzz are all tested in single-threaded mode [15]. also, by matching unions of keyword patterns "race*", "concurrent*" and "thread*" in the mitre cve database [48], we found that only 202 cve records are relevant to concurrency-vulnerabilities out of the 70438 assigned cve ids ranging from cve-2014-* to cve-2018-*. in particular, we observed that, theoretically, at most 4 cve records could be detected by grey-box fuzzers that work on user-space programs.
+
+as a result, there are no practical fuzzing techniques to test input-dependent user-space multithreaded programs and detect bugs or vulnerabilities inside them. to this end, we present a dedicated grey-box fuzzing technique, muzz, to reveal bugs by exercising input-dependent and interleaving-dependent paths. we categorize the targeted multithreading-relevant bugs into two major groups:
+
+- concurrency-vulnerabilities  $(v_{m})$ : they correspond to memory corruption vulnerabilities that occur in a multithreading context. these vulnerabilities can be detected during the fuzzing phase.  
+- concurrency-bugs  $(b_{m})$ : they correspond to the bugs like data-races, atomicity-violations, deadlocks, etc. we detect them by replaying the seeds generated by muzz with state-of-the-art concurrency-bug detectors such as tsan.
+
+note that  $b_{m}$  may not be revealed during fuzzing since they do not necessarily result in memory corruption crashes. in the remaining sections, when referring to multithreading-relevant bugs, we always mean the combination of concurrency-bugs and concurrency-vulnerabilities, i.e.,  $v_{m} \cup b_{m}$ .
+
+we summarize the contributions of our work as follows: 1) we develop three novel thread-aware instrumentations for grey-box fuzzing that can distinguish the execution states caused by thread-interleavings.  
+2) we optimize seed selection and execution strategies based on the runtime feedback provided by the instrumentations, which help generate more effective seeds concerning the multithreading context.  
+3) we integrate these analyses into muzz for an effective bug hunting in multithreaded programs. experiments on 12 real-world programs show that muzz outperforms other fuzzers like afl and mopt in detecting concurrency-vulnerabilities and revealing concurrency-bugs.  
+4) muzz detected 8 new concurrency-vulnerabilities and 19 new concurrency-bugs, with 4 cve ids assigned. considering the small portion of concurrency-vulnerabilities recorded in the cve database, the results are promising.
+
+# 2 background and motivation
+
+# 2.1 grey-box fuzzing workflow
+
+algorithm 1 presents the typical workflow of a grey-box fuzzizer [3, 34, 63]. given a target program  $\mathbb{p}_o$  and the input
+
+algorithm 1: grey-box fuzzing workflow  
+input :program  $\mathbb{p}_o$  , initial seed queue  $q_{s}$  output:final seed queue  $q_{s}$  , vulnerable seed files  $t_{c}$    
+1  $\mathbb{p}_f\gets$  instrument  $(\mathbb{p}_o)$  // instrumentation   
+2  $t_{c}\gets \emptyset$  .   
+3 while true do   
+4 t  $\leftarrow$  select_next(seed(qs); // seed selection   
+5 m  $\leftarrow$  get mutation_chance(pf,t); // seed scheduling   
+6 for  $i\in 1\dots \mathbb{m}$  do   
+7 t'  $\leftarrow$  mutated_input(t); // seed mutation   
+8 res  $\leftarrow$  run  $(\mathbb{p}_f,t',\mathbb{n}_c)$  // repeated execution   
+9 if is_crash(res) then // seed triaging   
+10 tc  $\leftarrow$  tcu{t};// report vulnerable seeds   
+11 else if cov_new_trace(t',res) then   
+12 qs  $\leftarrow$  qs+it';// preserve "effective" seeds
+
+seeds  $q_{s}$ , a gbf first utilizes instrumentation to track the coverage information in  $\mathbb{p}_o$ . then it enters the fuzzing loop: 1) seed selection decides which seed to be selected next; 2) seed scheduling decides how many mutations  $\mathbb{m}$  will be applied on the selected seed  $t$ ; 3) seed mutation applies mutations on seed  $t$  to generate a new seed  $t'$ ; 4) during repeated execution, for each new seed  $t'$ , the fuzzer executes against its  $\mathbb{n}_c$  times to get its execution statistics; 5) seed triaging evaluates  $t'$  based on the statistics and the coverage feedback from instrumentation, to determine whether the seed leads to a vulnerability, or whether it is "effective" and should be preserved in the seed queue for subsequent fuzzing. here, steps 3), 4), 5) are continuously processed  $\mathbb{m}$  times. notably,  $\mathbb{n}_c$  times of repeated executions are necessary since a gbf needs to collect statistics such as average execution time for  $t'$ , which will be used to calculate mutation times  $\mathbb{m}$  for seed scheduling in the next iteration. in essence, the effectiveness of grey-box fuzzing relies on the feedback collected from the instrumentation. specifically, the result of cov_new_trace (line 11) is determined by the coverage feedback.
+
+# 2.2 the challenge in fuzzing multithreaded programs and our solution
+
+figure 1 is an abstracted multithreaded program that accepts a certain input file and distributes computing jobs to threads. practically it may behave like compressors/decompressors (e.g., lbzip2, pbzip2), image processors (e.g., imagemagick, graphicsmagick), encoders/decoders (e.g., webm, libvpx), etc. after reading the input content buf, it does an initial validity check inside the function check. it exits immediately if the buffer does not satisfy certain properties. the multithreading context starts from function compute (viapthread_create at lines 24-25). it contains shared variables s_var (passed from main) and g_var (global variables), as well as the mutex primitive m to exclusively read/write shared variables (viapthread_mutex_lock andpthread_mutex_unlock).
+
+```c
+int g_var = -1;
+void modify(int *pv) { *pv -= 2; } // ⑨
+void check(char *buf) {
+    if (isinvalid(buf)) { exit(1); }
+    else { modify((int*)buf); }
+}
+char* compute(void *s_var) {
+    g_var += 1; // ①
+    g_var *= 2; // ②
+    if ((int*)s_var[0] < 0) // ③
+        modify((int*)s_var); // ④
+    pthread_mutex_lock(&m); // ⑤
+    modify(&g_var); // ⑥
+    pthread_mutex_unlock(&m); // ⑦
+    return (char*)s_var; // ⑧
+}
+```
+
+figure 1: code segments abstracted from real-world programs. the shadow lines denote "suspicious interleaving scope" introduced in §4.1.
+
+with different inputs, the program may execute different segments. for example, based on the condition of statement  $③$ , which is purely dependent on the input content (i.e., different results of buf provided by seed files), it may or may not execute  $④$ . therefore, different seed files need to be generated to exercise different paths in multithreading context — in fact, this is the starting point that we use fuzzing to generate seed files to test multithreaded programs.
+
+meanwhile, in the presence of thread-interleavings, g_var (initialized with -1) may also have different values. let us focus on different seeds' executions at two statements: ①:"g_var+=1", and ②:"g_var*=2". suppose there are two threads: t1, t2; and t1: ① is executed first. then there are at least three interleavings:
+
+i) t1: ①→t2: ①→t2: ②→t1: ②  
+ii) t1: ①→t2: ①→t1: ②→t2: ②  
+iii) t1: ①→t1: ②→t2: ①→t2: ②
+
+after the second  $②$  is executed, the values of g_var may be different (4 and 2, respectively). worse still, since neither  $①$  nor  $②$  is an atomic operation in the representation of the actual program binary, many more interleavings can be observed and g_var will be assigned to other values.
+
+the challenge. to reveal multithreading-relevant bugs, a gbf needs to generate diverse seeds that execute different paths in multithreading context (e.g., paths inside compute). however, existing gbfs even have difficulties in generat
+
+ing seeds to reach multithreading segments. for example, if check is complicated enough, most of the seeds may fail the check and exit before entering compute — this is quite common due to the low quality of fuzzer-generated seeds [34, 61]. meanwhile, even if a seed indeed executes multithreading code, it may still fail to satisfy certain preconditions to reach the problematic context. for example, suppose modify contains a vulnerability that can only be triggered when g_var is 2. if the fuzzer has occasionally generated a seed that executes compute and the condition of  $③$  is true, with no awareness of thread-interleavings, it will not distinguish different schedules between i), ii) and iii). as a result, subsequent mutations on this seed will miss important feedback regarding g_var, making it difficult to generate seeds that trigger the vulnerability.
+
+to summarize, the challenge of fuzzing multithreaded programs is, existing gbfs have difficulties in generating seeds that execute multithreading context and keep thread-interleaving execution states.
+
+our solution. we provide fine-grained thread-aware feedback for seed files that execute multithreading context and distinguish more such execution states. according to §2.1, the preservation of seeds is based on the feedback; then we can expect that the fuzzer will preserve more distinct seeds that execute multithreading code segments in the seed queue. this means that the multithreading-relevant seeds are implicitly prioritized. since these seeds have already passed the validity checking, the overall quality of the generated seeds is higher. the "matthew effect" helps keep the quality of seed generations for subsequent fuzzing. essentially, this provides a biased coverage feedback on multithreading code segments (more explanations on this are available in §5.3.
+
+now let us investigate what instrumentations can be improved to existing fuzzers for thread-aware feedback.
+
+# 2.3 thread-aware feedback improvements
+
+# 2.3.1 feedback to track thread-interleavings and thread-context
+
+the state-of-the-art gbfs, such as afl, instrument the entry instruction of each basicblock evenly as the basicblock's deputy. we refer to this selection strategy over deputy instructions as afl-ins. afl-ins provides coverage feedback during the dynamic fuzzing phase to explore more paths. during repeated execution (line 8 in algorithm 1), afl labels a value to each transition that connects the deputies of two consecutively executed basicblocks [63]. by maintaining a set of transitions for queued seeds, afl-ins tracks the "coverage" of the target program. cov_new_trace (line 11 in algorithm 1) checks whether a transition indicates a new path/state.
+
+figure 2b depicts the transitions upon executing the functions compute and modify in figure 1. for brevity, we use source code to illustrate the problem and use statements to represent instructions in assembly or llvm ir [28].
+
+afl-ins works perfectly on single-threaded programs: the
+
+![](images/bb5fc52f4709f220413da808580ccc18273e6d2560deb0869d7bb175a45cd7ee.jpg)  
+(a)  
+figure 2: (a) thread-aware callgraph of figure 1; (b) its edge transitions across compute and modify. in (b), the arrows denote the transitions between statements. the pentagons denote basicblocks' entry statements; the other statements are represented by rectangles. their colors are consistent with function nodes in (a). since afl-ins only tracks branches' entry statements, only branching edges  $(\text{③} \rightarrow \text{④}$  and  $\text{③} \rightarrow \text{⑤})$  and function call edges  $(\text{④} \rightarrow \text{⑨}$  and  $\text{⑥} \rightarrow \text{⑨})$  are recorded — these transitions are marked as solid arrows.
+
+![](images/8f9a2c3c1a754c55b9f453cafdd19e25d5e72d42a4122ecfd6972b675a9fe81a.jpg)  
+(b)
+
+kept transitions can reflect both branching conditions (e.g.,  $③ \rightarrow ④$  and  $③ \rightarrow ⑤$ ) and function calls (e.g.,  $④ \rightarrow ⑨$  and  $⑥ \rightarrow ⑨$ ). however, afl-ins cannot capture these differences among schedules i), ii) and iii) (c.f. §2.2). in fact, it can only observe there is a transition  $① \rightarrow ①$ ; thus it will not prioritize this path for subsequent mutations, compared to other paths that do not even execute compute. the root cause of this defect lies in that afl only tracks entry statements of basic-blocks evenly, and does not record thread identities. therefore, we can add more deputy instructions within multithreading-relevant basicblocks to provide more interleaving feedback, and add thread-context information to distinguish different threads.
+
+# 2.3.2 schedule-intervention across executions
+
+during a gbf's repeated execution procedure (line 8 in algorithm 1), a seed may exhibit non-deterministic behaviors: it executes different paths of the target program across executions due to randomness. in this scenario, afl (and other gbfs) will execute against such a seed more times than a seed with deterministic behaviors [63]. for the non-deterministic behaviors caused by scheduling-interleaving in multithreaded programs, since the execution is continuously repeated  $\mathbb{n}_c$  times, the system level environment (e.g., cpu usage, memory consumption, i/o status) is prone to be similar [23, 26]. this will decrease the diversities of schedules, and consequently reduce the overall effectiveness. for example, during a repeated execution with  $\mathbb{n}_c = 40$ , schedules i) and iii) might occur 10 and 30 times respectively, while schedule ii) do not occur at all; in this scenario, the execution states corresponding to ii) will not be observed by the fuzzer. ideally, we would
+
+like the fuzzer to observe as many distinct interleavings as possible during repeated execution since that marks the potential states a seed can exercise. in the case of statements ① and ②, we hope schedules i), ii), iii) can all occur. therefore, it is favorable to provide schedule interventions to diversify the actual schedules.
+
+# 3 system overview
+
+figure 3 depicts the system overview of muzz. it contains four major components: (a) static thread-aware analysis guided instrumentations, (b) dynamic fuzzing, (c) vulnerability analysis, (d) concurrency-bug revealing.
+
+during (a):instrumentation (\$4), for a multithreaded program  $\mathbb{p}_o$ , muzz firstly computes thread-aware interprocedural control flow graph (icfg) and the code segments that are likely to interleave with others during execution [11,45], namely suspicious interleaving scope, in  $\s 4.1$ . based on these results, it performs three instrumentations inspired by  $\s 2.3$ .
+
+1) coverage-oriented instrumentation (§4.2) is one kind of stratified instrumentation that assigns more deputies to suspicious interleaving scope. it is the major instrumentation to track thread-interleaving induced coverage.  
+2) thread-context instrumentation (§4.3) is a type of lightweight instrumentation that distinguishes different thread identities by tracking the context of threading functions for thread-forks, locks, unlocks, joins, etc.  
+3) schedule-intervention instrumentation (§4.4) is a type of lightweight instrumentation at the entry of a thread-fork routine that dynamically adjusts each thread's priority. this complementary instrumentation aims to diversify interleavings by intervening in the thread schedules.
+
+during  $\boxed{\mathrm{b}}$ :dynamic fuzzing (\$5), muzz optimizes seed selection and repeated execution to generate more multithreading-relevant seeds. for seed selection (\$5.1), in addition to the new coverage information provided by coverage-oriented instrumentation, muzz also prioritizes those seeds that cover new thread-context based on the feedback provided by thread-context instrumentation. for repeated execution (\$5.2), owing to the schedule-intervention instrumentation, muzz adjusts the repeating times  $\mathbb{n}_c$ , to maximize the benefit of repetitions and track the interleaved execution states.
+
+c:vulnerability analysis is applied to the crashing seeds found by dynamic fuzzing, which reveals vulnerabilities (including  $v_{m}$ ). d:concurrency-bug revealing component reveals  $b_{m}$  with the help of concurrency-bug detectors (e.g., tsan [42], helgrind [49]). these two components will be explained in the evaluation section ( $\s 6$ ).
+
+# 4 static analysis guided instrumentation
+
+this component includes the thread-aware static analysis and the instrumentations based on it.
+
+![](images/ee6a3cac6c0e9b356440d35c171aff5ec27eacb083430a8647a90e23405341e1.jpg)  
+figure 3: overview of muzz. inputs are the original program and initial seeds (in seed queue); outputs are the seeds with vulnerabilities or concurrency-bugs. it contains four components.  $\boxed{\mathrm{a}}$  (left area) does static analysis and applies thread-aware instrumentations;  $\boxed{\mathrm{b}}$  (center area) contains the flows that proceed with dynamic fuzzing (seed scheduling and seed mutation [34] are the same as typical gbf flows, thus are marked dashed);  $\boxed{\mathrm{c}}$  (right-bottom) denotes the vulnerability analysis applied on vulnerable seeds; and  $\boxed{\mathrm{d}}$  (right-top) is the replaying component used to reveal concurrency-bugs from the seed queue.
+
+# 4.1 thread-aware static analysis
+
+the static analysis aims to provide lightweight thread-aware information for instrumentation and runtime feedback.
+
+# 4.1.1 thread-aware icfg generation
+
+we firstly apply an inclusion-based pointer analysis [1] on the target program. the points-to results are used to resolve the def-use flow of thread-sharing variables and indirect calls to reconstruct the icfg. by taking into account the semantics of threading apis (e.g., posix standard pthread, the openmp library), we get an icfg that is aware of the following multi-threading information:
+
+1)  $t_{\text{fork}}$  is the set of program sites that call thread-fork functions. this includes the explicit call to pthread_create, the std::thread constructor that internally uses pthread_create, or the "parallel pragma" in openmp. the called functions, denoted as  $f_{\text{fork}}$ , are extracted from the semantics of these forking sites.  
+2) tjoin contains call sites for functions that mark the end of a multithreading context. it includes the call sites of thepthread apis such aspthread_join,pthread_exit, etc.  
+3)  $tlock$  is the set of sites that call thread-lock functions such as pthread_mutex_lock, omp_set_lock, etc.  
+4)  $tunlock$  is the set of sites that call thread-unlock functions like pthread_mutex_unlock, omp_unset_lock, etc.  
+5) tsharevar is the set of variables shared among different threads. this includes global variables and those variables that are passed from thread-fork sites (e.g.,  $t_{\text{fork}}$ ).
+
+# 4.1.2 suspicious interleaving scope extraction
+
+given a program that may run simultaneously with multiple threads, we hope the instrumentation to collect execution states to reflect the interleavings. however, instrumentation introduces considerable overhead to the original program, especially when it is applied intensively throughout the whole pro
+
+gram. fortunately, with the static information provided by the thread-aware icfg, we know that thread-interleavings may only happen on some specific program statements; therefore, the instrumentation can stress these statements. we hereby use  $l_{m}$  to denote the set of these statements and term it as suspicious interleaving scope.  $l_{m}$  is determined according to the following three conditions.
+
+c1 the statements should be executed after one of  $t_{\text{fork}}$ , while  $t_{\text{join}}$  is not encountered yet.  
+c2 the statements can only be executed before the invocation of tlock and after the invocation of tunlock.  
+c3 the statements should read or write at least one of the shared variables by different threads.
+
+c1 excludes the statements irrelevant to multithreading. these statements can be prologue code that does the validity check (e.g., check in figure 1), or the epilogue that postprocesses the inputs or deals with error handlings. c2 prevents the statements that are protected by certain locks from being put into  $l_{m}$ . c3 is necessary since the interleavings will not affect the shared states if the segment involves no shared variables. this condition is determined by observing whether the investigated statement contains a variable data dependent on tsharevar (based on pointer analysis). we provide a separate preprocessing procedure to exclude cases where there are only read operations on shared variables.
+
+note that  $l_{m}$  is used to emphasize multithreading-relevant paths via instrumentations for state exploration during fuzzing. therefore the conditions are different from the constraints required by static models (e.g., may-happen-in-parallel [11, 45]) or dynamic concurrency-bug detection algorithms (e.g., happens-before [12] or lockset [41]).
+
+in figure 1, according to the call pthread_create at lines 24 and 25,  $f_{fork} = \{\mathrm{compute}\}$ . muzz then gets all the functions that may be called by functions inside  $f_{fork}$ , i.e., {modify, compute} and according to c1 the scope  $l_{m}$  comes from lines 1, 2, 10-17. inside these functions, we check the statements that are outside pthread_mutex_lock
+
+and pthread_mutex_unlock based on c2: line 15 should be excluded from  $l_{m}$ . according to c3, we exclude the statements that do not access or modify the shared variables g_var, s_var, which means lines 14 and 16 should also be excluded. in the end, the scope is determined as  $l_{m} = \{1,2,10,11,12,13,17\}$ . note that although modify can be called in a single-threading site inside check (line 6), we still conservatively include it in  $l_{m}$ . the reason is that it might be called within multithreading contexts (line 13 and line 15) — modify is protected by mutex m at line 15 while unprotected at line 13. it is worth noting that line 15, although protected by m, may still happen-in-parallel [11,45] with lines 10 and 11. however, since lines 10 and 11 have already been put in  $l_{m}$ , we consider it sufficient to help provide more feedback to track thread-interleavings, with line 15 excluded from  $l_{m}$ . overall, the static analysis is lightweight. for example, the pointer analysis is flow- and context-insensitive; extraction of thread-aware results such as  $f_{fork}$  (in c1) and tsharevar (in c3) are over-approximated in that the statically calculated sets may be larger than the actual sets; c2 may aggressively exclude several statements that involve interleavings. the benefit, however, is that it makes our analysis scalable to large-scale real-world programs.
+
+# 4.2 coverage-oriented instrumentation
+
+with the knowledge of  $l_{m}$ , we can instrument more deputy instructions (corresponding to statements in source code) inside the scope than the others, for exploring new transitions. however, it is still costly to instrument on each instruction inside  $l_{m}$  since this may significantly reduce the overall execution speed of the target programs. it is also unnecessary to do so — although theoretically, interleavings may happen everywhere inside  $l_{m}$ , many interleavings are not important because they do not change the values of shared variables in practice. this means that we can skip some instructions for instrumentation, or equivalently instrument them with a probability. we still instrument, despite less, on segments outside  $l_{m}$  for exploration purposes [34]. for example, in figure 1, we apply instrumentation on check, just in case the initial seeds are all rejected by the validity check and no intermediate feedback are available at all, making the executions extremely difficult to even enter compute. similarly, we can also selectively instrument some instructions outside  $l_{m}$ .
+
+# 4.2.1 instrumentation probability calculation
+
+the goal of calculating instrumentation probabilities is to strike a balance between execution overhead and feedback effectiveness by investigating code segments' complexity of the target programs. first of all, muzz calculates a base instrumentation probability according to cyclomatic complexity [35], based on the fact that bugs or vulnerabilities usually come from functions with higher cyclomatic complexity [9,43]. for each function  $f$ , we calculate the complexity
+
+value:  $m_{c}(f) = e(f) - n(f) + 2$  where  $n(f)$  is the number of nodes (basicblocks) and  $e(f)$  is the number of edges in the function's control flow graph. intuitively, this value determines the complexity of the function across its basic-blocks. as 10 is considered to be the preferred upper bound of  $m_{c}$  [35], we determine the base probability as:
+
+$$
+p _ {e} (f) = \min  \left\{\frac {e (f) - n (f) + 2}{1 0}, 1. 0 \right\} \tag {1}
+$$
+
+we use  $p_{s}$  as the probability to selectively instrument on the entry instruction of a basicblock that is entirely outside suspicious interleaving scope, i.e., none of the instructions inside the basicblock belong to  $l_{m}$ . here,  $p_{s}$  is calculated as:
+
+$$
+p _ {s} (f) = \min  \left\{p _ {e} (f), p _ {s 0} \right\} \tag {2}
+$$
+
+where  $0 < p_{s0} < 1$ . empirically, muff sets  $p_{s0} = 0.5$ .
+
+further, for each basicblock  $b$  inside the given function  $f$ , we calculate the total number of instructions  $n(b)$ , and the total number of memory operation instructions  $n_{\mathbf{m}}(b)$  (e.g., load/store, memcpy, free). then for the instructions within  $l_{m}$ , the instrumentation probability is calculated as:
+
+$$
+p _ {m} (f, b) = \min  \left\{p _ {e} (f) \cdot \frac {n _ {\mathbf {m}} (b)}{n (b)}, p _ {m 0} \right\} \tag {3}
+$$
+
+where  $p_{m0}$  is a factor satisfying  $0 < p_{m0} < 1$  and defaults to 0.33. the rationale of  $\frac{n_{\mathbf{m}}(b)}{n(b)}$  is that vulnerabilities usually result from memory operation instructions [34], and executions on more such operations deserve more attention.
+
+# 4.2.2 instrumentation algorithm
+
+the coverage-oriented instrumentation algorithm is described in algorithm 2. it traverses functions in the target program  $p$ . for each basicblock  $b$  in function  $f$ , muzz firstly gets the intersection of the instructions inside both  $b$  and  $l_{m}$ . if this intersection  $l_{m}(b)$  is empty, it instruments the entry instruction of  $b$  with a probability of  $p_{s}(f)$ . otherwise, 1) for the entry instruction in  $b$ , muzz always instruments it (i.e., with probability 1.0); 2) for the other instructions, if they are inside  $l_{m}$ , muzz instruments them with a probability of  $p_{m}(f,b)$ . we will refer to our selection strategy over deputy instructions as m-ins. as a comparison, afl-ins always instruments evenly at the entry instructions of all the basicblocks.
+
+for the example in figure 1, since the lines 21-25 and line 5 are out of  $l_{m}$ , we can expect m-lns to instrument fewer entry statements on their corresponding basicblocks. meanwhile, for the statements inside  $l_{m}$ , m-lns may instrument other statements besides the entry statements. for example, ① is the entry statement thus it must be instrumented; statement ② may also be instrumented (with a probability) — if so, transition ①→ ② can be tracked.
+
+algorithm 2: coverage-oriented instrumentation  
+input :target program  $p$  , and suspicious interleaving scope  $l_{m}$  output:program  $p$  instrumented with m-ins deputies   
+1 for  $f\in p$  do   
+2 for  $b\in f$  do   
+3  $\begin{array}{rl} & l_m(b) = l_m\cap b;\\ & \mathrm{if~}l_m(b)\mathrel{\mathop{\vrule height 0.5pt width 0.5pt height 0.5pt width 0.5pt height 0.5pt width 0.5pt height 0.5pt width 0.5pt height 0.5pt width 0.5pt height 0.5pt width 0.5pt height 0.5pt width 0.5pt height 0.5pt width 0.5pt height 0.5pt width 0.5pt height 0.\end{array}$    
+4 if  $l_{m}(b)\coloneqq \emptyset$  then   
+5 for  $i\in b$  do if is_entry_instr(i,b) then p  $\leftarrow$  instrument_cov(p,i,1.0); else if  $i\in l_{m}$  then p  $\leftarrow$  instrument_cov(p,i,pm(f,b));   
+9 else   
+10 for  $b\in f$  do i  $\equiv$  get_entry_instr(b); p  $\leftarrow$  instrument_cov(p,i,ps(f));
+
+# 4.3 threading-context instrumentation
+
+we apply threading-context instrumentation to distinguish thread identities for additional feedback. this complements coverage-oriented instrumentation since the latter is unaware of thread ids. the context is collected at the call sites of  $f_{ctx} = \{tlock, tunlock, tjoin\}$ , each of which has the form  $tc = \langle loc, n_{ctx} \rangle$ , where  $loc$  is the labeling value of deputy instruction executed before this call site, and  $n_{ctx}$  is obtained by getting the value of the key identified by current thread id from the "thread id map" collected by the instrumented function  $f_s$  (to be explained in §4.4). given an item  $f$  in  $f_{ctx}$ , we keep a sequence of context  $\langle tc_1(f), \ldots, tc_n(f) \rangle, f \in f_{ctx}$ . at the end of each execution, we calculate a hash value  $h(f)$  for item  $f$ . the tuple  $s_{ctx} = \langle h(tlock), h(tunlock), h(tjoin) \rangle$  is a context signature that determines the overall thread-context of a specific execution. essentially, this is a sampling on threading-relevant apis to track the thread-context of a specific execution. as we shall see in §5.1, the occurrence of  $s_{ctx}$  determines the results of cov_new_mtctx during seed selection.
+
+in figure 1, each time when pthread_mutex_lock  $\in$  tlock is called, muzz collects the deputy instruction prior to the corresponding call site (e.g.,  $③$ ) and the thread id label (e.g., t1) to form the tuple (e.g.,  $\langle 3,t1\rangle$ ); these tuples form a sequence for tlock, and a hash value  $h(tlock)$  will be calculated eventually. similar calculations are applied for pthread_mutex_unlock and pthread_join.
+
+# 4.4 schedule-intervention instrumentation
+
+when a user-space program does not specify any scheduling policy or priority, the operating system determines the actual schedule dynamically [23, 26]. schedule-intervention instrumentation aims to diversify the thread-interleavings to
+
+algorithm 3: select_next_seed strategy  
+input :seed queue  $q_{s}$  , seed t at queue front output: whether t will be selected in this round 1 if has_new_mtctx(qs) or has_new_trace(qs) then 2 if cov_new_mtctx(t) then 3 return true; 4 else if cov_new_trace(t) then 5 return select_withprob(pynt); 6 else 7 return select_withprob(pynn);   
+8 else 9 return select_withprob(pnnn);
+
+collaborate with coverage-oriented and thread-context instrumentations. this instrumentation should be general enough to work for different multithreaded programs and extremely lightweight to keep runtime overhead minimal.
+
+posix compliant systems such as linux, freebsd usually provide apis to control the low-level process or thread schedules [23, 26]. in order to intervene in the interleavings during the execution of the multithreading segments, we resort to the posix api pthread_setschedparam to adjust the thread priorities with an instrumented function named  $f_{s}$  that will be invoked during fuzzing. this function does two tasks:
+
+a) during repeated execution (§5.2), whenever the thread calls  $f_{s}$ , it updates the scheduling policy to sched_rr, and assigns a ranged random value to its priority. this value is uniformly distributed random and diversifies the actual schedules across different threads. with this intervention, we try to approximate the goal in §2.3.2.  
+b) for each newly mutated seed file, it calls pthread_self in the entry of  $f_{fork}$  to collect the thread ids. it has two purposes: 1) it informs the fuzzer that the current seed is multithreading-relevant; 2) based on the invocation order of  $f_{s}$ , each thread can be associated with a unique id  $n_{ctx}$  starting from  $1,2,\ldots$ , which composes "thread id map" and calculates thread-context in §4.3.
+
+# 5 dynamic fuzzing
+
+the dynamic fuzzing loop follows the workflow of a typical gbf described in algorithm 1. to improve the feedback on multithreading context, we optimize seed selection (§5.1) and repeated execution (§5.2) for fuzzing multithreaded programs, based on the aforementioned instrumentations.
+
+# 5.1 seed selection
+
+seed selection decides which seeds to be mutated next. in practice, this problem is reduced to: when traversing seed queue  $q_{s}$ , whether the seed  $t$  at the queue front will be selected for mutation. algorithm 3 depicts our solution. the intuition
+
+is that we prioritize those seeds with new (normal) coverage or covering new thread-context.
+
+in addition to following afl's strategy by using has_new_trace  $(q_s)$  to check whether there exists a seed,  $s$ , in  $q_s$  that covers a new transition (i.e., cov_new_trace(s) == true), muzz also uses has_new_mtctx  $(q_s)$  to check whether there exists a seed in  $q_s$  with a new thread-context  $(s_{ctx})$ . if either is satisfied, it means there exist some "interesting seeds" in the queue. specifically, if the current seed  $t$  covers a new thread-context, the algorithm directly returns true. if it covers a new trace, it has a probability of  $p_{ynt}$  to be selected; otherwise, the probability is  $p_{ynn}$ . on the contrary, if no seeds in  $q_s$  are interesting, the algorithm selects  $t$  with a probability of  $p_{nnn}$ . analogous to afl's seed selection strategy [63], muzz sets  $p_{ynt} = 0.95$ ,  $p_{ynn} = 0.01$ ,  $p_{nnn} = 0.15$ .
+
+as to the implementation of cov_new_mtctx(t), we track the thread-context of calling a multithreading api in  $f_{ctx} = \{tjoin, tlock, tunlock\}$  (c.f. §4.3) and check whether the context-signature  $s_{ctx}$  has been met before — when  $s_{ctx}$  is new, cov_new_mtctx(t) == true; otherwise, cov_new_mtctx(t) == false. note that cov_new_trace(t) == true does not imply cov_new_mtctx(t) == true. the reason is that (1) we cannot instrument inside the body of threading api functions (as they are "external functions") inside  $f_{ctx}$ , hence cov_new_trace cannot track the transitions; (2) cov_new_mtctx also facilitates the thread ids that cov_new_trace is unaware of.
+
+# 5.2 repeated execution
+
+multithreaded programs introduce non-deterministic behaviors when different interleavings are involved. as mentioned in §2.3.2, for a seed with non-deterministic behaviors, a gbf typically repeats the execution on the target program against the seed for more times. with the help of  $f_{s}$  (c.f. §4.4), we are able to tell whether or not the exhibited non-deterministic behaviors result from thread-interleavings. in fact, since we focus on multithreading only, based on the thread-fork information kept by  $f_{s}$ , the fuzzer can distinguish the seeds with non-deterministic behaviors purely by checking whether the executions exercise multithreading context. further, if previous executions on a seed induce more distinct values of  $s_{ctx}$  (the number of these values for a provided seed  $t$  is denoted as  $c_m(t)$ ), we know that there must exist more thread-interleavings. to determine the repeating times  $\mathbb{n}_c$  applied on  $t$ , we rely on  $c_m(t)$ . in afl, the repeating times on  $t$  is:
+
+$$
+\mathbb {n} _ {c} (t) = n _ {0} + n _ {v} \cdot b _ {v}, \quad b _ {v} \in \{0, 1 \} \tag {4}
+$$
+
+where  $n_0$  is the initial repeating times,  $n_{\nu}$  is a constant as the "bonus" times for non-deterministic runs.  $b_{\nu} = 0$  if none of the  $n_0$  executions exhibit non-deterministic behaviors; otherwise  $b_{\nu} = 1$ . we augment this to fit for multithreading setting.
+
+$$
+\mathbb {n} _ {c} (t) = n _ {0} + \min  \left\{n _ {\nu}, n _ {0} \cdot c _ {m} (t) \right\} \tag {5}
+$$
+
+in both afl and muzz,  $n_0 = 8$ ,  $n_v = 32$ . for all the  $\mathbb{n}_c$  executions, we track their execution traces and count how many different states it exhibits. the rationale of adjusting  $\mathbb{n}_c$  is that, in real-world programs the possibilities of thread-interleavings can vary greatly for different seeds. for example, a seed may exhibit non-deterministic behaviors when executing compute in figure 1 (e.g., races in g_var), but it exits soon after failing an extra check inside compute (typically, exit code  $>0$ ). for sure, it will exhibit fewer non-deterministic behaviors than a seed that is concurrently processed and the program exits normally (typically, exit code  $=0$ ).
+
+# 5.3 complementary explanations
+
+here we provide some explanations to show why muzz's static and dynamic thread-aware strategies help to improve the overall fuzzing effectiveness.
+
+1) mutations on multithreading-relevant seeds are more valuable for seed mutation/generation. multithreading-relevant seeds themselves have already passed validity checks of the target program. compared to a seed that cannot even enter the thread-fork routines, it is usually much easier to generate a multithreading-relevant seed mutant from an existing multithreading-relevant seed. this is because the mutation operations (e.g., bitwise/bytewise flips, arithmetic adds/subs) in grey-box fuzzers are rather random and it is rather difficult to turn an invalid seed to be valid. therefore, from the mutation's perspective, we prefer multithreading-relevant seeds to be mutated.
+
+2) muzz can distinguish more multithreading-relevant states. for example, in figure 1, it can distinguish transitions  $① \rightarrow ① \rightarrow ② \rightarrow ②$  and  $① \rightarrow ② \rightarrow ① \rightarrow ②$ . then when two different seeds exercise the two transitions, muzz is able to preserve both seeds. however, other gbfs such as afl cannot observe the difference. conversely, when we provide less feedback for seeds that do not involve multithreading, muzz can distinguish less of these states and put less multithreading-irrelevant seeds in the seed queue.
+
+3) large portions of multithreading-relevant seeds in the seed queue benefit subsequent mutations. suppose at some time of fuzzing, both muzz and afl preserve 10 seeds  $(n_{all} = 10)$ , and muzz keeps 8 multithreading-relevant seeds  $(n_{mt} = 8)$  while afl keeps  $6(n_{mt} = 6)$ . obviously, the probability of picking muzz generated multithreading-relevant seeds  $(80\%)$  is higher than afl's  $(60\%)$ . after this iteration of mutation, more seed mutants in muzz are likely multithreading-relevant. the differences of seed quality (w.r.t. relevance to multithreading) in the seed queue can be amplified with more mutation iterations. for example, finally muzz may keep 18 multithreading-relevant seeds  $(n_{mt} = 18)$ , and 10 other seeds, making  $n_{all} = 28$  and  $\frac{n_{mt}}{n_{all}} = \frac{18}{28} = 64.3\%$ ; while afl keeps 12 multithreading-relevant seeds  $(n_{mt} = 12)$  and 14 other seeds, making  $n_{all} = 26$  and  $\frac{n_{mt}}{n_{all}} = \frac{12}{26} = 46.2\%$ .
+
+properties 1), 2) and 3) collaboratively affects the fuzzing effectiveness in a "closed-loop". eventually, both  $n_{mt}$  and
+
+$\frac{n_{mt}}{n_{all}}$  in muzz are likely to be bigger than those in afl. owing to more multithreading-relevant seeds in the queue and property 1), we can expect that:
+
+a) concurrency-vulnerabilities are more likely to be detected with the new proof-of-crash files mutated from multithreading-relevant files from the seed queue.  
+b) concurrency-bugs are more likely to be revealed with the (seemingly normal) files in the seed queue that violate certain concurrency conditions.
+
+providing more feedback for multithreading-relevant segments essentially provides a biased coverage criterion to specialize fuzzing on multithreaded programs. other specialization techniques, such as the context-sensitive instrumentation used by angora [7], or the typestate-guided instrumentation in uafl [52], provide similar solutions and achieve inspiring results. the novelty of muzz lies in that we facilitate the multithreading-specific features as feedback to innovatively improve the seed generation quality. it is worth noting that our solution only needs lightweight thread-aware analyses rather than deep knowledge of multithreading/concurrency; thus, it can scale to real-world software.
+
+# 6 evaluation
+
+we implemented muzz upon svf [46], afl [63], and clusterfuzz [16]. the thread-aware icfg construction leverages svf's inter-procedural value-flow analysis. the instrumentation and dynamic fuzzing strategies lay inside afl's llvm module. the vulnerability analysis and concurrency-bug replaying components rely on clusterfuzz's crash analysis module. we archive our supporting materials at https://sites.google.com/view/mtfuzz. the archive includes initial seeds for fuzzing, the detected concurrency-vulnerabilities and concurrency-bugs, the implementation details, and other findings during evaluation.
+
+our evaluation targets the following questions:
+
+rq1 can muzz generate more effective seeds that execute multithreading-relevant program states?  
+rq2 what is the capability of muzz in detecting concurrency-vulnerabilities  $(v_{m})$ ?  
+rq3 what is the effect of using muzz generated seeds to reveal concurrency-bugs  $(b_{m})$  with bug detectors?
+
+# 6.1 evaluation setup
+
+# 6.1.1 settings of the grey-box fuzzers
+
+we use the following fuzzers during evaluation.
+
+1) muzz is our full-fledged fuzzer that applies all the thread-aware strategies in §4 and §5.  
+2) mafl is a variant of muzz. it differs from muzz only on the coverage-oriented instrumentation — mafl uses afl-ins while muzz uses m-ins. we compare mafl with muzz to demonstrate the effectiveness of m-ins, and compare mafl with afl to stress other strategies.
+
+3) afl is by far the most widely-used gbf that facilitates general-purpose afl-ins instrumentation and fuzzing strategies. it serves as the baseline fuzzer.  
+4) mopt [33] is the recently proposed general-purpose fuzzer that leverages adaptive mutations to increase the overall fuzzing efficiency. it is claimed to be able to detect  $170\%$  more vulnerabilities than afl in fuzzing (single-thread) programs.
+
+# 6.1.2 statistics of the evaluation dataset
+
+the dataset for evaluation consists of the following projects.
+
+1) parallel compression/decompression utilities including pigz, lbzip2, pbzip2, xz and pxz. these tools have been present in gnu/linux distributions for many years and are integrated into the gnu tar utility.  
+2) imagemagick and graphicsmagick are two widely-used software suites to display, convert, and edit image files.  
+3) libvpx and libwebp are two webm projects for vp8/vp9 and webp codecs. they are used by popular browsers like chrome, firefox, and opera.  
+4)  $x264$  and  $x265$  are the two most established video encoders for h.264/avc and hevc/h.265, respectively.
+
+all these projects' single-thread functionalities have been intensively tested by mainstream gbfs such as afl. we try to use their latest versions at the time of our evaluation; the only exception is libvpx, which we use version v1.3.0-5589 to reproduce the ground-truth vulnerabilities and concurrencybugs. among the 12 multithreaded programs, pxz, graphicsmagick, and imagemagick use openmp library, while the others use native pthread.
+
+table 1 lists the statistics of the benchmarks. the first two columns show the benchmark ids and their host projects. the next column specifies the command-line options. in particular, four working threads are specified to enforce the program to run in multithreading mode.
+
+the rest of the columns are the static statistics. column "binary size" calculates the sizes of the instrumented binaries. column  $t_{pp}$  records the preprocessing time of static analysis (c.f. §4.1). among the 12 benchmarks, vpxdec takes the longest time of approximately 30 minutes. columns  $n_b$ ,  $n_i$ , and  $n_{ii}$  depict the number of basicblocks, the number of total instructions, and the number of deputy instructions for m-ins (c.f. §4.2), respectively. recall that afl-ins instruments evenly over entry instructions of all basicblocks, hence  $n_b$  also denotes the number of deputy instructions in afl, mafl, and mopt. the last column,  $\frac{n_{ii} - n_b}{n_b}$ , is the ratio of more instructions muzz instrumented versus afl (or mafl, mopt). this ratio ranges from 6.0% (pbzip2-c or pbzip2-d) to 288.9% (x265). fortunately, in practice, this does not proportionally increase the runtime overhead. many aspects can affect this metric, including the characteristics of the target programs, the precision of the applied static analysis, and the empirically specified thresholds  $p_{s0}$  and  $p_{m0}$ .
+
+fuzzing configuration the experiments are conducted on
+
+table 1: static statistics of the 12 evaluated benchmarks; meanings of the columns are explained in §6.1.2.  
+
+<table><tr><td>id</td><td>project</td><td>command line options</td><td>binary size</td><td>\(t_{pp}\)</td><td>\(n_{b}\)</td><td>\(n_{i}\)</td><td>\(n_{ii}\)</td><td>\(\frac{n_{ii}-n_{b}}{n_{b}}\)</td></tr><tr><td>lbzip2-c</td><td>lbzip2-2.5</td><td>lbzip2 -k -t -9 -z -f -n4 file</td><td>377k</td><td>7.1s</td><td>4010</td><td>24085</td><td>6208</td><td>54.8%</td></tr><tr><td>pbzip2-c</td><td>pbzip2-v1.1.13</td><td>pbzip2 -f -k -p4 -s16 -z file</td><td>312k</td><td>0.9s</td><td>2030</td><td>8345</td><td>2151</td><td>6.0%</td></tr><tr><td>pbzip2-d</td><td>pbzip2-v1.1.13</td><td>pbzip2 -f -k -p4 -s16 -d file</td><td>312k</td><td>0.9s</td><td>2030</td><td>8345</td><td>2151</td><td>6.0%</td></tr><tr><td>pigz-c</td><td>pigz-2.4</td><td>pigz -p 4 -c -b 32 file</td><td>117k</td><td>5.0s</td><td>3614</td><td>21022</td><td>5418</td><td>49.9%</td></tr><tr><td>pxz-c</td><td>pxz-4.999.9beta</td><td>pxz -c -k -t 4 -q -f -9 file</td><td>42k</td><td>1.2s</td><td>3907</td><td>30205</td><td>7877</td><td>101.6%</td></tr><tr><td>xz-c</td><td>xz-5.3.1alpha</td><td>xz -9 -k -t 4 -f file</td><td>182k</td><td>8.4s</td><td>4892</td><td>34716</td><td>8948</td><td>82.9%</td></tr><tr><td>gm-cnvt</td><td>graphicsmagick-1.4</td><td>gm convert-limit threads 4 file out.bmp</td><td>7.6m</td><td>224.4s</td><td>63539</td><td>383582</td><td>98580</td><td>55.1%</td></tr><tr><td>im-cnvt</td><td>imagemagick-7.0.8-7</td><td>convert-limit thread 4 file out.bmp</td><td>19.4m</td><td>434.2s</td><td>128359</td><td>778631</td><td>200108</td><td>55.9%</td></tr><tr><td>cwebp</td><td>libwebp-1.0.2</td><td>cwebp -mt file -o out.webp</td><td>1.8m</td><td>56.3s</td><td>12117</td><td>134824</td><td>33112</td><td>173.3%</td></tr><tr><td>vpxdec</td><td>libvpx-v1.3.0-5589</td><td>vpxdec -t 4 -o out.y4m file</td><td>3.8m</td><td>431.6s</td><td>31638</td><td>368879</td><td>93400</td><td>195.2%</td></tr><tr><td>x264</td><td>x264-0.157.2966</td><td>x264 -threads=4 -o out.264 file</td><td>6.4m</td><td>1701.0s</td><td>38912</td><td>410453</td><td>103926</td><td>167.1%</td></tr><tr><td>x265</td><td>x265-3.0_au+3</td><td>x265 -input file -pools 4 -f 2 -o</td><td>9.7m</td><td>78.3s</td><td>22992</td><td>412555</td><td>89408</td><td>288.9%</td></tr></table>
+
+four intel(r) xeon(r) platinum 8151 cpu@3.40ghz workstations with 28 cores, each of which runs a 64-bit ubuntu 18.04 lts; the evaluation upon a specific benchmark is conducted on one machine. to make fair comparisons, muzz, mafl and afl are executed in their "fidgety mode" [65], while mopt is specified with  $-\texttt{l} 0$  to facilitate its "pacemaker mode" [33]. the cpu affinity is turned off during fuzzing to avoid multiple threads being bound to a single cpu core. during fuzzing, we run each of the aforementioned fuzzers six times against all the 12 benchmark programs, with a time budget of 24 hours. since all the evaluated programs are set to run with four working threads and the threads are mapped to different cores, it takes each fuzzer approximately  $12\times 6\times 24\times 4 = 6912$  cpu hours.
+
+# 6.2 seed generation (rq1)
+
+table 2 shows the overall fuzzing results in terms of newly generated seeds. we collect the total number of generated seeds  $(n_{all})$  and the number of seeds that exercise the multithreading context  $(n_{mt})$ . in afl's jargon,  $n_{all}$  corresponds to the distinct paths that the fuzzer observes [63]. the multithreading-relevant seeds are collected with a separate procedure, based on the observations that they at least invoke one element in  $tfork$ . therefore,  $n_{mt}$  tracks the different multithreading execution states during fuzzing — a larger value of this metric suggests the fuzzer can keep more effective thread-interleaving seeds. we sum up those seed files across all six fuzzing runs to form  $n_{all}$  and  $n_{mt}$  in table 2. the  $\frac{n_{mt}}{n_{all}}$  column shows the percentage of  $n_{mt}$  over  $n_{all}$ .  $\frac{n_{mt}}{n_{all}}$  determines the probability of picking a multithreading-relevant seed during seed selection, which greatly impacts the overall quality of the generated seeds. obviously, the most critical metrics are  $n_{mt}$  and  $\frac{n_{mt}}{n_{all}}$ .
+
+muzz surpasses mafl, afl, and mopt in both metrics. first, muzz exhibits superiority in generating multithreadingrelevant seeds — in all the benchmarks muzz achieves the highest  $n_{mt}$ . for example, in pbzip2-d, despite that all the  $\frac{n_{mt}}{n_{all}}$  are relatively small, muzz generated 297 multithreadingrelevant seeds, which is 178 more than mafl (119), 229
+
+more than afl (68), and 235 more than mopt (62). moreover, for larger programs such as im-cnvt (binary size 19.4m),  $n_{mt}$  of muzz (12987) is still better than the others (mafl: 10610, afl: 7634, mopt: 8012). second, the value of  $\frac{n_{mt}}{n_{all}}$  in muzz is more impressive — muzz wins the comparison over all the benchmarks. for example, in pbzip2-d, muzz's result of  $\frac{n_{mt}}{n_{all}}$  is higher — muzz: 14.9%, afl: 7.0% mafl: 4.1%, and mopt: 3.8%. for the benchmark where afl has already achieved a decent result, e.g., 89.3% for x264, muzz can even improve it to 96.5%. meanwhile, although mafl has the largest  $n_{mt}$  for x265 (10890), the value of its  $\frac{n_{mt}}{n_{all}}$  (78.6%) is less than that of muzz (82.6%).
+
+it is worth noting that mafl also outperforms afl and mopt w.r.t.  $n_{mt}$  and  $\frac{n_{mt}}{n_{all}}$  in all the benchmarks. for example, in  $pxz-c$ , the number of generated multithreading-relevant seeds in mafl is 3401, which is more than afl (2470) and mopt (2634). correspondingly, the percentage of multithreading-relevant seeds in mafl is  $60.3\%$ ; for afl and mopt, they are  $46.1\%$  and  $47.2\%$ , respectively. considering mafl, afl, mopt apply coverage-oriented instrumentation (m-lns), we can conclude that other strategies in mafl, including thread-context instrumentation, schedule-intervention instrumentation, and the optimized dynamic strategies, also contribute to effective seed generation.
+
+answer to rq1: muzz has advantages in increasing the number and percentages of multithreading-relevant seeds for multithreaded programs. the proposed three thread-aware instrumentations and dynamic fuzzing strategies benefit the seed generation.
+
+# 6.3 vulnerability detection (rq2)
+
+for vulnerability detection, we denote the total number of proof-of-crash (poc) files generated during fuzzing as  $n_{c}$ . the vulnerability analysis component (right-bottom area as © in figure 3) analyzes the poc files and categorizes them into different vulnerabilities. this basically follows cluster-fuzz's practice [16]: if two poc files have the same last n lines of backtraces and the root cause is the same (e.g., both
+
+table 2: fuzzing results on muzz, mafl, afl and mopt, in terms of generated seeds.  $n_{all}$ : total number of new seeds;  $n_{mt}$ : number of new multithreading-relevant seeds;  $\frac{n_{mt}}{n_{all}}$ : the percentage of multithreading-relevant seeds among all the generated seeds. bold data entries mark the best results among the fuzzers, in terms of  $n_{mt}$  and  $\frac{n_{mt}}{n_{all}}$ . the numbers in parentheses (for  $n_{all}$  and  $\frac{n_{mt}}{n_{all}}$ ) denote the differences between muzz and the others; for example, “ $(+1850)$ ” is the more multithreading-relevant seeds generated by muzz: 5127 than mafl: 3277.
+
+<table><tr><td rowspan="2">id</td><td colspan="3">muzz</td><td colspan="3">mafl</td><td colspan="3">afl</td><td colspan="3">mopt</td></tr><tr><td>nall</td><td>nmt</td><td>nmtnall</td><td>nall</td><td>nmt</td><td>nmtnall</td><td>nall</td><td>nmt</td><td>nmtnall</td><td>nall</td><td>nmt</td><td>nmtnall</td></tr><tr><td>lbzip2-c</td><td>8056</td><td>5127</td><td>63.6%</td><td>6307</td><td>3277(+1850)</td><td>52.0%(+11.7%)</td><td>5743</td><td>2464(+2663)</td><td>42.9%(+20.7%)</td><td>6033</td><td>2524(+2603)</td><td>41.8%(+21.8%)</td></tr><tr><td>pbzip2-c</td><td>381</td><td>126</td><td>33.1%</td><td>340</td><td>91(+35)</td><td>26.8%(+6.3%)</td><td>272</td><td>69(+57)</td><td>25.4%(+7.7%)</td><td>279</td><td>71(+55)</td><td>25.4%(+7.6%)</td></tr><tr><td>pbzip2-d</td><td>1997</td><td>297</td><td>14.9%</td><td>1706</td><td>119(+178)</td><td>7.0%(+7.9%)</td><td>1650</td><td>68(+229)</td><td>4.1%(+10.8%)</td><td>1623</td><td>62(+235)</td><td>3.8%(+11.1%)</td></tr><tr><td>pigz-c</td><td>1406</td><td>1295</td><td>92.1%</td><td>1355</td><td>1189(+106)</td><td>87.7%(+4.4%)</td><td>1298</td><td>1098(+197)</td><td>84.6%(+7.5%)</td><td>1176</td><td>982(+313)</td><td>83.5%(+8.6%)</td></tr><tr><td>pxz-c</td><td>7590</td><td>5249</td><td>69.2%</td><td>5637</td><td>3401(+1848)</td><td>60.3%(+8.8%)</td><td>5357</td><td>2470(+2779)</td><td>46.1%(+23.0%)</td><td>5576</td><td>2634(+2615)</td><td>47.2%(+21.9%)</td></tr><tr><td>xz-c</td><td>2580</td><td>1098</td><td>42.6%</td><td>2234</td><td>767(+331)</td><td>34.3%(+8.2%)</td><td>1953</td><td>581(+517)</td><td>29.7%(+12.8%)</td><td>1845</td><td>566(+532)</td><td>30.7%(+11.9%)</td></tr><tr><td>gm-cnvt</td><td>15333</td><td>13774</td><td>89.8%</td><td>14031</td><td>10784(+2990)</td><td>76.9%(+13.0%)</td><td>12453</td><td>8290(+5484)</td><td>66.6%(+23.3%)</td><td>12873</td><td>8956(+4818)</td><td>69.6%(20.3%)</td></tr><tr><td>im-cnvt</td><td>14377</td><td>12987</td><td>90.3%</td><td>12904</td><td>10610(+2377)</td><td>82.2%(+8.1%)</td><td>9935</td><td>7634(+5353)</td><td>76.8%(+76.8%)</td><td>10203</td><td>8012(+4975)</td><td>78.5%(+11.8%)</td></tr><tr><td>cwebp</td><td>11383</td><td>7554</td><td>66.4%</td><td>10389</td><td>6868(+686)</td><td>66.1%(+0.3%)</td><td>9754</td><td>5874(+1680)</td><td>60.2%(+6.1%)</td><td>9803</td><td>5869(+1685)</td><td>59.9%(+6.5%)</td></tr><tr><td>vpxdec</td><td>28892</td><td>25593</td><td>88.6%</td><td>27735</td><td>22507(+3086)</td><td>81.2%(+7.4%)</td><td>24397</td><td>18936(+6657)</td><td>77.6%(+11.0%)</td><td>27119</td><td>20896(+4697)</td><td>77.1%(11.5%)</td></tr><tr><td>x264</td><td>15138</td><td>14611</td><td>96.5%</td><td>14672</td><td>13413(+1198)</td><td>91.4%(+5.1%)</td><td>13211</td><td>11801(+2810)</td><td>89.3%(+7.2%)</td><td>12427</td><td>11202(+3409)</td><td>90.1%(+6.4%)</td></tr><tr><td>x265</td><td>12965</td><td>10704</td><td>82.6%</td><td>13858</td><td>10890(-186)</td><td>78.6%(+4.0%)</td><td>12980</td><td>9957(+747)</td><td>76.7%(+5.9%)</td><td>13142</td><td>10154(+550)</td><td>77.3%(+5.3%)</td></tr></table>
+
+exhibit as buffer-overflow), they are treated as one vulnerability. afterwards, we manually triage all the vulnerabilities into two groups based on their relevance with multithreading: the concurrency-vulnerabilities  $v_{m}$ , and the other vulnerabilities that do not occur in multithreading context  $v_{s}$ . the number of these vulnerabilities are denoted as  $n_{\nu}^{m}$  and  $n_{\nu}^{s}$ , respectively.
+
+we mainly refer to  $n_{c}^{m}, n_{\nu}^{m}$  in table 3 to evaluate muzz's concurrency-vulnerability detection capability.
+
+the number of multithreading-relevant poc files,  $n_{c}^{m}$ , is important since it corresponds to different crashing states when executing multithreading context [27, 34]. it is apparent that muzz has the best results of  $n_{c}^{m}$  in all the benchmarks that have  $v_{m}$  vulnerabilities (e.g., for im-cnvt, muzz: 63, mafl: 23, afl: 6, mopt: 6). moreover, mafl also exhibits better results than afl and mopt (e.g., for pbzip2-c, muzz: 6, mafl: 6, afl: 0, mopt: 0). this suggests that muzz's and mafl's emphasis on multithreading-relevant seed generation indeed helps to exercise more erroneous multithreading-relevant execution states.
+
+the most important metric is  $n_{\nu}^{m}$  since our focus is to detect concurrency-vulnerabilities  $(v_{m})$ . table 3 shows that muzz has the best results: muzz detects 9 concurrency-vulnerabilities, while mafl, afl and mopt detects 5, 4, 4, respectively. detected  $v_{m}$  can be divided into three groups.
+
+1)  $v_{m}$  caused by concurrency-bugs. we term this group of vulnerabilities as  $v_{cb}$ . the 4 vulnerabilities in im-cnvt all belong to this group — the misuses of caches shared among threads cause the data races. the generated seeds may exhibit various symptoms such as buffer-overflow and memcpy-param-overlap. muzz found all the 4 vulnerabilities, while the others only found 2. we also observed that for the 2 vulnerabilities that are detected by all these fuzzers, mafl's detection capability appears more stable since it detects both in all its six fuzzing runs, while the others can only detect them at most in five runs (not depicted in the table). 2)  $v_{m}$  triggered
+
+in multithreading only but not induced by concurrencybugs. for example, the vulnerability in pbzip2-d stems from a stack-overflow error when executing a function concurrently. this crash can never happen when pbzip2-d works in single-thread mode since it does not even invoke that erroneous function. in our evaluation, muzz detected this vulnerability while the other fuzzers failed. another case is the vulnerability in pbzip2-c, which was detected by muzz and mafl, but not by afl or mopt. 3) other concurrency-vulnerabilities. the characteristics of these  $v_{m}$  are that their crashing backtrace contains multithreading context (i.e., tfork is invoked), however, the crashing condition might also be occasionally triggered when only one thread is specified. the  $v_{m}$  vulnerabilities detected in vpxdec and x264 belong to this category. in particular, muzz detects 2 vulnerabilities in vpxdec while mafl, afl, and mopt only find 1.
+
+we consider the reason behind the differences w.r.t.  $n_{c}^{m}$  and  $n_{\nu}^{m}$  among the fuzzers to be that, muzz keeps more "deeper" multithreading-relevant seeds that witness different execution states, and mutations on some of them are more prone to trigger the crashing conditions.
+
+columns  $n_{c}, n_{c}^{s}, n_{v}^{s}$  are metrics less focused. but we can still observe that 1) according to  $n_{c}$ , muzz (and mafl) can exercise more total crashing states; 2) despite that the values of  $n_{c}^{s}$  from muzz are usually smaller, muzz can still find all the (categorized)  $v_{s}$  detected by other fuzzers.
+
+from the 12 evaluated benchmarks, we reported the 10 new vulnerabilities (sum of muzz's results in columns  $n_{\nu}^{m}$  and  $n_{\nu}^{s}$  except for row vpxdec; 7 of them belong to  $v_{m}$ ), all of them have been confirmed or fixed, 3 of which have already been assigned cve ids. besides, we also conducted a similar evaluation on libvpx v1.8.0-178 (the git head version at the time of evaluation). muzz detected a 0-day concurrency-vulnerability within 24 hours (among six fuzzing runs, two of them detected the vulnerability in 5h38min and 16h07min,
+
+table 3: fuzzing results on muzz, mafl, afl and mopt, in terms of crashes and vulnerabilities. some projects (e.g., lbzip2-c) are excluded since there were no crashes/vulnerabilities detected by any of the fuzzers.  $n_{c}$ : number of proof-of-crash (poc) files;  $n_{c}^{m}$ : number of multithreading-relevant poc files;  $n_{v}^{m}$ : number of concurrency-vulnerabilities.  $n_{c}^{s}$ : number of poc files irrelevant with multithreading;  $n_{v}^{s}$ : number of vulnerabilities irrelevant to multithreading. bold data entries mark the best results for  $n_{c}^{m}$  and  $n_{v}^{m}$ . the numbers in parentheses denote the differences between muzz and others.  
+
+<table><tr><td rowspan="2">id</td><td colspan="5">muzz</td><td colspan="5">mafl</td><td colspan="5">afl</td><td colspan="5">mopt</td></tr><tr><td>nc</td><td>nmcm</td><td>nmvm</td><td>ncs</td><td>nss</td><td>nc</td><td>nmcm</td><td>nmvm</td><td>ncs</td><td>nss</td><td>nc</td><td>nmcm</td><td>nmvm</td><td>ncs</td><td>nss</td><td>nc</td><td>nmcm</td><td>nmvm</td><td>ncs</td><td>nss</td></tr><tr><td>pbzip2-c</td><td>6</td><td>6</td><td>1</td><td>0</td><td>0</td><td>6</td><td>0(+6)</td><td>1(0)</td><td>0</td><td>0</td><td>0</td><td>0(+6)</td><td>0(+1)</td><td>0</td><td>0</td><td>0</td><td>0(+6)</td><td>0(+1)</td><td>0</td><td>0</td></tr><tr><td>pbzip2-d</td><td>15</td><td>15</td><td>1</td><td>0</td><td>0</td><td>0</td><td>0(+15)</td><td>0(+1)</td><td>0</td><td>0</td><td>0</td><td>0(+15)</td><td>0(+1)</td><td>0</td><td>0</td><td>0</td><td>0(+15)</td><td>0(+1)</td><td>0</td><td>0</td></tr><tr><td>im-cnvt</td><td>87</td><td>63</td><td>4</td><td>24</td><td>1</td><td>49</td><td>23(+40)</td><td>2(+2)</td><td>26</td><td>1</td><td>29</td><td>6(+57)</td><td>2(+2)</td><td>23</td><td>1</td><td>32</td><td>6(+57)</td><td>2(+2)</td><td>26</td><td>1</td></tr><tr><td>cwebp</td><td>19</td><td>0</td><td>0</td><td>19</td><td>1</td><td>27</td><td>0(0)</td><td>0(0)</td><td>27</td><td>1</td><td>14</td><td>0(0)</td><td>0(0)</td><td>14</td><td>1</td><td>15</td><td>0(0)</td><td>0(0)</td><td>15</td><td>1</td></tr><tr><td>vpxdec</td><td>523</td><td>347</td><td>2</td><td>176</td><td>2</td><td>495</td><td>279(+68)</td><td>1(+1)</td><td>216</td><td>2</td><td>393</td><td>205(+142)</td><td>1(+1)</td><td>188</td><td>2</td><td>501</td><td>301(+46)</td><td>1(+1)</td><td>200</td><td>2</td></tr><tr><td>x264</td><td>103</td><td>103</td><td>1</td><td>0</td><td>0</td><td>88</td><td>88(+15)</td><td>1(0)</td><td>0</td><td>0</td><td>78</td><td>78(+25)</td><td>1(0)</td><td>0</td><td>0</td><td>66</td><td>66(+37)</td><td>1(0)</td><td>0</td><td>0</td></tr><tr><td>x265</td><td>43</td><td>0</td><td>0</td><td>43</td><td>1</td><td>52</td><td>0(0)</td><td>0(0)</td><td>52</td><td>1</td><td>62</td><td>0(0)</td><td>0(0)</td><td>62</td><td>1</td><td>59</td><td>0(0)</td><td>0(0)</td><td>59</td><td>1</td></tr></table>
+
+respectively), while mafl, afl and mopt failed to detect it in 15 days (360 hours) in all their six fuzzing runs. the newly detected vulnerability has been assigned with another cve id. the vulnerability details are available in table 5.
+
+given the fact that there are extremely few cve records caused by concurrency-vulnerabilities (e.g., 202 among 70438, based on records from cve-2014-* to cve-2018*) [48], muzz demonstrates the high capability in detecting concurrency-vulnerabilities.
+
+answer to rq2: muzz demonstrates superiority in exercising more multithreading-relevant crashing states and detecting concurrency-vulnerabilities.
+
+# 6.4 concurrency-bug revealing (rq3)
+
+the fuzzing phase only detects the vulnerabilities caused by crashes, but the seemingly normal seed files generated during fuzzing may still execute paths that trigger concurrency-violation conditions like data-races, deadlocks, etc. we detect concurrency-bugs in concurrency-bug revealing component (d), right-top in figure 3). it is worth noting that our goal is not to improve the capabilities of concurrency-bug detection over existing techniques such as tsan [42], helgrind [49], or ufo [21]. instead, we aim to reveal as many bugs as possible within a time budget, by replaying against fuzzer-generated seeds with the help of these techniques. in practice, this component feeds the target program with the seeds that were generated during fuzzing as its inputs, and facilitate detectors such as tsan to reveal concurrency-bugs. during this evaluation, we compiled the target programs with tsan and replayed them against the fuzzer-generated multithreading-relevant seeds (corresponding to  $n_{mt}$  in table 2). we did not replay with all the generated seeds (corresponding to  $n_{all}$  in table 2) since seeds not exercising multithreading context will not reveal concurrency-bugs.
+
+we limit our replay time budget to two hours; in §6.5.4 we discuss the rationale of this configuration. the next is to determine the replay pattern per seed to reveal more concurrency
+
+bugs within this budget. this is necessary since tsan may fail to detect concurrency-bugs in a few runs when it does not observe concurrency violation conditions [12, 42, 49]. meanwhile, as the time budget is limited, we cannot exhaustively replay against a given seed to see whether it may trigger concurrency-violations — in the worst case, we may waste time in executing against a seed that never violates the conditions. we provide two replay patterns.
+
+$\mathbb{p}1$  it executes against each seed in the queue once per turn in a round-robin way, until reaching the time budget.  
+$\mathbb{p}2$  it relies on  $\mathbb{n}_c$  in repeated execution (c.f., §5.2): each seed is executed  $\frac{\mathbb{n}_c}{n_0}$  times per turn continuously in a round-robin way. according to equation 4, we replay 5 times per turn (40/8) for afl generated multithreading-relevant seeds; for muzz and mafl, it is determined by equation (5), with candidate values 2, 3, 4, 5.
+
+it is fair to compare replay results w.r.t.  $\mathbb{p}1$  and  $\mathbb{p}2$  in that the time budget is fixed. the difference between the two patterns is that seeds' execution orders and accumulated execution time spent on them can be rather different.
+
+table 4 depicts the results for concurrency-bug revealing with  $\mathbb{p}1$  and  $\mathbb{p}2$ .  $n_e^m$  is the number of observed concurrency-violation executions and  $n_b^m$  is the number of concurrency-bugs ( $b_m$ ) according to their root causes. for example, it only counts one concurrency-bug ( $n_b^m = 1$ ) even when the replaying process observes 10 data-race pairs across executions ( $n_e^m = 10$ ), as long as the root cause of the races is unique. we analyze this table from two perspectives.
+
+first, muzz demonstrates superiority in concurrency-bug detection regardless of replay patterns. this is observed based on the "best results" for each metric in each pattern. muzz achieves the best results for most projects. for example, when  $x264$  is replayed with  $n_e^m$ , 1) muzz's found the most violations — the values of  $n_e^m$  are, muzz: 68, afl: 46, afl: 28, mopt: 30; 2) the best result of  $n_b^m$  also comes from muzz, muzz: 8, afl: 6, afl: 4, mopt: 5. similar results can also be observed with  $\mathbb{p}2$  for  $x264$ , where muzz has the biggest  $n_e^m(91)$  and biggest  $n_b^m(9)$ . the only project where mafl achieves the best is  $pigz-c$ , where it is slightly
+
+table 4: comparisons of replay patterns  $\mathbb{p}1$  and  $\mathbb{p}2$  on muzz, mafl, afl and mopt, in terms of concurrency violations  $(n_e^m)$  and concurrency-bugs  $(n_b^m)$ . the best results of  $n_e^m$  and  $n_b^m$  are underlined / bold for  $\mathbb{p}1$  /  $\mathbb{p}2$  respectively.  
+
+<table><tr><td rowspan="2">id</td><td colspan="8">p1</td><td colspan="7">p2</td><td></td></tr><tr><td colspan="2">muzz</td><td colspan="2">mafl</td><td colspan="2">afl</td><td colspan="2">mopt</td><td colspan="2">muzz</td><td colspan="2">mafl</td><td colspan="2">afl</td><td colspan="2">mopt</td></tr><tr><td></td><td>neme</td><td>nbm</td><td>neme</td><td>nbm</td><td>neme</td><td>nbm</td><td>neme</td><td>nbm</td><td>neme</td><td>nbm</td><td>neme</td><td>nbm</td><td>neme</td><td>nbm</td><td>neme</td><td>nbm</td></tr><tr><td>lbzip2-c</td><td>469</td><td>1/2</td><td>447</td><td>1/2</td><td>386</td><td>1/2</td><td>435</td><td>1/2</td><td>493</td><td>1</td><td>483</td><td>1</td><td>421</td><td>1</td><td>458</td><td>1</td></tr><tr><td>pigz-c</td><td>793</td><td>1/2</td><td>803</td><td>1/2</td><td>764</td><td>1/2</td><td>789</td><td>1/2</td><td>856</td><td>1</td><td>862</td><td>1</td><td>727</td><td>1</td><td>742</td><td>1</td></tr><tr><td>gm-cnvt</td><td>93</td><td>5/2</td><td>79</td><td>4/2</td><td>45</td><td>2/2</td><td>55</td><td>3/2</td><td>133</td><td>5</td><td>83</td><td>4</td><td>54</td><td>3</td><td>57</td><td>3</td></tr><tr><td>im-cnvt</td><td>92</td><td>3/2</td><td>84</td><td>3/2</td><td>58</td><td>2/2</td><td>56</td><td>2/2</td><td>118</td><td>3</td><td>117</td><td>3</td><td>65</td><td>2</td><td>59</td><td>2</td></tr><tr><td>vpxdec</td><td>31</td><td>3/2</td><td>17</td><td>1/2</td><td>23</td><td>1/2</td><td>18</td><td>1/2</td><td>42</td><td>3</td><td>22</td><td>1</td><td>25</td><td>1</td><td>22</td><td>1</td></tr><tr><td>x264</td><td>68</td><td>8/2</td><td>46</td><td>6/2</td><td>28</td><td>4/2</td><td>30</td><td>5/2</td><td>91</td><td>9/2</td><td>52</td><td>6/2</td><td>25</td><td>4/2</td><td>28</td><td>4</td></tr></table>
+
+better than muzz.
+
+second, as to muzz and mafl,  $\mathbb{p}2$  is probably better than  $\mathbb{p}1$ . it is concluded based on the fact that  $\mathbb{p}2$ 's "best results" are all better than  $\mathbb{p}1$ 's. for example, as to  $n_e^m$  in  $x264$ , the best result of  $n_e^m$  is achieved with  $\mathbb{p}2$  (p1: 68, p2: 91); similarly, the best result of  $n_b^m$  also comes from  $\mathbb{p}2$  (p1: 8, p2: 9). in the meantime, there seems to be no such implication inside afl or mopt. besides the numbers of concurrency-violations or concurrency-bugs, §6.5.3 provides a case study on gm-cnvt that demonstrates  $\mathbb{p}2$ 's advantages over  $\mathbb{p}1$  w.r.t. time-to-exposure of the concurrency-bugs.
+
+we have reported all the newly detected 19 concurrency-bugs (excluding the 3 concurrency-bugs in vpxdec-v1.3.0-5589) to their project maintainers (c.f., table 5 for the details).
+
+answer to rq3: muzz outperforms competitors in detecting concurrency-bugs; the value  $\mathbb{n}_c$  calculated during fuzzing additionally contributes to revealing these bugs.
+
+# 6.5 further discussions
+
+this section discusses miscellaneous concerns, issues and observations for muzz's design and evaluation.
+
+# 6.5.1 constant parameters
+
+using empirical constant parameters for grey-box fuzzing is practiced by many fuzzing techniques [6,33,63]. for example, afl itself has many hard-coded configurations used by default; mopt additionally has the suggested configuration to control the time to move on to pacemaker mode (i.e.,  $-\mathbb{l}0$ ).
+
+in muzz, constant parameters are used in two places.
+
+(1) the upper bounds for coverage-oriented instruction:  $p_{s0}$  (defaults to 0.5) and  $p_{m0}$  (defaults to 0.33). these default values inspire from afl's "selective deputy instruction instrumentation" strategy to make the instrumentation ratio to be 0.33 when addresssanitizer is involved during instrumentation. larger values of  $p_{s0}$  and  $p_{m0}$  increases the instrumentation ratio only if the thresholds are frequently reached. subsequently, the instrumented program has these symptoms: a) the program size after instrumentation increases; b) the execution state feedback is potentially better; c)
+
+the instrumentation-introduced execution speed slowdown is more evident. therefore, increasing the values of  $p_{s0}$  and  $p_{m0}$  reflects a tradeoff between precise feedback and its overhead. in our benchmarks, when we assign  $p_{s0} = 0.5$ ,  $p_{m0} = 0.33$ ,
+
+- for im-cnvt, the speed slowdown is about  $15\%$  compared to default settings, while the capability of detecting concurrency-vulnerabilities and concurrency-bugs are similar; meanwhile, there are a few more multithreading-relevant seeds  $(n_{mt})$  but  $\frac{n_{mt}}{n_{all}}$  is slightly smaller.  
+- for pbzip2-c, the differences brought by changes of  $p_{s0}$  and  $p_{m0}$  from the default settings are all negligible.
+
+we believe there are no optimal instrumentation thresholds that work for all the projects; therefore muzz provides the empirical values as the defaults.
+
+(2) the seed selection probabilities  $p_{ynt} = 0.95$ ,  $p_{ynn} = 0.01$ ,  $p_{nnn} = 0.15$  in algorithm 3. these constants are not introduced by muzz, but based on afl's "skipping probability" to conditionally favor seeds with new coverage [63].
+
+since the 12 benchmarks that we chose are quite diversified (c.f., §6.1.2), it is considered fair to use default settings for these parameters, when comparing muzz, mafl with other fuzzers such as afl, mopt. in practice, we suggest keeping muzz's default settings to test other multithreaded programs.
+
+# 6.5.2 schedule-intervention instrumentation
+
+the goal of muzz's schedule-intervention is to diversify interleavings during repeated executions in the fuzzing phase. during the evaluation, we did not separately evaluate the effects of schedule-intervention instrumentation. however, based on our observation, this instrumentation is important to achieve more stable fuzzing results. two case studies can support this statement.
+
+a) we turned off schedule-intervention instrumentation in muzz and fuzzed lbzip2-c six times on the same machine. the calculated value of  $\frac{n_{mt}}{n_{all}}$  is  $54.5\%$  (= 4533/8310), which is lower than the result in table 2 (63.6% = 5127/8056). since  $54.5\%$  is still greater than the results of afl (42.9%) and mopt (41.8%), this also indicates muzz's other two strategies indeed benefit the multithreading-relevant seed generation for fuzzing.
+
+table 5: newly detected vulnerabilities and concurrency-bugs. this summarizes the new vulnerabilities and concurrency-bugs evaluated in table 3 and table 4 over the 11 benchmarks (libvpx-v1.3.0-5589 results are all excluded), and includes one concurrency-vulnerability in vpxdec-v1.8.0-178 which was mentioned in §6.3.  
+
+<table><tr><td>bugs</td><td>project</td><td>bug type</td><td>reported category</td><td>muzz</td><td>mafl</td><td>afl</td><td>mopt</td><td>status</td></tr><tr><td>v1</td><td>pbzip2</td><td>vm</td><td>divide-by-zero</td><td>✓</td><td>✓</td><td>✗</td><td>✗</td><td>confirmed, not fixed</td></tr><tr><td>v2</td><td>pbzip2</td><td>vm</td><td>stack-overflow</td><td>✓</td><td>✗</td><td>✗</td><td>✗</td><td>confirmed, not fixed</td></tr><tr><td>v3</td><td>imagemagick</td><td>vm</td><td>memcpy-param-overlap</td><td>✓</td><td>✗</td><td>✗</td><td>✗</td><td>cve-2018-14560</td></tr><tr><td>v4</td><td>imagemagick</td><td>vm</td><td>buffer-overflow</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>cve-2019-15141</td></tr><tr><td>v5</td><td>imagemagick</td><td>vm</td><td>buffer-overflow</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>confirmed, fixed</td></tr><tr><td>v6</td><td>imagemagick</td><td>vm</td><td>buffer-overflow</td><td>✓</td><td>✗</td><td>✗</td><td>✗</td><td>confirmed, fixed</td></tr><tr><td>v7</td><td>imagemagick</td><td>vs</td><td>negative-size-param</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>cve-2018-14561</td></tr><tr><td>v8</td><td>x264</td><td>vm</td><td>buffer-overflow</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>confirmed, fixed</td></tr><tr><td>v9</td><td>libwebp</td><td>vs</td><td>failed-to-allocate</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>confirmed, won&#x27;t fix</td></tr><tr><td>v10</td><td>x265</td><td>vs</td><td>divide-by-zero</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>confirmed, not fixed</td></tr><tr><td>v11</td><td>libvpx-v1.8.0-178</td><td>vm</td><td>invalid-memory-read</td><td>✓</td><td>✗</td><td>✗</td><td>✗</td><td>cve-2019-11475</td></tr><tr><td>c1</td><td>lbzip2</td><td>bm</td><td>thread-leak</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>confirmed, not fixed</td></tr><tr><td>c2</td><td>pigz</td><td>bm</td><td>lock-order-inversion</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>confirmed, fixed</td></tr><tr><td>c3-c7</td><td>graphicsmagick</td><td>bm</td><td>data-race</td><td>5</td><td>4</td><td>3</td><td>2</td><td>confirmed, fixed</td></tr><tr><td>c8-c10</td><td>imagemagick</td><td>bm</td><td>data-race</td><td>3</td><td>3</td><td>2</td><td>2</td><td>confirmed, fixed</td></tr><tr><td>c11-c19</td><td>x264</td><td>bm</td><td>data-race</td><td>9</td><td>6</td><td>4</td><td>4</td><td>confirmed, not fixed</td></tr></table>
+
+b) we turned off schedule-intervention instrumentation in muzz and fuzzed im-cnvt on a different machine. in all the six fuzzing runs it only detects three concurrency-vulnerabilities which is less than the result in table 3  $(n_{\nu}^{m} = 4)$ . meanwhile, when the schedule-intervention instrumentation is re-enabled, muzz can still detect four concurrency-vulnerabilities in that machine.
+
+# 6.5.3 time-to-exposure forconcurrency-bug revealing
+
+in §6.4, we demonstrate  $\mathbb{p}2$ 's advantage over  $\mathbb{p}1$  in terms of occurrences of concurrency-violations  $(n_e^m)$  and the number of categorized concurrency-bugs  $(n_b^m)$ . another interesting metric is the time-to-exposure capability of these two replay patterns — given the ground truth that the target programs contain certain concurrency-bugs, the minimal time cost for each pattern to reveal all the known bugs. this metric can further distinguish the two replay patterns' capabilities in terms of revealing concurrency-bug.
+
+we conducted a case study on gm-cnvt. from table 4, it is observable that with both  $\mathbb{p}1$  and  $\mathbb{p}2$ , tsan detected four concurrency-bugs  $(n_b^m)$  by replaying the mafl generated multithreading-relevant seeds (totally 10784) from table 2; besides, their  $n_e^m$  results are also similar ( $\mathbb{p}1: 79$ ,  $\mathbb{p}2: 83$ ). we repeated six times against the 10784 seeds by applying  $\mathbb{p}1$  and  $\mathbb{p}2$ . when a replaying process detects all the four different ground-truth concurrency-bugs, we record the total execution time (in minutes). table 6 shows the results.
+
+in table 6, compared to  $\mathbb{p}1$ , we can observe that  $\mathbb{p}2$  reduces the average time-to-exposure from 66.5 minutes to 34.1 minutes. this fact means, for example, given a tighter replay time budget (say, 60 minutes),  $\mathbb{p}1$  has a high chance to miss some of the four concurrency-bugs. moreover,  $\mathbb{p}2$  is more stable since the timing variance is much smaller than that of
+
+table 6: time-to-exposure of gm-cnvt's concurrency-bugs during six replays with patterns  $\mathbb{p}1$  and  $\mathbb{p}2$ .  
+
+<table><tr><td></td><td>#1</td><td>#2</td><td>#3</td><td>#4</td><td>#5</td><td>#6</td><td>avg</td><td>variance</td></tr><tr><td>p1</td><td>55.3</td><td>92.1</td><td>21.8</td><td>93.7</td><td>101.5</td><td>34.7</td><td>66.5</td><td>959.2</td></tr><tr><td>p2</td><td>33.4</td><td>52.2</td><td>33.5</td><td>37.6</td><td>24.7</td><td>23.3</td><td>34.1</td><td>91.0</td></tr></table>
+
+$\mathbb{p}1$  (91.0 vs. 959.2). this result implicates that, in table 4, for the concurrency-bug revealing capability of mafl, the  $\mathbb{p}2$ 's result in  $gm-cnvt$  is likely to be much better than  $\mathbb{p}1$ 's.
+
+the evaluation of time-to-exposure suggests that, given a set of seeds,  $\mathbb{p}2$  is prone to expose concurrency-bugs faster and more stable. since  $\mathbb{p}2$  is closely relevant to schedule-intervention instrumentation (§4.4) and repeated execution (§5.2), this also indicates that these strategies are helpful for concurrency-bug revealing.
+
+# 6.5.4 time budget during replaying
+
+we chose two hours (2h) as the time budget in the reply phase during evaluation. unlike the fuzzing phase, which aims to generate new seed files that exercise multithreading context, the replay phase runs the target program against existing seeds (generated during fuzzing). therefore, the criterion is to 1) minimize the time for replay; 2) ensure that replay phase traverses all the generated seeds. for projects with less generated (multithreading-relevant) seeds (e.g.,  $n_{mt} = 126$  for pbzip2-c when applying muzz), traversing the seeds (with both p1 and p2) once are quite fast; however for projects with more generated seeds (e.g.,  $n_{mt} = 13774$  for gm-cnvt when applying muzz), this requires more time. to make the evaluation fair, we use the fixed time budget for all the 12 benchmarks, where seeds in projects like pbzip2-c will be traversed repeatedly until timeout. during the evaluation, we found 2h to be moderate
+
+since it can traverse all the generated multithreading-relevant seeds at least once for all the projects.
+
+less time budget, e.g., 1h, may make the replay phase to miss certain generated seeds triggering concurrency violation conditions. in fact, from table 6, we see that time-to-exposure for the concurrency-bugs may take 101.5 minutes. meanwhile, more time budget, e.g., 4h, might be a waste of time for the exercised 12 benchmarks. in fact, in a case study for  $gm$ -cnvt, when time budget is 4h, despite that  $n_e^m$  is nearly doubled, the number of revealed  $b_m$  (i.e.,  $n_b^m$ ) is still the same as the results in table 4, regardless of  $\mathbb{p}1$  or  $\mathbb{p}2$ .
+
+# 6.5.5 statistical evaluation results
+
+specific to the nature of multithreaded programs and our evaluation strategy to determine seeds' relevance with multithreading, we decide not to provide some commonly-used statistical results [27].
+
+first, it is unfair to track coverage over time when comparing muzz, mafl with afl or mopt due to the different meanings of "coverage". in fact, owing to coverage-oriented instrumentation (in muzz) and threading-context instrumentation (in muzz and mafl), muzz and mafl cover more execution states (corresponding to  $n_{all}$ ), therefore naturally preserve more seeds. that is also the reason that in §6.2 the values of  $n_{mt}$  and  $\frac{n_{mt}}{n_{all}}$  are more important than  $n_{all}$ .
+
+second, we cannot compare the multithreading-relevant paths over time among muzz, mafl, afl, and mopt. this reason is simple: we resort to a separate procedure after fuzzing to determine whether it covers thread-forking routines. we have to do so since afl and mopt do not provide a built-in solution to discovering seeds' relevance with multithreading. consequently, we cannot plot multithreading-relevant crashing states over time.
+
+third, despite that the statistical variance is important, it is not easy to be calculated comprehensively. during evaluation, to reduce the variance among individuals, we apply an ensemble strategy by sharing seeds among the six runs, for each of the specific fuzzers [63]. however, for multithreaded target programs, another variance comes from the thread scheduling for different threads (in our experiments, four working threads were specified). muzz and mafl have the schedule-intervention instrumentation to help diversify the effects, while it is absent in afl and mopt. in fact, from the case studies in §6.5.2, we envision that the variance may be huge for different machines under different workloads. due to this, providing fair statistical results w.r.t. the variance may still be impractical. therefore, we tend to exclude variance metrics and only choose those that exhibit the "overall results", i.e.,  $n_{mt}$ ,  $\frac{n_{mt}}{n_{all}}$ ,  $n_c^m$ ,  $n_v^m$ ,  $n_e^m$ , and  $n_b^m$ . similarly, the case studies or comparisons in §6.2, §6.3, §6.4 are all based on "overall results". during the evaluation, we indeed observed that the results of muzz and mafl are more stable than those of afl and mopt.
+
+# 7 related work
+
+# 7.1 grey-box fuzzing techniques
+
+the most relevant is the fuzzing techniques on concurrency-vulnerability detection. conafl [30] is a thread-aware gbf that focuses on user-space multithreaded programs. much different from muzz's goal to reveal both  $v_{m}$  and  $b_{m}$ , conafl only detects a subset of concurrency-bug induced vulnerabilities  $(v_{cb})$  that cause buffer-overflow, double-free, or use-after-free. conafl also utilizes heavy thread-aware static and dynamic analyses, making it suffer from scalability issues. the other difference is that muzz's thread-aware analyses aim to provide runtime feedback to distinguish more execution states in multithreading contexts, to bring more multithreading-relevant seeds; meanwhile, conafl relies on the discovery of sensitive concurrency operations to capture pairs that may introduce the aforementioned three kinds of vulnerabilities. further, since the static and dynamic analyses aim to capture and intervene "sensitive concurrency operation pairs", conafl suffers from the scalability issue. in fact, the biggest binary it evaluated was 196k (bzip2smp), while muzz can handle programs scaling to 19.4m (im-cnvt). in the evaluation, we did not evaluate conafl — the github version of conafl (https://github.com/lawliar/conafl) does not work since its static analysis is not publicly available and it is not trivial to implement that technique ourselves; further, we have not obtained the runnable tool after we requested from the authors. razzer [24] utilizes a customized hypervisor to control thread-interleaving deterministically to trigger data races in linux kernel. it is a kernel fuzzer that cannot reveal multithreading-relevant bugs in user-space programs. as a matter of fact, the proof-of-crashes are essentially sequences of system calls that could trigger race conditions, and the fix of the detected vulnerabilities requires patches to the kernel code. consequently, the guidance of fuzzing is also different. razzer spots the over-approximated racing segments and tames non-deterministic behavior of the kernel such that it can deterministically trigger a race. while muzz's solution is to distinguish more thread-interleaving states to trap the fuzzing to reveal more multithreading-relevant paths. practically, it is not easy to effectively sequentialize the thread-interleavings to fuzz the user-space programs [64].
+
+multithreading-relevant bugs are inherently deep. to reveal deep bugs in the target programs, some gbfs facilitate other feedback [7, 14, 29, 44, 52, 55, 56, 61]. angora [7] distinguishes different calling context when calculating deputy instruction transitions to keep more valuable seeds. driller [44], qsym [61], and savior [8] integrate symbolic execution to provide additional coverage information to exercise deeper paths. muzz inspires from these techniques in that it provides more feedback for multithreading context with stratified coverage-oriented and thread-context instrumentations, as well as schedule-intervention instrumentation. other fuzzing techniques utilize the domain knowledge of the target pro
+
+gram to generate more effective seeds [39,53,54]. skyfire [53] and superion [54] provide customized seed generation and mutation strategies on the programs that feed grammar-based inputs. sgf [39] relies on the specifications of the structured input to improve seed quality. these techniques are orthogonal to muzz and can be integrated into seed mutation (c.f.  $\boxed{\mathbf{b}}$  in figure 3).
+
+# 7.2 staticconcurrency-bug prediction
+
+static concurrency-bug  $(b_{m})$  predictors aim to approximate the runtime behaviors of a concurrent program without actual execution. several static approaches have been proposed for analyzing pthread and java programs [40, 45, 50]. lock-smith [40] uses existential types to correlate locks and data in dynamic heap structures for race detection. goblint [50] relies on a thread-modular constant propagation and points-to analysis for detecting concurrent bugs by considering conditional locking schemes. [51] scales its detection to large codebases by sacrificing soundness and suppressing false alarms using heuristic filters. fsam [45, 46] proposes a sparse flow-sensitive pointer analysis for  $\mathrm{c / c + + }$  programs using context-sensitive thread-interleaving analysis. currently, muzz relies on flow- and context-insensitive results of fsam for thread-aware instrumentations. we are seeking solutions to integrating other bug prediction techniques to further improve muzz's effectiveness.
+
+# 7.3 dynamic analysis onconcurrency-bugs
+
+there are a large number of dynamic analyses on concurrency-bugs. they can be divided into two categories: modeling concurrency-bugs and strategies to trigger these bugs.
+
+the techniques in the first category [12,41,42,59] typically monitor the memory and synchronization events [19]. the two fundamentals are happens-before model [12] and lockset model [41]. happens-before model reports a race condition when two threads read/write a shared memory arena in a causally unordered way, while at least one of the threads write this arena. lockset model conservatively considers a potential race if two threads read/write a shared memory arena without locking. modern detectors such as tsan [42], helgrind [49] usually apply a hybrid strategy to combine these two models. muzz does not aim to improve existing concurrency violation models; instead, it relies on these models to detect concurrency-bugs with our fuzzer-generated seeds.
+
+the second category of dynamic analyses focuses on how to trigger concurrency violation conditions. this includes random testings that mimic non-deterministic program executions [4, 25, 38], regression testings [47, 60] that target interleavings from code changes, model checking [13, 57, 62] and hybrid constraint solving [20-22] approaches that systematically check or execute possible thread schedules, heuristically avoid fruitless executions [10, 17, 18, 66], or utilizing multicore to accelerate bug detection [37]. our work differs from
+
+all the above, as our focus is not to test schedules with a given seed file, but to generate seed files that execute multithreading-relevant paths. in particular, our goal of schedule-intervention instrumentation is to diversify the actual schedules to help provide feedback during fuzzing.
+
+# 8 conclusion
+
+this paper presented muzz, a novel technique that empowers thread-aware seed generation to gbfs for fuzzing multithreaded programs. our approach performs three novel instrumentations that can distinguish execution states introduced by thread-interleavings. based on the feedback provided by these instrumentations, muzz optimizes the dynamic strategies to stress different kinds of multithreading context. experiments on 12 real-world programs demonstrate that muzz outperforms other grey-box fuzzers such as afl and mopt in generating valuable seeds, detecting concurrency-vulnerabilities, as well as revealing concurrency-bugs.
+
+# acknowledgement
+
+this research was supported (in part) by the national research foundation, prime ministers office, singapore under its national cybersecurity r&d program (award no. nrf2018ncr-ncr005-0001), national satellite of excellence in trustworthy software system (award no. nrf2018ncr-nsoe003-0001), and nrf investigatorship (award no. nrfi06-2020-0022) administered by the national cybersecurity r&d directorate. the research of dr xue is supported by cas pioneer hundred talents program.
+
+# references
+
+[1] l. o. andersen. program analysis and specialization for the c programming language. technical report, diku, university of copenhagen, 1994.  
+[2] s. blackshear, n. gorogiannis, p. w. o'earn, and i. sergey. racerd: compositional static race detection. oopsla, 2:144:1-144:28, oct. 2018.  
+[3] m. böhm, v. t. pham, and a. roychoudhury. coverage-based greybox fuzzing as markov chain. in ccs '16, pages 1032-1043. acm, 2016.  
+[4] y. cai and w. k. chan. magicfuzzer: scalable deadlock detection for large-scale applications. in icse '12, pages 606-616. ieee, 2012.  
+[5] y. cai, b. zhu, r. meng, h. yun, l. he, p. su, and b. liang. detecting concurrency memory corruption vulnerabilities. in esec/fse '19, pages 706-717, 2019.
+
+[6] h. chen, y. xue, y. li, b. chen, x. xie, x. wu, and y. liu. hawkeye: towards a desired directed grey-box fuzzzer. in ccs '18, pages 2095-2108. acm, 2018.  
+[7] p. chen and h. chen. angora: efficient fuzzing by principled search. in sp '18, pages 711-725, 2018.  
+[8] y. chen, p. li, j. xu, s. guo, r. zhou, y. zhang, t. wei, and l. lu. savior: towards bug-driven hybrid testing. in sp '20, 2020.  
+[9] i. chowdhury and m. zulkernine. using complexity, coupling, and cohesion metrics as early indicators of vulnerabilities. journal of system architecture, 57(3):294-313, mar. 2011.  
+[10] m. christakis, a. gotovos, and k. sagonas. systematic testing for detecting concurrency errors in erlang programs. in icst 2013, pages 154–163, march 2013.  
+[11] p. di and y. sui. accelerating dynamic data race detection using static thread interference analysis. in *pmam'16*, pages 30–39. acm, 2016.  
+[12] c. flanagan and s. n. freund. fasttrack: efficient and precise dynamic race detection. in pldi '09, pages 121-133. acm, 2009.  
+[13] c. flanagan and p. godefroid. dynamic partial-order reduction for model checking software. in *popl '05*, pages 110–121. acm, 2005.  
+[14] s. gan, c. zhang, x. qin, x. tu, k. li, z. pei, and z. chen. collafl: path sensitive fuzzing. in sp '18, pages 1-12. ieee, 2018.  
+[15] google inc. oss-fuzz, 2018.  
+[16] google inc. clusterfuzz, 2019.  
+[17] s. guo, m. kusano, and c. wang. conc-ise: incremental symbolic execution of concurrent software. in ase '16, pages 531-542. acm, 2016.  
+[18] s. guo, m. kusano, c. wang, z. yang, and a. gupta. assertion guided symbolic execution of multithreaded programs. in esec/fse '15, pages 854-865, 2015.  
+[19] s. hong and m. kim. a survey of race bug detection techniques for multithreaded programmes. stvr, 25(3):191-217, may 2015.  
+[20] j. huang. stateless model checking concurrent programs with maximal causality reduction. in pldi '15, pages 165-174. acm, 2015.  
+[21] j. huang. ufo: predictive concurrency use-after-free detection. in icse '18, pages 609-619. acm, 2018.
+
+[22] j. huang, p. o. meredith, and g. rosu. maximal sound predictive race detection with control flow abstraction. in pldi '14, pages 337-348, 2014.  
+[23] ieee and the open group. posix.1-2017, 2001.  
+[24] d. r. jeong, k. kim, b. shivakumar, b. lee, and i. shin. razzer: finding kernel race bugs through fuzzing. in sp '19, volume 00, pages 279-293, 2019.  
+[25] p. joshi, c. park, k. sen, and m. naik. a randomized dynamic program analysis technique for detecting real deadlocks. in pldi '09, pages 110-120, 2009.  
+[26] m. kerrisk. the linux programming interface. no starch, 2010.  
+[27] g. klees, a. ruef, b. cooper, s. wei, and m. hicks. evaluating fuzz testing. in ccs '18, pages 2123-2138. acm, 2018.  
+[28] c. lattner and v. adve. llvm: a compilation framework for lifelong program analysis & transformation. in cgo '04, pages 75-. ieee computer society, 2004.  
+[29] y. li, b. chen, m. chandramohan, s. lin, y. liu, and a. tiu. steelix: program-state based binary fuzzing. in esec/fse '17, pages 627-637. acm, 2017.  
+[30] c. liu, d. zou, p. luo, b. b. zhu, and h. jin. a heuristic framework to detect concurrency vulnerabilities. in acsac '18, pages 529-541. acm, 2018.  
+[31] llvm. libfuzzer, 2015.  
+[32] s. lu, s. park, e. seo, and y. zhou. learning from mistakes: a comprehensive study on real world concurrency bug characteristics. in asplos '08, pages 329-339. acm, 2008.  
+[33] c. lyu, s. ji, c. zhang, y. li, w. lee, y. song, and r. beyah. mopt: optimized mutation scheduling for fuzzers. in usenix security '19, pages 1949-1966. usenix association, 2019.  
+[34] v. j. m. manes, h. han, c. han, s. k. cha, m. egele, e. j. schwartz, and m. woo. fuzzing: art, science, and engineering. corr, abs/1812.00140:1-29, 2018.  
+[35] t. j. mccabe. a complexity measure. ieee transactions on software engineering, se-2(4):308-320, 1976.  
+[36] b. p. miller, l. fredriksen, and b. so. an empirical study of the reliability of unix utilities. communications of the acm, 33(12):32-44, dec. 1990.  
+[37] s. nagarakatte, s. burckhardt, m. m. k. martin, and m. musuvathi. multicore acceleration of priority-based schedulers for concurrency bug detection. in pldi '12, pages 543-554. acm, 2012.
+
+[38] c. park and k. sen. randomized active atomicity violation detection in concurrent programs. in esec/fse '08, pages 135-145, 2008.  
+[39] v. pham, m. böhme, a. e. santosa, a. r. caciulescu, and a. roychoudhury. smart greybox fuzzing. corr, abs/1811.09447:1-16, 2018.  
+[40] p. pratikakis, j. s. foster, and m. hicks. locksmith: context-sensitive correlation analysis for race detection. acm sigplan notices, 41(6):320-331, 2006.  
+[41] s. savage, m. burrows, g. nelson, p. sobalvarro, and t. anderson. eraser: a dynamic data race detector for multithreaded programs. acm trans. comput. syst., 15(4):391-411, nov. 1997.  
+[42] k. serebryany and t. iskhodzhanov. threadsanitizer: data race detection in practice. in wbia '09, pages 62-71. acm, 2009.  
+[43] m. o. shudrak and v. zolotarev. improving fuzzing using software complexity metrics. corr, abs/1807.01838:1-16, 2018.  
+[44] n. stephens, j. grosen, c. salls, a. dutcher, r. wang, j. corbetta, y. shoshitaishvili, c. kruegel, and g. vigna. driller: augmenting fuzzing through selective symbolic execution. in ndss '16. the internet society, 2016.  
+[45] y. sui, p. di, and j. xue. sparse flow-sensitive pointer analysis for multithreaded programs. in cgo '16, pages 160-170. acm, 2016.  
+[46] y. sui and j. xue. svf: interprocedural static value-flow analysis in llvm. in cc '16, pages 265-266. acm, 2016.  
+[47] v. terragni, s. cheung, and c. zhang. recontest: effective regression testing of concurrent programs. in icse '15, pages 246-256, 2015.  
+[48] the mitre corporation. download cve list, 1999.  
+[49] valgrind. helgrind: a thread error detector, 2000.  
+[50] v. vojdani and v. vene. goblint: path-sensitive data race analysis. annales univ. sci. budapest., sect. comp., pages 1-12, 2009.  
+[51] j. w. young, r. jhala, and s. lerner. relay: static race detection on millions of lines of code. in esec/fse '07, pages 205-214. acm, 2007.  
+[52] h. wang, x. xie, y. li, c. wen, y. liu, s. qin, h. chen, and y. sui. typestate-guided fuzzer for discovering use-after-free vulnerabilities. in icse '20, 2020.
+
+[53] j. wang, b. chen, l. wei, and y. liu. skyfire: data-driven seed generation for fuzzing. in sp '17, pages 579-594, may 2017.  
+[54] j. wang, b. chen, l. wei, and y. liu. superion: grammar-aware greybox fuzzing. in icse '19, pages 724-735. ieee / acm, 2019.  
+[55] y. wang, x. jia, y. liu, k. zeng, t. bao, d. wu, and p. su. not all coverage measurements are equal: fuzzing by coverage accounting for input prioritization. in ndss' 20, 2020.  
+[56] c. wen, h. wang, y. li, s. qin, y. liu, z. xu, h. chen, x. xie, g. pu, and t. liu. memlock: memory usage guided fuzzing. in icse '20, 2020.  
+[57] y. yang, x. chen, and g. gopalakrishnan. inspect: a runtime model checker for multithreaded c programs. technical report, technical report uucs-08-004, university of utah, 2008.  
+[58] y. yang, x. chen, g. gopalakrishnan, and r. m. kirby. distributed dynamic partial order reduction based verification of threaded software. in spin '07, pages 58-75. springer-verlag, 2007.  
+[59] j. yu, s. narayanasamy, c. pereira, and g. pokam. maple: a coverage-driven testing tool for multithreaded programs. in oopsla '12, pages 485-502, 2012.  
+[60] t. yu, z. huang, and c. wang. contesa: directed test suite augmentation for concurrent software. ieee transactions on software engineering, 2018.  
+[61] i. yun, s. lee, m. xu, y. jang, and t. kim. qsym: a practical concolic execution engine tailored for hybrid fuzzing. in usenix security '18, pages 745-761. usenix association, 2018.  
+[62] a. zaks and r. joshi. verifying multi-threaded c programs with spin. in spin '08, pages 325-342, 2008.  
+[63] m. zalewski. technical "whitepaper" for afl-fuzz, 2014.  
+[64] m. zalewski. what is the drawback of fuzzing a multithreaded binary?, 2015.  
+[65] m. zalewski. "fidgetyafl" implemented in 2.31b, 2016.  
+[66] w. zhang, j. lim, r. olichandran, j. scherpelz, g. jin, s. lu, and t. reps. conseq: detecting concurrency bugs through sequential errors. in asplos '11, pages 251-264. acm, 2011.

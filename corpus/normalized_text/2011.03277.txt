@@ -1,0 +1,497 @@
+# modular primitives for high-performance differentiable rendering
+
+samuli laine, nvidia  
+janne hellsten, nvidia  
+tero karras, nvidia  
+yeongho seol, nvidia  
+jaakko lehtinen, nvidia and aalto university  
+timo aila, nvidia
+
+we present a modular differentiable renderer design that yields performance superior to previous methods by leveraging existing, highly optimized hardware graphics pipelines. our design supports all crucial operations in a modern graphics pipeline: rasterizing large numbers of triangles, attribute interpolation, filtered texture lookups, as well as user-programmable shading and geometry processing, all in high resolutions. our modular primitives allow custom, high-performance graphics pipelines to be built directly within automatic differentiation frameworks such as pytorch or tensorflow. as a motivating application, we formulate facial performance capture as an inverse rendering problem and show that it can be solved efficiently using our tools. our results indicate that this simple and straightforward approach achieves excellent geometric correspondence between rendered results and reference imagery.
+
+ccs concepts: computing methodologies  $\rightarrow$  rasterization; shape inference.
+
+additional key words and phrases: differentiable rendering, rasterization, motion capture.
+
+# acm reference format:
+
+samuli laine, janne hellsten, tero karras, yeongho seol, jaakkoo lehtinen, and timo aila. 2020. modular primitives for high-performance differentiable rendering. acm trans. graph. 39, 6, article 194 (december 2020), 14 pages. https://doi.org/10.1145/3414685.3417861
+
+# 1 introduction
+
+differentiable rendering is a fundamental building block in machine learning of 3d geometry. typically training data is available only as images, and finding a corresponding 3d representation requires analysis by synthesis, i.e., rendering candidate images, computing the loss based on training and candidate images, and propagating the errors back to 3d positions and other scene attributes. many classical computer graphics and vision problems including the estimation of reflectance, geometry, lighting, and camera parameters can be cast into this inverse rendering framework [patow and pueyo 2003].
+
+much of modern machine learning makes use of first order (gradient-based) optimization techniques implemented using backpropagation. from a computational point of view, the explosive growth in model sizes and capabilities has, for a large part, relied on the availability of primitive operations that allow massively parallel and
+
+authors' addresses: samuli laine, nvidia, slaine@nvidia.com; janne hellsten, nvidia, jhellsten@nvidia.com; tero karras, nvidia, tkarras@nvidia.com; yeongho seol, nvidia, yseol@nvidia.com; jaakko lehtinen, nvidia, aalto university, jlehtinen@ nvidia.com; timo aila, nvidia, taila@nvidia.com.
+
+coherent execution of both the forward and backward (gradient) passes, allowing highly complex computation graphs to be built out of them. however, the majority of effort in creating efficient primitive operations has focused on operating on densely-sampled data stored in multidimensional regular grids. these kind of operations alone are not sufficient for 3d rendering because the mapping from a scene representation to pixel values is highly irregular and dynamic. as such, specialized differentiable rendering algorithms have emerged for solving two problems:
+
+(1) forward pass: given the factors that affect the shape and appearance of a 3d scene, render a 2d image; and  
+(2) backward pass: given the gradient of a loss function defined on the output image pixels, compute the gradient of the loss with respect to the input shape and appearance factors.
+
+this interface is universally used by autodifferentiation frameworks such as pytorch and tensorflow, and it allows 3d rendering to be used as a building block in a complex model that is trained by modern stochastic first order optimization techniques.
+
+despite its long history, differentiable rendering can be considered a nascent field due to the recent proliferation of algorithms and applications. most previous research is targeted towards a specific use case (e.g., pose or shape estimation), and is typically only evaluated on downstream tasks as part of a larger machine learning system [chen et al. 2019; kato et al. 2018; liu et al. 2019]. these specific use cases and data sets allow optimizations and design choices that do not scale to other uses. for example, low geometric complexity may make it acceptable to not parallelize over triangles, but this quickly backfires on a larger scene; single objects viewed in a vacuum may enable one to disregard the effects of mutual occlusion between triangles when computing gradients, but this approximation is untenable in a scene with non-trivial depth complexity.
+
+another parallel line of research studies differentiable physically-based light transport simulation that models complex effects such as area light sources and indirect illumination [li et al. 2018; loubet et al. 2019; nimier-david et al. 2019]. built on monte carlo sampling, these methods seek the best attainable image quality and accuracy at the cost of longer rendering times.
+
+we build on the rich literature on real-time graphics systems that has long sought efficient solutions for managing the complex, dynamic mapping between world points and image pixels, and has delivered extremely efficient and practical hardware implementations. in particular, we seek to formulate and implement a differentiable rendering system that makes use of these pipelines to maximal
+
+table 1. comparison of characteristics of selected differentiable rendering systems.  
+
+<table><tr><td></td><td>opendr [2014]</td><td>nmr [2018]</td><td>softras [2019]</td><td>dib-r [2019]</td><td>li et al. [2018]</td><td>mitsuba2 [2019]</td><td>our</td></tr><tr><td>performance*</td><td>✓</td><td>✗</td><td>✗</td><td>✗</td><td>✗</td><td>✗</td><td>✓</td></tr><tr><td>scalability</td><td>✓</td><td>✗</td><td>✗</td><td>✗</td><td>✓</td><td>✓</td><td>✓</td></tr><tr><td>flexibility</td><td>✗</td><td>✗</td><td>✗</td><td>✗</td><td>✓</td><td>✓</td><td>✓</td></tr><tr><td>antialiasing</td><td>✗</td><td>✗</td><td>✗</td><td>✗</td><td>✓</td><td>✓</td><td>✓</td></tr><tr><td>occlusion</td><td>✓</td><td>✓</td><td>✗</td><td>✗</td><td>✓</td><td>✓</td><td>✓</td></tr><tr><td>gradients</td><td>✗</td><td>✗</td><td>✓</td><td>✗</td><td>✓</td><td>✗</td><td>✓</td></tr><tr><td>noise-free</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✗</td><td>✗</td><td>✓</td></tr><tr><td>no tuning</td><td>✓</td><td>✓</td><td>✗</td><td>✗</td><td>✓</td><td>✗</td><td>✓</td></tr><tr><td>gi</td><td>✗</td><td>✗</td><td>✗</td><td>✗</td><td>✓</td><td>✓</td><td>✗</td></tr></table>
+
+* performance considers suitability to intensive optimization such as in deep learning; scalability refers to performance with respect to surface tessellation and image resolution; flexibility is whether the system is designed to support arbitrary shading; antialiasing requires that geometric edges are smoothed in the result image; occlusion considers if geometrically obscured surfaces are guaranteed to not affect the resulting image; gradients refers to the correctness of gradients with respect to rendered image; noise-free systems do not rely on random sampling; no tuning refers to lack of tunable parameters that affect the rendered image or gradients. gi denotes global illumination, support for physically-based illumination and shadowing including indirect effects. see text for detailed analysis.
+
+extent, without sacrificing their desirable properties such as correct outputs, a high degree of user control through programmable shading and geometry processing, massive parallelization in all operations, and the ability to render high-resolution images of scenes consisting of millions of geometric primitives.
+
+concretely, we describe a differentiable rendering system based on deferred shading [deering et al. 1988], and identify four primitive operations for which we provide custom, high-performance implementations: rasterization, attribute interpolation, texture filtering, and antialiasing. our modular primitives enable rendering high-resolution images of complex scenes, using arbitrary user-specified shading, directly inside automatic differentiation (ad) frameworks such as tensorflow or pytorch.
+
+as a motivating example, we cast facial performance capture as an inverse rendering problem and show that it can be efficiently solved using direct photometric optimization of shape and surface texture in megapixel resolutions. while our proof-of-concept solution does not aim to reconstruct the mouth, eyes, or complex material appearance, the high accuracy of the results in comparison to a state-of-the-art commercial solution demonstrates the viability of high-performance differentiable rendering in solving this problem.
+
+our differential rasterization primitives are publicly available at https://github.com/nvlabs/nvdiffrast.
+
+# 2 related work
+
+there is a large body of work on using rendering as part of an optimization process that infers properties of the world from images. these include inverse rendering algorithms that fit 3d and appearance models to photographs in an analysis-by-synthesis loop [patow and pueyo 2003], as well as techniques that use a 3d renderer as part of a more complex machine learning model.
+
+by far the most common approach in previous work is to design a special-purpose differentiable image synthesis pipeline focusing on
+
+the particular requirements of the downstream task, with no particular emphasis on flexibility or generality [chen et al. 2019; kato et al. 2018; liu et al. 2019]. a notable exception is opendr [loper and black 2014] that, despite its limited shading model, explicitly sets out to develop a general-purpose differentiable rendering system.
+
+research on general-purpose differentiable rendering divides into two categories depending on whether the primary motivation is image quality or performance. table 1 summarizes various characteristics of the previous methods analyzed below.
+
+li et al. [2018] introduce differentiable, physically-based rendering using monte carlo ray tracing with proper visibility gradients. light transport is integrated using random sampling, which leads to noise in the images that diminishes with more sampling. mitsuba 2 [loubet et al. 2019; nimier-david et al. 2019] is a versatile rendering framework that can target a wide array of rendering problems. the primary problem in using these renderers as parts of an intensive optimization or learning task is their lack of performance - to not become a bottleneck over millions of iterations, the rendering times in sufficiently high resolutions should be measured in milliseconds, instead of seconds or minutes needed for recursive light transport simulation. these systems can also be configured to compute only primary visibility and local shading, which is sufficient for many applications. this boosts the performance of li et al. [2018] to  $\sim 100\mathrm{ms}$  in a simple scene in  $640\times 480$  resolution, which is still orders of magnitude too slow for many applications.
+
+the second category of differentiable rendering aims at higher performance. primarily targeted at solving tasks such as shape or pose inference [chen et al. 2019; de la gorce et al. 2011; liu et al. 2019; loper and black 2014], they render and shade 3d meshes using local shading only. strong emphasis is placed on obtaining useful visibility gradients to facilitate shape inference via gradient descent.
+
+soft rasterizer [liu et al. 2019] rasterizes each triangle as a probabilistic cloud with a configurable blur radius; these clouds are combined heuristically based on other configurable parameters. this blur makes coverage a continuous function of vertex positions, which is necessary for obtaining visibility gradients. however, the blur also means that opaque surfaces become transparent around edges, leading to an incorrect image. optimization thus requires tuning these parameters to reach a balance between image correctness and gradient quality. dib-r [chen et al. 2019] renders colors without antialiasing and outputs an additional alpha channel that extends outside the covered pixels by a configurable blur radius. the alpha channel can be used for approximating visibility gradients, but only if an alpha mask is available for reference images as well. also, these gradients are affected by all triangles regardless of occlusion. because color channels are point sampled, no visibility gradients are obtained for silhouettes that are in front of other geometry. this is insufficient for, e.g., determining hand poses [de la gorce et al. 2011], and would also fail if one were to render, e.g., a skybox behind the mesh, so the method cannot be considered general-purpose. as with soft rasterizer, it is not obvious how the blur parameter should be set. neural mesh rendering [kato et al. 2018] produces the image using point sampling and no antialiasing, and in the backward pass hallucinates image-based gradients on triangle edges based on the geometry. the gradients are thus not consistent with the rendered image.
+
+in contrast to these approximations, our aim is to differentiate the standard hardware graphics pipeline without altering its image formation principles. this places special emphasis on occlusion by opaque surfaces. for the gradient to be consistent with the forward imaging model, a 3d primitive that has no effect on the image – for instance, due to being off the screen or occluded by other primitives – should, by our premise, receive a zero gradient.
+
+the reparameterization technique of loubet et al. [2019] used in mitsuba 2 [nimier-david et al. 2019] produces correct visibility gradients only when occluders and occludees can be inferred from four samples. although more complex occlusion scenarios are not handled correctly, loubet et al. introduce a bandwidth parameter that can be adjusted to reduce the errors at the cost of increased noise. it is argued that handling the most common, simple cases is sufficient for practical purposes, and our approach for visibility gradients is founded on the same premise. opendr [loper and black 2014] approximates all gradients based on the final image and knowledge of which triangle was rendered into each pixel. this has the unfortunate effect of producing incorrect gradients for effects such as highlights, because all shading is assumed to be "glued" onto the surfaces. as an example, opendr's gradients falsely indicate that moving a planar surface tangentially would move the highlights and reflections on it as well. in addition, inferring gradients from the final pixels can be seen as equivalent to taking finite differences instead of analytic gradients. flexibility is limited because textures can modulate appearance only multiplicatively, and differentiation with respect to textures is not supported.
+
+# 3 differentiable rendering primitiveis
+
+given a 3d scene description in the form of geometric shapes, materials, and camera and lighting models, rendering 2d images boils down to two computational problems: figuring out the things that are visible in each pixel, and what color those things appear to be. a proper differentiable renderer has to provide gradients for all the parameters - e.g., lighting and material parameters, as well as the contents of texture maps - used in the process.
+
+for what follows, it is useful to break the rendering process down into the following form, where the final color  $i_{i}$  of the pixel at screen coordinates  $(x_{i},y_{i})$  is given by
+
+$$
+i _ {i} = \operatorname {f i l t e r} _ {x, y} \left(\operatorname {s h a d e} \left(m (p (x, y)), \text {l i g h t s}\right)\right) \left(x _ {i}, y _ {i}\right). \tag {1}
+$$
+
+here,  $p(x,y)$  denotes the world point visible at (continuous) screen coordinates  $(x,y)$  after projection from 3d to 2d, and  $m(p)$  denotes all the spatially-varying factors (texture maps, normal vectors, etc.) that live on the surfaces of the scene. the shade function typically models light-surface interactions. the 2d antialiasing filter, crucial for both image quality and differentiability, is applied to the shading results in continuous  $(x,y)$ , and the final color is obtained by sampling the result at the pixel center  $(x_i,y_i)$ . in real-time graphics, these steps are typically approximated by techniques like multisample antialiasing (msaa).
+
+the geometry, projection, and lights can all be considered as parametric functions. the visible world point is affected by the geometry, parameterized by  $\theta_{g}$ , as well as the projection, parameterized by  $\theta_{c}$ . similarly, the surface factors are parameterized by  $\theta_{m}$ , and light
+
+sources by  $\theta_l$ .<sup>1</sup> we follow the common view and take differentiable rendering to mean computing the gradients  $\partial l(i) / \partial \{\theta_g, \theta_m, \theta_c, \theta_l\}$  of a scalar function  $l(i)$  of the rendered image  $i$  with respect to the scene parameters. note that this does not require computing the (very large) jacobian matrices  $[\partial i / \partial \theta_g]$ , etc., but rather only the ability to implement multiplication with the jacobian transpose ("backpropagation"), yielding the final result through the chain rule:
+
+$$
+\left[ \frac {\partial l (i)}{\partial \theta_ {g}} \right] = \left[ \frac {\partial i}{\partial \theta_ {g}} \right] \left[ \frac {\partial l}{\partial i} \right],
+$$
+
+and similarly for the other parameter vectors.
+
+two main factors make the design of efficient rendering algorithms challenging. first, the mapping  $p(x,y)$  between world points and screen coordinates is dynamic: it is affected by changes in both scene geometry and the 3d-to-2d projection. furthermore, it is discontinuous due to occlusion boundaries. these two factors are also central points of difficulty in computing the gradients we seek. the following sections outline our approach to addressing them.
+
+# 3.1 design goals
+
+our overall aim is to implement an efficient differentiable real-time graphics pipeline, with the following specific design goals:
+
+g1 efficiency. support modern graphics pipelines' ability to render, in high resolution, 3d scenes that are complex in terms of geometric detail, occlusion, and appearance.  
+g2 minimalism. easy integration with modern automatic differentiation (ad) frameworks, such as pytorch and tensorflow, without duplication of features.  
+g3 freedom. support arbitrary user-specified shading, as well as arbitrary parameterizations of input geometry, without committing to specific forms such as the phong model or blendshapes.  
+g4 quality. support the texture filtering operations required by shaders that implement complex appearance models, while making no assumptions about the contents of the textures. in addition to quality, this is also important for optimization dynamics.
+
+# 3.2 system design
+
+goal g1 immediately precludes algorithms that do not parallelize over both the geometric primitives and pixels, and those that do not properly account for occlusion of overlapping primitives. in the remaining space, we make the following design choices:
+
+c1 modularity. we identify four modular primitive operations that implement crucial operations in a graphics pipeline. each primitive is exposed as a backpropagation-capable operation with a fixed input/output interface to the host ad framework. much like today's configurable and programmable hardware graphics pipelines, this non-monolithic design enables easy construction of potentially complex custom rendering pipelines.  
+c2 positions and textures are tensors. our system takes the input geometry and texture maps in the form of tensors from
+
+![](images/8f2fc2386d044920dbb4fcd354e3853b5c6bd3fa3296548f8b33b343946f51c7.jpg)  
+fig. 1. a simple differentiable rendering pipeline with our proposed primitive operations highlighted in red. the input data for rendering (blue) may be generated by, e.g., a neural network if the pipeline is part of a larger computation graph. in simpler setups the geometry processing might include only the model/view/perspective transformations for vertex positions with other inputs being constants or learnable parameters. all intermediate buffers (green) are in image space. connections with gradients are denoted by a white triangle. channel counts are fixed only for vertex positions and indices, and in the intermediate buffers produced by the rasterization operation. there are no restrictions on the channel counts for vertex attributes, textures, related intermediate data, or the output image.
+
+the host ad system. this allows parameterizing both in a freely-chosen manner, and enables our rendering primitives to be used as building blocks of a complex learning system.
+
+c3 operate in clip space. contrary to common differentiable rendering systems, we place it on the user's responsibility to perform world, view, and homogeneous perspective transformations - but not perspective division - on the geometry using the host ad system. by this, we follow the separation between geometry and pixel processing made by all major graphics apis. we feel this offers the cleanest possible interface between the host ad system and the renderer, further amplifying the benefits of their co-existence.  
+c4 deferred shading. we build on the concept of deferred shading [deering et al. 1988]. this entails first computing, for each pixel, the  $m(p(x,y))$  terms from equation (1) and storing the intermediate results in an image-space regular grid. the grid is subsequently consumed by the shading function. as shading is performed on a regular grid, it can be implemented entirely outside our rendering primitives using the efficient dense tensor operations in the host ad library, in line with g2 and g3.  
+c5 image-space antialiasing. we approach differentiation of coverage in image space, approximating the inputs of the antialiasing filter in equation (1) by the output grid of the deferred shading pass. effectively, we assume shading to be constant with respect to the coverage effects at silhouette boundaries, but not with respect to other effects in appearance.  
+c6 triangles. we focus on triangle meshes as the basic geometric primitive, and seek to utilize the modern graphics pipelines' immensely optimized rasterization subsystem to maximal extent.
+
+we build pipelines out of the following four primitive operations customized for gradient computation. figure 1 illustrates an example graphics pipeline built out of them.
+
+rasterization implements the dynamic mapping between world coordinates and discrete pixel coordinates. leveraging the hardware rasterizer, we store per-pixel auxiliary data in the form of barycentric coordinates and triangle ids in the forward pass. using barycentrics as a base coordinate system allows easy coupling of shading and
+
+interpolation, as well as combining texture gradients with geometry gradients in the backward pass.
+
+interpolation is a pipeline operation that expands user-defined per-vertex data (i.e., vertex attributes) to pixel space. making use of the barycentrics computed by the rasterizer, the interpolator module manages this mapping in both directions.
+
+texture filtering is a key operation in a shading system. taking as inputs the interpolated texture coordinates and their screen-space derivatives for mip-mapping, as well as texture data tensors, our texture filtering module performs trilinear mip-mapping with gradients correctly propagated through both input texture coordinates as well as the contents of the (mip-mapped) texture maps.
+
+antialiasing is performed on the output of the deferred shading operation, taking as additional inputs the barycentrics, triangle ids, and vertex positions and indices.
+
+we now proceed to describe each primitive operation in detail. for simplicity, the following discussion assumes that a single image is being rendered. however, a differentiable renderer is typically used in stochastic gradient descent -type schemes using minibatches of multiple rendered images. all our operations efficiently support minibatching.
+
+# 3.3 rasterization
+
+as per widely adopted graphics api standards, our rasterization module consumes triangles with vertex positions given as an array of clip-space homogeneous coordinates  $(x_{c},y_{c},z_{c},w_{c})$ . we leave it as the user's responsibility to compute clip space positions - often, this comprises only a few homogeneous  $4\times 4$  matrix multiplications. the backward pass then computes the gradient  $\partial l / \partial \{x_c,y_c,z_c,w_c\}$  of the loss  $l$  with respect to the clip-space positions, leaving differentiation with respect to any higher-level parameterizations for the host ad library.
+
+forward pass. in the forward pass, the rasterizer outputs a 2d sample grid, with each position storing a tuple  $(id, u, v, z_c / w_c)$ , where  $id$  identifies the triangle covering the sample,  $(u, v)$  are barycentric coordinates specifying relative position along the triangle, and  $z / w$  corresponds to the depth in normalized device coordinates (ndc).
+
+a special  $id$  is reserved for blank pixels. barycentrics serve as a convenient base domain for interpolation and texture mapping computations further down the pipeline. the ndc depth is utilized only by the subsequent antialiasing module, and does not propagate gradients. as a secondary output, the rasterizer outputs a buffer with the  $2\times 2$  jacobian of the barycentrics w.r.t. the screen coordinates  $j_{uv} = \partial \{u,v\} /\partial \{x,y\}$  for each pixel. these are later used for determining the footprint for filtered texture lookups.
+
+internally, the rasterization is performed through opengl, leveraging the hardware graphics pipeline. using the hardware graphics pipeline ensures that the rasterization is accurate and there are, e.g., no visibility leaks due to precision issues. we also automatically get proper view frustum clipping as performed by the hardware. the output values, including the per-pixel jacobians between barycentrics and screen coordinates, are calculated using an opengl fragment shader.
+
+both tensorflow and pytorch implement gpu tensor operations in cuda. to bridge them with opengl, we use the driver's opengl/cuda interoperability api. the api minimizes data copies, using the same physical memory when possible, and never requires data to leave the gpu memory.
+
+backward pass. the backward pass receives, for each pixel, the gradient  $\partial l / \partial \{u,v\}$  with respect to the barycentrics output by the rasterizer, and computes the gradients  $\partial l / \partial \{x_c,y_c,z_c,w_c\}$  for each input vertex. the perspective mapping between barycentrics and clip-space positions is readily differentiated analytically, and the necessary output is obtained through
+
+$$
+\left[ \frac {\partial l}{\partial \left\{x _ {c} , y _ {c} , z _ {c} , w _ {c} \right\}} \right] = \left[ \frac {\partial l}{\partial \{u , v \}} \right] \left[ \frac {\partial \{u , v \}}{\partial \left\{x _ {c} , y _ {c} , z _ {c} , w _ {c} \right\}} \right]. \tag {2}
+$$
+
+the gradients w.r.t. the screen-space derivatives of the barycentrics  $(\partial l / \partial j_{uv})$  are taken into account in a similar fashion. the backward pass is implemented as a dense operation over output pixels, using a scatter-add operation to accumulate the gradients from the pixels to the correct vertices based on the triangle ids. it can thus be trivially parallelized using a cuda kernel.
+
+# 3.4 interpolation
+
+attribute interpolation is a standard part of the graphics pipeline. specifically, it entails computing weighted sums of vertex attributes, with the weights given by the barycentrics, thereby creating a mapping between the pixels and the attributes.<sup>3</sup>
+
+generally, vertex attributes can be used for arbitrary purposes. one of their typical uses, however, is to provide 2d coordinates for texture mapping. because of this, our interpolator module supports computing, in the forward pass, screen-space derivatives  $j_{a} = \partial a / \partial \{x,y\}$  of all or a subset of attributes for later use in determining texture filter footprints and other purposes.
+
+forward pass. consider a single pixel at  $(x,y)$ . denoting a vector of attributes associated with the  $i$ th vertex by  $a_{i}$ , the attribute indices of the triangle visible in the pixel  $(x,y)$  by  $i_{0,1,2}$ , and the barycentrics generated by the rasterizer by  $u = u(x,y)$  and  $v = v(x,y)$ , the interpolated vector  $a$  is defined as
+
+$$
+a = u a _ {i _ {0}} + v a _ {i _ {1}} + (1 - u - v) a _ {i _ {2}}. \tag {3}
+$$
+
+given the rasterizer's outputs (per-pixel triangle ids and barycentrics), implementation of the forward pass is trivial.
+
+the screen-space derivatives for attributes tagged as requiring them are computed using the barycenter jacobians output by the rasterizer by  $\partial a / \partial \{x,y\} = [\partial \{u,v\} /\partial \{x,y\} ][\partial a / \partial \{u,v\} ]$ , where the last jacobian is simple to derive from equation (3).
+
+backward pass. the inputs to the backward pass are the per-pixel gradients  $\partial l / \partial a$  w.r.t. the interpolated attributes, as well as gradients w.r.t. the screen-space derivatives of the attributes. much like the backward pass of the rasterizer, the gradients w.r.t. the attribute tensor are computed by a scatter-add into the tensor, applying the jacobians  $\partial a / \partial \{a_{i_0,i_1,i_2}\} = \{u,v,1 - u - v\}$  to the per-pixel input gradients. by simple differentiation, the gradients w.r.t. the input barycentrics are given by
+
+$$
+\left[ \frac {\partial l}{\partial u} \right] = \left[ a _ {i _ {0}} - a _ {i _ {2}} \right] ^ {\mathrm {t}} \left[ \frac {\partial l}{\partial a} \right], \left[ \frac {\partial l}{\partial v} \right] = \left[ a _ {i _ {1}} - a _ {i _ {2}} \right] ^ {\mathrm {t}} \left[ \frac {\partial l}{\partial a} \right]. \tag {4}
+$$
+
+in the same vein, the gradients w.r.t. the screen-space derivatives of the input barycentrics  $\partial l / \partial j_{uv}$  are computed based on the incoming gradients w.r.t. the screen-space derivatives of the attributes  $\partial l / \partial j_a$ .
+
+# 3.5 texture mapping
+
+we perform texture mapping using trilinear mip-mapped texture fetches. in the general case, this entails picking a fractional mip-map pyramid level (i.e., level-of-detail, lod) based on the incoming screen-space derivatives of the attributes used as texture coordinates, and performing a trilinear interpolation from the eight texels on the appropriate mip pyramid levels. figure 2 illustrates our implementation. we choose the mip level based on the texture-space length of the major axis of the sample footprint as defined by the screen-space derivatives of the texture coordinates. this is conservative in the sense that grazing angles result in blurring instead of aliasing.
+
+once a pair of mip-map levels has been picked, operation of the forward and backward passes closely resemble attribute interpolation: on each level, the four closest texels take the place of the three triangle vertices, and the two sub-textel coordinates that determine exact position within the four-pixel ensemble take the place of the barycentrics. consequently, our implementation is highly similar, with the forward pass requiring a gather, and the backward pass requiring a scatter-add, with the related jacobians computed with equal simplicity from the bilinear basis functions and texture contents. as the derivations are highly similar, we omit them for space. note, however, that gradients are computed also for the texture coordinate attributes, as well as for the screen-space derivatives for the texture coordinates.
+
+mip-mapped texturing differs from attribute interpolation by its multiscale nature: gradients are accumulated on various levels of the mip-map pyramid in the backward pass. as all mip-map levels are
+
+![](images/56661b46c4aae183991acc3b1192be22cd5f9f075a09f7d8b5e1f356535088c8.jpg)  
+(a)
+
+![](images/faaeca52405562946016d2cd0b96a47796c03ca0507e7d320cece55a4cce64fd.jpg)  
+(b)
+
+![](images/cfe8e55511303775806c7c4b3d38585356a5f02137784f298657849eff383a1b.jpg)  
+(c)  
+fig. 2. filtered differentiable texture lookup with a non-constant texture. (a) in the beginning of forward pass, prefiltered mip levels  $c_{lod}$  are constructed from the full-resolution texture  $c[i,j]$  by repeated downsampling using a  $2 \times 2$  box filter. (b) in forward pass, each lookup  $g = f(s,t,lod)$  interpolates prefiltered values on the appropriate mip level as determined by the size of sample footprint. in backward pass, we receive incoming gradients  $\partial l / \partial g$ . texture coordinate gradients  $\partial l / \partial s$  and  $\partial l / \partial t$  for each lookup are computed based on these and contents of texels that were used in interpolation. simultaneously, texture image gradients  $\partial l / \partial c_{lod}[i,j]$  are accumulated into each mip level. in a trilinear lookup, these calculations are performed on two adjacent levels and weighted according to the fractional part of  $lod$ . (c) to produce outgoing full-resolution texture image gradients  $\partial l / \partial c[i,j]$ , we sum the accumulated gradients from all mip levels.
+
+obtained from the finest-level texture during the construction in the forward pass, the backward pass needs to finish by transposing the construction operation and flattening the gradient pyramid so that the gradient is specified densely at the finest level. fortunately, this is implemented easily by starting at the coarsest level, recursively up-sampling the result and adding gradients from the next level, precisely like collapsing a laplacian pyramid.
+
+to the best of our knowledge, no previous differentiable renderer except for li et al. [2018] has supported differentiable, filtered texture sampling. while we currently do not do so, we note that it would be possible to utilize the hardware texture unit in the forward pass, and retain the cuda kernel only for the backward pass. the key challenge is that we cannot be certain of the implementation (e.g., numerical precision) of the hardware texture unit, and thus the gradients might not match the forward pass. this will be especially true for anisotropic texture fetches, where considerable freedom exists in covering the footprint [schilling et al. 1996]. hardware texture units also require specific memory layouts.
+
+# 3.6 analytic antialiasing for visibility gradients
+
+as usual in real-time graphics, we expect shading to be band-limited via filtered texture lookups and other means, and thus not exhibit aliasing within surfaces. however, point-sampled visibility causes aliasing at visibility discontinuities, and more crucially, cannot produce visibility-related gradients for vertex positions. antialiasing converts the discontinuities to smooth changes, from which the gradients can be computed [li et al. 2018]. note that antialiasing can only be performed after shading, and therefore must be implemented as a separate stage instead of bundling it into rasterization.
+
+we follow the same approach as several previous methods [de la gorce et al. 2011; loper and black 2014] and approach the problem by analytic post-process edge antialiasing. image-based post-process
+
+![](images/c745e0bd4e6dae9bcafc44d87df8dff185321b68813c8a0dcfba5e044866a8c5.jpg)  
+(a)
+
+![](images/fb28a01615f9cf16209ba6c15b67513557633dc055feb378945b21d624c8da89.jpg)  
+(b)  
+fig. 3. illustration of our analytic antialiasing method. a vertical silhouette edge  $p, q$  passes between centers of horizontally adjacent pixels  $a$  and  $b$ . this is detected by the pixels having a different triangle id rasterized into them. pixel pair  $a, b$  is processed together, and one of the following cases may occur. (a) the edge crosses the segment connecting pixel centers inside pixel  $b$ , causing color of  $a$  to blend into  $b$ . (b) the crossing happens inside pixel  $a$ , so blending is done in the opposite direction. to approximate the geometric coverage between surfaces, the blending factor is a linear function of the location of the crossing point — from zero at midpoint to  $50\%$  at pixel center. this antialiasing method is differentiable because the resulting pixel colors are continuous functions of positions of  $p$  and  $q$ .
+
+antialiasing is an old and widely-used technique in real-time graphics, with famous techniques such as fxaa being recently superseded by deep learning algorithms [nvidia 2018]. for an overview, see jimenez et al. [2011]. our method is a variant of distance-to-edge anti-aliasing (deaa) [malan 2010] and geometric post-process antialiasing (gpaa) [persson 2011]. the main differences are in how visibility discontinuities are detected and attributed to vertex positions, as required for computing gradients.
+
+forward pass. figure 3 illustrates our antialiasing method. we first detect potential visibility discontinuities by finding all neighboring horizontal and vertical pixel pairs with mismatching triangle ids. for each potential discontinuity, we fetch the triangle associated with the surface closer to camera, as determined from the ndc depths computed during rasterization. we then examine the edges of the triangle to see if any of them are silhouettes4 and pass between the neighboring pixel centers. for horizontal pixel pairs, we consider only vertically oriented edges  $(|w_{c,1}\cdot y_{c,2} - w_{c,2}\cdot y_{c,1}| > |w_{c,1}\cdot x_{c,2} - w_{c,2}\cdot x_{c,1}|)$ , and vice versa.
+
+if a silhouette edge crosses the segment between pixel centers, we compute a blend weight by examining where this crossing happens. pixel colors are then adjusted to reflect the approximated coverage of either surface in the pixels. essentially this approach approximates the exact surface coverage per pixel [jalobeanu et al. 2004] using an axis-aligned slab. consequently the coverage estimate is exact for only perfectly vertical and horizontal edges that extend beyond the pixel. for a diagonal long edge that passes exactly between the pixel centers, the error in coverage is  $\frac{1}{8}$ th of a pixel.
+
+finely tessellated surfaces reveal two further approximations. theoretically, the silhouette between two pixel centers can take
+
+any poly-line shape, and the axis-aligned slab approximation can be arbitrarily poor. however, typically additional tessellation manifests itself on the pixel-scale as slightly rounded silhouettes, and for these the approximation accuracy is only slightly worse than for long edges, although exact error bounds cannot be given.
+
+a potentially more serious approximation results from the assumption that all triangles that contain silhouette edges overlap pixel centers and are thus stored during rasterization. clearly, if we tessellate a surface enough, it is rare for a triangle with a silhouette edge to get rasterized. in this situation, some silhouette edges are not found during antialiasing and no visibility gradient is obtained for these pixels. occasionally missing a gradient can slow down optimization but rarely prevents it from succeeding, as we show in section 4.
+
+backward pass. to prepare for the gradient computation, we store the results of the discontinuity analysis in the forward pass so that we do not have to repeat it in the backward pass. gradient computation with the stored data is then easy - for each pixel pair that was antiaised in the forward pass, we determine how both vertex positions influence the blending coefficient, and transfer incoming pixel gradients to vertex positions accordingly using scatter-add operations.
+
+# 3.7 discussion
+
+our design aims to do as little as possible apart from managing the complex and dynamic mappings between pixels and the input vertices and textures, leaving the field open for utilizing novel parameterizations for geometry, textures, and lighting models. in particular, the modular design allows the units to be chained many times in a single rendering pipeline. the deferred shading design also leaves many options open. for example, it is easy to perform texture-space shading instead of shading in the pixel domain: after computing shading results using array operations in texture space, one would simply look up the surface colors from the texture in the deferred shading pass.
+
+# 4 analysis
+
+in this section, we validate our design principles via targeted, synthetic tests. we first examine the properties of the visibility gradients resulting from our antialiasing, as well as the effects of filtered texture lookups on texture convergence. then, we construct a rendering pipeline with nontrivial shading and use it to demonstrate an optimization task that involves indirect texture lookups. we also examine a pose fitting task with a difficult optimization landscape. finally, we measure the performance of our system and compare it to previous differentiable rasterizers.
+
+# 4.1 visibility gradients
+
+to examine the validity of the gradients, we perform a synthetic test where we attempt to infer vertex positions and colors of a simple unit cube. we initialize the solution by taking the true vertex positions and perturbing them randomly in range  $\left[-\frac{1}{2}, \frac{1}{2}\right]^3$ . the vertex colors are initialized to random rgb values in  $[0, 1]^3$ . we then run adam optimizer [kingma and ba 2015] ( $\beta_1 = 0.9$ ,  $\beta_2 = 0.999$ ) for 5000 iterations, where in each iteration we render the reference mesh
+
+![](images/b4210b7c3256d50479e4700650c9717fccccbcdecf87912279759c0a2b1d14bc.jpg)  
+fig. 4. to validate that our visibility gradients provide useful information even for small triangles, we infer vertex positions and colors of a simple mesh in extremely small resolutions. the geometry of the current solution is superimposed on the rasterized images for illustration purposes only. rightmost column shows the final, optimized mesh rendered in high resolution. in  $4 \times 4$  resolution, the average triangle area is only 0.54 pixels. the optimization nonetheless converges to the correct solution, albeit slower than in higher resolutions. in  $2 \times 2$  resolution the optimization fails to converge.
+
+and the optimized mesh from same, random viewpoint, and take the image-space  $l_{2}$  loss between the images. based on this loss, we learn both vertex positions and colors simultaneously. the learning rate was ramped down exponentially from  $10^{-2}$  to  $10^{-4}$  over the course of the optimization.
+
+we implemented two modes for coloring the vertices. in the continuous coloring mode, the vertex colors at each corner are shared. this yields a coloring that is continuous across the surface of the cube and has 8 unique colors to optimize. in the discontinuous coloring mode, each face has four unique colors at the corners, i.e., a total of 24 unique colors. consequently, the coloring is not continuous across the edges or vertices of the cube. it can be expected that the latter mode is more difficult to optimize because of the larger number of unknowns and presumably less smooth gradients due to color discontinuities.
+
+figure 4 illustrates the results in the continuous coloring mode. to our surprise, the optimization succeeds even at  $4 \times 4$  resolution, where the average size of a rendered triangle is approximately half a pixel. this indicates that our antialiasing-based visibility gradients offer enough information even for small triangles such as those seen in finely tessellated meshes. however, rendering in higher resolution offers faster convergence, highlighting that rendering performance in high resolutions is crucial.
+
+figure 5 shows the average convergence curves for both coloring modes in the three resolutions tested. each curve is an average over 10 successful optimization runs. we manually excluded the cases where early optimization steps produced an irrecoverable self-intersecting mesh, which happened in approximately  $25\%$  of runs in  $4 \times 4$  resolution, and less often in higher resolutions. this concurs
+
+![](images/b00e131fdadbc94ec7b3a9830f717f269d763b9be886506f80da9beb64da23d8.jpg)  
+fig. 5. convergence of the cube shape and color optimization test (average of 10 successful optimizations). vertical axis shows the average distance between vertices and their true positions in the unit cube. the solid curves indicate convergence in the continuous coloring mode (figure 4), and the dashed curves correspond to the discontinuous coloring mode. as expected, the latter is somewhat more difficult to optimize. note the logarithmic horizontal axis.
+
+with the observation from mitsuba 2 [nimier-david et al. 2019] that some rendering-related components require careful initialization. we could have made these configurations less likely by lowering the learning rate, initializing the mesh to further away from self-intersecting states, or by using a suitable regularization term that pushes apart geometry that is in danger of folding over itself. we chose not to use any regularizers in this test because we explicitly wanted our gradients to be based on image-space loss only.
+
+# 4.2 texture filtering
+
+to measure the importance of texture filtering via mipmaps, we constructed a test where we attempt to learn a texture based on synthetic, high-quality reference images that exhibit large variations in scale. we then measure how well the texture is learned with and without mipmapping.
+
+figure 6a shows example reference images of this task. the reference images are rendered first in  $4096 \times 4096$  resolution and then downsampled to  $512 \times 512$  using a high-quality downsampling filter. the reference images are thus well band-limited and display no aliasing, blurring, or other artifacts.
+
+the goal of the optimization is to learn a cube map -parameterized texture with  $512 \times 512$  pixel faces, mapped onto a unit sphere, based on the reference images. we again use adam [kingma and ba 2015] as the optimizer ( $\beta_{1} = 0.9$ ,  $\beta_{2} = 0.99$ ) and run it for 20 000 iterations, ramping the learning rate from  $10^{-2}$  to  $10^{-3}$  during the course of optimization. this learning rate schedule was chosen to be optimal for the case without mipmapping. the training images are rendered directly in  $512 \times 512$  resolution, from the same, random viewpoints as the reference images, and the optimizer attempts to minimize  $l_{2}$  loss between training and reference images. the same mesh and texture parameterization are used for all images.
+
+learning the texture is made difficult by the sphere being placed randomly at distance [1.5, 50] from the camera. hence some reference images view a close-up patch of the surface, whereas most are too distant to infer texel-level details. this replicates the effects of highly variable pixel-to-texel ratio in reference imagery, which we expect to be present in many kinds of real-world data such as street view images or sets of in-the-wild photographs.
+
+figures 6b,c illustrate that with mipmapped texture filtering, the learned texture converges to a solution much closer to the reference (32.9 db vs 25.6 db). the convergence failure of non-mipmapped version can be explained by a simple thought experiment. when the reference image has a faraway pixel with a large texture footprint, its value is determined by a weighted mean of the reference texture over that footprint. without mipmapping, we will sample whichever full-resolution texel quad lands under that pixel center. if this value deviates from the large-area average in the reference image, the gradients will pull the texels in the learned texture towards this average. over many such updates, this pull towards the mean leads to attenuated high-contrast details, which can be seen in figure 6b where even the converged non-mipmapped solution has less visible contrast than the solution obtained via proper texture filtering.
+
+# 4.3 indirect texturing, brdf optimization
+
+to demonstrate the flexibility of our modules, we construct a rendering pipeline that computes reflections via environment mapping [greene 1986] and adds a highlight from an additional light source using a phong brdf [phong 1975]. figure 7 illustrates the use of this rendering pipeline for solving the environment map contents and phong brdf parameters based on the reflections from an irregular object with known geometry and pose.
+
+at the beginning of optimization, the brdf parameters are initialized to random values, whereas the environment map is initialized to uniform gray. in each iteration, the camera angle and light direction are randomized. optimization is done using adam with a fixed learning rate of  $10^{-2}$  and a simple image-space  $l_{2}$  loss. in this synthetic test, the unknown environment texture and brdf parameters rapidly converge to the reference solutions.
+
+the rendering pipeline is constructed as follows. we start by rasterizing the geometry as usual, obtaining a frame buffer with per-triangle barycentrics and their screen-space derivatives. we also calculate a normalized reflection vector for each vertex. these reflection vectors are then used as attributes for interpolation, which yields per-pixel reflection vectors and screen-space derivatives for each of their components. we represent the environment map as a cube map, so for each per-pixel reflection vector we determine the corresponding cube map face and 2d texture coordinates within it. the same calculation also yields the screen-space derivatives of the texture coordinates, and we perform a trilinear texture fetch to the environment map. this is important because reflections from curved surfaces introduce highly variable distortions and texture footprint sizes. the cosine between the reflection vector and light direction vector required by the phong brdf model is computed based on the per-pixel reflection vectors.
+
+the shading computation involves 18 lines of python code using standard tensorflow operations. in our opinion, this is a small price to pay for the complete freedom to tailor shading, data representations, etc., to the needs of the application, compared to incorporating a fixed set of shading models into the differentiable rendering system itself. it would not be possible to implement a similar setup in previous rasterization-based differentiable renderers without modifying their internals.
+
+![](images/02fbc37cbc0c6c3267a06eec94849063db6e6d310dd1801342bb35a2f8bce1f0.jpg)
+
+![](images/842291938231da64e8e8fa8a9f1a604c1ac02575e6bd8fb3d5a5f2f7e6749958.jpg)
+
+![](images/f4ebea325bec88e24c80a14fea61bdd48cbeb92fdd3cd47fd9e27f9096fa5a2c.jpg)  
+(a) example reference images
+
+![](images/787261bfa6a152bf8c32132b85ce0313729104bf9e95d5fea3ce783aaca1585f.jpg)  
+fig. 6. filtered texture sampling via mipmaps helps considerably when learning a texture in a difficult geometric setup. see text for full description. (a) example synthetic reference images in  $512 \times 512$  resolution. (b) with mipmapping enabled, sampling is prefiltered and gradients are routed to the correct detail levels. without mipmaps, faraway views yield badly filtered samples and spurious, noisy texture updates that do not converge to the correct solution. (c) convergence of the learned texture compared to the reference texture. learning rate schedule was optimized for the "no mipmaps" case, and the same schedule was used with mipmaps.
+
+![](images/725a1e32148665bac7de154731ab1eb9cf7137136dfa9f85bfcab5b1d9909dd4.jpg)  
+(b) closeups of learned texture
+
+![](images/c29d3c41266e1be233d0e2c76396d5cd15ce9f45224cf6ac6f98f0dd3ed72da7.jpg)
+
+![](images/48d775be04c22e3d255c771e81396460fd2c89fdcc417cf00c626a8ee2fa19c1.jpg)
+
+![](images/24e6a47fc564fa145d6d38152b4c0f1852fc7eb4cfe08286d07fecd95b36f539.jpg)
+
+![](images/5e872841cdcb27099f57d130422113d6bed6eb98e25df90c99ba17b00e258733.jpg)  
+(c) texture convergence vs. reference
+
+![](images/755ffdd08f21f1091c9fd56fecc38008afc5193804564713a602735047e7485d.jpg)  
+initialization
+
+![](images/f17ad932d7b06f0c19fe73beef69222f04c295486f97e8ea8ab01ec6b7de4f65.jpg)  
+100iter.
+
+![](images/c09444a6afd9288cd62b63014fc94adb3a8982f1e335ecb3b96511abc95c07ae.jpg)  
+400iter.
+
+![](images/a4d4e21cfea1c0fce1537eaae65e88d752eb9da5c01f431d86bb3017394e07f8.jpg)  
+700iter.
+
+![](images/ec578990b33fbb4f3bdb40af5c29624efd5121fe9cefc82cea49bdd2bfcd70e6.jpg)  
+fig. 8. two example cases from the cube pose optimization test. with trivial noise-based regularization, we obtain an average error of  $48.62^{\circ}$  which is an improvement over the  $63.57^{\circ}$  of liu et al. [2019], indicating that the blur and transparency offered by softras are not necessary in this task. the average error is dominated by local minima where the pose looks correct but the colors are wrong (see example on the right with  $\sim 180^{\circ}$  final pose error—the yellow face should be on top instead of white). customizing the optimization method to suit the task better lowers the average error to  $2.61^{\circ}$ . some cases are impossible due to only one face of the cube being visible in the reference image, but they are rare enough to not contribute significantly to the averages.
+
+![](images/3308b448327d7a8f0236ed6760240fbad840fbd80db76ada9cee1ae29fb66d0a.jpg)  
+1000iter.  
+fig. 7. optimizing environment map texture and phong brdf parameters in a synthetic test case. top: example renderings at various iteration counts. the texture converges slightly unevenly due to the distribution of indirect texture lookups, as seen at 100 iterations. bottom: convergence of the learned parameters over the course of optimization.
+
+limitations. local shading models, such as the one demonstrated here, cannot accurately model global phenomena such as interreflections. if such fidelity is required, a path tracing based differentiable renderer will be necessary [li et al. 2018; loubet et al. 2019; nimier-david et al. 2019]. however, there is no inherent limit on the complexity of the local shading model, so e.g. microfacet [cook and torrance 1982] or gaussian mixture model [herholz et al. 2016] brdfs could be used to seek a better fit to data. ultimately it depends on the intended use how physically accurate the shading should be - even a crude approximation of appearance may be sufficient for inferring other unknowns such as pose or geometry. in section 5, we demonstrate that in the context of facial performance capture, the per-frame geometry of skin areas can be accurately recovered without any shading at all. in situations like this, striving for physical fidelity would unnecessarily slow down the optimization.
+
+![](images/c01f116ae675c05ae02214134426d4c67bbd9501825599d64f06c01a00951b07.jpg)  
+initial  
+final  
+reference
+
+![](images/b89fc3e3af0be29348ba58c1317f4d5391a062ff645e47830e69625f539c3418.jpg)  
+initial  
+final  
+reference
+
+# 4.4 pose optimization
+
+in the softras paper, liu et al. [2019] investigate the problem of resolving the pose of a rendered cube using gradient-based optimization of image-space loss. the task is made difficult by an optimization landscape with many local minima (figure 8). the image synthesis model of softras allows turning all surfaces partially transparent and blurring them by an arbitrary amount. this results in a smoother loss function and a modest improvement in the resolved poses.
+
+to demonstrate that the nonstandard image synthesis model of softras is not necessary for solving this task, we focus on the optimization process instead of manipulating the rendering model. a simple and efficient way to discourage local minima in a stochastic fashion is to add noise to the unknown parameters $^5$  during optimization. indeed, running the optimization for 10k iterations using adam and ramping down the noise strength from 1 to 0.003 over the course of optimization yields an average pose error of  $48.62^\circ$  measured over 100 random trials. this is an improvement over the best result of  $63.57^\circ$  reported by liu et al. [2019], indicating that
+
+noise-based regularization is at least as effective as their approach based on transparency and blur.
+
+however, we note that gradient descent from a random initial state is an ineffective way to solve this problem. splitting the optimization into two phases – first greedily seeking for a good initial pose by applying ramped-down noise in a gradient-free fashion, and then continuing with adam from the pose with the smallest image-space loss – lowers the average error to  $22.49^{\circ}$ . as a further task-specific optimization, we can take the symmetries of the cube into account and customize the noise to incorporate random symmetry-preserving rotations. this effectively bridges the local minima with similar pose but different color combinations and lowers the average error to  $2.61^{\circ}$ .
+
+# 4.5 performance
+
+to assess the performance of our method, we selected 14 meshes of varying triangle counts from the shapenet database [chang et al. 2015]. we rendered these meshes using both our method and two comparison methods in multiple resolutions. as comparison methods we used the official implementation of soft rasterizer [liu et al. 2019], and pytorch3d [ravi et al. 2020], a more recent differentiable rasterization library for pytorch. the test was set up to include both forward and gradient evaluations, reflecting the total cost of including a rendering operation in an optimization task.
+
+default  $\gamma, \sigma$  parameter values were used for soft rasterizer. pytorch3d was set up to render one pixel blur radius, one face per pixel, and soft compositing (softgouraudshader). default bin size heuristic was enabled. we originally intended to include interior scenes in our tests, but soft rasterizer could not render "in-scene" viewpoints due to lack of clipping, making triangles behind the camera render erroneously in front of the camera. therefore, we limited our test to individual objects rendered in front of the camera. all tests were run on a single nvidia titan v gpu with 12 gb of memory.
+
+results of the test are summarized in table 2. we can see that our method is much less sensitive to triangle and pixel counts than the comparison methods. soft rasterizer slows down quickly because it tests each triangle for every pixel, and consequently loses to our method by several orders of magnitude with nontrivial triangle counts and resolutions. pytorch3d fares better than soft rasterizer thanks to its coarse-to-fine rasterization architecture. still, the performance difference is more than an order of magnitude in our favor and grows with high resolutions and triangle counts, highlighting the better scalability of our method.
+
+occluded vs visible geometry. it is generally desirable that rendering performance is not affected by the amount of geometry that is not visible in the rendered image. our method employs deferred shading, and is therefore mostly oblivious to occluded or out-of-view geometry except at the rasterization step. the same holds for pytorch3d when storing just one face per pixel, but its rasterization step is expensive so it is not obvious how hidden geometry affects the overall performance.
+
+to quantify the effects of depth complexity, we constructed pairs of synthetic scenes where the number of triangles and covered pixels are held constant but the depth complexity is varied. specifically,
+
+![](images/ed7ba64524dadeac203682bb290a0f9f3595c9135d1633171761ff0c47a86f6e.jpg)  
+fig. 9. the effect of geometric configuration on forward + gradient pass execution times in  $1024 \times 1024$  resolution. a  $8 \times 8$  grid base mesh (128 triangles) is repeated 1, 64, 256, or 1024 times (horizontal axis). the repeated meshes are either stacked in depth direction (dashed lines) or placed adjacent to each other on the same plane (solid lines). the meshes are scaled so that the output image always has the same number of pixels covered. pytorch3d [ravi et al. 2020] scales mostly with the total area of geometry, occluded or not, whereas our method is not slowed down by hidden geometry. softras [liu et al. 2019] has approximately constant cost per triangle, and cannot keep up with the other two methods.
+
+we repeat a simple base mesh either so that all copies are visible and together cover the image, or so that only one is visible and covers the image while all other copies are hidden behind it. figure 9 shows the measured performance as function of geometric complexity and geometric setup. resolution is fixed to  $1024 \times 1024$  and the settings are otherwise the same as above. pytorch3d, disregarding the constant cost of  $\sim 50$  ms, scales strongly with the total area of geometry, occluded or not. this is due to its software rasterizer resolving visibility so late that practically no work is saved if the tested fragment is found to be occluded. the performance of our method is mostly unaffected by the depth complexity, as it uses the hardware rasterizer with efficient hierarchical depth tests. softras scales linearly with geometric complexity regardless of the geometric setup, and does not compare favorably to the other two methods.
+
+# 5 application: facial performance capture
+
+to illustrate the performance and utility of the design of our differentiable rendering pipeline, we examine how to use it to solve markerless facial performance capture, i.e., inferring time-varying facial geometry based on multiple camera streams. this is a non-trivial classical computer graphics problem that has been approached in several ways in the past. many methods utilize morphable 3d models [blanz and vetter 1999] that enable approximating the facial geometry even from monocular data. the downside of this class of methods is that the obtained geometry is approximate and cannot fully reproduce intricate motion. high-quality markerless capture often requires complex capture setups involving structured light or special cameras [alexander et al. 2009; bradley et al. 2010]. the passive capture method of beeler et al. [2011] first reconstructs each frame using a single-shot method [beeler et al. 2010] and then builds frame-to-frame correspondences iteratively.
+
+while these methods yield great results, they are fairly complex and consequently difficult to implement. as a result, the state of the
+
+table 2. performance comparison between our method, the official implementation of soft rasterizer (softras) [liu et al. 2019], and pytorch3d [ravi et al. 2020].  
+
+<table><tr><td></td><td colspan="2">triangles → 284</td><td>352</td><td>514</td><td>1236</td><td>4474</td><td>5216</td><td>5344</td><td>10908</td><td>21695</td><td>25643</td><td>43448</td><td>91145</td><td>196179</td><td>308170</td></tr><tr><td>resolution</td><td colspan="15">rendering + gradients time* (ms)</td></tr><tr><td rowspan="5">our method</td><td>256×256</td><td>2.13</td><td>2.03</td><td>1.95</td><td>1.89</td><td>1.95</td><td>2.02</td><td>2.02</td><td>2.08</td><td>2.02</td><td>2.05</td><td>2.00</td><td>2.18</td><td>2.97</td><td>3.12</td></tr><tr><td>512×512</td><td>2.26</td><td>2.29</td><td>2.07</td><td>2.08</td><td>2.23</td><td>2.12</td><td>2.08</td><td>2.11</td><td>2.14</td><td>2.20</td><td>2.27</td><td>2.44</td><td>2.66</td><td>3.33</td></tr><tr><td>1024×1024</td><td>2.70</td><td>2.94</td><td>2.60</td><td>2.56</td><td>2.52</td><td>2.56</td><td>2.61</td><td>2.59</td><td>2.61</td><td>2.64</td><td>2.66</td><td>3.03</td><td>3.36</td><td>4.13</td></tr><tr><td>2048×2048</td><td>6.21</td><td>6.72</td><td>4.31</td><td>4.95</td><td>4.53</td><td>4.58</td><td>5.31</td><td>4.35</td><td>4.95</td><td>4.46</td><td>4.82</td><td>5.64</td><td>6.46</td><td>6.21</td></tr><tr><td>4096×4096</td><td>17.73</td><td>20.11</td><td>12.12</td><td>13.18</td><td>12.40</td><td>12.49</td><td>13.29</td><td>12.05</td><td>12.92</td><td>12.39</td><td>12.73</td><td>14.70</td><td>17.73</td><td>15.64</td></tr><tr><td rowspan="5">softras [2019]</td><td>256×256</td><td>7.48</td><td>6.76</td><td>7.84</td><td>7.73</td><td>18.11</td><td>14.29</td><td>10.91</td><td>29.21</td><td>30.93</td><td>49.06</td><td>65.21</td><td>144.57</td><td>331.30</td><td>788.92</td></tr><tr><td>512×512</td><td>10.01</td><td>10.42</td><td>8.78</td><td>10.68</td><td>24.05</td><td>24.33</td><td>24.40</td><td>50.09</td><td>82.48</td><td>99.76</td><td>163.51</td><td>375.39</td><td>865.63</td><td>1430.17</td></tr><tr><td>1024×1024</td><td>20.73</td><td>24.55</td><td>15.74</td><td>22.00</td><td>69.43</td><td>73.56</td><td>74.07</td><td>153.14</td><td>277.36</td><td>336.54</td><td>556.92</td><td>1250.74</td><td>3012.63</td><td>4856.97</td></tr><tr><td>2048×2048</td><td>66.25</td><td>86.49</td><td>46.66</td><td>68.43</td><td>250.65</td><td>276.06</td><td>280.30</td><td>557.96</td><td>1039.49</td><td>1234.61</td><td>2044.79</td><td>4602.11</td><td>11487.70</td><td>18402.19</td></tr><tr><td>4096×4096</td><td>223.88</td><td>332.33</td><td>163.87</td><td>240.71</td><td>946.76</td><td>1055.14</td><td>1082.35</td><td>2104.77</td><td>4036.47</td><td>4768.91</td><td>7958.07</td><td>17992.60</td><td>45499.74</td><td>72277.20</td></tr><tr><td rowspan="5">pytorch3d [2020]</td><td>256×256</td><td>27.12</td><td>27.19</td><td>26.81</td><td>27.95</td><td>27.67</td><td>27.14</td><td>26.94</td><td>28.62</td><td>27.93</td><td>30.08</td><td>32.03</td><td>37.52</td><td>54.82</td><td>115.87</td></tr><tr><td>512×512</td><td>31.83</td><td>30.93</td><td>31.08</td><td>31.19</td><td>31.70</td><td>31.82</td><td>30.83</td><td>32.06</td><td>34.84</td><td>38.41</td><td>41.50</td><td>55.53</td><td>95.21</td><td>158.71</td></tr><tr><td>1024×1024</td><td>53.70</td><td>53.24</td><td>52.03</td><td>51.38</td><td>52.44</td><td>52.17</td><td>53.02</td><td>53.99</td><td>58.98</td><td>64.87</td><td>83.04</td><td>140.34</td><td>267.45</td><td>438.82</td></tr><tr><td>2048×2048</td><td>156.31</td><td>153.17</td><td>145.34</td><td>141.66</td><td>144.91</td><td>145.48</td><td>141.49</td><td>148.75</td><td>165.77</td><td>182.21</td><td>259.04</td><td>456.07</td><td>930.77</td><td>1435.20</td></tr><tr><td>4096×4096</td><td>571.53</td><td>553.69</td><td>525.49</td><td>513.69</td><td>524.58</td><td>521.84</td><td>508.87</td><td>528.99</td><td>604.20</td><td>677.21</td><td>966.76</td><td>1754.35</td><td>3527.62</td><td>5567.26</td></tr><tr><td colspan="16">speedup factor</td></tr><tr><td rowspan="5">our vs softras</td><td>256×256</td><td>3.51</td><td>3.33</td><td>4.02</td><td>4.09</td><td>9.29</td><td>7.07</td><td>5.40</td><td>14.04</td><td>15.31</td><td>23.93</td><td>32.60</td><td>66.32</td><td>111.55</td><td>252.86</td></tr><tr><td>512×512</td><td>4.43</td><td>4.55</td><td>4.24</td><td>5.13</td><td>10.78</td><td>11.48</td><td>11.73</td><td>23.74</td><td>38.54</td><td>45.35</td><td>72.03</td><td>153.85</td><td>325.42</td><td>429.48</td></tr><tr><td>1024×1024</td><td>7.68</td><td>8.35</td><td>6.05</td><td>8.59</td><td>27.55</td><td>28.73</td><td>28.38</td><td>59.13</td><td>106.27</td><td>127.48</td><td>209.37</td><td>412.79</td><td>896.62</td><td>1176.02</td></tr><tr><td>2048×2048</td><td>10.67</td><td>12.87</td><td>10.83</td><td>13.82</td><td>55.33</td><td>60.28</td><td>52.79</td><td>128.27</td><td>210.00</td><td>276.82</td><td>424.23</td><td>815.98</td><td>1778.28</td><td>2963.32</td></tr><tr><td>4096×4096</td><td>12.63</td><td>16.53</td><td>13.52</td><td>18.26</td><td>76.35</td><td>84.48</td><td>81.44</td><td>174.67</td><td>312.42</td><td>384.90</td><td>625.14</td><td>1223.99</td><td>2566.26</td><td>4621.30</td></tr><tr><td rowspan="5">our vs pytorch3d</td><td>256×256</td><td>12.73</td><td>13.39</td><td>13.75</td><td>14.79</td><td>14.19</td><td>13.44</td><td>13.34</td><td>13.76</td><td>13.83</td><td>14.67</td><td>16.02</td><td>17.21</td><td>18.46</td><td>37.14</td></tr><tr><td>512×512</td><td>14.08</td><td>13.51</td><td>15.01</td><td>15.00</td><td>14.22</td><td>15.01</td><td>14.82</td><td>15.19</td><td>16.28</td><td>17.46</td><td>18.28</td><td>22.76</td><td>35.79</td><td>47.66</td></tr><tr><td>1024×1024</td><td>19.89</td><td>18.11</td><td>20.01</td><td>20.07</td><td>20.81</td><td>20.38</td><td>20.31</td><td>20.85</td><td>22.60</td><td>24.57</td><td>31.22</td><td>46.32</td><td>79.60</td><td>106.25</td></tr><tr><td>2048×2048</td><td>25.17</td><td>22.79</td><td>33.72</td><td>28.62</td><td>31.99</td><td>31.76</td><td>26.65</td><td>34.20</td><td>33.49</td><td>40.85</td><td>53.74</td><td>80.86</td><td>144.08</td><td>231.11</td></tr><tr><td>4096×4096</td><td>32.24</td><td>27.53</td><td>43.36</td><td>38.97</td><td>42.30</td><td>41.78</td><td>38.29</td><td>43.90</td><td>46.76</td><td>54.66</td><td>75.94</td><td>119.34</td><td>198.96</td><td>355.96</td></tr></table>
+
+*execution times include both forward and gradient evaluations for rendering one frame. each mesh was rendered several times from multiple angles and the results were averaged to reduce random variation. the exact same meshes, viewpoints, and camera parameters were used for all methods. for our method, we perform rasterization, attribute interpolation, and antialiasing, but no texturing. for soft rasterizer, rasterization with default lighting is computed. pytorch3d was set up to perform gouraud shading, i.e., attribute interpolation.
+
+art in many cases is using commercial capture systems such as di4d pro [2020] or commercial software such as agisoft metashape [2020] and r3ds wrap [2020]. our goal is not to attempt to surpass this state of the art, but to illustrate how far we can get with a near-trivial formulation as an inverse rendering problem. in particular, we will not attempt to reconstruct tricky regions such as mouth, eyes, or hair, but instead focus on skin areas only.
+
+our test material consists of three performances captured in a di4d pro rig at 29.97 frames per second. there are synchronized 9 camera feeds with 3 in color and 6 in monochrome - for simplicity, we convert the color reference images to monochrome as well prior to processing. resolution of the reference images is  $3008 \times 4112$  pixels, and the camera intrinsics and extrinsics are known. lengths of the three performances ("neutral", "disgust", and "anger") are 89, 123, and 207 frames, respectively.
+
+# 5.1 solution via inverse rendering
+
+our goal is to find a global texture and a per-frame mesh so that when rendered from the known camera positions, the textured meshes match the reference footage as closely as possible measured
+
+using image-space  $l_{2}$  loss. we learn the geometry as per-frame deformation of a fixed-topology base mesh that has 16521 vertices and 16472 original faces that were triangulated into 32916 triangles for rendering. the base mesh has texture coordinates referencing a 5:1 aspect ratio texture atlas, and our learned texture is a single-channel  $10240 \times 2048$  texture initialized to zeros. the texture coordinates of the base mesh are not modified during optimization.
+
+we do not consider material properties or lighting in our image synthesis model, and assume skin to be lambertian and lighting to be uniform. neither assumption is valid [marschner et al. 1999] but we can still expect the geometry to be reconstructed correctly if this produces the best achievable images. capturing material properties and incident lighting, along with geometry, should be possible with a more complex rendering pipeline [liu et al. 2017]. occasional convergence problems were caused by variable shadowing under the nose. we alleviate the problem by passing both rendered and reference images through a high-pass filter so that all low-frequency effects are attenuated before computing the image-space loss. this has the added benefit of making the optimization more resilient to
+
+illumination and shading effects that occur due to changes in head orientation.
+
+# 5.2 parameterization and regularization
+
+in principle, the vertex positions for every frame could be encoded in one large matrix to be optimized. however, we decompose the vertex positions into a matrix product in order to make the optimization landscape more tractable. one could see our model as a three-layer dense neural network that maps a one-hot animation frame index vector into a vector of per-vertex deltas from the base mesh. even though using a chain of matrices without nonlinearities does not increase the expressiveness of the representation, it accelerates optimization similar to how overparameterization accelerates deep learning [arora et al. 2018].
+
+let us denote the vertex count  $n$  and the number of reference frames  $m$ . denoting the  $3n$  column vector encoding base mesh vertex positions as  $v_{base} = [x_1, y_1, z_1, x_2, \dots]$ , the vertex positions for frame  $i$  are computed as  $v_i = v_{base} + m_3m_2m_1w_i$ , where  $w_i$  is a one-hot column vector of length  $m$  with entry at index  $i$  being one. matrices  $m_1$  and  $m_2$  are of size  $m \times m$ , and  $m_3$  has size  $3n \times m$ . the square matrices  $m_1$  and  $m_2$  are initialized to identity, whereas  $m_3$  is initialized to zero.  $m_3$  can be seen as a learned basis for the mesh deltas, and  $m_1$  and  $m_2$  acting as a mapping from frame index to this basis. finding the geometry thus corresponds to finding values for  $m_{1,2,3}$  via optimization.
+
+this formulation has no inherent propensity to, e.g., keep the surface tessellation of the mesh intact. because of this, we apply a mesh laplacian regularization term that penalizes local curvature changes compared to the base mesh. sorkine [2005] gives an overview of laplacian-based methods for mesh processing. using their notation, the uniformly-weighted differential  $\delta_{j}$  of vertex  $v_{j}$  is  $\delta_{j} = v_{j} - \frac{1}{|n_{j}|}\sum_{k\in n_{j}}v_{k}$ , where  $n_{j}$  is the set of one-ring neighbors of vertex  $v_{j}$ . in other words,  $\delta_{j}$  is the difference between position of vertex  $v_{j}$  and the average position of its neighbors. our laplacian regularization term is  $l_{\delta} = \frac{1}{n}\sum_{1\leq j\leq n}||\delta_{j} - \delta_{j}^{base}||^{2}$ , i.e., the average square euclidean difference between the vertex differentials of the base mesh and those of the deformed mesh. although this representation is not rotation-invariant [lipman et al. 2005], we have not found this to be a problem in practice. similar regularization has been used in earlier work on shape inference [liu et al. 2019].
+
+in addition to texture and geometry, we learn global, per-camera brightness and contrast adjustment values that are applied to the rendered images during training. this accounts for differences between reference images originating from color vs monochrome cameras. we do not use any form of temporal regularization, i.e., there are no terms that would prefer nearby frames to be similar to each other. regardless of this, the solution is temporally stable as can be seen in the accompanying video.
+
+# 5.3 optimization
+
+to resolve geometry and texture for a sequence of frames, we initialize the geometry representation as explained above. in each iteration, we choose random frame and camera indices, and render the corresponding mesh using a pipeline similar to one shown in figure 1. we perform rendering in the same resolution as reference
+
+images, i.e.,  $3008 \times 4112$  pixels, which limits our minibatch size to one in practice.
+
+in our primary configuration, optimization is run for 100 000 iterations using adam optimizer [kingma and ba 2015] ( $\beta_{1} = 0.9$ ,  $\beta_{2} = 0.999$ ) with a base learning rate of  $\lambda = 10^{-3}$ . the learning rate is decayed to  $10^{-4}$  during the last  $25\%$  of optimization. high-pass filtering is computed as  $x' = x - 0.3 \cdot \text{blur}(x)$  where  $x$  is the rendered/reference image, and  $\text{blur}(x)$  downsamples the image by a factor of  $32 \times 32$  and upsamples it back using an approximate gaussian filter. images are compared using  $l_{2}$  loss, so the overall loss function with the laplacian term included is  $l = ||x' - y'||_{2}^{2} + 3l_{\delta}$  where  $x'$  and  $y'$  are the high-pass filtered rendered and reference images, respectively. a typical optimization run takes 60-70 minutes on a single nvidia tesla v100 gpu, with each optimization iteration taking approximately 40 milliseconds.
+
+in an additional test, we resolved all three capture sequences in a single optimization run. this task is complicated by the actor being positioned slightly differently in each sequence - with just one base mesh, the alignment is off and large motion of the mesh is required. to circumvent this problem, we also learn a  $3 \times 4$  rigid transformation matrix  $r_{j}$  for each sequence  $j$ , and apply it before the vertex deltas, i.e.,  $v_{i} = r_{j} v_{base} + m_{3} m_{2} m_{1} w_{i}$ . in addition we initialize the texture with one previously solved for the "neutral" performance, limited  $m_{2}$  to  $100 \times 100$  elements, and adjusted the dimensions of  $m_{1}$  and  $m_{3}$  accordingly. with these modifications and extending the computation to 800 000 iterations, the optimization successfully found a rigid transformation for each sequence to handle the misalignments, and subsequently solved the vertex deltas for every frame of the combined set along with a texture that best fits all three sequences. as a consequence of optimizing a single texture for the entire material, the mapping between surface and texture-space points becomes automatically consistent between all sequences.
+
+# 5.4 results
+
+figure 10 shows an example result of the geometry and texture optimization in the "neutral" sequence. for clarity, the wireframes in figure 10c-e include only the edges of original base mesh instead of the triangulated version. see the accompanying video for the sequences and our reconstructions, as well as the progression of geometry and texture during training.
+
+in our base mesh, the holes for mouth and eyes are simply covered with triangles in order to avoid spurious visibility leaks to the opposite side of the mesh. obviously, this does not allow faithful reconstruction of mouth and eyes, because eyes have strong view-dependent reflections, and mouth has complex internal geometry. as such, the optimization ends up texturing these covering triangles only somewhat believably. hair becomes similarly approximated by the learned texture.
+
+figure 11 shows closeups of the nose region in five frames selected from sequences "neutral" and "disgust". there is a surprising amount of fine-grained motion, and our method captures this very accurately as illustrated in the figure. we obtained a 3d reconstruction from di4d [di4d 2020] for comparison purposes, and it shows markedly less deformation and does not align properly with the
+
+![](images/414b7eb2e14c4fbf6d8963ef00f7a6c76f030ca48c39606aa13b4253ff51e9b3.jpg)  
+(a) reference
+
+![](images/173a88f2b53d228f2230090efd300b277254a455643e1d0375e41608483b8a8f.jpg)  
+(b) our reconstruction
+
+![](images/f26c12d97e299d2661c0b9079d9fa5019f46d34900f984cf624a6b04c07b95d1.jpg)  
+(c) with wireframe
+
+![](images/40f7bbccc4712a995eec887b4ae73d00affddb5ebbd22a5151aa619b98aaa555.jpg)  
+(d) wireframe only
+
+![](images/20bf6f54d10cb00871f0a3f4e0e5bb99af1688bbc26f57ac7f204b1bdc3875cb.jpg)  
+(e) base mesh
+
+![](images/451f76d746a11b94fe1ce9c4c906d10f3618ab71cd04e3b960267a2dd57f7418.jpg)  
+fig. 10. an example frame from the reconstruction of a 89-frame sequence. (a) one of the 9 camera images for the frame. (b-d) our reconstructed texture and geometry, rendered from the same viewpoint using the known camera parameters. (e) base mesh  $v_{base}$  used as the starting point for optimization.  
+fig. 11. closeup of the nose reveals significant motion and deformation. our solution reproduces the changes in geometry faithfully, while the solution from di4d [2020] severely attenuates the deformations. false-color difference images (red/blue = brighter/darker than reference) highlight the geometric discrepancies around the nostrils. in our solution, the geometric silhouettes are located correctly and the differences are only due to defocus blur in the reference images that is lacking in our renderings. right: the di4d solution did not attempt to recover the motion of ears. we placed no constraints on which vertices are allowed to move during optimization, and thus also captured this motion.
+
+camera images. their optical flow based reconstruction does not
+
+![](images/6ca06c165ec835725b2962d5216a304131f47a900107e33dadf3d16855033ef5.jpg)  
+fig. 12. example reconstructions from the optimization of three sequences as a single 419-frame sequence, starting from the same base mesh as shown in figure 10e. because a single texture is solved for all frames, the vertex to skin correspondence is consistent across all sequences.
+
+attempt to track areas that lack high-quality multi-view observations such as ears and nostrils, whereas our solution automatically reconstructs this motion as well.
+
+figure 12 shows three example frames from the test where all three performances were resolved at once. in these selected frames, the mouth region looks reasonable, but the "anger" sequence exhibits artifacts around the mouth in many frames. this is not surprising – our model is unable to render the mouth adequately, so the optimum may be far from correct. nonetheless, the solution is otherwise temporally stable, and the motion and texture of skin
+
+areas are reconstructed well. as the same texture and texture coordinates are used for all frames, our method provides highly consistent vertex to skin correspondence across all sequences.
+
+# 6 discussion and future work
+
+we have demonstrated a modular differentiable renderer design capable of rendering high-resolution images of complex 3d scenes up to several orders of magnitude faster than prior approaches, while supporting crucial features such as filtered texture mapping with correct gradients. we believe that a high-performance differentiable renderer enables countless uses in inverse graphics, generative modeling, and other computer vision and ai problems, and to help this development, have made our library publicly available at https://github.com/nvlabs/nvdiffrast.
+
+as a practical use case whose success hinges on high-performance differentiable rendering performance, we have demonstrated that multi-view facial performance capture from synchronized high-resolution video cameras can be solved accurately by casting it as a simple inverse rendering problem. it will be interesting to extend this solution to joint material appearance capture, dynamic textures, as well as custom solutions for the eyes, mouth, and hair, integrated as a single optimization problem.
+
+there may exist specific circumstances and applications (e.g., discovery of occluded geometry) where the all-transparent image formation model used by several earlier differentiable renderers may be beneficial for optimization. however, we believe that such problems can also be approached in a principled way via careful choices for mesh parameterization, regularization, and optimization methods, while following the standard occlusion model of the modern graphics hardware pipeline.
+
+# acknowledgments
+
+we thank simon yuen for providing input and comparison data for the facial performance capture experiment, david luebke for comments, and sanja fidler and wenzheng chen for discussions on previous work.
+
+# references
+
+agisoft. 2020. agisoft metashape. https://www.agisoft.com/  
+oleg alexander, mike rogers, william lambeth, matt chiang, and paul debevec. 2009. the digital emily project: photoreal facial modeling and animation. in acm siggraph 2009 courses (siggraph '09).  
+sanjeev arora, nadav cohen, and elad hazan. 2018. on the optimization of deep networks: implicit acceleration by overparameterization. in icml (proceedings of machine learning research, vol. 80). 244-253.  
+thabo beeler, bernd bickel, paul beardsley, bob sumner, and markus gross. 2010. high-quality single-shot capture of facial geometry. acm trans. graph. 29, 4 (2010).  
+thabo beeler, fabian hahn, derek bradley, bernd bickel, paul beardsley, craig gotsman, robert w. sumner, and markus gross. 2011. high-quality passive facial performance capture using anchor frames. acm trans. graph. 30, 4 (2011).  
+volker blanz and thomas vetter. 1999. a morphable model for the synthesis of 3d faces (siggraph '99). 187-194.  
+derek bradley, wolfgang heidrich, tiberiu popa, and alla sheffer. 2010. high resolution passive facial performance capture. acm trans. graph. 29, 4 (2010).  
+angel x. chang, thomas funkhouser, leonidas guibas, pat hanrahan, qixing huang, zimo li, silvio savarese, manolis savva, shuran song, hao su, jianxiong xiao, li yi, and fisher yu. 2015. shapenet: an information-rich 3d model repository. technical report arxiv:1512.03012 [cs.gr]. stanford university - princeton university - toyota technological institute at chicago.
+
+wenzheng chen, jun gao, huan ling, edward smith, jaakko lehtinen, alec jacobson, and sanja fidler. 2019. learning to predict 3d objects with an interpolation-based differentiable renderer. in advances in neural information processing systems.  
+r. l. cook and k. e. torrance. 1982. a reflectance model for computer graphics. acm trans. graph. 1, 1 (1982), 7-24.  
+martin de la gorce, david j. fleet, and nikos paragios. 2011. model-based 3d hand pose estimation from monocular video. ieee transactions on pattern analysis and machine intelligence 33, 9 (2011), 1793-1805.  
+michael deering, stephanie winner, bic schediwy, chris duffy, and neil hunt. 1988. the triangle processor and normal vector shader: a vlsi system for high performance graphics. in siggraph '88. 21-30.  
+di4d. 2020. di4d pro system. https://www.di4d.com/di4d-pro/  
+ned greene. 1986. environment mapping and other applications of world projections. ieee computer graphics and applications 6, 11 (1986), 21-29.  
+sebastian herholz, oskar elek, jiri vorba, hendrik lensch, and jaroslav krivánek. 2016. product importance sampling for light transport path guiding. computer graphics forum 35, 4 (2016), 67-77.  
+andre jalobeanu, frank o. kuehnel, and john c. stutz. 2004. modeling images of natural 3d surfaces: overview and potential applications. 2004 conference on computer vision and pattern recognition workshop (2004).  
+jorge jimenez, diego gutierrez, jason yang, alexander reshetov, pete demoreuille, tobias berghoff, cedric perthuis, henry yu, morgan mcguire, timothy lottes, hugh malan, emil persson, dmitry andreev, and tiago sousa. 2011. filtering approaches for real-time anti-aliasing. in acm siggraph courses.  
+hiroharu kato, yoshitaka ushiku, and tatsuya harada. 2018. neural 3d mesh renderer. in the ieee conference on computer vision and pattern recognition (cvpr).  
+diederik p. kingma and jimmy ba. 2015. adam: a method for stochastic optimization. in aclr.  
+tzu-mao li, miika aittala, fredo durand, and jaakko lehtinen. 2018. differentiable monte carlo ray tracing through edge sampling. acm trans. graph. (proc. siggraph asia) 37, 6 (2018), 222:1-222:11.  
+yaron lipman, olga sorkine, david levin, and daniel cohen-or. 2005. linear rotation-invariant coordinates for meshes. acm trans. graph. 24, 3 (2005), 479-487.  
+guilin liu, duygu ceylan, ersin yumer, jimei yang, and jyh-ming lien. 2017. material editing using a physically based rendering network. iccv (2017), 2280-2288.  
+shichen liu, tianye li, weikai chen, and hao li. 2019. soft rasterizer: a differentiable renderer for image-based 3d reasoning. in iccv.  
+matthew m. loper and michael j. black. 2014. opendr: an approximate differentiable renderer. in eccv 2014, vol. 8695. 154-169.  
+guillaume loubet, nicolas holzschuch, and wenzel jakob. 2019. reparameterizing discontinuous integrands for differentiable rendering. acm trans. graph. (proc. siggraph asia) 38, 6 (2019).  
+hugh malan. 2010. edge anti-aliasing by post-processing. in *gpu pro*, wolfgang engel (ed.). a k peters, 265–289.  
+steve marschner, stephen h. westin, eric p. lafortune, kenneth e. torrance, and donald p. greenberg. 1999. image-based brdf measurement including human skin. in rendering techniques.  
+merlin nimier-david, delio vicini, tizian zeltner, and wenzel jakob. 2019. mitsuba 2: a retargetable forward and inverse renderer. acm trans. graph. 38, 6 (2019).  
+nvidia. 2018. nvidia turing gpu architecture. technical report.  
+gustavo patow and xavier pueyo. 2003. a survey of inverse rendering problems. computer graphics forum 22, 4 (2003), 663-687.  
+emil persson. 2011. geometric post-process anti-aliasing. http://www.humus.name/index.php?page=3d&id=86  
+bui tuong phong. 1975. illumination for computer generated pictures. commun. acm 18, 6 (1975), 311-317.  
+r3ds. 2020. r3ds wrap. https://www.russian3dscanner.com/  
+nikhila ravi, jeremy reizenstein, david novotny, taylor gordon, wan-yen lo, justin johnson, and georgia gkioxari. 2020. pytorch3d. https://github.com/facebookresearch/pytorch3d  
+andreas schilling, günter knittel, and wolfgang strasser. 1996. texram: a smart memory for texturing. ieee computer graphics and applications 16, 3 (1996), 32-41.  
+ken shoemake. 1985. animating rotation with quaternion curves. siggraph comput. graph. 19, 3 (1985), 245-254.  
+olga sorkine. 2005. laplacian mesh processing. in eurographics 2005 - state of the art reports.

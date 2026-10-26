@@ -1,0 +1,608 @@
+# efficient algorithms for device placement of dnn graph operators
+
+jakub tarnawski*, amar phanishayee*, nikhil r. devanur‡*, divya mahajan†, fanny nina paravecino†
+
+* microsoft research ‡ amazon † microsoft
+
+# abstract
+
+modern machine learning workloads use large models, with complex structures, that are very expensive to execute. the devices that execute complex models are becoming increasingly heterogeneous as we see a flourishing of domain-specific accelerators being offered as hardware accelerators in addition to cpus. these trends necessitate distributing the workload across multiple devices. recent work has shown that significant gains can be obtained with model parallelism, i.e., partitioning a neural network's computational graph onto multiple devices. in particular, this form of parallelism assumes a pipeline of devices, which is fed a stream of samples and yields high throughput for training and inference of dnns. however, for such settings (large models and multiple heterogeneous devices), we require automated algorithms and toolchains that can partition the ml workload across devices. in this paper, we identify and isolate the structured optimization problem at the core of device placement of dnn operators, for both inference and training, especially in modern pipelined settings. we then provide algorithms that solve this problem to optimality. we demonstrate the applicability and efficiency of our approaches using several contemporary dnn computation graphs.
+
+# 1 introduction
+
+deep neural networks (dnns) have been effective across a range of applications, including image classification [ksh12, sz14, hzrs15a], translation [wsc+16], language modeling [mks17], and video captioning [vrd+15]. the proliferation of heterogeneous hardware accelerators [jyp+17, spm+16] coupled with the dramatic growth in the size and the structural complexity of dnns has bolstered the importance of model parallelism, where for both inference and training, the model is distributed across devices.
+
+dnn inference in the "single-stream" setting [mlp], where only one inference request is issued at a time, is latency-sensitive. to achieve low latency, model parallel executions split the model across many accelerators [ckes16,  $\mathrm{fop}^{+}18$ ,  $\mathrm{cfo}^{+}18$ ]. model-parallel inference is beneficial due to three primary reasons. first, such splits are mandated by the memory-capacity (size) limitations of accelerators that cannot fit a single dnn model. current dnn models have billions of parameters and require multiple gbs of space to store the weights and intermediate activations. second, wide branching in recent dnn structures, as well as in the operator-granularity graphs for established dnns, opens up the potential of executing data-independent sections of the computation in parallel to reduce latency. third, the model needs to be split across multiple types of devices when a subset of operators in the graph are better suited or only supported to execute on certain devices.
+
+dnn training, on the other hand, is throughput-bound, as is dnn inference for the "offline" setting where many inputs can be serviced together [mlp]. model parallelism has been proposed for training for the very same motivational reasons listed for inference above [ksh12, kri14]. early influential systems
+
+such as distbelief  $\left[\mathrm{dcm}^{+}12\right]$  and project adam [csak14] split models to operate on commodity cpu clusters and out of cpu caches. in such a setting, operators in a dnn model are partitioned across the available devices, with each device evaluating and performing updates only on a subset of the model's parameters for all inputs. while traditional model parallel training suffers from problems of low hardware utilization, as only a single accelerator is active at any given time, pipelined model parallelism overcomes this deficiency. the amount of data communicated in pipelined training is the size of intermediate outputs (and corresponding gradients), which need to be sent across accelerators, and is much lower than the size of data communicated in data-parallel training. in particular, for a range of existing models that fit on a single gpu, pipedream  $\left[\mathrm{hnp}^{+}18, \mathrm{nhp}^{+}19\right]$  uses pipelined model-parallelism to achieve much faster training time to advertised accuracy than data-parallelism. similarly, gpipe  $\left[\mathrm{hcc}^{+}18, \mathrm{hcb}^{+}19\right]$  uses pipelined model-parallel training for very large models whose total training memory footprint exceeds the memory capacity of a single accelerator.
+
+given the importance of model-parallel inference and training, in this paper we present efficient algorithms to answer the following general question: for a dnn model and a deployment scenario (a set of accelerators and their memory and interconnect constraints), how can we effectively partition the model to optimize the metric of interest, such as latency or throughput, relevant to the inference or training task at hand?
+
+we provide novel algorithmic approaches to tackle the problem of partitioning the model in both model-parallel inference and training scenarios, optimizing for their corresponding metrics of interest:
+
+- inference - (i) model-parallel inference, optimized for "single-stream" latency (fig. 2a), (ii) pipelined inference, optimized for "offline" throughput (fig. 5a).  
+- training, optimized for throughput - (i) model-parallel training (fig. 2b), (ii) pipeline-parallel training with pipedream and gpipe schedules (fig. 7).
+
+in particular, for both non-pipelined and pipelined settings, we identify the combinatorial optimization problem at the core of the device placement question, whose solution will yield the optimal partition. we then show how to solve this problem to optimality via integer programming (ip) and dynamic programming (dp) based algorithms. our methods are general as they can be applied either to coarse-granularity layer graphs or to more complex fine-granularity operator graphs. we support graph partitions where accelerators can hold a non-contiguous fragment of the graph. we evaluate our partitioning algorithms for different scenarios described above for a variety of modern dnn workloads (7 dnns, 16 layer and operator graphs). we find that the placements are efficient and result in non-trivial optimal splits; non-contiguous splits outperform all the techniques, with an improvement of up to  $2 \times$  over expert (average  $1.46 \times$ ),  $2.08 \times$  over local search (average  $1.29 \times$ ) [mka07],  $1.21 \times$  over pipedream (average  $1.10 \times$ ) [nhp+19],  $7.69 \times$  over scotch (average  $1.50 \times$ ) [pel09].
+
+outline. this paper is organized as follows. we discuss related work in section 2. in section 3 we define our model of dnn computation, as well as the input/output specification for the problem of finding the best split. next, in sections 4 and 5 we focus on the latency objective (feeding one sample) and throughput objective (pipelining multiple samples), respectively. we present efficient algorithms that find optimal splits for both objectives. in sections 6 and 7 we present our evaluation results for the throughput objective and the latency objective, respectively.
+
+# 2 related work
+
+in the context of dnn workloads, model partitioning across different devices has mostly been a manual process driven by human experts. most prior work on automated device placement falls into two broad categories.
+
+the first category comprises methods that treat the objective function (i.e., latency or throughput) as a black box. these works use heuristics, mostly based on reinforcement learning, to find partitions for a given workload (mirhoseini et al.  $\mathrm{[mpl^{+}17}$ ,  $\mathrm{mgp^{+}18]}$ , spotlight [gcl18]) or learn a placement policy that
+
+can then be adjusted for new workloads via transfer learning (placeto [abvg+19], gdp [zra+19]) or used to bootstrap a genetic algorithm (regal [pgn+20]). unfortunately, these methods are computationally expensive, as they need to evaluate large numbers of placements, each of which entails a reconfiguration of the deployed devices (for a new dnn split) and measuring the runtime of several inference/training steps. for instance,  $\mathrm{[mpl^{+}17]}$  requires 12-27 hours of training time on the target system to partition modern workloads;  $\mathrm{[mgp^{+}18]}$  requires 12 gpu hours. for this reason, some systems (placeto [abvg+19], flexflow [jza19]) resort to implementing a simulator to evaluate the objective.
+
+works in the second category - including ours - build a cost model that closely reflects real performance, and then algorithmically solve the resulting "offline" optimization problem of finding good partitions and schedules. this includes classic results in scheduling on multiple machines/devices [llks93, gra66, kl70, py90, sw99, st93], as well as modern dnn scheduling works (optcnn [jlqa18], pipedream's  $\mathrm{[nhp^{+}19]}$  optimizer). such algorithms use profiled compute time of each node (layer or operator) and data-transfer requirements between nodes in a graph, and the target deployment system infrastructure such as machine and network properties (e.g. measured bandwidths). such techniques do not evaluate the performance of splits in an online fashion. nevertheless, it has been demonstrated that for well-defined cost models the objective function closely matches real performance (pipedream  $\mathrm{[nhp^{+}19}$ , figure 15], flexflow [jza19, figure 11], optcnn [jlqa18, table 4]). our throughput maximization model in section 5 generalizes the cost model used in pipedream  $\mathrm{[nhp^{+}19]}$ , and our latency minimization objective (section 4) is similar to the cost model of flexflow's simulator [jza19]. in terms of approach, both optcnn [jlqa18] and flexflow [jza19] optimize over different dimensions than our methods, opting for more local parallelization strategies.
+
+pipelining. gpipe  $\left[\mathrm{hcb}^{+}19\right]$  and pipedream  $\left[\mathrm{nhp}^{+}19\right]$  introduce pipelined model-parallelism for training. given that this prior work has already shown the efficacy of pipeline parallel training on statistical efficiency (training progress compared to data-parallel training), the focus of this paper is instead on efficient algorithms to effectively partition dnn models across accelerators. for finding good dnn splits, gpipe presents no algorithm, and pipedream proposes a method limited to layer graphs that are linear (i.e., a path). efficiently finding optimal splits for pipelined execution in a general-dag setting for both training and inference is a central contribution of this paper.
+
+# 3 computational model
+
+input. we consider a heterogeneous system with  $k$  dnn hardware accelerators and  $\ell$  cpus. for simplicity of exposition we assume all accelerators to be of the same type (such as gpu, fpga, or tpu) for a single input. every such accelerator has a capacity limit for its associated memory, denoted by  $m$ . we refer to both cpus and accelerators as devices. the rest of the input to our algorithms consists of a directed acyclic graph (dag)  $g = (v,e)$  with associated weights:
+
+- the set  $v$  of nodes represents operators such as matmul, add, relu, etc. (for operator graphs), or layers such as maxpool2d or lstm (for layer graphs). each node  $v$  has an associated time  $p_v^{\mathrm{cpu}}$  required to process  $v$  on a cpu, as well as the processing time  $p_v^{\mathrm{acc}}$  of  $v$  on an accelerator. each node also has a size  $m_v$ : the memory usage of its associated weights and activations.  
+- the set  $e$  of directed edges encodes dependency/precedence constraints: an edge  $(u, v)$  implies that the operation  $v$  depends on the result of  $u$ . each node  $u$  has a communication cost  $c_u$ , which corresponds to the time required to transfer  $u$ 's output between cpu dram (henceforth referred to as ram) and the accelerator's memory, say through a pcie bus. crucially, this cost is paid only if  $u$  and  $v$  are placed on different devices: if  $u$  is on an accelerator, it needs to write this output to ram, and if  $v$  is on an accelerator, it needs to read this input from ram. we ignore the cost of reading or writing to ram from cpus.
+
+![](images/0c34c07536a2a6e62658ac32812e1c6829bfd343b37412aad42fad509e3f0868.jpg)  
+(a) contiguous split
+
+![](images/3886d7393208581804a78a03639d3d949e1aa1fe32c8e2b9c2bcb8e71872e409.jpg)  
+(b) non-contiguous split
+
+![](images/439a7dfc61759b0a3e356fa25f2a1545e95ac204731bb9d91b53442e3289975c.jpg)  
+figure 1: (a) contiguous and (b) non-contiguous splits. note that the brick-patterned orange nodes in (a) form a contiguous subgraph despite not being connected, and checked blue nodes in (b) form a non-contiguous subgraph despite being connected.  
+(a) model-parallel inference schedule
+
+![](images/98eaaa0658ffa2b378fdc7a8997c4d79f09fe253587fa6b836accc353a716c48.jpg)  
+(b) model-parallel training schedule  
+figure 2: (a) single-stream model-parallel inference and (b) model-parallel training schedule with darker shades for forward pass and lighter for backward. the  $x$ -axis is time, and numbers 1-4 are input minibatch identifiers. different colors represent different devices.
+
+output. we seek to assign each node in the graph to exactly one device so that for every accelerator the sum of sizes  $m_v$  of nodes assigned to it does not exceed its capacity  $m$ . out of all feasible partitions we want to select one that optimizes a metric of interest (latency or throughput).
+
+contiguous and non-contiguous subgraphs of computation. by default, we desire every device to hold a contiguous fragment of the dnn:
+
+definition 3.1. we say that a set  $s \subseteq v$  is contiguous if there do not exist nodes  $u \in s$ ,  $v \in v \setminus s$ , and  $w \in s$  such that  $v$  is reachable from  $u$  and  $w$  is reachable from  $v$ .
+
+see fig. 1 for an example. this property enables subgraphs to be invoked in an uninterrupted way: all required inputs can be transferred to the accelerator at one time, after which it performs computations and produces all its outputs. this allows for simpler system implementations and less interactivity with the accelerator.[2]
+
+however, in this work we also explore non-contiguous splits, where the subgraphs placed on an accelerator can be arbitrary. in particular, we explain how to build a pipelined schedule for executing such a split for a stream of many samples, and how to find an optimal split of this more general form.
+
+min totallatency
+
+s.t.  $\sum_{i = 0}^{k}x_{vi} = 1$  (vv) (1)
+
+subgraph  $\{v\in v:x_{vi} = 1\}$  is contiguous  $(\forall i = 1,\dots ,k)$  (2)
+
+$m\geq \sum_{v}m_{v}\cdot x_{vi}$ $(\forall i = 1,\dots,k)$  (3)
+
+$\mathrm{commin}_{ui}\geq x_{vi} - x_{ui}$ $(\forall (u,v)\in e)(\forall i = 1,\dots,k)$  (4)
+
+$\mathrm{commout}_{ui}\geq x_{ui} - x_{vi}$ $(\forall (u,v)\in e)(\forall i = 1,\dots,k)$  (5)
+
+totallatency  $\geq$  latency  $v$
+
+subgraphstart  $\geq$  latency  $v\cdot \mathrm{commin}_{vi}$  (6)
+
+$\mathrm{subgraphfinish}_i = \mathrm{subgraphstart}_i + \sum_v \mathrm{commin}_{vi} \cdot c_v$
+
+$\begin{array}{r} + \sum_{v}x_{vi}\cdot p_{v}^{\mathrm{acc}} + \sum_{v}\mathrm{commout}_{vi}\cdot c_{v}\quad (\forall i = 1,\dots ,k) \end{array}$  (7)
+
+latency  $v\geq x_{v0}\cdot p_v^{\mathrm{cpu}}$  (8)
+
+latency  $v\geq x_{v0}\cdot p_v^{\mathrm{cpu}} + \mathrm{latency}_u$  (9)
+
+latency  $\mathbf{\psi}_v\geq x_{vi}\cdot$  subgraphfinish  $^i$  (vv) (v=1,...,k) (10)
+
+$x_{vi}\in \{0,1\}$ $(\forall v)(\forall i = 0,\dots ,k)$
+
+figure 3: a schema of the integer program for latency minimization
+
+# 4 inference and latency minimization
+
+in this section we focus on the task of dnn inference in the non-pipelined setting, i.e., when one sample is fed at a time (see fig. 2). the objective here is latency, i.e., the time to produce the final output. here, model parallelism is required and/or assists in the following two ways. first, the model might not fit in the memory of a single accelerator, making the split necessary. second, it enables us to exploit the parallelism inherent in the model: if two operators are independent, they can be processed simultaneously if placed on different devices. we present an integer programming based solution for this setting.
+
+mode of computation. in the setting of latency minimization, we assume the way of invoking contiguous subgraphs of computation that we mentioned above (in section 3). specifically, an accelerator, which is assigned a subgraph  $s \subseteq v$  of nodes, can be invoked when all of its required inputs are ready in dram (these are outputs of nodes not in  $s$  but with an edge to  $s$ ). once invoked, the accelerator transfers this data to its memory. next, it processes operations  $v \in s$  (in some sequential order). finally, it transfers the results back to dram (these are outputs of nodes in  $s$  with an edge leaving  $s$ ). this uninterrupted mode of execution is made possible by  $s$  being contiguous.
+
+another mild assumption we make to streamline the integer programming formulation is that the number  $\ell$  of cpu cores is no smaller than the width of  $g$ , i.e., the maximum number of nodes that can feasibly be processed in parallel.
+
+our formulation. our ip formulation is presented in fig. 3. devices/subgraphs of accelerators are indexed  $i = 1, \dots, k$ , and the special index  $i = 0$  denotes all cpu cores together. we use binary variables  $x_{vi}$  to denote
+
+whether node  $v$  should be placed on device/subgraph  $i$ , and continuous variables latency  $v$  to denote the time at which node  $v$  has finished executing and its output (or that of the subgraph where it is placed) is available in ram. the objective totallatency is the maximum of latency  $v$  over all nodes  $v$ . all variables except  $x_{vi}$  are bound to be non-negative (i.e., not necessarily integral). we explain the remaining variables and constraints below:
+
+- the variable  $\mathrm{commin}_{ui}$  is intended to be 1 if  $u$  is not in subgraph  $i$ , but has an edge to it (and 0 otherwise). in this case its output needs to be transferred to the corresponding accelerator's memory. this is encoded by constraint (4).  
+- similarly  $\mathrm{commout}_{ui}$  should be 1 if  $u$  is in subgraph  $i$  and has an edge going out of  $i$ . in this case its output needs to be transferred from the corresponding accelerator to ram. this is encoded by constraint (5).  
+- for a subgraph  $i$ , subgraphstart $_i$  is the time at which all its inputs are ready in ram (not the accelerator's memory). this is encoded by constraint (6). subgraphfinish $_i$  is the time at which all its outputs are ready and have been transferred to ram. constraint (7) relates the two by taking into account the in-transfer, processing inside the subgraph, and the out-transfer.  
+- constraint (1) means that every node should be assigned to exactly one subgraph (or a cpu).  
+- constraint (3) encodes the requirement that the sum of sizes of nodes on accelerator  $i$  should be at most  $m$ .  
+- constraints (8) and (9) encode that node  $v$  can start processing once all of its predecessors  $u$  are finished. if  $v$  is placed on a cpu, then its processing takes  $p_v^{\mathrm{cpu}}$  time. otherwise, its processing time is taken into account in constraint (7) of the subgraph  $i$  where it is placed; the outputs of  $i$  are available at time subgraphfinish  $_i$ , and constraint (10) will set latency  $_v$  to that value.
+
+note that the formulation as presented in fig. 3 is not yet a mixed-integer program (mip) - but can be made so.
+
+lemma 4.1. the constraints (2), (6) and (10) can be reformulated as linear constraints.
+
+proof. to reformulate (6), take  $h$  to be a very large number (guaranteed to be larger than latency $_v$  in any considered solution) and write
+
+$$
+\mathrm {s u b g r a p h s t a r t} _ {i} \geq \mathrm {l a t e n c y} _ {v} - (1 - \mathrm {c o m m i n} _ {v i}) \cdot h.
+$$
+
+if  $\mathrm{commin}_{vi} = 1$ , then we recover the original constraint. otherwise, if  $\mathrm{commin}_{vi} = 0$ , the right-hand side is negative and the constraint becomes vacuous. constraint (10) can be rewritten analogously.
+
+to formulate the contiguity constraint (2), we use extra variables  $z_{vi}$ , with the following linear constraints:
+
+$$
+z _ {v i} \geq x _ {v i} \quad (\forall v) (\forall i = 1, \dots , k) \tag {11}
+$$
+
+$$
+z _ {v i} \leq z _ {u i} \quad (\forall (u, v) \in e) (\forall i = 1, \dots , k) \tag {12}
+$$
+
+$$
+z _ {v i} \leq x _ {v i} - x _ {u i} + 1 \quad (\forall (u, v) \in e) (\forall i = 1, \dots , k) \tag {13}
+$$
+
+intuitively, one can think of  $z_{i}$  as being a non-increasing sequence that lays above  $x_{i}$ .
+
+fix  $i$ . we claim that the subgraph  $s = \{v \in v : x_{vi} = 1\}$  is contiguous if and only if there exists a vector  $(z_{vi})_{v \in v}$  satisfying constraints (11)-(13).
+
+"only if" direction: for every  $v$  define  $z_{vi} = 1$  if any node in  $s$  is reachable from  $v$ , and 0 otherwise. constraints (11) and (12) are clearly satisfied. for constraint (13), the only interesting case is when  $x_{vi} = 0$  and  $x_{ui} = 1$ ; then the constraint becomes  $z_{vi} \leq 0$ . this is indeed satisfied as no node  $w \in s$  can be reachable from  $v$ ; if it were, then the triple  $(u, v, w)$  would contradict the contiguity of  $s$  (cf. theorem 3.1).
+
+"if" direction: towards a contradiction assume that there are nodes  $u \in s$ ,  $v \notin s$  and  $w \in s$  such that  $v$  is reachable from  $u$  and  $w$  is reachable from  $v$ . without loss of generality assume that  $(u, v) \in e$ . then  $z_{vi} \leq 0$  by constraint (13). by following the path from  $v$  to  $w$  and repeatedly applying constraint (12) we get  $z_{wi} \leq z_{vi}$ , thus  $z_{wi} \leq 0$ . but by constraint (11) we must also have  $z_{wi} \geq 1$  since  $w \in s$ , a contradiction.
+
+min totallatency
+
+s.t.  $\sum_{j = 0}^{kq}x_{vj} = 1$  (v) (1)
+
+subgraph  $\{v\in v:x_{vj} = 1\}$  is contiguous (204
+
+$$
+m \geq \sum_ {v} m _ {v} \cdot \sum_ {j = (i - 1) q + 1} ^ {i q} x _ {v j} \quad (\forall i = 1, \dots , k) \tag {3*}
+$$
+
+$\operatorname {commin}_{uj}\geq x_{vj} - x_{uj}$ $(\forall (u,v)\in e)(\forall j > 0)$  (4)
+
+$\mathrm{commout}_{uj}\geq x_{uj} - x_{vj}$ $(\forall (u,v)\in e)(\forall j > 0)$  (5)
+
+totallatency  $\geq$  latency  $v$
+
+subgraphstart  $\geq$  latency  $v\cdot \mathrm{commin}_{vj}$ $(\forall v)(\forall j > 0)$  (6)
+
+subgraphfinish  $j = \mathrm{subgraphstart}_j + \sum_v\mathrm{commin}_{vj}\cdot c_v$
+
+$\begin{array}{r} + \sum_{v}x_{vj}\cdot p_{v}^{\mathrm{acc}} + \sum_{v}\mathrm{commout}_{vj}\cdot c_{v}\quad (\forall j > 0) \end{array}$  (7)
+
+latency  $v\geq x_{v0}\cdot p_v^{\mathrm{cpu}}$  (8)
+
+latency  $v\geq x_{v0}\cdot p_v^{\mathrm{cpu}} + \mathrm{latency}_u$  (∀(u,v)∈e) (9)
+
+latency  $\mathbf{\psi}_v\geq x_{vj}\cdot$  subgraphfinish  $j$  (vv) (vj>0) (10)
+
+subgraphstart  $\geq$  subgraphfinish  $j - 1$  （20  $(\forall j > 0,j\neq 1\bmod q)$  (14)
+
+$x_{vj}\in \{0,1\}$
+
+figure 4: a schema of the integer program for latency minimization (non-contiguous splits:  $q$  contiguous subgraphs per accelerator).
+
+our formulation has  $o(|v| \cdot k)$  variables and  $o((|v| + |e|) \cdot k)$  constraints.
+
+# 4.1 non-contiguous splits
+
+our formulation can be extended to allow every accelerator to hold up to some number  $q$  of contiguous subgraphs. we then need to ensure that their processing times in our schedule do not overlap.
+
+we use a modified integer program that provides for a customizable extent of non-contiguity. here, an accelerator can be assigned several subsets of nodes  $s \subseteq v$ , each of which we will call a subgraph. the mode of computation described at the beginning of section 4 is used for every subgraph. we require every subgraph to be a contiguous set  $s$  of nodes.
+
+we index devices/subgraphs as follows. for each accelerator  $i = 1, \dots, k$  we create  $q$  subgraph slots indexed  $j = (i - 1)q + 1, (i - 1)q + 2, \dots, iq$ , where  $q$  is a customizable degree of non-contiguity that can be adjusted for the workload at hand. the special index  $j = 0$  will denote all cpu cores together.
+
+the modified ip formulation is given in fig. 4.
+
+we discuss the constraints that differ from the contiguous version:
+
+- constraint  $(3^{*})$  encodes the requirement that the sum of sizes of nodes in all subgraphs that are placed on accelerator  $i$  should be at most  $m$ .  
+- constraint (14) arises because an accelerator  $i$  cannot process more than one subgraph at a time. therefore we order its subgraphs  $j = (i - 1)q + 1, \dots, iq$  by the time when they are processed.
+
+finally, if collocation constraints are required (e.g. for training), then they should be expressed in terms of devices rather than subgraphs. that is, for two nodes  $u$  and  $v$  that should be collocated, we write  $x_{u0} = x_{v0}$  and for  $i = 1,\dots,k$ ,  $\sum_{j=(i-1)q+1}^{iq}x_{uj} = \sum_{j=(i-1)q+1}^{iq}x_{vj}$ .
+
+![](images/197227e182f93d52de47f903a697220d00ae9e923b9caf7f2a15bd34b4ebf051.jpg)  
+(a) pipeline with contiguous splits
+
+![](images/5aa21556c613d0e005a9b77a9e85786928ba9db84c131994b8dc355ab498a444.jpg)  
+(b) pipeline with non-contiguous splits  
+figure 5: pipelined inference. in these figures  $x$ -axis is time, rectangle widths are device loads (processing times for a sample), and numbers 1-9 are input sample/minibatch identifiers. the average time spent per sample is decided by the most loaded and always-busy device. in (b) the non-contiguous subgraph of device 1 can be split into two contiguous subgraphs and thought to be assigned to virtual sub-devices 1a and 1b (that can never be executing at same time). the top and bottom figures in (b) present two equivalent ways to view this schedule.
+
+our formulation has  $o(|v| \cdot q \cdot k)$  variables and  $o((|v| + |e|) \cdot q \cdot k)$  constraints.
+
+# 4.2 non-pipelined model-parallel training
+
+the algorithm described above can be directly applied to the traditional setting of model-parallel training with no pipelining (one sample at a time, as shown in fig. 2b). in this case the computation graph contains a forward-pass part followed by a backward-pass part. a natural extra requirement is that corresponding forward and backward nodes be placed on the same device, as they operate on the same set of weights. it is easy to express this co-location constraint: for forward and corresponding backward nodes  $u$  and  $v$  we require  $x_{ui} = x_{vi}$  for all  $i$ . the contiguity constraint (see section 4.1 below) should be enforced separately for the forward and the backward parts.
+
+# 5 throughput maximization
+
+the next goal of this work is to provide an algorithm for the setting where the dnn handles a steady stream of samples and the metric of interest is throughput. for simplicity we think that there are  $n \to \infty$  samples to be processed offline. a schedule of choice in this scenario is model parallelism with pipelining. without pipelining, only one device is active at any given time (see figs. 2a and 2b), which leads to under-utilization of resources. we remark that pipelining schedules that we discuss are essentially due to prior works [hcb+19, nhp+19], which discuss their implementation aspects, statistical efficiency, and demonstrate large real-world gains in time-to-accuracy. here we focus on algorithms to find optimal splits for this mode of execution.
+
+we begin by introducing our techniques in the setting of pipelined inference, as it is simpler yet allows us to present the main ideas. next, we will extend them to handle training workloads.
+
+# 5.1 inference and throughput maximization
+
+imagine a dnn that has already been contiguously split into subgraphs per device. the question we ask is: how do we schedule the execution of many samples so as to maximize the throughput, or equivalently, minimize the average time-per-sample? to do so, we use pipelined inference, i.e., we build a pipeline out of devices (in the order in which the subgraphs are arranged in the dnn), and we insert consecutive samples into it (see fig. 5a). time can be viewed as divided into rounds: each sample spends one round on every device. after a short ramp-up period, the pipeline reaches a steady state, in which the duration of every round is determined by the slowest (most loaded) device. with a batch of  $n$  samples, the average time-per-sample
+
+becomes just the maximum load of a device (plus a vanishing  $o(1/n)$  term for the ramp-up and ramp-down periods). we remark that this schedule is optimal, in the sense that that this average time cannot be lower: the bottleneck device would need to spend at least  $(n \times \text{its load})$  time to process  $n$  samples in any schedule.
+
+the above discussion shows that the best split is one that minimizes the maximum load of a device. under this min-max objective, it is optimal to balance the load among devices, in contrast to the min-sum-like objective of latency minimization. another difference is that here, when searching for the best split, we do not need to simultaneously optimize for the best schedule (which was done for latency minimization using the latency $_v$  variables in section 4) – pipelining gives this for free. without this scheduling aspect, we are left with a partitioning problem, which is easier to solve.
+
+# 5.1.1 dynamic programming solution
+
+the two main ideas behind our dynamic programming (dp) solution are described below. first, if we want contiguous splits, then we can carve out successive device-subgraphs starting from the beginning of the network. at all times, the already-partitioned region will be a downward-closed set that we henceforth call an ideal.
+
+definition 5.1. we call a set  $i \subseteq v$  of nodes an ideal if for any  $(u, v) \in e$  with  $v \in i$  we have  $u \in i$ .
+
+it turns out that, going from ideal to ideal, we can obtain every possible contiguous subgraph:
+
+fact 5.2. a set  $s \subseteq v$  of nodes is contiguous (see theorem 3.1) if and only if it is the difference of two ideals:  $s = i \setminus i'$  where  $i' \subseteq i$ .
+
+proof. "only if" direction: we take  $i = \{v \in v : \text{some node in } s \text{ is reachable from } v\}$  and  $i' = i \setminus s$ . clearly  $i$  is an ideal and  $s = i \setminus i'$ ; it remains to show that  $i'$  is an ideal. for this, take any edge  $(u, v) \in e$  with  $v \in i'$ ; we need to show that  $u \in i'$ . since  $v \in i$ , we also have  $u \in i$ . it remains to show that  $u \notin s$ . assume otherwise, i.e., that  $u \in s$ . since  $v \in i$ , some node  $w \in s$  is reachable from  $v$ . but  $v \notin s$ ; thus the triple  $(u, v, w)$  contradicts the contiguity of  $s$ .
+
+"if" direction: towards a contradiction assume that there are nodes  $u \in s$ ,  $v \notin s$  and  $w \in s$  such that  $v$  is reachable from  $u$  and  $w$  is reachable from  $v$ . we have  $w \in s \subseteq i$  and  $i$  is an ideal, so  $v \in i$ . since  $v \notin s = i \setminus i'$ , we must have  $v \in i'$ . since  $i'$  is an ideal, also  $u \in i'$ . however,  $u \in s = i \setminus i'$ , a contradiction.
+
+general dags can contain exponentially many ideals (the worst case being a graph with no edges). our second insight is that the operator graphs of most modern dnns, while less and less linear in structure, still contain a manageable amount of branching. this topology ensures a limited number of ideals. thus, we can consider all possible contiguous sets via dynamic programming.
+
+the dynamic program. we fill a dp table of dimensions  $(k + 1) \times (\ell + 1) \times$  (number of ideals in  $g$ ), where the cell  $\mathrm{dp}[i][k'][\ell']$  is intended to hold the optimal (i.e. smallest) maximum load of a device if we use  $k'$  accelerators and  $\ell'$  cpus to partition the set  $i \subseteq v$  of nodes. the initialization, which is  $(k', \ell') = (0,0)$ , is easy: the only ideal that we can partition using 0 devices is the empty set, so we have  $\mathrm{dp}[i][0][0] = 0$  if  $i = \emptyset$  and  $\infty$  otherwise. for  $(k', \ell') \neq (0,0)$  and any  $i$ , we iterate over all choices of the subgraph being placed on the last device (which is either a cpu or an accelerator), which are contiguous sets of the form  $i \setminus i'$  for an ideal  $i' \subseteq i$ :
+
+$$
+\mathrm {d p} [ i ] [ k ^ {\prime} ] [ \ell^ {\prime} ] = \min  _ {\text {i d e a l} i ^ {\prime} \subseteq i} \min  \left[ \max  \left(\mathrm {d p} [ i ^ {\prime} ] [ k ^ {\prime} - 1 ] [ \ell^ {\prime} ], \operatorname {a c c} (i \setminus i ^ {\prime})\right), \max  \left(\mathrm {d p} [ i ^ {\prime} ] [ k ^ {\prime} ] [ \ell^ {\prime} - 1 ], \operatorname {c p u} (i \setminus i ^ {\prime})\right) \right]
+$$
+
+with the caveat that if  $k' = 0$  or  $\ell' = 0$ , then we should skip the corresponding branch of the second min. by  $\mathrm{cpu}(s)$  and  $\mathrm{acc}(s)$  we denote the total load of the corresponding device holding the contiguous set  $s$ ; thus  $\mathrm{cpu}(s) = \sum_{v \in s} p_v^{\mathrm{cpu}}$ , and  $\mathrm{acc}(s)$  comprises: the incoming communication costs of  $s$  ( $\sum_v c_v$  over  $v \notin s$ )
+
+with an edge to  $s$ ), the processing cost  $\sum_{v \in s} p_v^{\mathrm{acc}}$ , and the outgoing communication costs of  $s$  ( $\sum_v c_v$  over  $v \in s$  with an edge to  $v \setminus s$ ). if  $s$  would not fit on an accelerator, i.e.,  $\sum_{v \in s} m_v > m$ , then we instead set  $\mathrm{acc}(s) = \infty$ .
+
+runtime and memory usage. the dp table dominates the memory usage, which is  $o(\mathcal{i} \cdot (k + 1) \cdot (\ell + 1))$ , where by  $\mathcal{i}$  we denote the number of ideals in  $g$ . it takes  $o(\mathcal{i})$  time to fill one entry of the table. the entire dp solution can be implemented to run in time  $o(\mathcal{i}^2 \cdot [(k + 1) \cdot (\ell + 1) + |v| + |e|])$ , where the additional term  $\mathcal{i}^2 \cdot (|v| + |e|)$  arises due to computing the costs  $\mathrm{cpu}(i \setminus i')$  and  $\mathrm{acc}(i \setminus i')$ .
+
+extensions. a similar dp solution is used in pipedream  $\left[\mathrm{nhp}^{+}19\right]$ , albeit only for layer-granularity graphs that are linear (i.e., a path). that work also considers two extensions: replication (where a single subgraph is replicated on multiple devices, creating a hybrid model-parallel/data-parallel split) and hierarchical accelerator topologies (e.g. clusters of gpus connected internally with faster interconnects). both of these extensions can also be handled by our dp algorithm, at the costs of  $o(k + \ell)$  and  $o(\mathcal{i})$  factors in the runtime, respectively. see appendix c for more details.
+
+# 5.1.2 dynamic programming solution - linearization heuristic (dpl)
+
+the  $\mathcal{i}^2$  term in the running time can make the dp solution inefficient for certain dnn workloads that are both large and strongly branching. to deal with this, one can reduce the search space by adding artificial edges to the graph. in particular, we use the following version of this technique: find a hamiltonian path (in other words, a linear/topological ordering) of the input dag using a depth-first search (dfs) traversal, and add this path of artificial edges. this yields the largest possible reduction of the search space: the resulting graph has only one topological ordering, and thus the number  $\mathcal{i}$  of ideals becomes the number  $|v|$  of nodes plus 1, giving an  $o(|v|^2)$  term instead of  $o(\mathcal{i}^2)$ . the algorithm so obtained is polynomial-time, but it may not return the optimal solution. in section 6 we show that it is very close to optimal for most workloads and provides a compelling trade-off between solution quality and runtime. we denote it by dpl in that section.
+
+# 5.1.3 integer programming solution
+
+our ip formulation is presented in fig. 6. we index devices as follows: accelerators are assigned indices  $i = 1, \dots, k$  and cpus are indexed  $i = k + 1, \dots, k + \ell$ . as in section 4, we use binary variables  $x_{vi}$  to denote whether node  $v$  should be placed on device  $i$ . the variables  $\mathrm{commin}_{vi}$ ,  $\mathrm{commout}_{vi}$  and constraints (15)-(19) are also analogous to those used in the latency-minimization ip. however, this ip is simpler as, thanks to the maximum-load objective, no scheduling aspect is present. the objective maxload is the maximum over  $\mathrm{load}_i$  for all devices  $i$ , which is given by constraint (20) for accelerators and (21) for cpus.
+
+# 5.2 non-contiguous splits
+
+suppose we are given a non-contiguous split of a dnn. we go back to the question from section 5.1: how to best schedule our workload? clearly, we still cannot obtain a smaller average time per sample than the max-load. fortunately, we can still match the max-load using a variant of pipelining. a challenge here is that the device-subgraphs may no longer have a linear or acyclic ordering induced from the input dnn (e.g. in fig. 1b, neither subgraph comes fully before the other). one possible solution (see fig. 5b for an example) is to split non-contiguous subgraphs into smaller ones, so that all subgraphs can be topologically ordered, and mentally place them on virtual devices; then we build a pipeline of virtual devices. now we can build a round-based schedule as before, keeping in mind that virtual devices belonging to the same real device cannot process concurrently. the bottleneck device will be the one whose total load (of all virtual devices) is maximal. see fig. 5b for an example.
+
+min
+
+$$
+\mathrm {m a x l o a d}
+$$
+
+s.t.
+
+$$
+\sum_ {i = 1} ^ {k + \ell} x _ {v i} = 1 \quad (\forall v) \tag {15}
+$$
+
+the subgraph  $\{v\in v:x_{vi} = 1\}$  is contiguous (optional) (16)
+
+$$
+m \geq \sum_ {v} m _ {v} \cdot x _ {v i} \quad (\forall i = 1, \dots , k) \tag {17}
+$$
+
+$$
+\operatorname {c o m m i n} _ {u i} \geq x _ {v i} - x _ {u i} \quad (\forall (u, v) \in e) (\forall i = 1, \dots , k) \tag {18}
+$$
+
+$$
+\operatorname {c o m m o u t} _ {u i} \geq x _ {u i} - x _ {v i} \quad (\forall (u, v) \in e) (\forall i = 1, \dots , k) \tag {19}
+$$
+
+$$
+\operatorname {m a x l o a d} \geq \operatorname {l o a d} _ {i} \quad (\forall i)
+$$
+
+$$
+\operatorname {l o a d} _ {i} = \sum_ {v} \operatorname {c o m m i n} _ {v i} \cdot c _ {v} + \sum_ {v} x _ {v i} \cdot p _ {v} ^ {\text {a c c}} + \sum_ {v} \operatorname {c o m m o u t} _ {v i} \cdot c _ {v} \quad (\forall i = 1, \dots , k) \tag {20}
+$$
+
+$$
+\operatorname {l o a d} _ {i} = \sum_ {v} x _ {v i} \cdot p _ {v} ^ {\mathrm {c p u}} \quad (\forall i = k + 1, \dots , k + \ell) \tag {21}
+$$
+
+$$
+x _ {v i} \in \{0, 1 \} \quad (\forall v) (\forall i)
+$$
+
+![](images/22f1c16813af877bd964c27e0c439764ce2bbf368ef76400c5ccae6cc7a3d7a8.jpg)  
+figure 6: a schema of the integer program for max-load minimization (throughput maximization). see theorem 4.1 on how to reformulate constraint (16) to obtain an integer program.  
+(a) gpipe schedule (batch with 4 microbatches).  
+figure 7: pipeline-parallel training schedules. for simplicity the load is drawn as equal for all devices and for the forward (darker color) and backward passes (lighter color).
+
+![](images/465c8c880f83f2f5772f79e82ba2075185aef982442e61bab55afdc49628c1fc.jpg)  
+(b) pipedream's 1f1b schedule.
+
+the above discussion shows that our max-load objective does not change when dealing with non-contiguous splits. our ip solution (section 5.1.3) "natively supports" the non-contiguous setting, by just removing the contiguity constraint.
+
+# 5.3 training and throughput maximization
+
+pipeline parallelism can be applied to training as well, where the task of processing large numbers of samples (and maximizing throughput) is especially relevant. as discussed at the end of section 4, computation graphs for training consist of a forward-pass part and a backward-pass part. certain backward nodes operate on the same state (weights/parameters) as their corresponding forward nodes, and so they must be colocated. contiguity, if desired, should be enforced separately for the forward and the backward parts; i.e., a device  $i$  would hold a contiguous subgraph of the forward part and a contiguous subgraph of the backward part. let  $\mathrm{fw}_i$  and  $\mathrm{bw}_i$  denote their respective loads/costs.
+
+objective. gpipe  $\left[\mathrm{hcb}^{+}19\right]$  and pipedream  $\left[\mathrm{nhp}^{+}19\right]$  propose two different pipeline schedules. our max-load objective function is appropriate for both these schedules. in pipedream - see fig. 7b - after a short ramp-up period, every device starts alternating between processing a forward sample and a backward sample, which together takes  $\mathrm{fw}_i + \mathrm{bw}_i$  time. as before, the device  $i$  that maximizes this quantity, i.e., the
+
+load, is the bottleneck that decides the throughput of the system. the gpipe schedule, shown in fig. 7a, first processes all forward samples in a batch, pipelined as they would be for inference; the average time taken for a sample in this pass is  $\max_i\mathrm{fw}_i$  (ignoring an  $o(1 / n)$  term). the backward pass then takes place, with an average time of  $\max_i\mathrm{bw}_i$ . we thus get the objective  $\max_i\mathrm{fw}_i + \max_i\mathrm{bw}_i$ ; the difference between this and the objective  $\max_i\mathrm{fw}_i + \mathrm{bw}_i$  is insignificant, as we argue in appendix a. for non-contiguous splits, both types of schedules can be modified in the same vein as in section 5.2.
+
+next we describe how to extend our algorithms from section 5.1 for training workloads.
+
+integer programming: our ip solution handles training graphs out-of-the-box; the only required modification is that we apply the contiguity constraint (16) separately for the forward and the backward parts (if desired).
+
+dynamic programming: our dp algorithm can only find contiguous splits, but now most devices need to be assigned two contiguous subgraphs (backward and forward). our solution is to run the dp only on the forward part, but taking the corresponding backward nodes together with every considered contiguous subgraph (we also count their cost). some care is required to make sure that we assign those backward nodes that do not have a corresponding forward node, and that we only consider those contiguous subgraphs on the forward side whose corresponding backward nodes also form contiguous subgraphs. see appendix b for more details.
+
+# 6 experiments - throughput maximization
+
+in this section we evaluate our throughput maximization algorithms on the following modern dnn models for inference and training: bert (with 3, 6, 12, and 24 transformer layers), resnet50, inception-v3, and gnmt. the results for latency minimization can be found in section 7.
+
+we reiterate that we do not evaluate a particular pipelining system, but algorithms to find high-quality splits for pipelined executions. however, we remark that our max-load objective function (cost model) is a natural generalization of that of pipedream, which has been shown [nhp+19, figure 15] to closely reflect real performance.
+
+the code and workloads used for evaluations are available at https://github.com/msr-fiddle/dnn-partitioning.
+
+inputs (workloads). we evaluate our algorithms on diverse and widely used deep learning workloads ranging from transformer models (bert) and convolutional neural networks (resnet, inception) to translation lstm-based models (gnmt). we exported bert [vsp+17] and resnet [hzrs15b] operator graphs through the onnx runtime library [onn20]. it allows exporting the operator graph topology for deep learning models by taking as input their forward pass and appending the corresponding backward pass to generate an output in onnx format. we obtained all the layer graphs from previous work [hnp+18].
+
+our inputs correspond to the following deployment scenarios for these workloads. the dnn workloads are split across 6 accelerators of the same type (gpu for layer graphs, a hardware accelerator representing tpus or fpgas for operator graphs). we use 3 accelerators in case of the smaller bert-3 and bert-6 models. each accelerator has 16 gb of dram and is connected to the cpu over a pcie 3.0 interconnect. to assign a cost to each node and edge in the graph, we profile the workloads on gpu for layer workloads, and we estimate the numbers for the operator graphs for the hardware accelerator. we then convert the topology of each graph to a json format, comprising all the relevant information about the graph that is required of an input instance of our algorithms (see section 3). for our dynamic programming solution, we run several preprocessing steps before we can apply our basic method; see appendix b for more details.
+
+algorithm execution setup. all our experiments are executed (that is, the optimization algorithms that we develop are run) on a machine with an intel xeon e5-2673 v4 cpu and 64 gb of ram running ubuntu
+
+<table><tr><td rowspan="2">workload</td><td rowspan="2">nodes</td><td colspan="3">dp (contiguous)</td><td colspan="2">ip (contiguous)</td><td colspan="3">ip (non-contiguous)</td><td>dpl</td><td colspan="4">expert local search pipedream scotch</td></tr><tr><td>ideals</td><td>runtime</td><td>tps</td><td>runtime</td><td>tps</td><td>runtime</td><td>tps</td><td>gain</td><td>tps</td><td>tps</td><td>tps</td><td>tps</td><td>tps</td></tr><tr><td colspan="15">operator-granularity graphs, pipelined inference</td></tr><tr><td>bert-3</td><td>235</td><td>1428</td><td>1s</td><td>27.92</td><td>1s</td><td>27.92</td><td>2s</td><td>21.91</td><td>27%</td><td>27.92</td><td>-</td><td>24.32</td><td>-</td><td>35.94</td></tr><tr><td>bert-6</td><td>418</td><td>1923</td><td>5s</td><td>29.58</td><td>4s</td><td>29.58</td><td>54s (3s*)</td><td>28.33</td><td>4%</td><td>29.58</td><td>-</td><td>42.52</td><td>-</td><td>49.80</td></tr><tr><td>bert-12</td><td>783</td><td>2906</td><td>19s</td><td>147.48</td><td>11m (1m*)</td><td>147.48</td><td>&gt;20m (18s*)</td><td>130.03</td><td>13%</td><td>147.48</td><td>-</td><td>257.38</td><td>-</td><td>230.12</td></tr><tr><td>resnet50</td><td>604</td><td>241</td><td>0s</td><td>124.35</td><td>15s</td><td>124.35</td><td>1m (10s*)</td><td>124.35</td><td>0%</td><td>124.35</td><td>-</td><td>250.08</td><td>-</td><td>197.84</td></tr><tr><td colspan="15">operator-granularity graphs, pipelined training</td></tr><tr><td>bert-3</td><td>600</td><td>2774</td><td>8s</td><td>65.30</td><td>2s</td><td>65.30</td><td>1s</td><td>54.21</td><td>20%</td><td>65.30</td><td>-</td><td>66.17</td><td>-</td><td>416.97</td></tr><tr><td>bert-6</td><td>1071</td><td>3776</td><td>25s</td><td>72.86</td><td>6s</td><td>72.86</td><td>13m (2s*)</td><td>71.64</td><td>1%</td><td>79.50</td><td>-</td><td>94.86</td><td>-</td><td>130.20</td></tr><tr><td>bert-12</td><td>2012</td><td>2938</td><td>1m</td><td>438.00</td><td>&gt;20m (1m*)</td><td>438.00</td><td>&gt;20m (1m*)</td><td>373.42</td><td>17%</td><td>438.00</td><td>-</td><td>737.99</td><td>-</td><td>800.79</td></tr><tr><td>resnet50</td><td>1243</td><td>258</td><td>2s</td><td>255.19</td><td>2m (28s*)</td><td>255.19</td><td>7s</td><td>255.19</td><td>0%</td><td>255.19</td><td>-</td><td>530.95</td><td>-</td><td>379.21</td></tr><tr><td colspan="15">layer-granularity graphs, pipelined inference</td></tr><tr><td>bert-24</td><td>32</td><td>30</td><td>0s</td><td>17.79</td><td>1s</td><td>17.79</td><td>&gt;20m (1s*)</td><td>17.71</td><td>0.4%</td><td>17.79</td><td>20.08</td><td>17.80</td><td>17.79</td><td>18.03</td></tr><tr><td>resnet50</td><td>177</td><td>242</td><td>0s</td><td>33.77</td><td>48s</td><td>33.77</td><td>14s</td><td>33.31</td><td>1.3%</td><td>33.77</td><td>43.92</td><td>35.63</td><td>39.38</td><td>34.50</td></tr><tr><td>inceptionv3</td><td>326</td><td>36596</td><td>32m</td><td>51.55</td><td>3m</td><td>51.55</td><td>19s</td><td>51.52</td><td>0%</td><td>51.55</td><td>102.48</td><td>54.03</td><td>60.42</td><td>54.01</td></tr><tr><td>gnmt</td><td>96</td><td>17914</td><td>29s</td><td>32.91</td><td>4s</td><td>32.91</td><td>9s</td><td>31.68</td><td>4%</td><td>32.91</td><td>46.21</td><td>31.75</td><td>33.03</td><td>34.92</td></tr><tr><td colspan="15">layer-granularity graphs, pipelined training</td></tr><tr><td>bert-24</td><td>64</td><td>30</td><td>0s</td><td>41.75</td><td>1s</td><td>41.75</td><td>9s</td><td>39.79</td><td>5%</td><td>41.75</td><td>49.40</td><td>39.93</td><td>41.75</td><td>42.01</td></tr><tr><td>resnet50</td><td>354</td><td>242</td><td>1s</td><td>78.63</td><td>45s</td><td>78.63</td><td>15s</td><td>76.65</td><td>3%</td><td>78.65</td><td>112.11</td><td>81.32</td><td>83.67</td><td>80.10</td></tr><tr><td>inceptionv3</td><td>652</td><td>36596</td><td>58m</td><td>122.76</td><td>8m</td><td>123.35</td><td>43s</td><td>117.72</td><td>5%</td><td>123.93</td><td>213.65</td><td>122.80</td><td>128.32</td><td>128.32</td></tr><tr><td>gnmt</td><td>192</td><td>17914</td><td>42s</td><td>107.00</td><td>4s</td><td>107.00</td><td>1s</td><td>88.47</td><td>21%</td><td>107.00</td><td>137.15</td><td>91.52</td><td>107.35</td><td>107.00</td></tr></table>
+
+table 1: pipelined workloads for maximization of throughput / minimization of time-per-sample (tps, equal to max-load). we run the ip optimizer until it guarantees a solution within  $1\%$  of the optimum, but no longer than 20 minutes. the parenthesized times with asterisks denote the time it took the optimizer to find the solution of the final value (though it could not yet guarantee its near-optimality). dpl stands for the dp with the linearization heuristic (see section 5.1.2), which always runs under 3 seconds. the fastest non-dpl runtime for every input is in bold.
+
+18.04. the dynamic programming solution is implemented in  $\mathrm{c + + }$  and compiled with gcc 7.4 using the -03 optimization flag; it is a sequential (single-threaded) implementation. the integer programming formulations are solved using gurobi 8.1 [go19], which runs on 4 cpu cores. the ip models are constructed using gurobi bindings for python; the runtime of this construction is insignificant.
+
+baselines used for comparison. we use the following baselines to compare our solutions:
+
+- hand-crafted placements, similar to  $\left[\mathrm{mgp}^{+}18\right.$ , gcl18,  $\left.\mathrm{abvg}^{+}19\right]$ . this is still a widely used means for device placement. we perform expert splits only for layer graphs, as the operator graphs with their much stronger branching are infeasible to split manually. in line with prior work [svl14, wsc  $^+$  16], for gnmt we place each lstm layer on a separate gpu, and then balance between 6 devices. we proceed similarly with bert-24. in resnet50 and inception-v3, we split the convolution, batch normalization, and relu layers equally among all devices.  
+- scotch [pel09], a graph partitioning software used for mapping computation graphs onto devices in a balanced way, taking communication costs between dependent nodes into account. the output splits are not guaranteed to be contiguous.  
+- local search [mka07] is a heuristic that starts from a random split and repeatedly makes the best single-node reassignment until a local optimum is reached. we restart 10 times and take the best solution. note that this almost always yields a non-contiguous split.  
+- pipedream  $\left[\mathrm{nhp}^{+}19\right]$  's optimizer only supports layer graphs, thus we only run it on our layer workloads. it requires the input to be a linear path, thus it contracts all branchings to single nodes.
+
+workload dp ip (contiguous) ip (non-contiguous) dpl expert local search pipedream scotch  
+
+<table><tr><td colspan="9">operator-granularity graphs, pipelined inference</td></tr><tr><td>bert-3</td><td>1.00×</td><td>1.00×</td><td>1.27×</td><td>1.00×</td><td>-</td><td>1.15×</td><td>-</td><td>0.78×</td></tr><tr><td>bert-6</td><td>1.00×</td><td>1.00×</td><td>1.04×</td><td>1.00×</td><td>-</td><td>0.70×</td><td>-</td><td>0.59×</td></tr><tr><td>bert-12</td><td>1.00×</td><td>1.00×</td><td>1.13×</td><td>1.00×</td><td>-</td><td>0.57×</td><td>-</td><td>0.64×</td></tr><tr><td>resnet50</td><td>1.00×</td><td>1.00×</td><td>1.00×</td><td>1.00×</td><td>-</td><td>0.50×</td><td>-</td><td>0.63×</td></tr><tr><td colspan="9">operator-granularity graphs, pipelined training</td></tr><tr><td>bert-3</td><td>1.00×</td><td>1.00×</td><td>1.20×</td><td>1.00×</td><td>-</td><td>0.99×</td><td>-</td><td>0.16×</td></tr><tr><td>bert-6</td><td>1.00×</td><td>1.00×</td><td>1.02×</td><td>0.92×</td><td>-</td><td>0.77×</td><td>-</td><td>0.56×</td></tr><tr><td>bert-12</td><td>1.00×</td><td>1.00×</td><td>1.17×</td><td>1.00×</td><td>-</td><td>0.59×</td><td>-</td><td>0.55×</td></tr><tr><td>resnet50</td><td>1.00×</td><td>1.00×</td><td>1.00×</td><td>1.00×</td><td>-</td><td>0.48×</td><td>-</td><td>0.67×</td></tr><tr><td colspan="9">layer-granularity graphs, pipelined inference</td></tr><tr><td>bert-24</td><td>1.00×</td><td>1.00×</td><td>1.00×</td><td>1.00×</td><td>0.89×</td><td>1.00×</td><td>1.00×</td><td>0.99×</td></tr><tr><td>resnet50</td><td>1.00×</td><td>1.00×</td><td>1.01×</td><td>1.00×</td><td>0.77×</td><td>0.95×</td><td>0.86×</td><td>0.98×</td></tr><tr><td>inceptionv3</td><td>1.00×</td><td>1.00×</td><td>1.00×</td><td>1.00×</td><td>0.50×</td><td>0.95×</td><td>0.85×</td><td>0.95×</td></tr><tr><td>gnmt</td><td>1.00×</td><td>1.00×</td><td>1.04×</td><td>1.00×</td><td>0.71×</td><td>1.04×</td><td>1.00×</td><td>0.94×</td></tr><tr><td colspan="9">layer-granularity graphs, pipelined training</td></tr><tr><td>bert-24</td><td>1.00×</td><td>1.00×</td><td>1.05×</td><td>1.00×</td><td>0.85×</td><td>1.05×</td><td>1.00×</td><td>0.99×</td></tr><tr><td>resnet50</td><td>1.00×</td><td>1.00×</td><td>1.03×</td><td>1.00×</td><td>0.70×</td><td>0.97×</td><td>0.94×</td><td>0.98×</td></tr><tr><td>inceptionv3</td><td>1.00×</td><td>1.00×</td><td>1.04×</td><td>0.99×</td><td>0.57×</td><td>1.00×</td><td>0.96×</td><td>0.96×</td></tr><tr><td>gnmt</td><td>1.00×</td><td>1.00×</td><td>1.21×</td><td>1.00×</td><td>0.78×</td><td>1.17×</td><td>1.00×</td><td>1.00×</td></tr></table>
+
+table 2: throughput maximization results, same as in table 1 in section 6, but presented in terms of throughput improvement in relation to the dp (dynamic program, contiguous splits) being  $1 \times$ . for example, on bert-3 inference operator-graph, the best non-contiguous split offers  $1.27 \times$  the throughput of the best contiguous one, and scotch gives  $0.78 \times$  the throughput of the best contiguous one. in addition, we show the single-accelerator throughput (placing the entire dnn workload on one accelerator). see figure 8 for a graphical representation of data in this table.
+
+# 6.1 results
+
+table 1 shows each workload, the number of nodes (operators or layers) in the graph, runtimes of our algorithms, and the average time-per-sample (tps) - that is, the maximum device load, which is inversely proportional to throughput - of the found splits. we also report the gain of best non-contiguous splits over best contiguous splits, and the tps of the baselines. for better understanding of the dp runtimes we show the number of ideals in the forward part of each dnn. we also present the same results in an equivalent form, displaying the throughput advantages obtained by our algorithms with respect to baselines. see table 2 on page 14 and fig. 8 on page 15. also, see fig. 9 for an illustration of an example pair of optimal contiguous (top) and non-contiguous (bottom) splits of an operator-level graph (bert-3) that are returned by our algorithms.
+
+below we discuss the main takeaways.
+
+dp vs. ip (optimality, efficiency). dp and ip (contiguous) both return the optimal split, so their tps/max-load values are equal (up to a  $1\%$  ip optimality threshold). the optimization problems we solve are computationally hard, and our algorithms are exponential-time in general; however, we see that their runtimes are reasonable on real-life dnn inputs due to their workload structure. for our ip solution we used a commercial-grade solver [go19] that ran on 4 cpu cores. the efficiency of free software solvers is much worse. it is worth noting that most of the runtime is often spent on certifying the near-optimality of the found solution; it would therefore be reasonable to cut the computation much sooner, still obtaining high-quality solutions. for the dp solution we created a single-core, self-contained implementation. its runtimes are very competitive with those of the ip, except for the most branching models such as inception-v3. we remark that
+
+![](images/c9547896bbaaeee6faf75bdf7274f21faeca8dadf16c321fdd456e44f54d33ce.jpg)  
+(a)operator graphs,inference
+
+![](images/e7252e683341999eba80a22d2230cf4bd3952c05080654c081056bffcc52ea5b.jpg)  
+(b)operator graphs,training
+
+![](images/8889388cf997c9726334c1d84b2e4531cea471e115222d18ff80f684cb77d662.jpg)  
+(c) layer graphs, inference
+
+![](images/ff08f33c15e1468e220db77e5b8a1ce51faa182aa4a22305c938cc215e8392f7.jpg)  
+(d) layer graphs, training  
+figure 8: an illustration of throughput maximization results from table 2, with dp (contiguous) serving as  $1 \times$ . the blue bars are algorithms from this work, whereas the non-blue-colored bars show baselines. plots (a) and (b) represent throughput improvements for operator-level graphs, and (c) and (d) for layer-level graphs.
+
+![](images/ce20f7c25489f6e3b292ee970e7a34f685cadbaff00a710745b1355dba43278c.jpg)  
+figure 9: optimal contiguous (top) and non-contiguous (bottom) splits of the bert-3 operator-level inference graph onto 3 accelerators and 1 cpu (for throughput maximization). each node is colored based on its placement - red color indicates cpu placement, and each remaining color indicates a different accelerator. the non-contiguous split achieves a  $27\%$  higher throughput. if viewed on a computer, the figures can be zoomed in to an arbitrary degree for better inspection.
+
+in practice the dp runtime is dominated by the  $o(\mathcal{i}^2 |e|)$  term and does not depend much on the numbers  $k$ ,  $\ell$  of devices unless these are very large; in contrast, increasing the number of accelerators can have a large impact on the ip runtime (e.g. having 6 rather than 3 accelerators for the bert-3 inference workload causes the ip runtime to jump from 1s to 27s). moreover, the dp runtime does not depend on the node weights, whereas the ip runtime does.
+
+dpl (dp with the linearization heuristic) (see section 5.1.2). the dpl solution runs in time essentially  $o(|v|^2 |e|)$ , which for our workloads is at most seconds. crucially, the restricted search space results in a throughput loss of  $9\%$  for the bert-6 training workload,  $1\%$  loss for inceptionv3 training, and no loss for all other workloads. therefore, dpl would be our method of choice for very large graphs; it would be able to process graphs with tens of thousands of nodes within, say, an hour.
+
+contiguous vs. non-contiguous splits. our ip solution is able to find optimal non-contiguous splits. to the best of our knowledge, our work is the first one to examine non-contiguous splits for pipelined model parallelism; thus we use our experiments to evaluate the potential gains in throughput. we observe that on average, the best non-contiguous splits offer an  $\sim 10\%$  gain over the best contiguous splits; for bert-3, the gain is as large as  $20 - 27\%$ .
+
+comparison to other baselines. as seen in table 1, our non-contiguous splits outperform all the techniques, with an improvement of up to  $2 \times$  over hand-crafted expert splits (average  $1.46 \times$ ),  $2.08 \times$  over local search (average  $1.29 \times$ ),  $1.21 \times$  over pipedream (average  $1.10 \times$ ),  $7.69 \times$  over scotch (average  $1.50 \times$ ). hand-crafted expert placements for the layer-based graphs provide  $71\%$  and  $68\%$  of the throughput in comparison to contiguous and non-contiguous splits, respectively. at the layer granularity, some workloads have a repetitive graph structure, which can be split manually across devices, yet this turns out to be not enough to obtain optimality. furthermore, performing a reasonable human split over operator graphs is infeasible due to the large branching and number of nodes. local search fares badly, underscoring the difficult, non-local structure of the optimization problem, which is also resistant to the heuristics used by scotch. finally, pipedream only considers linear layer graphs and contracts branchings in the input graph; whereas our technique that does not contract branches is able to explore a larger search space for operator placement and achieve up to  $1.21 \times$  higher throughput.
+
+# 6.2 advantage of operator vs. layer graphs
+
+in this section we measure the throughput advantage that can be obtained by using finer-granularity operator graphs in lieu of layer graphs. no conclusions on this matter can be drawn from the experimental results
+
+<table><tr><td>workload</td><td>dp (run on original operator graph)</td><td>dp (run on contracted layer graph)</td><td>gain</td></tr><tr><td colspan="4">operator-granularity graphs, pipelined inference</td></tr><tr><td>bert-3</td><td>27.92</td><td>27.92</td><td>0%</td></tr><tr><td>bert-6</td><td>29.58</td><td>29.58</td><td>0%</td></tr><tr><td>bert-12</td><td>147.48</td><td>159.43</td><td>8%</td></tr><tr><td>resnet50</td><td>124.35</td><td>129.15</td><td>4%</td></tr><tr><td colspan="4">operator-granularity graphs, pipelined training</td></tr><tr><td>bert-3</td><td>65.30</td><td>65.30</td><td>0%</td></tr><tr><td>bert-6</td><td>72.86</td><td>72.86</td><td>0%</td></tr><tr><td>bert-12</td><td>438.00</td><td>465.41</td><td>6%</td></tr><tr><td>resnet50</td><td>255.19</td><td>269.63</td><td>6%</td></tr></table>
+
+table 3: throughput maximization; throughput advantage of optimization on the operator-granularity level vs. the layer-granularity level (see section 6.2), for optimal contiguous splits. the numbers shown are tps (time-per-sample).
+
+of section 6 or section 7 alone, as our operator-graph and layer-graph workloads are disjoint. $^{6}$  therefore we proceed as follows: for each operator-graph workload, we manually annotate all nodes to group them into corresponding layers. then we contract each layer and run the dp algorithm on the layer-graph thus obtained.
+
+we present the results of this experiment in table 3. we compare the optimal contiguous splits. the results show that finding the best split on the more precise operator level results in a throughput advantage of up to  $8\%$ .
+
+# 7 experiments - latency minimization
+
+in this section we evaluate our integer programming (ip) based algorithm for latency minimization. we consider the most relevant deployment scenario: single-sample inference with memory-bound accelerators (that is, when the entire model does not fit on one accelerator). we run our algorithm for the same inference workloads as in section 6. as before, we use gurobi to solve our ip formulation. the code and workloads used for evaluations are available at https://github.com/msr-fiddle/dnn-partitioning.
+
+devices, implementation, experimental setup. we run experiments on the same inference workloads as in section 6. however, to model a memory-bound deployment scenario where splits are necessary to fit the dnn, we assume an accelerator dram size of either  $600\mathrm{mb}$  (for smaller dnns, of size at most 3.6 gb) or 2 gb (for larger dnns, of size at least 9 gb), and a number of accelerators such that the total accelerator memory is 1.4-1.8 times the size of the dnn. note that this implies, in particular, that a single-accelerator split is not feasible for any of our workloads. in keeping with the mild assumption made at the beginning of section 4, we assume 8 cpu cores. we use our ip solution to optimize for the best contiguous split. other implementation details are similar as in section 6.
+
+baselines. we compare our ip algorithm against four baseline solutions. the first is the following greedy algorithm:
+
+- contract colocated nodes and any strongly connected components that arise (as in appendix b),  
+- fix a topological ordering of the nodes,
+
+<table><tr><td rowspan="2">workload</td><td rowspan="2">nodes</td><td>greedy</td><td>max-load dp</td><td>scotch</td><td>expert</td><td colspan="4">ip</td></tr><tr><td>latency</td><td>latency</td><td>latency</td><td>latency</td><td>latency</td><td>runtime</td><td>mip gap</td><td>gain</td></tr></table>
+
+operator-granularity graphs, single-query inference  
+
+<table><tr><td>bert-3</td><td>235</td><td>416.20</td><td>415.90</td><td>497.75</td><td>-</td><td>408.47</td><td>3m (6s*)</td><td>&lt;1%</td><td>1.8%</td></tr><tr><td>bert-6</td><td>418</td><td>494.13</td><td>445.48</td><td>564.61</td><td>-</td><td>438.06</td><td>&gt;1h (1m*)</td><td>12.6%</td><td>1.7%</td></tr><tr><td>bert-12</td><td>783</td><td>867.84</td><td>1327.03</td><td>1755.41</td><td>-</td><td>729.56</td><td>&gt;1h (10m*)</td><td>93.8%</td><td>19.0%</td></tr><tr><td>resnet50</td><td>604</td><td>839.54</td><td>1123.65</td><td>857.73</td><td>-</td><td>672.06</td><td>&gt;1h (7m*)</td><td>54.0%</td><td>24.9%</td></tr></table>
+
+layer-granularity graphs, single-query inference  
+
+<table><tr><td>bert-24</td><td>32</td><td>100.22</td><td>108.03</td><td>108.03</td><td>111.94</td><td>100.22</td><td>14s (1s*)</td><td>&lt;1%</td><td>0.0%</td></tr><tr><td>resnet50</td><td>354</td><td>4197.06</td><td>1443.79</td><td>3610.87†</td><td>oom</td><td>1191.02</td><td>&gt;1h (19m*)</td><td>93.1%</td><td>21.2%</td></tr><tr><td>inceptionv3</td><td>652</td><td>2485.24</td><td>1621.74</td><td>3068.00†</td><td>oom</td><td>1318.08</td><td>&gt;1h (43m*)</td><td>93.5%</td><td>23.0%</td></tr><tr><td>gnmt</td><td>192</td><td>268.50</td><td>244.33</td><td>636.91†</td><td>293.40†</td><td>225.6</td><td>3m (1m*)</td><td>&lt;1%</td><td>8.3%</td></tr></table>
+
+table 4: single-sample inference workloads for latency minimization. we run the ip optimizer until it guarantees a solution within  $1\%$  of the optimum, but no longer than 60 minutes. where the optimization was terminated after 60 minutes, we report the optimality gap that the solver was able to certify at that time. the parenthesized times with asterisks denote the time it took the optimizer to find a solution within  $2\%$  of the final value (though it could not yet guarantee its near-optimality). we also report the latencies obtained by the four baselines described in section 7; their running times are always under 0.5s (greedy, scotch) or the same as reported in section 6 (max-load dp). daggers† denote a slight (between  $20\%$  and  $34\%$ ) violation of the memory constraints, and "oom" denotes a major violation (more than a factor  $3\times$ ). the best latency for each workload is given in bold. in the column "gain" we report the advantage of our ip algorithm's solution over the best baseline.
+
+- for every available accelerator, place as many nodes (in the topological order above) as will fit on the accelerator,  
+- place any remaining nodes on the cpu.
+
+the greedy algorithm returns a contiguous split that is feasible (i.e. satisfies the memory size constraints). for all our test workloads, it is able to place all nodes on accelerators (thus it does not use the cpu). however, it does not take processing times or communication costs into account when selecting the split. the runtimes of this baseline are under 0.5s.
+
+our second baseline is meant to answer the following question: if we obtain splits by optimizing the max-load objective, as we would for the throughput maximization task (that pertains to the pipelined setting), are they "good" in terms of minimizing latency as well? therefore, we obtain contiguous splits by running the max-load dp algorithm of section 5.1.1, and then we report the single-sample latency that they obtain. the runtimes of this baseline are essentially the same as those of the max-load dp reported in section 6 for the corresponding dnns.
+
+the third baseline is scotch [pel09], a graph partitioning software used for mapping computation graphs onto devices in a balanced way, taking communication costs between dependent nodes into account (used also in section 6). it produces non-contiguous splits.
+
+the fourth baseline are human-expert placements, the same as used in section 6.
+
+we do not compare against a local search heuristic, as it is not clear how to design one that satisfies the memory bounds.
+
+# 7.1 results
+
+table 4 shows each workload, the number of nodes (operators or layers) in the graph, and the latencies found by our ip algorithm and by the baselines. we also report running times.
+
+as we remarked in section 5, the latency minimization task is significantly harder than throughput maximization as it contains a scheduling component. this is reflected in the performance of our ip algorithm:
+
+for five out of eight workloads used, the ip solver did not converge to certified (near-)optimality within 1 hour. however, it still comes out far ahead:
+
+- the ip, even where it could not prove that it has found an optimal solution, does no worse than the baselines. in fact, it outperforms the best of them by a margin of around  $20\%$  in terms of the solution value (latency) for half of the considered workloads.  
+- similarly as for max-load minimization (section 6), we note that the solution quality improves slowly over time, and most of the runtime is often spent on certifying the near-optimality of the found solution; it would therefore be reasonable to cut the computation much sooner, still obtaining high-quality solutions.  
+- in particular, for each workload it took the ip solver at most 7 minutes to match the solution quality of the best baseline.
+
+# comparison to baselines.
+
+- greedy: our algorithm achieves latency lower by up to  $72\%$  (i.e., over  $3 \times$  faster inference;  $23\%$  lower latency on average).  
+- max-load dp: the latency-ip achieves lower by up to  $42\%$  (17% on average). this shows that the best splits for latency minimization are, indeed, different from the best splits for max-load minimization (throughput maximization for pipelined settings). still, the max-load dp turns out to be the best baseline in 5 out of the 8 cases, showing some degree of compatibility between the two objectives.  
+- scotch: our algorithm achieves latency lower by up to  $67\%$  (40% on average). in fact, scotch never does better than the greedy heuristic. furthermore, as it does not balance devices with respect to memory usage, it violates the memory constraints by up to  $34\%$  in some cases.  
+- human expert splits: as in section 6, we provide them for layer graphs only, due to the large node counts and high branching of operator graphs. as the expert splits were not designed with our strictly memory-bound scenario in mind, two of them are unbalanced with respect to memory usage, violating the size constraints by more than a factor  $3 \times$ . for the other two, our algorithm achieves latency lower by up to  $23\%$  (17% on average).
+
+# 8 conclusions
+
+in this paper we give algorithms for the problem of model partitioning of dnn workloads. they target both inference and training, and optimize the objectives of either minimizing latency or maximizing throughput. our work follows a principled algorithmic approach, in which we identify the "right" combinatorial optimization problem to solve, and find provably optimal splits. while other approaches struggle to capture long-term dependencies in the graph and require trying large numbers of placements on the target system, we solve the global, end-to-end joint placement and scheduling problem in one shot. our algorithms are efficient and can be run on arbitrary dags, including operator-granularity graphs, and are hardware-platform agnostic. experiments show that they outperform human experts and significantly improve over state-of-the-art methods.
+
+# references
+
+[abvg+19] ravichandra addanki, shaileshh bojja venkatakrishnan, shreyan gupta, hongzi mao, and mohammad alizadeh. learning generalizable device placement algorithms for distributed machine learning. in advances in neural information processing systems 32, pages 3981-3991. curran associates, inc., 2019.
+
+[cfo+18] eric s. chung, jeremy fowers, kalin ovtcharov, michael papamichael, adrian m. caulfield, todd massengill, ming liu, daniel lo, shlomi alkalay, michael haselman, maleen abeydeera, logan adams, hari angepat, christian boehn, derek chiou, oren firestein, alessandro forin, kang su gatlin, mahdi ghandi, stephen heil, kyle holohan, ahmad el hussein, tamás juhász, kara kagi, ratna kovvuri, sitaram lanka, friedel van megen, dima mukhortov, prerak patel, brandon perez, amanda rapsang, steven k. reinhardt, bita rouhani, adam sapek, raja seera, sangeetha shekar, balaji sridharan, gabriel weisz, lisa woods, phillip yi xiao, dan zhang, ritchie zhao, and doug burger. serving dnns in real time at datacenter scale with project brainwave. in ieee micro, 2018.  
+[ckes16] yu-hsin chen, tushar krishna, joel emer, and vivienne sze. eyeriss: an energy-efficient reconfigurable accelerator for deep convolutional neural networks. in ieee international solid-state circuits conference, isscc 2016, digest of technical papers, pages 262-263, 2016.  
+[csak14] trishul m chilimbi, yutaka suzue, johnson apacible, and karthik kalyanaraman. project adam: building an efficient and scalable deep learning training system. in 11th usenix symposium on operating systems design and implementation (osdi '14), volume 14, pages 571-582, 2014.  
+[ cxzg16] tianqi chen, bing xu, chiyuan zhang, and carlos guestrin. training deep nets with sublinear memory cost. arxiv, abs/1604.06174, 2016.  
+[dcm+12] jeffrey dean, greg corrado, rajat monga, kai chen, matthieu devin, mark mao, andrew senior, paul tucker, ke yang, quoc v le, et al. large scale distributed deep networks. in advances in neural information processing systems, pages 1223-1231, 2012.  
+$\left[\mathrm{fop}^{+}18\right]$  jeremy fowers, kalin ovtcharov, michael papamichael, todd massengill, ming liu, daniel lo, shlomi alkalay, michael haselman, logan adams, mahdi ghandi, stephen heil, prerak patel, adam sapek, gabriel weisz, lisa woods, sitaram lanka, steve reinhardt, adrian caulfield, eric chung, and doug burger. a configurable cloud-scale dnn processor for real-time ai. in acm/ieee 45th annual international symposium on computer architecture (isca '18), 2018.  
+[gcl18] yuanxiang gao, li chen, and baochun li. spotlight: optimizing device placement for training deep neural networks. in jennifer dy and andreas krause, editors, proceedings of the 35th international conference on machine learning, volume 80 of proceedings of machine learning research, pages 1676-1684, stockholm, sweden, 10-15 jul 2018. pmlr.  
+[go19] llc gurobi optimization. gurobi optimizer reference manual, 2019.  
+[gra66] r. l. graham. bounds for certain multiprocessing anomalies. bell system technical journal, 45(9):1563-1581, 1966.  
+$\left[\mathrm{hcb}^{+}19\right]$  yanping huang, youlong cheng, ankur bapna, orhan first, dehao chen, mia chen, hyoukjoong lee, jiquan ngiam, quoc v. le, yonghui wu, and zhifeng chen. gpipe: efficient training of giant neural networks using pipeline parallelism. in advances in neural information processing systems, 2019.  
+$\left[\mathrm{hcc}^{+}18\right]$  yanping huang, yonglong cheng, dehao chen, hyoukjoong lee, jiquan ngiam, quoc v le, and zhifeng chen. gpipe: efficient training of giant neural networks using pipeline parallelism. arxiv preprint arxiv:1811.06965, 2018.  
+$\left[\mathrm{hnp}^{+}18\right]$  aaron harlap, deepak narayanan, amar phanishayee, vivek seshadri, nikhil devanur, greg ganger, and phil gibbons. pipedream: fast and efficient pipeline parallel dnn training. arxiv preprint arxiv:1806.03377, 2018.  
+[hzrs15a] kaiming he, xiangyu zhang, shaoqing ren, and jian sun. deep residual learning for image recognition. corr, abs/1512.03385, 2015.
+
+[hzrs15b] kaiming he, xiangyu zhang, shaoqing ren, and jian sun. deep residual learning for image recognition. corr, abs/1512.03385, 2015.  
+[qla18] zhihao jia, sina lin, charles r qi, and alex aiken. exploring hidden dimensions in parallelizing convolutional neural networks. in proceedings of the 28th international conference on machine learning (icml '18), 2018.  
+[nyp+17] norman p. jouppi, cliff young, nishant patil, david patterson, gaurav agrawal, raminder bajwa, sarah bates, suresh bhatia, nan boden, al borchers, rick boyle, pierre-luc cantin, clifford chao, chris clark, jeremy coriell, mike daley, matt dau, jeffrey dean, ben gelb, tara vazir ghaemmaghami, rajendra gottipati, william gulland, robert hagmann, c. richard ho, doug hogberg, john hu, robert hundt, dan hurt, julian ibarz, aaron jaffey, alek jaworski, alexander kaplan, harshit khaitan, daniel killebrew, andy koch, naveen kumar, steve lacy, james laudon, james law, diemthu le, chris leary, zhuyuan liu, kyle lucke, alan lundin, gordon mackean, adriana maggiore, maire mahony, kieran miller, rahul nagarajan, ravi narayanaswami, ray ni, kathy nix, thomas norrie, mark omernick, narayana penukonda, andy phelps, jonathan ross, matt ross, amir salek, emad samadiani, chris severn, gregory sizikov, matthew snelham, jed souter, dan steinberg, andy swing, mercedes tan, gregory thorson, bo tian, horia toma, erick tuttle, vijay vasudevan, richard walter, walter wang, eric wilcox, and doe hyun yoon. in-datacenter performance analysis of a tensor processing unit. sigarch comput. archit. news, 45(2):1-12, june 2017.  
+[zha19] zhihao jia, matei zaharia, and alex aiken. beyond data and model parallelism for deep neural networks. in proceedings of the 2nd sysml conference, sysml '19, palo alto, ca, usa, 2019.  
+[bkl70] b. w. kernighan and s. lin. an efficient heuristic procedure for partitioning graphs. the bell system technical journal, 49(2):291-307, 1970.  
+[kri14] alex krizhevsky. one weird trick for parallelizing convolutional neural networks. arxiv preprint arxiv:1404.5997, 2014.  
+[ksh12] alex krizhevsky, ilya sutskever, and geoffrey e hinton. imagenet classification with deep convolutional neural networks. in advances in neural information processing systems, pages 1097-1105, 2012.  
+[llks93] eugene l lawler, jan karel lenstra, alexander hg rinnooy kan, and david b shmoys. sequencing and scheduling: algorithms and complexity. *handbooks in operations research and management science*, 4:445–522, 1993.  
+$\left[\mathrm{mgp}^{+}18\right]$  azalia mirhoseini, anna goldie, hieu pham, benoit steiner, quoc v. le, and jeffrey dean. a hierarchical model for device placement. iclr, 2018.  
+[mka07] wil michiels, jan korst, and emile aarts. theoretical aspects of local search. springer berlin heidelberg, 2007.  
+[ mks17] stephen merity, nitish shirish keskar, and richard socher. regularizing and optimizing lstm language models. arxiv preprint arxiv:1708.02182, 2017.  
+[mlp] mlperf.org. ml perf inference overview.  
+[mpl+17] azalia mirhoseini, hieu pham, quoc v le, benoit steiner, rasmus larsen, yuefeng zhou, naveen kumar, mohammad norouzi, samy bengio, and jeff dean. device placement optimization with reinforcement learning. in proceedings of the 34th international conference on machine learning-volume 70, pages 2430-2439. jmlr.org, 2017.
+
+$\left[\mathrm{nhp}^{+}19\right]$  deepak narayanan, aaron harlap, amar phanishayee, vivek seshadri, nikhil devanur, greg ganger, phil gibbons, and matei zaharia. pipedream: generalized pipeline parallelism for dnn training. in proc. 27th acm symposium on operating systems principles (sosp), huntsville, on, canada, october 2019.  
+[onn20] onnx runtime. operator graphs, 2020.  
+[pel09] francois pellegrini. distillating knowledge about scotch. in uwe naumann, olaf schenk, horst d. simon, and sivan toledo, editors, combinatorial scientific computing, number 09061 in dagstuhl seminar proceedings, dagstuhl, germany, 2009. schloss dagstuhl - leibniz-zentrum fuer informatik, germany.  
+[pgn+20] aditya paliwal, felix gimeno, vinod nair, yujia li, miles lubin, pushmeet kohli, and oriol vinyals. reinforced genetic algorithm learning for optimizing computation graphs. in international conference on learning representations, 2020.  
+[py90] c. h. papadimitriou and m. yannakakis. towards an architecture-independent analysis of parallel algorithms. siam j. comput., 19(2):322-328, april 1990.  
+[spm+16] hardik sharma, jongse park, divya mahajan, emmanuel amaro, joon kyung kim, chenkai shao, asit mishra, and hadi esmaeilzadeh. from high-level deep neural models to fpgas. in microarchitecture (micro), 2016 49th annual ieee/acm international symposium on, pages 1-12. ieee, 2016.  
+[st93] david b. shmoys and éva tardos. an approximation algorithm for the generalized assignment problem. math. program., 62:461-474, 1993.  
+[svl14] ilya sutskever, oriol vinyals, and quoc v le. sequence to sequence learning with neural networks. in advances in neural information processing systems, pages 3104-3112, 2014.  
+[sw99] martin skutella and gerhard j. woeginger. a ptas for minimizing the weighted sum of job completion times on parallel machines. in symposium on theory of computing, stoc, pages 400-407, 1999.  
+[karen simonyan and andrew zisserman. very deep convolutional networks for large-scale image recognition. arxiv preprint arxiv:1409.1556, 2014.]  
+[vrd+15] subhashini venugopalan, marcus rohrbach, jeffrey donahue, raymond mooney, trevor darrell, and kate saenko. sequence to sequence-video to text. in proceedings of the ieee international conference on computer vision, pages 4534-4542, 2015.  
+[vsp+17] ashish vaswani, noam shazeer, niki parmar, jakob uszkoreit, llion jones, aidan n gomez, lukasz kaiser, and illia polosukhin. attention is all you need. in i. guyon, u. v. luxburg, s. bengio, h. wallach, r. fergus, s. vishwanathan, and r. garnett, editors, advances in neural information processing systems 30, pages 5998-6008. curran associates, inc., 2017.  
+[wsc+16] yonghui wu, mike schuster, zhifeng chen, quoc v le, mohammad norouzi, wolfgang macherey, maxim krikun, yuan cao, qin gao, klaus macherey, et al. google's neural machine translation system: bridging the gap between human and machine translation. arxiv preprint arxiv:1609.08144, 2016.  
+[zra+19] yanqi zhou, sudip roy, amirali abdolrashidi, daniel wong, peter c. ma, qiumin xu, ming zhong, hanxiao liu, anna goldie, azalia mirhoseini, and james laudon. gdp: generalized device placement for dataflow graphs, 2019.
+
+![](images/c39cc2ccdfc86a98c95f8d458535bf0c3c2fc5301b86ebd2414b30a341009099.jpg)  
+figure 10: cumulative training time for forward and backward layers of resnet50 (layer graph). the time accumulates with each layer progressively, that is, the  $i$ -th entry is the sum of processing times of layers from 1 to  $i$ .
+
+# a objective functions across schedules
+
+in section 5.3 we have argued that for pipedream schedules, the objective function that accurately reflects the quality of any split, that is, the average time taken per sample (inverse throughput), is  $\max_i(\mathrm{fw}_i + \mathrm{bw}_i)$  where  $\mathrm{fw}_i$  and  $\mathrm{bw}_i$  are the respective loads/costs of the forward and the backward subgraph associated with device  $i$ . this is the objective function that we minimize in both our ip and dp solutions.
+
+in the case of gpipe schedules, we have argued that the objective function can be formulated as  $\max_{i}\mathrm{fw}_{i} + \max_{i}\mathrm{bw}_{i}$ . this is equal to the former if the maximizing  $i$ 's are the same - that is, if the bottleneck device is the same for the pipelined forward pass (the first seven columns in fig. 7a) as for the pipelined backward pass (the next seven columns).
+
+this usually holds true for real-world dnn workloads due to three factors described below:
+
+- for any device, its forward subgraph  $s$  and its backward subgraph  $s'$  contain paired nodes; that is, most nodes in the backward subgraph  $s'$  have a corresponding forward node, which, due to colocation constraints, will be in  $s$ , and vice versa. for instance, most forward nodes operate on a set of weights, for which the backward pass then computes gradients and weight updates.  
+- the processing and communication times of such corresponding/colocated nodes are correlated; for example, if the forward node corresponds to a matrix multiplication, then the processing times of both forward and backward nodes will grow with the size of the matrix.  
+- in fact, gpipe uses a re-materialization technique [cxzg16] to save memory: it discards stashed activations generated in the forward pass (needed later in the backward pass), and instead reruns the forward pass operators in the backward pass to re-materialize the required stashed activations for the backward operators. if this is reflected in the dnn workload operator-graph or layer-graph, then it further increases the aforementioned correlation between forward and backward times.
+
+in fig. 10 we plot cumulative forward and backward times for an example training workload (that does not use re-materialization), which grow at a similar pace. these runtimes have been profiled on a gpu.
+
+the above discussion motivates the use of our objective  $\max_i(\mathrm{fw}_i + \mathrm{bw}_i)$  as a proxy for the objective  $\max_i\mathrm{fw}_i + \max_i\mathrm{bw}_i$  also in the case of gpipe schedules. nonetheless, our ip solution can also be adjusted to optimize the latter objective. unsurprisingly, we empirically find that splits found by optimizing either objective differ by at most  $6\%$  when using re-materialization.
+
+# b dp preprocessing and reductions
+
+dp preprocessing. in our dynamic programming solution we need to handle colocation constraints given in the input: certain pairs of nodes operate on the same state and thus they are required to be on the same device. a common scenario where this arises concerns forward and backward nodes that operate on the same set of weights, but pairs of forward nodes (or pairs of backward nodes) can also be colocated. in the input files this is expressed via the colorclass field: nodes of the same color class must be placed on the same device.
+
+moreover, for training workloads, the dp can natively find only contiguous splits, but now most devices need to be assigned two contiguous subgraphs (backward and forward). therefore we run the dp only on the forward part, but we take the corresponding backward nodes together with every considered contiguous subgraph. however, some care is required to make sure that we assign those backward nodes that do not have a corresponding forward node; we call these backward nodes orphaned.
+
+for the reasons outlined above, our solution needs to run a series of preprocessing steps before the core dp method can be applied:
+
+- for every color class  $c \subseteq v$ , i.e., a set of nodes that must be colocated, let  $c_{\mathrm{fw}}$  and  $c_{\mathrm{bw}}$  be the forward and backward nodes in  $c$ , respectively (so that  $c = c_{\mathrm{fw}} \cup c_{\mathrm{bw}}$ ). we contract each set  $c_{\mathrm{fw}}$  and each set  $c_{\mathrm{bw}}$  (that is, we compress each of them into a single node; this new node will be forward for  $c_{\mathrm{fw}}$  and backward for  $c_{\mathrm{bw}}$ ).  
+- the input graph was guaranteed to be acyclic at the beginning, but the new contracted graph may no longer be acyclic. for instance, there could be a path  $u, v, w$  where  $u$  and  $w$  are colocated (but not  $v$ ); then the contracted graph will have edges in both directions between  $v$  and the new node corresponding to  $\{u, w\}$ . in the original graph, any colocation-respecting contiguous split would need to contain all of  $u, v, w$  in a single subgraph; more generally, every strongly connected component in the contracted graph needs to be colocated. therefore, we contract all strongly connected components. now the contracted graph is again acyclic.  
+- later, when we run the dp, while considering a subgraph  $s$  of forward nodes we will consider the subgraph  $s'$  of their corresponding backward nodes at the same time, and take the total computation and communication cost of  $s \cup s'$  into account. thus, when we have assigned all forward nodes, we will have also assigned all backward nodes that are not orphaned. however, orphaned nodes would not be assigned to any subgraph/device.
+
+to prevent this behavior, we introduce new artificial forward nodes, to be images of the orphaned backward nodes. when the dp decides where to place these new forward nodes, it will also have decided the placement of the orphaned backward nodes. (at the end we will remove the artificial nodes from the final split.)
+
+however, if the new nodes are isolated (have no adjacent edges), then the number of ideals grows exponentially<sup>7</sup>; furthermore, as the placement of the new forward and orphaned backward nodes is arbitrary, we may end up with non-contiguous splits on the backward side.
+
+to deal with these issues, we also add new artificial edges adjacent to the new artificial nodes. since backward nodes and edges mostly resemble a mirror image of their corresponding forward nodes and edges, we add the new edges in such a way as to also build such a mirror image. namely, for a backward edge  $(u', v')$  where at least one of  $u'$ ,  $v'$  is orphaned, we add a forward edge  $(v, u)$ , where  $u$  and  $v$  are the forward images of  $u'$  and  $v'$  respectively (note that at least one of  $u$ ,  $v$  is a new artificial node).
+
+after these preprocessing steps, we can use our core dp method on the contracted graph. once this is done, we map the resulting splits back to the original graph and return the result. for more details on implementation, see the attached code and the comments therein.
+
+we remark that due to our preprocessing steps, the number of ideals may sometimes be smaller than the number of nodes in the initial input graph (this happens for several of our workloads in table 1).
+
+non-uniform outgoing communication costs. in the case of operator graphs, the input files for our solvers are created based on onnx computation graphs. there, communication costs are given on edges, rather than on nodes as we require in our model (see section 3). in the vast majority of cases, all edges going out of the same node  $u$  have the same cost, and we can set that cost as parameter  $c_{u}$ . however, sometimes there could be two or more edges with different costs going out of the same node in an onnx graph; this situation corresponds to e.g. sending different parts of the operator's output to different operators. in this case, we perform the following reduction:
+
+suppose that  $u$  has outgoing edges to nodes  $v_{1}, v_{2}, \ldots, v_{r}$  with possibly different edge costs  $d_{1}, d_{2}, \ldots, d_{r}$ . for every outgoing edge  $(u, v_{j})$ , we subdivide it: insert a new node  $w_{j}$  in the middle and replace the edge  $(u, v_{j})$  with two edges  $(u, w_{j})$  and  $(w_{j}, v_{j})$ . the new node  $w_{j}$  should have  $p_{w_{j}}^{\mathrm{cpu}} = p_{w_{j}}^{\mathrm{acc}} = m_{w_{j}} = 0$  and be colocated with  $u$ . we set  $c_{w_{j}} = d_{j}$ . finally, set  $c_{u}$  to any value, say  $\infty$ ; this communication cost will never be paid in any feasible solution, as now  $u$  is colocated with all of its successors, which are  $w_{1}, w_{2}, \ldots, w_{r}$ .
+
+after obtaining a final split, we may remove the artificial nodes  $w_{j}$  from the solution. it is easy to see that the way we have set the outgoing communication costs  $c$  on nodes reflects the edge-communication costs given in the input onnx graph.
+
+# c extensions
+
+in this section, which deals with throughput maximization (i.e. the pipelined setting), we briefly explain how to adjust our model and solutions so as to account for certain different or more complex deployment scenarios that appear in related work or in practice.
+
+# c.1 interleaving communication and computation
+
+throughout the paper we have assumed that accelerators are invoked when their inputs are ready, at which point they are transferred to the accelerator memory; next, computation takes place; next, outgoing transfers take place (see section 3). after that, the in-transfer for the subsequent sample/minibatch may begin, and so on. for this reason, the load of a device is defined as the sum of the computation cost and the communication cost. however, it is also reasonable to assume that communication (data transfers) may proceed in parallel to computation, at least for different samples. for instance, once we have finished the in-transfer for sample 1, we might simultaneously start the processing of sample 1 and the in-transfer for sample 2. this is the setting considered in the pipedream paper  $\mathrm{[hnp^{+}18]}$ .
+
+both of our solutions (dp and ip) can be easily adjusted to this setting: one just needs to define the load of a device as the maximum of the computation cost and the communication cost, rather than the sum. in terms of pipeline schedules, one can think of splitting the device into two virtual devices, one holding the communication portion of the load and the other holding the computation portion, that can be processing at the same time. then either virtual device could be a bottleneck in the pipeline.
+
+in fact, one can further assume that the in-transfer and the out-transfer are done over separate channels (full-duplex communication); then a maximum of three quantities (in-transfer cost, computation, out-transfer cost) should be used.
+
+# c.2 replication
+
+an alternative to model parallelism is data parallelism: an approach where the entire model is replicated over multiple devices that process minibatches in parallel. when using this approach, the communication cost associated with synchronizing the parameters of the entire model proves to be very high for many dnn workloads. nevertheless, it can also yield large gains for other workloads, especially sparser ones (with a small number of parameters relative to computation cost). pipedream  $\left[\mathrm{hnp}^{+}18\right]$  proposed a hybrid
+
+model-parallel/data-parallel approach, where we form a pipeline, but certain subgraphs in this pipeline can be replicated over multiple devices. this allows the automated partitioner to replicate those fragments of the network that will reap the most benefit while keeping synchronization costs low.
+
+we can also introduce this capability into our dp algorithm. when the dp decides whether to place the currently considered subgraph on a cpu or on an accelerator, now it will also decide how many devices to use. that is, in the dp relation, where previously we had  $\max (\mathrm{dp}[i^{\prime}][k^{\prime} - 1][\ell^{\prime}],\mathrm{acc}(i\setminus i^{\prime}))$  , now we write8
+
+$$
+\min _ {k ^ {\prime \prime} = 1} ^ {k ^ {\prime}} \max \left(\mathrm {d p} [ i ^ {\prime} ] [ k ^ {\prime} - k ^ {\prime \prime} ] [ \ell^ {\prime} ], \mathrm {a c c} (i \setminus i ^ {\prime}, k ^ {\prime \prime})\right),
+$$
+
+where  $\mathrm{acc}(i\setminus i',k'')$  is the average time per sample for this subgraph when replicated over  $k''$  accelerators. in absence of weight synchronization, this average time would be just  $\mathrm{acc}(i\setminus i') / k''$ . weight synchronization (assuming efficient allreduce collective communication) contributes a term  $\left((k'' - 1)\cdot \sum_{v\in i\setminus i'}m_v\right) / (k''\cdot b)$ , where  $m_v$  are sizes of weights associated with nodes and  $b$  is the communication bandwidth. thus,  $\mathrm{acc}(i\setminus i',k'')$  should be either the sum or maximum of these two terms, depending on our assumption of interleaving communication with computation (see appendix c.1).
+
+this modification of the dp increases the running time by a factor of  $o(\max(k, \ell))$ . the memory usage remains unchanged.
+
+# c.3 accelerator hierarchies
+
+throughout the paper we have assumed a homogeneous system with  $k$  accelerators and  $\ell$  cpu cores (probably a single machine). to more precisely capture a distributed setting, one can consider a hierarchical collection of accelerators, such as clusters of gpus connected internally with faster interconnects and externally (i.e. between clusters) with slower connections (or over a network). such a multi-level model is used in pipedream [hnp+18]. now, the cost of transferring data over an edge between two nodes depends on whether these nodes are placed on devices in the same or different clusters (or even on different machines). the main new challenge is knowing which cost should be taken into account.
+
+the dp solution in pipedream handles this by dynamically computing optimal splits not only for prefixes of the input network (that correspond to our ideals), but for every contiguous segment of the network. we remark that we can use the same method, at a cost of an  $o(\mathcal{i})$ -factor increase in both memory usage (number of dp states) and running time.

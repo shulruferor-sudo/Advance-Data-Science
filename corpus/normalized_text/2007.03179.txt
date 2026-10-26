@@ -1,0 +1,397 @@
+# ge-spmm: general-purpose sparse matrix-matrix multiplication on gpus for graph neural networks
+
+guyue huang, guohao dai, yu wang and huazhong yang
+
+abstract—graph neural networks (gnns) based graph learning algorithms have achieved significant improvements in various domains. sparse matrix-matrix multiplication (spmm) is a fundamental operator in gnns, which performs a multiplication operation between a sparse matrix and a dense matrix. accelerating spmm on parallel hardware like gpus can face the following challenges: from the gnn application perspective, the compatibility needs to be considered. general gnn algorithms require spmm-like operations (e.g., pooling) between matrices, which are not supported in current high-performance gpu libraries (e.g., nvidia cusparse [1]). moreover, the sophisticated preprocessing in previous implementations will lead to heavy data format conversion overheads in gnn frameworks. from the gpu hardware perspective, optimizations in spmv (sparse matrix-vector) designs on gpus do not apply well to spmm. spmm exposes the column-wise parallelism in the dense output matrix, but straightforward generalization from spmv leads to inefficient, uncoalesced access to the gpu global memory. moreover, the sparse row data can be reused among gpu threads, which is neither possible in spmm designs inherited from spmv.
+
+to tackle these challenges, we propose ge-spmm<sup>1</sup>. ge-spmm performs spmm-like operation on sparse matrices represented in the most common compressed sparse row (csr) format. thus, ge-spmm can be efficiently embedded in gnn frameworks with no preprocessing overheads and support general gnn algorithms. we introduce the coalesced row caching method to process columns in parallel and ensure efficient coalesced access to the gpu global memory. we also present the coarse-grained warp merging method to reduce redundant data loading among gpu warps. experiments on a real-world graph dataset show that ge-spmm achieves up to  $1.41 \times$  speedup over nvidia cusparse [1] and up to  $1.81 \times$  over graphblast [2]. we also embed ge-spmm in gnn frameworks and get up to  $3.67 \times$  speedup over popular gnn models like gcn [3] and graphsage [4].
+
+# i. introduction
+
+machine learning algorithms on graphs, especially the recently proposed graph neural networks (gnns), have been successfully applied to tasks such as link prediction and node classification [3]–[8]. acceleration of gnn systems is crucial to solving real-world problems because of days of execution time (e.g., it takes up to 78 hours to train a gnn model with 7.5 billion edges on 16 gpus [9]). in gnn algorithms, data are organized in the graph structure composed of vertices (nodes) and edges (links). each vertex in the graph is associated with a feature vector, and these feature vectors are propagated through edges to perform gnn algorithms. thus, aggregating the feature vectors of neighbor vertices is a
+
+all authors are with department of electronic engineering, tsinghua university, beijing, china (email: huang-gy16@mails.tsinghua.edu.cn, daiguo-hao@mail.tsinghua.edu.cn, {yu-wang, yanghz} @tsinghua.edu.cn).
+
+<sup>1</sup>the project is open-sourced at https://github.com/hgyhungry/ge-spmm
+
+![](images/6391f6f5958bb34f43334588cb6ec5d5eeda7dc57aad96e924b26c592a33975c.jpg)  
+fig. 1. spmm operation from a graph- and matrix-perspective. left: aggregating feature vectors (length  $= n$ ) from vertex  $j, m, n$  to vertex  $i$ . right: the spmm operation between the in-edge adjacency matrix and the feature matrix, involving the  $j$ -th,  $m$ -th,  $n$ -th vectors in the feature matrix. the  $\otimes$  operation represents the general-purpose aggregating operation.
+
+fundamental operation in gnns, which can be expressed with equation (1).
+
+$$
+\overrightarrow {f _ {u}} = \operatorname {r e d u c e} _ {-} o p \left(\left\{\overrightarrow {f _ {v}} \right\}\right), \exists e d g e _ {v \rightarrow u} \tag {1}
+$$
+
+in equation (1),  $\overrightarrow{f_u}$  represents the feature vector of a vertex  $u$  in the graph, while  $\{\overrightarrow{f_v}\}$  denotes the collection of feature vectors of  $u$ 's in-edge neighbors. the reduce_op is the aggregation operation to generate a new feature vector of  $u$ , which varies in different gnn algorithms [3], [4]. the edges between vertices in natural graphs are usually sparse, and the graph structure can be represented using a sparse adjacency matrix. fig. 1 shows that the aggregation operation on the graph can be treated as a customized multiplication between the sparse adjacency matrix (representing the graph) and dense feature matrix (representing feature vectors of vertices). when the reduce_op in equation (1) is taking sum, the operation between the adjacency matrix and the feature matrix is a standard sparse matrix-matrix multiplication (spmm). when a customized reduce_op is adopted (e.g., pooling), we call it a general spmm-like operation.
+
+being a primary operation in gnn models, spmm is also a time-consuming step even on parallel hardware like gpus. we profile the percentage of spmm operations $^2$  during a gcn [3] training procedure. in gcn training, the forward and backward of graph convolution layers both involve spmm. as listed in table i, spmm operations take  $\sim 30\%$  of the total time in the example code provided by dgl [11] with default settings. dense matrix multiplications take  $\sim 10\%$ , and the rest of the operators all take less than  $10\%$ . thus,
+
+accelerating spmm operations in gnn frameworks is significant for improving performance. however, current spmm acceleration solutions on gpus still face challenges from 1) meeting gnn application requirements, and 2) full utilization of global memory bandwidth of the gpu hardware.
+
+tablei  
+percentage of spmm in cuda [12] time during gcn training on gtx1080ti  
+
+<table><tr><td>graph</td><td>spmm percentage</td></tr><tr><td>cora</td><td>33.1%</td></tr><tr><td>citeseer</td><td>29.3%</td></tr><tr><td>pubmed</td><td>29.8%</td></tr></table>
+
+from the gnn application perspective, embedding spmm designs in gnn frameworks has at least two requirements: support for general spmm-like operators (rather than the standard spmm), and no (or very low) data format conversion overhead in the whole framework. in terms of general spmm-like operators, existing gnn frameworks cannot achieve as good performance as using standard spmm in cusparse [1] library. current spmm researches claiming better performance than cusparse rely on preprocessing sparse matrix and cannot be conveniently adopted. existing gnn systems like dgl [11] relies on nvidia cusparse to perform standard spmm, but falls back to its own implementation for spmm-like operations because they are not provided in cusparse. table ii shows the comparison of the same aggregation step in two models: graphsage-gcn [4], which internally calls spmm, and graphsage-pool [4], which internally calls spmm-like. we again use example codes provided by dgl with default parameters. the results show that current implementation of spmm-like in dgl cannot compete with the performance of cusparse. on the other hand, although recent studies on spmm [13], [14] in high-performance computing fields achieve even better performance than cusparse, they cannot be directly adopted by gnn frameworks. these implementations require preprocessing on input sparse matrix, which is hard to be integrated into gnn frameworks. also, the extra time spent on preprocessing cannot be compensated by spmm performance gain if spmm is performed only a few times in gnns, as is the case in gnn direct inference or batched training.
+
+table ii  
+spmm and spmm-like comparison in dgl [11] on gtx 1080ti  
+
+<table><tr><td>graph</td><td>spmm-like perf. loss against spmm in graphsage [4]</td></tr><tr><td>cora</td><td>8.8%</td></tr><tr><td>citeseer</td><td>89.2%</td></tr><tr><td>pubmed</td><td>139.1%</td></tr></table>
+
+from the gpu hardware perspective, spmm exposes column-wise parallelism in output dense matrix, which does not exist in the widely-studied sparse matrix-vector product (spmv). a straightforward generalization by adding parallel threads along the column dimension can result in uncoalesced access patterns to sparse matrix data, as shown in fig. 2. uncoalesced access pattern has been proved to be inefficient on gpus [12], [15]. thereby, spmm kernel needs to be carefully designed to enable a coalesced access pattern for data loading. on the other hand, reusing sparse matrix data is
+
+![](images/1fba2ca6f0d668bd2e0c52dfe58bb15e07d0066958d3fc6faa55d0ce35ac9c6f.jpg)  
+fig. 2. differences in data loading in spmv and its straightforward generalization to spmm. spmm exposes more redundant data loading and uncoalesced access pattern.
+
+crucial for spmm, while this issue does not rise for spmv. in real applications, the column dimension of the dense matrix can be up to 512 [16], in which case the amount of memory transactions is substantial. fig. 3 shows the profiling of spmm kernel in cusparse. we use as input sparse matrix a synthetic random matrix of  $65\mathrm{k}$  rows and  $650\mathrm{k}$  non-zeros, detailed in section v-b, and test a range of column numbers ( $n$  in table iii) in the dense matrix. the two metrics are 1) number of global load transactions (in the unit of 32bytes), and 2) global load throughput (in the unit of gb/s), both reported by nvidia nvprof [12]. the gpu we use has a maximum global bandwidth of  $484\mathrm{gb/s}$ . fig. 3 shows that the total number of memory transactions linearly grows with  $n$ , but the kernel reaches near maximum bandwidth throughput after  $n$  reaches 32. from the test we can observe that, unlike spmv which is typically bounded by low bandwidth utilization [17], spmm can easily achieve a high utilization but suffers from too much data movement. thereby, spmm design requires a data-reuse mechanism to reduce redundant data transactions.
+
+in this paper, we present ge-spmm (an acronym for general-purpose spmm), a customized csr-based (compressed sparse row) spmm design that tackles all these challenges. we summarize our contributions as follows:
+
+- we present ge-spmm, an efficient csr-based spmm-like kernel on gpus to accelerate gnn workloads. ge-spmm can be integrated into existing gnn frameworks with no data conversion overhead for various gnn algorithms.  
+- we introduce the coalesced row caching (crc) method for spmm, which uses gpu shared memory to cache sparse matrix rows. this method enables coalesced memory access to both sparse and dense matrix, leading to a more efficient utilization of bandwidth. the average
+
+![](images/e138197c9824e05e639ea06738447d75feac9095cbeafd438a0288691d7a3a76.jpg)  
+fig. 3. profiling of csrmm2 in cusparse. the loading throughput approaches upper bound when  $n \geq 32$  but memory transactions keep growing linearly.
+
+table iii notations.  
+
+<table><tr><td>notation</td><td>description</td></tr><tr><td>a</td><td>sparse input matrix with dimension m×k</td></tr><tr><td>b</td><td>dense input matrix with dimension k×n</td></tr><tr><td>c</td><td>dense output matrix with dimension m×n</td></tr><tr><td>m</td><td>number of rows in a. 
+number of vertices in graph.</td></tr><tr><td>k</td><td>number of columns in a, 
+equal to m in graph problems.</td></tr><tr><td>n</td><td>number of columns in b. 
+feature vector length.</td></tr><tr><td>nnz</td><td>number of non-zero elements in a. 
+number of directed edges in graph.</td></tr></table>
+
+improvement by adopting this method can be up to  $1.25 \times$
+
+- we introduce the coarse-grained warp merging (cwm) method for spmm, which reuses loaded sparse matrix by merging the workload of different warps. this technique reduces the amount of memory transactions and improves instruction-level parallelism. the average speedup by adopting this method can be up to  $1.51 \times$  
+- we conduct extensive experiments on ge-spmm on real-world graphs [18], [19]. ge-spmm achieves up to  $1.41 \times$  speedup over nvidia cusparse [1] and up to  $1.81 \times$  over graphblast [2]. we also embed ge-spmm in gnn frameworks and get up to  $3.67 \times$  cuda time reduction on popular gnn models like gcn [3] and graphsage [4].
+
+the rest of this paper is organized as follows. background information is introduced in section ii. the designs and optimizations of ge-spmm will then be detailed in section iii, followed by the method to embed ge-spmm in gnn frameworks. our experimental setup and results will be presented in section v. the paper is concluded in section vi.
+
+# ii. background and related works
+
+in this section, we introduce background information about both spmm and gnns on gpus. the notations used in this paper are shown in table iii.
+
+# a. gpu preliminaries
+
+we use nvidia gpus with cuda [12] as the programming interface in this paper. gpu is a highly parallel architecture composed of many streaming multiprocessors (sms). an sm executes threads in a simt (single instruction multiple threads) fashion, and a bunch of 32 threads called a warp run simultaneously. the warp is transparent in cuda programming model. instead, users define a bunch of parallel blocks and assign each block with a certain number of threads. in cuda programming model, each block owns a shared memory, which is more efficient to access than the global memory (accessible to all blocks). shared memory can be used for data reusing for different threads in order to reduce data transactions from the global memory.
+
+organizing threads into warps also have effects on the memory access pattern. gpu always try to merge the memory request from a warp into as few transactions as possible. from the program perspective, it is recommended in technical materials [12], [15] to make a warp of threads access consecutive,
+
+aligned memory in one simt instruction. this technique is called coalesced memory access.
+
+# b. spmm on gpus
+
+because the dense matrix in the spmm problem can be treated as a vector of vectors, a straight forward spmm implementation is simply to perform spmv for multiple times sequentially, as can be done in [20]. this method clearly does not exploit parallelism along the output column dimension. spmv design in [17] uses a gpu warp to process a row in the sparse matrix, and previous spmm design in graphblast [2] inherits this method so that multiple threads can work on one output row in parallel. for intra-warp data reuse, it uses a warp-level intrinsic (__shfl) to broadcast fetched data to other threads within the same warp. however, graphblast fails to consider reusing the sparse row data among different warps and still has room for improvement. nvidia cusparse library [1] also provides a high-performance (not open-source) spmm kernel (csrmm2), but general spmm-like operations in gnn applications are not supported in cusparse.
+
+there are also other researches on high-performance spmm kernels that perform better than cusparse. unlike graph-blast [2] which takes compressed sparse row (csr) format as input, these works require preprocess on input sparse matrix to form a new sparse format specially for spmm, such as ellpack-r in fastspmm [21], and sparse formats used by rs-spmm [13] and aspt [14]. but they are not practical for gnn frameworks to adopt. these non-standard formats lead to extra memory space and difficulties in software maintenance. moreover, preprocess time can be up to  $5 \times$  actual spmm computation time [13], [14]. although this cost can be tolerated in iterative algorithms, gnn applications sometimes demand running spmm only a few times for one matrix. one example scenario is gnn inference, where trained models are directly used on new graphs to make predictions, such as predicting properties on new protein graphs [4]. another is sampled batch training [4], [22], where the sampled subgraphs are different for each batch. for these applications, preprocess cannot be amortized in gnn frameworks since the benefit cannot make up to overhead.
+
+# c. graph neural network frameworks
+
+many existing systems aim to provide high performance and easy programming abstractions for gnn algorithm developers. projects like dgl [11] and pytorch-geometric (pyg) [23] provide graph apis on top of deep learning frameworks (e.g., pytorch [10]). other systems in the industry [24], [25] and academia [16], [20] also provide programming interfaces and optimizations for gnns.
+
+as spmm is a critical operation in many gnn models, dgl and pyg both implement custom spmm kernel instead of using sparse matrix operators provided by pytorch.
+
+- dgl internally calls the function, `csrmm2` in cusparse [1], to perform spmm. however, for spmm-like operations cusparse does not provide corresponding functions, so dgl falls back to its own kernels.
+
+![](images/f87218adeee3f3f1856dc23c91519b92e33dfda67c7ed1599dd64dc36888edcb.jpg)  
+fig. 4. the sparse matrix (left) and its csr representation (right).
+
+![](images/7ced9ed1108b31a26c51827808f8f273c55925b3727379065780ef925f4700e3.jpg)
+
+- besides limited support for spmm-like operations, csrmm2 produces a column-major output. since in gnns both input and output of feature matrix need to be row-major, dgl calls a matrix transpose from cublas [26] to transform the layout.  
+- pyg uses another abstraction called messagepassing to represent graph propagation in gnn models. message-passing first generates message on all edges explicitly and then reduces them, while spmm can fuse these two stages into one kernel. the consideration of messagepassing is to allow more flexible user-defined operation, but with generality it loses the room for improving the performance of specific operations like spmm.
+
+some aforementioned researches on fast spmm design require preprocessing [13], [14]. cusparse [1] has limited support for spmm-like operation [1]. other spmm designs inherited from spmv fail to consider the column-wise parallelism or sparse matrix data reuse, which may lead to inefficiency when implemented on gpus. these will further hinder the performance of both spmm and gnns.
+
+# iii. ge-spmm design
+
+in section i, we observe from experiments that spmm can be memory-bounded, so it is crucial to load data in a more efficient way and reduce total memory transactions. in this section, we propose coalesced row caching (crc) and coarse-grained warp merging (cwm) methods to achieve these goals.
+
+# a. data organization in ge-spmm
+
+in order to meet the requirement of compatibility to gnn frameworks with low preprocess overheads, an universal data format for both spmm and other sparse matrix operations is required. the compress sparse row (csr) format is a
+
+algorithm 1 a simple parallel csr-based spmm  
+input: a.rowptr[], a.colind[], a.val[], b[]  
+output: c[]  
+1: for i = 0 to m - 1 in parallel do  
+2: for j = 0 to n - 1 in parallel do  
+3: result = 0  
+4: for ptr = a.rowptr[i] to a.rowptr[i+1] do  
+5: k = a[colind[ptr]  
+6: result += a.val[ptr] * b[k,j]  
+7: end for  
+8: c[i,j] = result  
+9: end for  
+10: end for
+
+algorithm 2 spmm with crc  
+input: a.colind[] a.val[] b[]  
+output: c[]  
+1: i = tb_id  
+2: j = tid  
+3: lane_id = tid % warp_size  
+4: sm_base = tid - lane_id  
+5: row_start = a.colptr[i]  
+6: row_end = a.colptr[i+1]  
+7: result = 0  
+8: for ptr = row_start to row_end-1 step warp_size do  
+9: /*load a.colind and a.val with tile warp_size*/  
+10: if ptr+lane_id < row_end then  
+11: sm_k[tid] = a.colind[ptr+lane_id]  
+12: sm_v[tid] = a.val[ptr+lane_id]  
+13: end if  
+14: __syncwarp()  
+15: /*consume the loaded elements*/  
+16: for kk = 0 to warp_size do  
+17: if ptr+kk < row_end then  
+18: k = sm_k[sm_base + kk]  
+19: result += sm_v[sm_base + kk] * b[k,j]  
+20: end if  
+21: end for  
+22: end for  
+23: c[i,j] = result
+
+widely-used format in vendor libraries (e.g., nvidia cus-parse [1]), data science toolkit (e.g., scipy [27]), and gnn frameworks [11], [20]. as shown in 4, a sparse matrix is stored by three arrays using the csr format: rowptr, colind, val. the column indices and values of non-zeros are first packed along the column and then stored in the order of their row indices. rowptr stores the offset of first element of each row in colind.
+
+the data structure of csr format determines the procedure of spmm. the computation of each output  $c[i,j]$ , which is dot-product of sparse row  $i$  of  $a$  and dense column  $j$  of  $b$ , begins with accessing  $a.\text{rowptr}$  for the offset of row  $i$ . then the program needs to traverse a segment of  $a.\text{colind}$  and  $a.\text{val}$  array to acquire the non-zeros in sparse row  $i$ . for each non-zero element, the program needs to use the column index got from  $a.\text{colind}$  to locate a specific row in dense matrix  $b$ . if the column index gives  $k$ , the program then loads  $b[k,j]$ , multiply it with the sparse element value from  $a.\text{val}$  and add to final result. when all non-zeros in sparse row  $i$  is consumed, the final result of  $c[i,j]$  is returned. algorithm 1 shows this procedure with pseudo code.
+
+# b. coalesced row caching
+
+when trying to map algorithms 1 on parallel architectures like gpu, a simple way is to parallelize for-loop in line 1 and 2 since there exists no dependency among each iteration of the loop. for-loop at line 4 in algorithm 1 has variable loop bound decided at runtime and involves adding to one same
+
+![](images/854669fabaa0d372343ae3e94278d39dfd065b04408780a842e6aa86d4cae98c.jpg)  
+fig. 5. overview of crc which enables coalesced access to sparse rows. non-zero elements of sparse matrix are first loaded into shared memory in a coalesced way and consumed later. partial-sums are stored in local variables and written to global memory at the end. note that no two threads write to the same output, so no atomic operation is needed.
+
+variable, so it cannot be parallelized. as introduced in section ii-a, coalesced memory access can improve bandwidth efficiency, and it requires a warp of threads to access consecutive elements in one instruction.
+
+in algorithm 1, it is easy to ensure coalesced access to dense matrix  $b$  (the instruction at line 9). when we parallelize loop at line 1 and 2 among threads, we just need to ensure that threads within a warp have same  $i$  and contiguous  $j$ . however, the current algorithm does not present coalesced memory access to any part of the sparse matrix. since threads within a warp share same  $i$ , we cannot enable coalesced access to a.rowptr. as to a.colind and a.val, in the current algorithm, the sequential execution of for-loop at line 4 forces threads in the same warp to access the same address (instructions at line 5-6), leading to the broadcast-like pattern in fig 2. compared with ideal coalesced access to sparse rows (referring to a segment of a.colind and a.val), the current algorithm is not making full use of data in one memory transaction and issues too many transactions.
+
+our solution is to partially unroll this sequential for-loop, by a factor of warp_size (number of threads within a warp, 32 on nvidia gpus). during each iteration, a warp of threads first loads a tile of the sparse row  $i$  into gpu shared memory. the size of a tile is the same as warp_size, meaning that each thread loads a different element. for now, we assume that the total number of non-zeros in row  $i$  is multiples of warp_size, but we will generalize to arbitrary sparse row length later. after loading a tile to shared memory, threads enter an inner for-loop and compute on the loaded data one-by-one, but this time the sparse row data are loaded from shared memory instead of global memory.
+
+a pseudo-code of our method is listed in algorithm 2. basically, our method uses a two-phase strategy to load and compute on sparse rows, as shown in fig. 5. in the first phase, a warp loads a tile of a sparse row into shared memory to enable coalesced loading of a sparse row. in the second phase, a warp sequentially consumes the previously loaded elements. this is to ensure that a warp always accesses the same row in the dense matrix. when the number of non-zeros in sparse row exceeds a tile, the two-phase procedure continues until all non-zeros are consumed. it is not hard to deal with arbitrary row length. each thread has a copy of row length, and always checks if the bound is exceeded before loading from a sparse row in the first phase (if-condition at line 10). in the second phase, since elements stored in shared memory
+
+![](images/0bd641995955e434f65a2c97dde17e347ef2c0e4bc04d405e3b1eb7483aa1278.jpg)  
+fig. 6. an example of cwm with  $n = 64$  and  $cf = 2$ . left: cwm is not applied, and the element in the sparse matrix is loaded twice by two threads. right: the workloads of the previous two threads are merged, so the element in the sparse matrix is loaded only once.
+
+![](images/aef2753f9d20e09b7200b79b02e06edb1463178c4751e17902b26eb4b780c558.jpg)
+
+are consumed sequentially, we simply check with loop bound in every iteration (condition at line 17).
+
+the improvement of this algorithm over algorithm 1 lies in more efficient global memory loading of sparse rows. ideally, the total number of load requests to these two arrays can be reduced by a factor of warp_size, because a tile of sparse row is loaded in one coalesced request. in reality, sparse rows are often not perfectly aligned, leading to more than one transaction for a tile. moreover, many sparse rows have fewer non-zeros than a tile, and the number of load transactions in the algorithm 1 equals to number of non-zeros. thus the reduction in load transactions for these short rows is strictly less than warp_size. despite all these factors, the improved algorithm still achieves an obvious reduction of load transactions and improves the efficiency of global bandwidth, as shown in section v-b.
+
+# c. coarse-grained warp merging
+
+with crc, we can convert the uncoalesced access to sparse matrix into a more efficient, coalesced way. from the data reuse perspective, the benefit of crc is to share loaded sparse matrix via gpu shared memory. although each nonzero element in the sparse matrix can be used to compute an entire row in the output, our crc method only makes loaded elements shared by threads within the same warp. the consideration behind is to reduce synchronization overhead. to safely use the shared memory, synchronization needs to be called to avoid read-write races (between line 12 and line 18 in algorithm 2). if we allow different warps to use the same piece of data in shared memory, we need to insert synchronization in the entire thread block which brings significant overhead. since cuda provides warp-level fine-grained synchronization, which is much less expensive than block-level synchronization, we only make loaded data to be shared within a warp. the drawback is that different warps still perform redundant loading of sparse rows.
+
+our technique to address redundant data loading is coarse-grained warp merging (cwm). it is similar to thread coarsening in dense matrix multiplication, which can improve bandwidth throughput with instruction-level parallelism (ilp) [28], and reduce the amount of memory transactions [29]. the basic idea is to merge the workload of different warps that
+
+algorithm 3 spmm with crc and cwm  $(cf = 2)$  
+input: a.rowptr[], a.colind[], a.val[], b[])  
+output: c[]  
+1: /* initialization (line 1-6 of algorithm 2) */  
+2: result_1 = 0, result_2 = 0  
+3: for ptr = row_start to row_end - 1 step warp_size do  
+4: /* load a.colind, a.val (line 10-14 of algorithm 2) */  
+5: for kk = 0 to warp_size do  
+6: k = sm_k[sm_base + kk]  
+7: result_1 += sm_v[sm_base + kk] * b[k,j]  
+8: result_2 += sm_v[sm_base + kk] * b[k,j + warp_size]  
+9: end for  
+10: end for  
+11: c[i,j] = result_1  
+12: c[i,j + warp_size] = result_2
+
+has redundant data loading. in spmm, merging workloads means to make each thread produce more output. we illustrate cwm by an example in fig. 6. in fig. 6, the suffix of  $t$  (short for thread) indicates both the indices to this thread and the indices of output it produces. observe that  $thread_{0,0}$  and  $thread_{0,32}$  both load data from row 0 of  $a$ , but they belong to different warps and cannot share data under algorithm 2. to dismiss this redundant load, we merge these two threads' workloads, making  $thread_{0,0}$  compute both  $c[0,0]$  and  $c[0,32]$ .  $thread_{0,0}$  will have two partial sum variables locally, and with every non-zero element in  $a$ , it will load two values from matrix  $b$  and update two partial results. in algorithm 3 we give a pseudo code with cwm adopted.
+
+in fig. 6, we merge the workloads of two warps and cut the number of threads by half. intuitively this process can continue and we can cut down more threads. we call the factor of thread number reduction coarsening factor  $(cf)$ . for example,  $cf$  is 2 in fig. 6, which means each thread is assigned to produce 2 output values. in general, the load transactions of sparse rows can be reduced by  $cf$  through this technique. another benefit of introducing thread coarsening is to improve bandwidth utility via ilp [28]. line 7-8 in algorithm 3 is independent memory loading instructions and gpu architecture can serve these two requests simultaneously, potentially increasing the usage of global bandwidth. increasing  $cf$  can further reduce memory load, but there will be fewer threads on the fly. large  $cf$  also causes each thread to hold more local variables for partial results, and this increment in resource usage may hurt performance. gpus use massive parallel threads to hide all types of stalls, mostly the latency of memory load. when using cwm, it is significant to balance between data reuse and parallelism. analytical models for choosing  $cf$  could be difficult due to the entangled effects of hardware parameters and sparse matrix properties. we turn to an empirical method and experimented on our dataset of real-world graphs with  $n = 512$  to find a general best choice of  $cf$ , detailed in section v-b.
+
+![](images/3d528b5a8669c55dd364ee214d82831999ed4a797621e6b85f7cb444de7b82b8.jpg)  
+fig. 7. the overall flow of embedding ge-spmm in gnn frameworks.
+
+# iv. accelerate gnn frameworks with ge-spmm
+
+ge-spmm is developed to accelerate gnn applications. the csr format and spmm-like operation support make it easy to be embedded in existing frameworks. this section briefly discusses how we use ge-spmm to enhance the performance of existing gnn frameworks.
+
+# a. ge-spmm for different matrix sizes
+
+to accelerate real applications, we make a few enhancements to support arbitrary input size  $(n)$ . crc and cwm apply well to problems with large  $n$ , where the kernel needs to load a large amount of data from dense matrix and is bottle-necked by bandwidth efficiency. fig. 7(c) shows the overall benefit of our two techniques when  $n = 16$  and  $n = 64$ , with average performance on the test dataset (detailed in section v-a) normalized to algorithm 1. when  $n > 32$ , we apply both crc and cwm in the kernel. cwm is not necessary for  $n \leq 32$  since warp_size is 32, and we should directly call algorithm 2 to dismiss the overhead of unnecessary instructions.
+
+to address the need for spmm-like operation in gnn models, we modify the basic ge-spmm to allow user-defined operation. to define an spmm-like operation, the user needs to provide an initialization function and a reduce function, both will be inlined at compile time. the parallel execution requires the reduction function to be associative and commutative, but common operations like taking sum or maximum are naturally valid.
+
+# b. gnn acceleration based on ge-spmm
+
+current gnn frameworks like dgl [11] and pyg [23] are often based on other deep learning (dl) frameworks (e.g. pytorch [10]), but add new apis for graph operations. although it is possible to express graph operations with sparse tensor operations provided by dl frameworks, the performance of sparse tensor operations are not satisfactory, so dgl implements all graph-related operations in  $\mathrm{c}++/\mathrm{cuda}$  and exposes to dl frameworks as shared lib. we also follow this method to accelerate gnn application with a high-performance cuda kernel.
+
+to be more specific, we wrap our kernel inside a custom autograd function, which is an atomic operator with gradient definition in pytorch. this function represents an aggregation step on the graph, and can be used to build gnn layers and modules. since dgl already implements spmm-like in cuda, we simply substitute their kernel with ours and rebuild the project. pyg is another popular python library for gnn built on pytorch. it abstracts gnn as messagepassing procedure and implements messagepassing as a versatile module that allows user-defined message and aggregation functions. messagepassing is a more general interface than spmm-like, so we cannot use spmm-like to replace messagepassing. we instead implement an spmm-like operator and replace the messagepassing function calls in training code with ours. an overview of how we integrate ge-spmm to gnn frameworks is shown in fig. 7.
+
+# v. experiment evaluations
+
+we conduct extensive experiments on our ge-spmm design, and the performance comparison against various spmm kernels and gnn frameworks is shown in this section.
+
+# a. experiment setup
+
+1) graph benchmarks: in order to test the proposed ge-spmm for gnn workloads, we run experiments on three graphs [19] used for node-classification tasks in many gnn models [3], [4], cora, citeseer, and pubmed, whose properties are listed in table iv. we also test the performance on snap dataset collected in suitesparse matrix collection [30], a sparse matrix benchmark. snap group in suitesparse contains 66 valid graphs from various domains. the original snap dataset maintained in [18] also contains metadata of some graphs which are not collected in suitesparse, but we limit our test to graphs in suitesparse to save the effort of converting metadata to standard input. we omit two graphs (friendster and twitter) due to out-of-memory. some items in suitesparse contains more than one matrices. we only run tests on one matrix in each item $^3$ . this set of 64 sparse matrices has size  $m$  from 1005 to 4847571 with nnz/row from 1.58 to 32.53. [16] experiments on models with feature size up to 512 and presents the best model accuracy of feature size around 256 with deeply-stacked layers. this should provide an intuition of how large  $n$  is in real applications. all average results are based on the geometric mean.
+
+table iv graphs used in gnn for classification [19]  
+
+<table><tr><td>graph</td><td># vertices</td><td># edges</td><td># classes</td></tr><tr><td>cora</td><td>2708</td><td>5429</td><td>7</td></tr><tr><td>citeseer</td><td>3327</td><td>4732</td><td>6</td></tr><tr><td>pubmed</td><td>19717</td><td>44338</td><td>3</td></tr></table>
+
+3the matrix which has the same filename as this item is considered the default one.
+
+2) spmm baselines: we compare our ge-spmm with the following baselines in our experiments.
+
+- spmm kernel by vendor: csrmm2. it is a function in cusparse [1] for spmm. cusparse has two functions for multiplication of sparse and dense matrices. the csrmm2 assumes a row-major input dense matrix, while the other one, csrmm, assumes a column-major input dense matrix. the csrmm2 consistently outperforms csrmm, and here we show a comparison to csrmm2. note that, the output dense matrix of csrmm2 is column-major, which is a convention in many nvidia libraries. as explained in section ii-c, gnn applications require row-major output, so existing solution is forced to perform matrix transpose upon csrmm2 output. we do not add this to baseline when comparing kernel performance. however, this overhead of cusparse cannot be ignored in real applications.
+
+- open-source spmm kernel: rowsplit in graph-blast [2]. it is a most-recent csr-based spmm implementation in literature.
+
+- graph processing engine on gpus: gunrock [20]. because the spmm can be executed from a graph perspective by assigning each vertex with a feature vector, we also compare our ge-spmm with the state-of-the-art graph processing system on gpus.
+
+3) environments: we conduct experiments on the following two machines:
+
+- machine 1. gpu: nvidia gtx 1080ti, compute capability 6.1 (28 pascal sms at 1.481 ghz, 11 gb gddr5x with 484 gb/s bandwidth). host cpu: intel(r) xeon(r) cpu e5-2643 v4 (24 cores).
+
+- machine 2. gpu: nvidia rtx 2080, compute capability 7.5 (46 turing sms at 1.515 ghz, 8 gb gddr6 with 448 gb/s bandwidth). host cpu: intel(r) core(tm) i7-9700k (8 cores).
+
+in kernel performance tests, all codes are compiled using nvcc (cuda compiler provided by nvidia) in cuda 10.1 with -03 flag. execution time is measured from average of 200 kernel runs. throughput is calculated from theoretical float-operation  $(2 * n n z * n)$  over measured execution time. for application speedup, all reported items (kernel and model time) refer to cuda time reported in pytorch profiler.
+
+# b. benefits of ge-spmm design
+
+1) benefits of coalesced row caching: the aim of crc is to enable coalesced access to sparse matrix and improve bandwidth efficiency. to evaluate the effectiveness of crc, we use nvidia's nvprof to profile two metrics [12]: gld_transactions (glt), the number of global load transactions; gld_efficiency (glt_effi), ratio of requested global memory load throughput to required global memory load throughput. one issued memory transaction loads a fixed size of data, but the program may only require a part of it. this metric can reflect how efficiently the program uses global bandwidth.
+
+![](images/24ca0747866f2a78b2467945035c8599c0c5c273ab2900252e5f65898e2e515a.jpg)
+
+![](images/fb90d047222b677468c2305af4b106343d8c7175791291eb05fc961bde7066da.jpg)  
+fig. 8. relative speedup using coalesced row caching.
+
+the tests run on three synthetic random graphs<sup>4</sup> with  $n = 512$ . we only have profiling results on machine 1 since nvprof in cuda 10.1 does not support gpu over 7.2 capability [12]. the results in table v show that using crc can significantly reduce the total number of load transactions, as well as improve the memory load efficiency due to coalesced memory access.
+
+tablev effects of crc  
+
+<table><tr><td>matrix</td><td>method</td><td>glt(×32bytes)</td><td>glt_effi</td></tr><tr><td>m=16k</td><td>w/o crc</td><td>1.34e+8</td><td>68.95%</td></tr><tr><td>nnz=160k</td><td>w/ crc</td><td>0.55e+8</td><td>92.40%</td></tr><tr><td>m=65k</td><td>w/o crc</td><td>5.36e+8</td><td>68.95%</td></tr><tr><td>nnz=650k</td><td>w/ crc</td><td>2.18e+8</td><td>92.40%</td></tr><tr><td>m=262k</td><td>w/o crc</td><td>21.47e+8</td><td>68.95%</td></tr><tr><td>nnz=2.6m</td><td>w/ crc</td><td>8.73e+8</td><td>92.39%</td></tr></table>
+
+fig. 8 shows the relative improvement of applying crc (algorithm 2 against algorithm 1). on gtx 1080ti, crc brings an average of  $1.246 \times$  performance gain. on rtx 2080, simply applying crc does not bring significant performance gain (average of  $1.011 \times$ ). however, crc is the foundation of our second technique cwm. one benefit of cwm is a high throughput of loading dense matrix with ilp, but without crc, the bandwidth is spent on a large amount of inefficient access to the sparse matrix, and leaves little room for loading the dense matrix. in the next part, we will show that combined with cwm, ge-spmm still achieved significant improvement over simple spmm on rtx 2080.
+
+2) benefits of coarse-grained warp merging: cwm is introduced in order to reuse loaded data and reduce global transactions. however, it reduces the total number of warps and may harm parallelism. we also use nvprof to test the effects brought by cwm. we profile three metrics: gld_transactions (glt), as previously mentioned it indicates the amount of data loading; gldthroughput, the throughput of the global load; achieved_occupancy (occ), the ratio of the average active warps to the maximum supported on a multiprocessor, which can be a reflection of achieved parallelism.
+
+the results in table vi are tested on one of the random graphs  $(m = 65k, n n z = 650k, n = 512)$ . it shows that
+
+![](images/a1a68ba6b364f82649a3d71002b23333417fdea7d9f1f2202e1cebb7d05f76b3.jpg)
+
+![](images/3917a6ec203680008e111ba7753130311ab40ea1a77122ce0d6abe3dc5255f1c.jpg)  
+fig. 9. relative speedup using coarse-grained warp merging when  $cf$  varies.
+
+cwm can reduce global data loading. when the coarsening factor  $(cf)$  gets larger, gld_transactions keep decreasing, but the benefit becomes smaller because loading dense matrix takes up most of the transactions. when increasing  $cf$ , the occupancy also decreases, indicating parallelism loss. the combination of crc and cwm brings an average of  $1.65 \times$  and  $1.53 \times$  speedup on gtx 1080ti and rtx 2080 respectively over non-optimized version (algorithm 1).
+
+table vi effects of cwm  
+
+<table><tr><td>method</td><td>glt(×32bytes)</td><td>gldthroughput(gb/s)</td><td>occ</td></tr><tr><td>w/o cwm</td><td>2.18e+8</td><td>479.54</td><td>0.78</td></tr><tr><td>cwm (cf=2)</td><td>1.93e+8</td><td>567.82</td><td>0.78</td></tr><tr><td>cwm (cf=4)</td><td>1.80e+8</td><td>479.23</td><td>0.75</td></tr><tr><td>cwm (cf=8)</td><td>1.74e+8</td><td>395.22</td><td>0.75</td></tr></table>
+
+in practice, tuning for optimal  $cf$  requires a balance between data reuse and parallelism, which are related to properties of the input matrix. in fig. 9, we plot the relative performance when taking different  $cf$ . each bar represents a test on one graph in snap dataset. the relative performance means speedup over not using cwm. it can be observed that  $cf = 2$  works well for most matrices, while  $cf > 4$  shows obvious performance drop. for rare cases (4 and 1 out of 64 on two gpus), choosing  $cf = 2$  causes over  $15\%$  performance loss compared to optimal  $cf$ . since our goal is to provide a runtime spmm kernel, we avoid any parameter tuning and
+
+![](images/6f72ff627933af3a55da91ffc889d8cc7808d3af078b7b29cadde25b4d96f98a.jpg)  
+fig. 10. performance on gnn graphs.
+
+![](images/5d05fd5894494a7632cd066425163472a10e6bb19a0bf81e0e9f36de4a7c3a16.jpg)  
+fig. 11. overall performance on 64 graphs in snap dataset. the omitted bars are due to out-of-memory. the matrix_id corresponds to the alphabetical order of matrix name.
+
+use  $cf = 2$  because it provides the best overall effect. the kernel performance reported in the following experiments is all the results of  $cf = 2$ . moreover, our previous tests show that on rtx 2080, crc cannot bring large performance gain, but a combination of crc and cwm can bring significant improvement (an average of  $1.51 \times$ ) with  $cf = 2$ .
+
+# c. overall performance of spmm kernel
+
+in this part, we present overall performance compared to kernels in cusparse [1] and graphblast [2]. all matrices in tests are single-precision, as is the case in gnn models. for kernel performance, we test  $n$  from 128 up to 512.
+
+1) graphs for gnns: we test ge-spmm on three graphs used in gnn models, and results are shown in fig. 10. benefit from our two techniques, ge-spmm can outperform cusparse by at most  $1.62 \times$  tests on these three graphs show that ge-spmm can potentially accelerate real gnn models if applied in gnn frameworks.  
+2) graphs from snap: the performance comparison of ge-spmm and baselines on snap dataset is shown in fig. 11. to summarize, the average performance gain is listed in table vii, ge-spmm achieves up to  $1.43 \times$  and  $1.81 \times$  speedup compared with cusparse [1] and graphblast [2]. although the arbitrary performance is related to graph characteristics, fig. 11 can demonstrate that for any specific graph, our kernel becomes more competitive over baseline when  $n$  gets larger. in other words, our techniques are crucial for applications with large  $n$ .
+
+table vii ge-spmm average improvement on snap dataset  
+
+<table><tr><td>machine</td><td>baseline</td><td>n=128</td><td>n=256</td><td>n=512</td></tr><tr><td rowspan="2">gtx 1080ti</td><td>cusparse [1]</td><td>1.18</td><td>1.30</td><td>1.37</td></tr><tr><td>graphblast [2]</td><td>1.42</td><td>1.44</td><td>1.61</td></tr><tr><td rowspan="2">rtx 2080</td><td>cusparse [1]</td><td>1.20</td><td>1.34</td><td>1.43</td></tr><tr><td>graphblast [2]</td><td>1.57</td><td>1.73</td><td>1.81</td></tr></table>
+
+# d. comparison with graph engines on gpus
+
+it is also possible to build spmm with graph engines from a graph processing perspective. gunrock [20] provides many apis and built-in kernels that allow users to write graph algorithms. we use gunrock's api advance to write an spmm program. however, gunrock does not provide any options to parallelize along feature dimension, because in traditional graph algorithms like pagerank, the feature of a vertex is an undivisible scalar. gunrock fails to provide feature-dimension parallelism, which significantly harms spmm performance. fig. 12 shows the kernel execution time of ge-spmm compared to the program written with gunrock. ge-spmm outperforms gunrock-based implementation by  $18.27 \times$  on average for all test cases, indicating that spmm and gnn workloads require new primitives in graph processing frameworks rather than spmv.
+
+# e. comparison with preprocess-based approaches
+
+some previous researches propose specialized sparse formats for spmm problem that exploit regular memory access [21] or data reuse [13], [14]. as far as we know, aspt [14] is the best spmm implementation publicly avail
+
+![](images/1776984a4118af3b4684bfab1ea024fd6dba0902d905dfdbd63c869237cb6d42.jpg)  
+fig. 12. speedup of ge-spmm over gunrock-based spmm.
+
+able. aspt [14] exploits reusing dense matrix data with tiling. it requires a special sparse format composed of csr and additive arrays to mark the positions of locally-dense blocks explicitly. our optimizations in this paper to reuse sparse matrix data is orthogonal to their techniques.
+
+we test their source code on our machines on the snap dataset and results are listed in viii. our ge-spmm achieves average of 0.93x, 0.97x, 1.00x for  $n = 128$ , 256, 512 on gtx1080ti gpu, and average 0.85x, 0.93x, 0.98x on rtx2080, against aspt (without preprocess time).
+
+the preprocess overhead varies significantly on different sparse matrices, from  $0.01 \times$  to  $64.53 \times$  of actual spmm execution time, and average overhead is  $0.47 \times$  execution time on gtx1080ti and  $0.34 \times$  on rtx2080. with preprocess time added (one preprocess + one run), our kernel is average  $1.43 \times 2.06 \times$  against aspt.
+
+table viii ge-spmm average speed against aspt [14]  
+
+<table><tr><td>machine</td><td>baseline</td><td>n=128</td><td>n=256</td><td>n=512</td></tr><tr><td rowspan="2">gtx 1080ti</td><td>aspt [1]</td><td>0.93</td><td>0.97</td><td>1.00</td></tr><tr><td>aspt w/ preproc [2]</td><td>1.88</td><td>1.97</td><td>2.06</td></tr><tr><td rowspan="2">rtx 2080</td><td>aspt [1]</td><td>0.85</td><td>0.93</td><td>0.98</td></tr><tr><td>aspt w/ preproc [2]</td><td>1.43</td><td>1.57</td><td>1.69</td></tr></table>
+
+# f. end-to-end performance for gnns
+
+our kernel is developed to accelerate gnn applications, and the csr-based property makes it easy to be embedded in existing frameworks. as introduced in section iv, we embed ge-spmm in dgl [11] and pyg [23]. we test application speedup on gcn, graphsage, and other popular gnn models that involve spmm or spmm-like operations.
+
+1) gnns based on spmm operators: comparison with dgl. spmm is a very common operator in gnn, and ge-spmm can benefit many gnn models. we test the benefit of integrating ge-spmm in dgl with two models: gcn [3] and graphsage-gcn [4]. for both models, we use example codes provided by dgl, and run tests on different model settings (number of layers and length of feature vectors in each layer). we use pytorch profiler to monitor the entire training process and record total cuda time from the report. the results are shown in fig. 13. ge-spmm brings speedup in most of these applications. however, in 4 tests on gtx 1080ti, ge-spmm does not bring acceleration over original dgl. this is because the feature length of the last layer in gnn models usually
+
+![](images/046b9c2fd0b5f15cbe4c0ae161194e07a5ce8ecafcd5e1ddbc4c228c6a30a01b.jpg)
+
+![](images/e062deee1fb153689a1ed66c336a3d0bc54fca7c669d3ed0c46e4eca596d4bf9.jpg)  
+fig. 13. accelerating gnns using ge-spmm in dgl [11], (x, y) represents the number of layers (x) and the length of features (y) in a gnn model, which is the input parameter for gnns.  
+fig. 14. accelerating gnns using ge-spmm in pyg [23],  $(\mathbf{x},\mathbf{y})$  represents the number of layers (x) and the length of features (y) in a gnn model, which is the input parameter for gnns.
+
+equals the number of classes in the classification problem. therefore, the output layer involves spmm with a small  $n$ , when ge-spmm is not very competitive.
+
+comparison with pyg. pyg [23] provides an example code for gcn. we repeat running gcn on different graphs with different model settings on pyg and report the total reduction of cuda time in fig. 14. improvements on pyg is more obvious than on dgl. this is because the general messagepassing api in pyg explicitly generates 'message' on all edges and then performs reduction, while dgl fuses the two phases into one spmm kernel. to summarize, integrating ge-spmm brings up to  $3.67 \times$  and  $2.10 \times$  cuda time reduction on two gpus.
+
+2) gnns based on spmm-like operators: ge-spmm is intended to accelerate a class of spmm-like operators that is not yet supported by cusparse. one good example is the pooling operation in graphsage-pool [4], where each vertex aggregates the features of its neighbors by taking maximum. cusparse does not provide this operation. future gnn models may also use customized reduction functions for pooling, and relying on cusparse is not flexible to these user-defined operations. it is not hard to generalize ge-spmm to support spmm-like operations, since these operations follow similar memory access patterns and the code is almost the same. we implement a ge-spmm kernel for the aggregation step in graphsage-pool. our kernel brings up to  $1.14 \times$  acceleration on the cuda time of graphsage-pool training on pubmed graph. note that for spmm-like operation only, ge-spmm can achieve  $2.39 \times$  to  $6.15 \times$  speedup over dgl's
+
+spmm-like kernel. this shows the value of this work in supporting flexible, user-defined spmm-like operation in new gnn models, which are not covered by the vendor library, and achieve even better performance.
+
+table ix summary of graphsage-pool cuda time reduction on dgl.  
+
+<table><tr><td></td><td colspan="2">gtx 1080ti</td><td colspan="2">rtx 2080</td></tr><tr><td>(#layer, #feature)</td><td>spmm-like</td><td>total</td><td>spmm-like</td><td>total</td></tr><tr><td>(1,16)</td><td>2.89</td><td>1.10</td><td>3.24</td><td>1.11</td></tr><tr><td>(1,64)</td><td>3.92</td><td>1.14</td><td>3.44</td><td>1.11</td></tr><tr><td>(1,256)</td><td>4.04</td><td>1.14</td><td>3.46</td><td>1.09</td></tr><tr><td>(2,16)</td><td>2.39</td><td>1.11</td><td>3.03</td><td>1.09</td></tr><tr><td>(2,64)</td><td>3.09</td><td>1.09</td><td>3.37</td><td>1.11</td></tr><tr><td>(2,256)</td><td>6.15</td><td>1.12</td><td>3.51</td><td>1.09</td></tr></table>
+
+# vi. conclusion
+
+in this paper, we propose an efficient csr-based spmm design, ge-spmm, for graph neural network applications on gpus. ge-spmm considers requirements by gnn applications, including no preprocessing and spmm-like operation requirements. ge-spmm introduces two techniques: coalesced row caching and coarse-grained warp merging, to improve the efficiency of global data access, leading to  $1.25 \times$  and  $1.51 \times$  speedup, respectively. by adopting these optimizations, ge-spmm achieves up to  $1.41 \times$  speedup over nvidia cusparse [1] and up to  $1.81 \times$  over graphblast [2]. we also embed ge-spmm in gnn frameworks (e.g., dgl, pyg) and achieve significant cuda time reduction.
+
+# references
+
+[1] m. naumov, l. chien, p. vandermersch, and u. kapasi, "cusparse library," in gpu technology conference (gtc), 2010.  
+[2] c. yang, a. buluc, and j. d. owens, “design principles for sparse matrix multiplication on thegpu,” in european conference on parallel processing. springer, 2018, pp. 672-687.  
+[3] t. n. kipf and m. welling, "semi-supervised classification with graph convolutional networks," arxiv preprint arxiv:1609.02907, 2016.  
+[4] w. hamilton, z. ying, and j. leskovec, "inductive representation learning on large graphs," in advances in neural information processing systems, 2017, pp. 1024-1034.  
+[5] m. schlichtkrull, t. n. kipf, p. bloem, r. van den berg, i. titov, and m. welling, "modeling relational data with graph convolutional networks," in european semantic web conference. springer, 2018, pp. 593-607.  
+[6] k. xu, w. hu, j. leskovec, and s. jegelka, "how powerful are graph neural networks?" arxiv preprint arxiv:1810.00826, 2018.  
+[7] a. fout, j. byrd, b. shariat, and a. ben-hur, "protein interface prediction using graph convolutional networks," in advances in neural information processing systems (neurips), 2017, pp. 6530-6539.  
+[8] z. wu, s. pan, f. chen, g. long, c. zhang, and s. y. philip, "a comprehensive survey on graph neural networks," ieee transactions on neural networks and learning systems (tnnls), p. early access, 2020.  
+[9] r. ying, r. he, k. chen, p. eksombatchai, w. l. hamilton, and j. leskovec, "graph convolutional neural networks for web-scale recommender systems," in acm international conference on knowledge discovery and data mining (sigkdd), 2018, pp. 974-983.  
+[10] a. paszke, s. gross, f. massa, a. lerer, j. bradbury, g. chanan, t. killeen, z. lin, n. gimelshein, l. antiga et al., "pytorch: an imperative style, high-performance deep learning library," in advances in neural information processing systems (neurips), 2019, pp. 8024-8035.
+
+[11] m. wang, l. yu, d. zheng, q. gan, y. gai, z. ye, m. li, j. zhou, q. huang, c. ma, z. huang, q. guo, h. zhang, h. lin, j. zhao, j. li, a. j. smola, and z. zhang, "deep graph library: towards efficient and scalable deep learning on graphs," *iclr workshop on representation learning on graphs and manifolds*, 2019. [online]. available: https://arxiv.org/abs/1909.01315  
+[12] "nvidia cuda toolkit," =https://docs.nvidia.com/cuda/index.html.  
+[13] c. hong, a. sukumaran-rajam, b. bandyopadhyay, j. kim, s. e. kurt, i. nisa, s. sabhlok, u. v. catalyurek, s. parthasarathy, and p. sadayappan, "efficient sparse-matrix multi-vector product on gpus," in international symposium on high-performance parallel and distributed computing (hpdc), 2018, pp. 66-79.  
+[14] c. hong, a. sukumaran-rajam, i. nisa, k. singh, and p. sadayappan, "adaptive sparse tiling for sparse matrix multiplication," in symposium on principles and practice of parallel programming (ppopp), 2019, pp. 300-314.  
+[15] d. b. kirk and w. h. wen-mei, programming massively parallel processors: a hands-on approach. morgan kaufmann, 2016.  
+[16] z. jia, s. lin, m. gao, m. zaharia, and a. aiken, "improving the accuracy, scalability, and performance of graph neural networks with roc."  
+[17] n. bell and m. garland, "implementing sparse matrix-vector multiplication on throughput-oriented processors," in international conference for high performance computing, networking, storage and analysis (sc), 2009, pp. 1-11.  
+[18] j. leskovec and a. krevl, “snap datasets: stanford large network dataset collection,” http://snap.stanford.edu/data, jun. 2014.  
+[19] z. yang, w. w. cohen, and r. salakhutdinov, “revisiting semisupervised learning with graph embeddings,” in international conference on machine learning (icml), 2016, pp. 40–48.  
+[20] y. wang, a. davidson, y. pan, y. wu, a. riffel, and j. d. owens, "gunrock: a high-performance graph processing library on thegpu," in acm sigplan symposium on principles and practice of parallel programming (ppopp), ser. ppopp 16, 2016.  
+[21] g. ortega, f. vázquez, i. garcía, and e. m. garzón, "fastspmm: an efficient library for sparse matrix matrix product on gpus," the computer journal, vol. 57, no. 7, pp. 968-979, 2014.  
+[22] j. chen, t. ma, and c. xiao, "fastgcn: fast learning with graph convolutional networks via importance sampling," arxiv preprint arxiv:1801.10247, 2018.  
+[23] m. fey and j. e. lenssen, "fast graph representation learning with pytorch geometric," in iclr workshop on representation learning on graphs and manifolds, 2019.  
+[24] r. zhu, k. zhao, h. yang, w. lin, c. zhou, b. ai, y. li, and j. zhou, "aligraph: a comprehensive graph neural network platform," proceedings of the vldb endowment (vldb), vol. 12, no. 12, pp. 2094-2105, 2019.  
+[25] l. ma, z. yang, y. miao, j. xue, m. wu, l. zhou, and y. dai, "neugraph: parallel deep neural network computation on large graphs," in usenix annual technical conference (atc), 2019, pp. 443-458.  
+[26] c. nvidia, "cublas library programming guide," nvidia corporation. edit, vol. 1, 2007.  
+[27] e. jones, t. oliphant, p. peterson et al., "scipy: open source scientific tools for python," 2001-, [online; accessed ]. [online]. available: http://www.scipy.org/  
+[28] v. volkov and j. w. demmel, "benchmarking gpus to tune dense linear algebra," in international conference for high performance computing, networking, storage and analysis (sc). ieee, 2008, pp. 1-11.  
+[29] y. yang, p. xiang, j. kong, m. mantor, and h. zhou, “a unified optimizing compiler framework for different gpgpu architectures,” acm transactions on architecture and code optimization (taco), vol. 9, no. 2, pp. 1–33, 2012.  
+[30] t. a. davis and y. hu, “the university of florida sparse matrix collection,” acm trans. math. softw., vol. 38, no. 1, dec. 2011. [online]. available: https://doi.org/10.1145/2049662.2049663  
+[31] j. shun and g. e. blelloch, "ligra: a lightweight graph processing framework for shared memory," in acm symposium on principles and practice of parallel programming (ppopp), 2013, pp. 135-146.

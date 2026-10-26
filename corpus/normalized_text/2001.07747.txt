@@ -1,0 +1,412 @@
+# enabling highly-scalable remote memory access programming with mpi-3 one sided
+
+robert gerstenberger  
+eth zurich  
+dept. of computer science  
+universitätstr. 6  
+8092 zurich, switzerland  
+robertge@inf.ethz.ch
+
+maciej besta  
+eth zurich  
+dept. of computer science  
+universitätstr. 6  
+8092 zurich, switzerland  
+maciej.besta@inf.ethz.ch
+
+torsten hoefler  
+eth zurich  
+dept. of computer science  
+universitätstr. 6  
+8092 zurich, switzerland  
+htor@inf.ethz.ch
+
+# abstract
+
+modern interconnects offer remote direct memory access (rdma) features. yet, most applications rely on explicit message passing for communications albeit their unwanted overheads. the mpi-3.0 standard defines a programming interface for exploiting rdma networks directly, however, it's scalability and practicability has to be demonstrated in practice. in this work, we develop scalable bufferless protocols that implement the mpi-3.0 specification. our protocols support scaling to millions of cores with negligible memory consumption while providing highest performance and minimal overheads. to arm programmers, we provide a spectrum of performance models for all critical functions and demonstrate the usability of our library and models with several application studies with up to half a million processes. we show that our design is comparable to, or better than upc and fortran coarrays in terms of latency, bandwidth, and message rate. we also demonstrate application performance improvements with comparable programming complexity.
+
+# 1. motivation
+
+network interfaces evolve rapidly to implement a growing set of features directly in hardware. a key feature of today's high-performance networks is remote direct memory access (rdma). rdma enables a process to directly access memory on remote processes without involvement of the operating system or activities at the remote side. this hardware support enables a powerful programming mode similar to shared memory programming. rdma is supported by on-chip networks in, e.g., intel's scc and ibm's cell systems, as well as off-chip networks such as infiniband [29,35], ibm's percs [2] or bluegene/q [20], cray's gemini [1] and aries [9], or even roce over ethernet [5].
+
+from a programmer's perspective, parallel programming schemes can be split into three categories: (1) shared memory with implicit communication and explicit synchronization, (2) message passing with explicit communication and implicit synchronization (as side-effect of communication), and (3) remote memory access and partitioned global address space (pgas) where synchronization and communication are managed independently.
+
+architects realized early that shared memory can often not be efficiently emulated on distributed machines [18]. thus, message passing became the de facto standard for largescale parallel programs [27]. however, with the advent of rdma networks, it became clear that message passing over rdma incurs additional overheads in comparison with native remote memory access (rma, aka. pgas) programming [6, 7, 28]. this is mainly due to message matching, practical issues with overlap, and because fast message passing libraries over rdma usually require different protocols [39]: an eager protocol with receiver-side buffering of small messages and a rendezvous protocol that synchronizes the sender. eager requires additional copies, and rendezvous sends additional messages and may delay the sending process.
+
+in summary, directly programming rdma hardware has benefits in the following three dimensions: (1) time by avoiding message matching and synchronization overheads, (2) energy by reducing data-movement, e.g., it avoids additional copies of eager messages, and (3) space by removing the need for receiver buffering. thus, several programming environments allow to access rdma hardware more or less directly: pgas languages such as unified parallel c (upc [36]) or fortran coarrays [16] and libraries such as cray shmem [3] or mpi-2.2 one sided [26]. a lot of experience with these models has been gained in the past years [7,28,40] and several key design principles for remote memory access (rma) programming evolved. the mpi forum set out to define a portable library interface to rma programming using these established principles. this new interface in mpi-3.0 [27] extends mpi-2.2's one sided chapter to support the newest generation of rdma hardware.
+
+however, the mpi standard only defines a programming interface and does not mandate an implementation. thus, it has yet to be demonstrated that the new library interface delivers comparable performance to compiled languages like upc and fortran coarrays and is able to scale to large process numbers with small memory overheads. in this work, we develop scalable protocols for implementing mpi-3.0 rma over rdma networks. we demonstrate that (1) the performance of a library implementation can be competitive to tuned, vendor-specific compiled languages and (2) the interface can be implemented on highly-scalable machines with negligible memory overheads. in a wider sense, our work answers the question if the mpi-3.0 rma interface is a vi
+
+![](images/d070c3497ba5b858da11247330c11fdb802564d159b76b0f6fe0e0ebeb23d922.jpg)
+
+![](images/281c869ee06492a1453465e3e06fa2bbd82d7f73d69c4c6411bfb84b072ebf96.jpg)  
+figure 1: overview of mpi-3.0 one sided and associated cost functions. the figure shows abstract cost functions for all operations in terms of their input domains. the symbol  $p$  denotes the number of processes,  $s$  is the data size,  $k$  is the maximum number of neighbors, and  $o$  defines an mpi operation. the notation  $\mathcal{p} \colon \{p\} \to \mathcal{t}$  defines the input space for the performance (cost) function  $\mathcal{p}$ . in this case, it indicates, for a specific mpi function, that the execution time depends only on  $p$ . we provide asymptotic cost functions in section 2 and parametrized cost functions for our implementation in section 3.
+
+able candidate for moving into the post-petascale era.
+
+our key contributions are:
+
+- we describe scalable protocols and a complete implementation for the novel mpi-3.0 rma programming interface requiring  $\mathcal{o}(\log p)$  time and space per process on  $p$  processes.  
+- we provide a detailed performance evaluation and performance models that can be used for algorithm development and to demonstrate the scalability to future systems.  
+- we demonstrate the benefits of rma programming for several motifs and real-world applications on a multipetaflop machine with full-application speedup of more than  $13\%$  over mpi-1 using more than half a million mpi processes.
+
+# 2. scalable protocols for mpi-3.0 one sided over rdma networks
+
+we describe protocols to implement mpi-3.0 one sided purely based on low-level remote direct memory access (rdma). in all our protocols, we assume that we only have small bounded buffer space at each process, no remote software agent, and only put, get, and some basic atomic operations for remote memory access. this makes our protocols applicable to all current rdma networks and is also forward-looking towards exascale interconnect architectures.
+
+mpi-3.0 offers a plethora of functions with different performance expectations and use-cases. we divide the rma functionality into three separate concepts: (1) window creation, (2) communication functions, and (3) synchronization functions. in addition, mpi-3.0 specifies two memory models: a weaker model, called "separate", to retain portability and a stronger model, called "unified", for highest performance. in this work, we only consider the stronger unified model since it is supported by all current rdma networks. more details on memory models can be found in the mpi standard [27].
+
+figure 1a shows an overview of mpi's synchronization functions. they can be split into active target mode, in which
+
+the target process participates in the synchronization, and passive target mode, in which the target process is passive. figure 1b shows a similar overview of mpi's communication functions. several functions can be completed in bulk with bulk synchronization operations or using fine-grained request objects and test/wait functions. however, we observed that the completion model only minimally affects local overheads and is thus not considered separately in the remainder of this work.
+
+figure 1 also shows abstract definitions of the performance models for each synchronization and communication operation. the precise performance model for each function depends on the exact implementation. we provide a detailed overview of the asymptotic as well as exact performance properties of our protocols and our implementation in the next sections. the different performance characteristics of communication and synchronization functions make a unique combination of implementation options for each specific use-case optimal. however, it is not always easy to choose this best variant. the exact models can be used to design such optimal implementations (or as input for model-guided autotuning [10]) while the simpler asymptotic models can be used in the algorithm design phase (cf. [19]).
+
+to support post-petascale computers, all protocols need to implement each function in a scalable way, i.e., consuming  $\mathcal{o}(\log p)$  memory and time on  $p$  processes. for the purpose of explanation and illustration, we choose to discuss a reference implementation as use-case. however, all protocols and schemes discussed in the following can be used on any rdma-capable network.
+
+# 2.1 use-case: cray dmapp and xpmem
+
+we introduce our implementation fompi (fast one sided mpi), a fully-functional mpi-3.0 rma library implementation for cray gemini (xk5, xe6) and aries (xc30) systems. in order to maximize asynchronous progression and minimize overhead, fompi interfaces to the lowest available hardware apis.
+
+for inter-node (network) communication, fompi  ${}^{1}$  uses the
+
+lowest-level networking api of gemini and aries networks, dmapp (distributed memory application), which has direct access to the hardware (ghal) layer. dmapp provides an rdma interface and each process can expose (register) local memory regions. accessing remote memory requires a special key (which is returned by the registration call). dmapp offers put, get, and a limited set of atomic memory operations, each of them comes in three categories: blocking, explicit nonblocking, and implicit nonblocking. all explicit nonblocking routines return a handle that can be used to complete single operations, implicit nonblocking operations can only be finished by bulk completion (gsync) functions. dmapp put and get can operate on 1, 4, 8 and 16 byte chunks while atomic memory operations (amo) always operate on 8 bytes.
+
+for intra-node communication, we use xpmem [38], a portable linux kernel module that allows to map the memory of one process into the virtual address space of another. similar to dmapp, processes can expose contiguous memory regions and other processes can attach (map) exposed regions into their own address space. all operations can then be directly implemented with load and store instructions, as well as cpu atomics (e.g., using the x86 lock prefix). since xpmem allows direct access to other processes' memory, we include it in the category of rdma interfaces.
+
+fompi's performance properties are self-consistent [21] and thus avoid surprises for users. we now proceed to develop algorithms to implement the window creation routines that expose local memory for remote access. after this, we describe protocols for synchronization and communication functions over rdma networks.
+
+# 2.2 scalable window creation
+
+a window is a region of process memory that is made accessible to remote processes. mpi-3.0 provides four collective functions for creating different types of windows: mpi_win_create (traditional windows), mpi_win_allocate (allocated windows), mpi_win_createdynamic (dynamic windows), and mpi_win_allocate_shared (shared windows). we assume that communication memory needs to be registered with the communication subsystem and that remote processes require a remote descriptor that is returned from the registration to access the memory. this is true for most of today's rdma interfaces including dmapp and xp-mem.
+
+traditional windows. these windows expose existing user-memory to remote processes. each process can specify an arbitrary local base address for the window and all remote accesses are relative to this address. this essentially forces an implementation to store all remote addresses separately. this storage may be compressed if addresses are identical, however, it requires  $\omega(p)$  storage on each of the  $p$  processes in the worst case.
+
+each process discovers intra-node and inter-node neighbors and registers the local memory using xpmem and dmapp. memory descriptors and various information (window size, displacement units, base pointer, et cetera) can be communicated with two mplallgather operations: the first with all
+
+processes of the window to exchange dmapp information and the second with the intra-node processes to exchange xpmem information. since traditional windows are fundamentally non-scalable, and only included in mpi-3.0 for backwards-compatibility, their use is strongly discouraged.
+
+allocated windows. allow the mpi library to allocate window memory and thus use a symmetric heap, where the base addresses on all nodes are the same requiring only  $\mathcal{o}(1)$  storage. this can either be done by allocating windows in a system-wide symmetric heap or with the following posix-compliant protocol: (1) a leader (typically process zero) chooses a random address which it broadcasts to all processes in the window, and (2) each process tries to allocate the memory with this specific address using mmap(). those two steps are repeated until the allocation was successful on all processes (this can be checked with mpi_allreduce). size and displacement unit can now be stored locally at each process. this mechanism requires  $\mathcal{o}(1)$  memory and  $\mathcal{o}(\log p)$  time (with high probability).
+
+dynamic windows. these windows allow the dynamic attach and detach of memory regions using mpl_win attached and mpl_win_detach. attach and detach operations are noncollective. in our implementation, attach registers the memory region and inserts the information into a linked list and detach removes the region from the list. both operations require  $\mathcal{o}(1)$  memory per region.
+
+the access of the list of memory regions on a target is purely one sided using a local cache of remote descriptors. each process maintains an id counter, which will be increased in case of an attach or detach operation. a process that attempts to communicate with the target first reads the id (with a get operation) to check if its cached information is still valid. if so, it finds the remote descriptor in its local list. if not, the cached information are discarded, the remote list is fetched with a series of remote operations and stored in the local cache.
+
+optimizations can be done similar to other distributed cache protocols. for example, instead of the id counter, each process could maintain a list of processes that have a cached copy of its local memory descriptors. before returning from detach, a process notifies all these processes to invalidate their cache and discards the remote process list. for each communication attempt, a process has to first check if the local cache has been invalidated (in which case it will be reloaded). then the local cache is queried for the remote descriptor. if the descriptor is missing, there has been an attach at the target and the remote descriptor is fetched into the local cache. after a cache invalidation or a first time access, a process has to register itself on the target for detach notifications. we explain a scalable data structure that can be used for the remote process list in the general active target synchronization part (see figure 2c).
+
+the optimized variant enables better latency for communication functions, but has a small memory overhead and is suboptimal for frequent detach operations.
+
+shared memory windows. shared memory windows can be implemented using posix shared memory or xpmem as described in [12] with constant memory overhead per core. performance is identical to our direct-mapped (xpmem) implementation and all operations are compatible with shared memory windows.
+
+we now show novel protocols to implement synchronization modes in a scalable way on pure rdma networks without remote buffering.
+
+# 2.3 scalable window synchronization
+
+mpi differentiates between exposure and access epochs. a process starts an exposure epoch to allow other processes to access its memory. in order to access exposed memory at a remote target, the origin process has to be in an access epoch. processes can be in access and exposure epochs simultaneously and exposure epochs are only defined for active target synchronization (in passive target, window memory is always exposed).
+
+fence. mpi_win_fence, called collectively by all processes, finishes the previous exposure and access epoch and opens the next exposure and access epoch for the whole window. an implementation must guarantee that all remote memory operations are committed before it leaves the fence call. our implementation uses an x86 mfence instruction (xpmem) and dmapp bulk synchronization (gsync) followed by an mpi barrier to ensure global completion. the asymptotic memory bound is  $\mathcal{o}(1)$  and, assuming a good barrier implementation, the time bound is  $\mathcal{o}(\log p)$ .
+
+general active target synchronization. synchronizes a subset of processes of a window. exposure (mpi_win_post/mpi_win_wait) and access epochs (mpi_win_start/mpi_win_complete) can be opened and closed independently. however, a group argument is associated with each call that starts an epoch and it states all processes participating in the epoch. the calls have to guarantee correct matching, i.e., if a process  $i$  specifies a process  $j$  in the group argument of the post call, then the next start call at process  $j$  that has process  $i$  in the group argument matches the post call.
+
+since our rma implementation cannot assume buffer space for remote messages, it has to ensure that all processes in the group argument of the start call have called a matching post before the start returns. similarly, the wait call has to ensure that all matching processes have called complete. thus, calls to mpi_win_start and mpi_win_wait may block, waiting for the remote process. both synchronizations are required to ensure integrity of the accessed data during the epochs. the mpi specification forbids matching configurations where processes wait cyclically (deadlocks).
+
+we now describe a scalable implementation of the matching protocol with a time and memory complexity of  $\mathcal{o}(k)$  if each process has at most  $k$  neighbors across all epochs. in addition, we assume  $k$  is known to the implementation. the scalable algorithm can be described at a high level as follows: each process  $i$  that posts an epoch announces itself
+
+![](images/73ec4d0fcb1de5d751d25b59fd2f30175c3807f145dbf30a921fbc4f585bebf1.jpg)
+
+![](images/ed778af78745247799d3e63994097d8cb4c9f2de1bef465582ced71ba320956a.jpg)  
+(a) source code
+
+(b) data structures  
+![](images/7d9daadf1658ea2479f759fe7d23bab856fc3474a2d373b2ad2d3239a023a750.jpg)  
+(c) free-storage management: protocol to acquire a free element in a remote matching list, denoted as "free-mem" below
+
+(d) possible execution of the complete protocol  
+![](images/455cf981b29c471b4861c61e6890f84f19cd98258ddfb434d2c01074b02e21f7.jpg)  
+figure 2: example of general active target synchronization. the numbers in the brackets for mpl_win_start and mpl_win_post indicate the processes in the access or exposure group.
+
+to all processes  $j_1, \ldots, j_l$  in the group argument by adding  $i$  to a list local to the processes  $j_1, \ldots, j_l$ . each process  $j$  that tries to start an epoch waits until all processes  $i_1, \ldots, i_m$  in the group argument are present in its local list. the main complexity lies in the scalable storage of this neighbor list, needed for start, which requires a remote free-storage management scheme (see figure 2c). the wait call can simply be synchronized with a completion counter. a process calling wait will not return until the completion counter reaches the number of processes in the specified group. to enable this, the complete call first guarantees remote visibility of all issued rma operations (by calling m fence or dmapp's gsync) and then increases the completion counter at all processes of the specified group.
+
+figure 2a shows an example program with two distinct matches to access three processes from process 0. the first epoch on process 0 matches with processes 1 and 2 and the second epoch matches only with process 3. figure 2b shows the necessary data structures, the free memory buffer, the matching list, and the completion counter. figure 2c shows the part of the protocol to acquire a free element in a remote matching list and figure 2d shows a possible execution of the complete protocol on four processes.
+
+if  $k$  is the size of the group, then the number of messages issued by post and complete is  $\mathcal{o}(k)$  and zero for start and wait. we assume that  $k \in \mathcal{o}(\log p)$  in scalable programs [11].
+
+lock synchronization. we now describe a low-overhead and scalable strategy to implement shared global, and shared and exclusive process-local locks on rma systems (the mpi-3.0 specification does not allow exclusive global lock all). we utilize a two-level lock hierarchy: one global lock variable (at a designated process, called master) and  $p$  local lock variables (one lock on each process). we assume that the word-size of the machine, and thus each lock variable, is 64 bits. our scheme also generalizes to other  $t$  bit word sizes as long as the number of processes is not more than  $2^{\lfloor \frac{t}{2} \rfloor}$ .
+
+each local lock variable is used to implement a reader-writer lock, which allows only one writer (exclusive lock), but many readers (shared locks). the highest order bit of the lock variable indicates a write access, while the other bits are used to count the number of shared locks held by other processes (cf. [23]). the global lock variable is split into two parts. the first part counts the number of processes holding a global shared lock in the window and the second part counts the number of exclusively locked processes. both parts guarantee that there are only accesses of one type (either exclusive or lock-all) concurrently. this data structure enables all lock operations to complete in  $\mathcal{o}(1)$  steps if a lock can be acquired immediately. figure 3a shows the structure of the local and global lock variables (counters).
+
+figure 3b shows an exemplary lock scenario for three processes. we do not provide an algorithmic description of the protocol due to the lack of space (the source-code is available online). however, we describe a locking scenario to foster understanding of the protocol. figure 3c shows a possible execution schedule for the scenario from figure 3b. please note that we permuted the order of processes to  $(1,0,2)$  instead of the intuitive  $(0,1,2)$  to minimize overlapping lines in the figure.
+
+process 1 starts a lock all epoch by increasing the global shared counter atomically. process 2 has to wait with its exclusive lock request until process 1 finishes its lock all epoch. the waiting is performed by an atomic fetch and add. if the result of this operation finds any global shared lock then it backs off its request and does not enter the lock, and proceeds to retry. if there is no global shared lock then it enters its local lock phase. an acquisition of a shared lock on a specific target (mpi_win_lock) only involves the local lock on the target. the origin process (e.g., process 0) fetches and increases the lock in one atomic operation. if the writer
+
+![](images/c9b46acd433e348ae0769b8454b4c1167ae64e5e39f5c29ac0fde37a5f1c0f86.jpg)
+
+![](images/543725706ac4ddf5ecbefdef93b1051cedbe35236e95eb60ffe0c0b7e0e56b62.jpg)
+
+![](images/7be4721b436cb6dea6917161417c0def223ed094dfef639aa272740e5043863a.jpg)  
+(c) possible schedule  
+figure 3: example of lock synchronization
+
+bit is not set, the origin can proceed. if an exclusive lock is present, the origin repeatedly (remotely) reads the lock until the writer finishes his access. all waits/retries can be performed with exponential back off to avoid congestion.
+
+summarizing the protocol: for a local exclusive lock, the origin process needs to ensure two invariants: (1) no global shared lock can be held or acquired during the local exclusive lock and (2) no local shared or exclusive lock can be held or acquired during the local exclusive lock. for the first part, the locking process fetches the lock variable from the master process and also increases the writer part in one atomic operation to register its wish for an exclusive lock. if the fetched value indicates lock all accesses, then the origin backs off by decreasing the writer part of the global lock. in case there is no global reader, the origin proceeds to the second invariant and tries to acquire an exclusive local lock on its target using compare-and-swap with zero (cf. [23]). if this succeeds, the origin acquired the lock and can proceed. in the example, process 2 succeeds at the second attempt to acquire the global lock but fails to acquire the local lock and needs to back off by releasing its exclusive global lock. process 2 will repeat this two-step operation until it acquired the exclusive lock. if a process already holds any exclusive lock, then it can immediately proceed to invariant two.
+
+when unlocking (mpi_win_unlock) a shared lock, the origin only has to atomically decrease the local lock on the target. in case of an exclusive lock it requires two steps. the first step is the same as in the shared case, but if the origin does not hold any additional exclusive locks, it has to release its global lock by atomically decreasing the writer part of the global lock.
+
+the acquisition or release of a shared lock on all processes of the window (mpi_win_lock_all/mpi_win_unlock_all) is simi-
+
+lar to the shared case for a specific target, except it targets the global lock.
+
+if no exclusive locks exist, then shared locks (both mpl_win_lock and mpl_win_lock_all) only take one remote atomic update operation. the number of remote requests while waiting can be bound by using mcs locks [24]. the first exclusive lock will take in the best case two atomic communication operations. this will be reduced to one atomic operation if the origin process already holds an exclusive lock. unlock operations always cost one atomic operation, except for the last unlock in an exclusive case with one extra atomic operation for releasing the global lock. the memory overhead for all functions is  $\mathcal{o}(1)$ .
+
+flush. flush guarantees remote completion and is thus one of the most performance-critical functions on mpi-3.0 rma programming. fompi's flush implementation relies on the underlying interfaces and simply issues a dmapp remote bulk completion and an x86 mfence. all flush operations (mpl_win flush, mpl_win flush_local, mpl_win flush_all, and mpl_win flush_all_local) share the same implementation and add only 78 cpu instructions (x86) to the critical path.
+
+# 2.4 communication functions
+
+communication functions map nearly directly to low-level hardware functions. this is a major strength of rma programming. in fompi, put and get simply use dmapp put and get for remote accesses or local memcpy for xpmem accesses. accumulates either use dmapp atomic operations (for many common integer operations on 8 byte data) or fall back to a simple protocol that locks the remote window, gets the data, accumulates it locally, and writes it back. this fallback protocol is necessary to avoid involvement of the receiver for true passive mode. it can be improved if we allow buffering (enabling a space-time trade-off [41]) such that active-mode communications can employ active messages to perform the remote operations atomically.
+
+handling datatypes. our implementation supports arbitrary mpi datatypes by using the mpitypes library [32]. in each communication, the datatypes are split into the smallest number of contiguous blocks (using both, the origin and target datatype) and one dmapp operation or memory copy (xpmem) is initiated for each block.
+
+while offering the full functionality of the rich mpi interface, our implementation is highly tuned for the common case of contiguous data transfers using intrinsic datatypes (e.g., mpldouble). our full implementation adds only 173 cpu instructions (x86) in the optimized critical path of mplput and mplget. we also utilize sse-optimized assembly code to perform fast memory copies for xpmem communication.
+
+# 2.5 blocking calls
+
+the mpi standard allows an implementation to block in several synchronization calls. each correct mpi program should thus never deadlock if all those calls are blocking. however, if the user knows the detailed behavior, she can
+
+tune for performance, e.g., if locks block, then the user may want to keep lock/unlock regions short. we describe here which calls may block depending on other processes and which calls will wait for other processes to reach a certain state. we point out that, in order to write (performance) portable programs, the user cannot rely on such knowledge in general!
+
+with our protocols, (a) mplwin_fence waits for all other window processes to enter the mpi_win_fence call, (b) mpi_win_start waits for matching mpi_win_post calls from all processes in the access group, (c) mpi_win_wait waits for the calls to mpi_win_complete from all processes in the exposure group, and (d) mpi_win_lock and mpi_win_lock_all wait until they acquired the desired lock.
+
+# 3. detailed performance modeling and evaluation
+
+we now describe several performance features of our protocols and implementation and compare it to cray mpi's highly tuned point-to-point as well as its relatively untuned one sided communication. in addition, we compare fompi with two major hpc pgas languages: upc and fortran 2008 with coarrays, both specially tuned for cray systems. we did not evaluate the semantically richer coarray fortran 2.0 [22] because no tuned version was available on our system. we execute all benchmarks on the blue waters system, using the cray xe6 nodes only. each compute node contains four 8-core amd opteron 6276 (interlagos) 2.3 ghz and is connected to other nodes through a 3d-torus gemini network. we use the cray programming environment 4.1.40 for mpi, upc, and fortran coarrays, and gnu gcc 4.7.2 when features that are not supported by cray's c compiler are required (e.g., inline assembly for a fast x86 sse copy loop).
+
+our benchmark measures the time to perform a single operation (for a given process count and/or data size) at all processes and adds the maximum across all ranks to a bucket. the run is repeated 1,000 times to gather statistics. we use the cycle accurate x86 rdtsc counter for each measurement. all performance figures show the medians of all gathered points for each configuration.
+
+# 3.1 latency and bandwidth
+
+comparing latency and bandwidth between one-sided rma communication and point-to-point communication is not always fair since rma communication may require extra synchronization to notify the target. all latency results presented for rma interfaces are guaranteeing remote completion (the message is committed in remote memory) but no synchronization. we analyze synchronization costs separately in section 3.2.
+
+we measure mpi-1 point-to-point latency with standard ping-pong techniques. for fortran coarrays, we use a remote assignment of a double precision array of size sz:
+
+double precision, dimension(sz) :: buf[*]
+
+do memsize in all sizes  $< \mathrm{sz}$
+
+buf(1:memsize)[2]  $=$  buf(1:memsize)
+
+sync memory
+
+end do
+
+![](images/c18c73166001ca990db513fb33d138459efbdbdde5b5a19e9d12f5ff800cbb6f.jpg)  
+(a) latency inter-node put
+
+![](images/214c66982bea16b2f30a3fc8d72e6ce93be8bfa5260a8c38b4ef4a40a6eb05a4.jpg)  
+(b) latency inter-node get
+
+![](images/69d2195de13ec62c0ea2a9e9043235ba82781c211984adc2ac98ab3ce2036ea9.jpg)  
+(c) latency intra-node put/get
+
+![](images/2c266173d4943f4d5a425a22eb3b7f4212889211542fd20d97a9d9ef0a91ac95.jpg)  
+(a) overlap inter-node
+
+![](images/e29ccbe13b120d23495f0c0a6794c849f78cba14724dd5a68eb62c561b25b6a6.jpg)  
+figure 4: latency comparison for remote put/get for dmapp and xpmem (shared memory) communication. note that mpi-1 send/recv implies remote synchronization while upc, fortran coarrays and mpi-2.2/3.0 only guarantee consistency.  
+(b) message rate inter-node
+
+![](images/e8924a1233cf41fc9dadbf83957f5a8c111049d2f568f7c27dba3638fb1d1e9e.jpg)  
+(c) message rate intra-node  
+figure 5: communication/computation overlap for put over dmapp, cray mpi-2.2 has much higher latency up to  $64\mathrm{~kb}$  (cf. figure 4a), thus allows higher overlap. xpmem implementations do not support overlap due to the shared memory copies. figures (b) and (c) show message rates for put communication for all transports.
+
+in upc, we use a single shared array and the intrinsic function memput, we also tested shared pointers with very similar performance:
+
+```c
+shared [sz] double *buf;  
+buf = vec_all_alloc(2, sz);  
+for (size=1; size<=sz; size*=2) {  
+    vec_memput(&buf[sz], &priv_buf[0], size);  
+    vec_fence;  
+}
+```
+
+in mpi-3.0 rma, we use an allocated window and passive target mode with flushes:
+
+```c
+mpl_win_allocate(sz，...，&buf，&win);  
+mpl_win_lock(excl，1，...，win);  
+for(size=1；size<=sz；size*=2）{  
+    mplput(&buf[0]，size，...，1，...，win);  
+    mpl_win flush(1，win);  
+}  
+mpi_win_unlock(1，win);
+```
+
+figures 4a, 4b, and 4c show the latency for varying message sizes for intra- and inter-node put, get. due to the highly optimized fast-path, fompi has more than  $50\%$  lower latency than other pgas models while achieving the same bandwidth for larger messages. the performance functions (cf. figure 1) are:  $\mathcal{p}_{put} = 0.16ns \cdot s + 1\mu s$  and  $\mathcal{p}_{get} = 0.17ns \cdot s + 1.9\mu s$ .
+
+# 3.1.1 overlapping computation
+
+the overlap benchmark measures how much of the communication time can be overlapped with computation. it calibrates a computation loop to consume slightly more time than the latency. then it places computation between the communication and the synchronization and measures the combined time. the ratio of overlapped computation is then computed from the measured communication, computation, and combined times. figure 5a shows the ratio of the communication that can be overlapped for cray's mpi-2.2, upc, and fompi mpi-3.0.
+
+# 3.1.2 message rate
+
+the message rate benchmark is very similar to the latency benchmark, however, it benchmarks the start of 1,000 transactions without synchronization. this determines the overhead for starting a single operation. the cray-specific pgas pragma defersync was used in the upc and fortran coarrays versions for full optimization. figures 5b and 5c show the message rates for dmapp and xpmem (shared memory) communications, respectively. injecting a single 8-byte message costs 416ns for inter-node and 80ns ( $\approx$ 190 instructions) for intra-node case.
+
+# 3.1.3 atomics
+
+figure 6a shows the performance of the dmapp-accelerated mpi_sum of 8-byte elements, a non-accelerated mpi_min, and 8-byte cas. the performance functions are  $\mathcal{p}_{acc,sum} =$
+
+![](images/51a6a01815305deff42312c30031a066e4653380f2abb095305e11d0c7952c94.jpg)  
+(a) atomic operation performance
+
+![](images/d94b45ba6d5c033c0169eb562c24a333909f9f5936b8a3ef536ed44de4f98668.jpg)  
+(b) latency for global synchronization
+
+![](images/47958940959729b236ecae4773a84afd7e59fa43155f9e38474d875d1b4542ff.jpg)  
+(c) latency for pscw (ring topology)  
+figure 6: performance of atomic accumulate operations and synchronization latencies.
+
+$28ns \cdot s + 2.4\mu s$ ,  $\mathcal{p}_{acc,min} = 0.8ns \cdot s + 7.3\mu s$ , and  $\mathcal{p}_{cas} = 2.4\mu s$ . the dmapp acceleration lowers the latency for small messages while the locked implementation exhibits a higher bandwidth. however, this does not consider the serialization due to the locking.
+
+# 3.2 synchronization schemes
+
+in this section, we study the overheads of the various synchronization modes. the different modes have nontrivial trade-offs. for example general active target synchronization performs better if small groups of processes are synchronized and fence synchronization performs best if the synchronization groups are essentially as big as the full group attached to the window. however, the exact crossover point is a function of the implementation and system. while the active target mode notifies the target implicitly that its memory is consistent, in passive target mode, the user has to do this explicitly or rely on synchronization side effects of other functions (e.g., allreduce).
+
+we thus study and model the performance of all synchronization modes and notification mechanisms for passive target. our performance models can be used by the programmer to select the best option for the problem at hand.
+
+global synchronization. global synchronization is offered by fences in mpi-2.2 and mpi-3.0. it can be directly compared to fortran coarrays sync all and upc's upc barrier which also synchronize the memory at all processes. figure 6b compares the performance of fompi with cray's mpi-2.2, upc, and fortran coarrays implementations. the performance function for fompi's fence implementation is:  $\mathcal{p}_{fence} = 2.9\mu s\cdot \log_2(p)$ .
+
+general active target synchronization. only mpi2.2 and mpi-3.0 offer general active target (also called "pscw") synchronization. a similar mechanism (sync images) for fortran coarrays was unfortunately not available on our test system. figure 6c shows the performance for cray mpi and fompi when synchronizing an one-dimensional torus (ring) where each process has exactly two neighbors  $(k = 2)$ . an ideal implementation would exhibit constant time for this benchmark. we observe systematically growing overheads in cray's implementation as well as system noise [14,30] on runs with more than 1,000 pro
+
+cesses with fompi. we model the performance with varying numbers of neighbors and fompi's pscw synchronization costs involving  $k$  off-node neighbor are  $\mathcal{p}_{post} = \mathcal{p}_{complete} = 350ns\cdot k$ , and  $\mathcal{p}_{start} = 0.7\mu s$ ,  $\mathcal{p}_{wait} = 1.8\mu s$ ,
+
+passive target synchronization. the performance of lock/unlock is constant in the number of processes (due to the global/local locking) and thus not graphed. the performance functions are  $\mathcal{p}_{\text{lock,excl}} = 5.4\mu s$ ,  $\mathcal{p}_{\text{lock,shrd}} = \mathcal{p}_{\text{lock,all}} = 2.7\mu s$ ,  $\mathcal{p}_{\text{unlock}} = \mathcal{p}_{\text{unlock,all}} = 0.4\mu s$ ,  $\mathcal{p}_{\text{flush}} = 76ns$ , and  $\mathcal{p}_{\text{sync}} = 17ns$ .
+
+we demonstrated the performance of our protocols and implementation using microbenchmarks comparing to other rma and message passing implementations. the exact performance models for each call can be utilized to design and optimize parallel applications, however, this is outside the scope of this paper. to demonstrate the usability and performance of our protocols for real applications, we continue with a large-scale application study.
+
+# 4. application evaluation
+
+we selected two motif applications to compare our protocols and implementation with the state of the art: a distributedisable representing many big data and analytics applications and a dynamic sparse data exchange representing complex modern scientific applications. we also analyze the application mimd lattice computation (milc), a full production code with several hundred thousand source lines of code, as well as a 3d fft code.
+
+in all codes, we tried to keep most parameters constant to compare the performance of pgas languages, mpi-1, and mpi-3.0 rma. thus, we did not employ advanced concepts, such as mpi datatypes or process topologies, that are not available in all implementations (e.g., upc and fortran coarrays).
+
+# 4.1 distributed hashtable
+
+our simple hashtable represents data analytics applications that often require random access in distributed structures. we compare mpi point-to-point communication, upc, and mpi-3.0 rma. in the implementation, each process manages a part of the hashtable called the local volume consisting of a table of elements and an additional overflow heap to store elements after collisions. the table and the heap
+
+figure 7: application motifs: (a) hastable representing data analytics applications and key-value stores, (b) dynamic sparse data exchange representing graph traversals, n-body methods, and rapidly evolving meshes [15], (c) full parallel 3d fft  
+![](images/37a84856b5db08119724fb9453e6fd4180d70391497d476c249c5f0937acf8e7.jpg)  
+(a) inserts per second for inserting 16k el- (b) time to perform one dynamic sparse (c) 3d fft performance. the annotations elements per process including synchronization data exchange (dsde) with 6 random represent the improvement of fompi over neighbors mpi-1.
+
+![](images/2b8136795ab1bf09812dedc82caa5d57b240bcd9c107960ec1a7747b8250e3d5.jpg)
+
+![](images/2b9e9f7b280966e213133ec43f4de862659b5c175a0f423e9218a8b83beff536.jpg)
+
+are constructed using fixed-size arrays. in order to avoid traversing of the arrays, pointers to most recently inserted items as well as to the next free cells are stored along with the remaining data in each local volume. the elements of the hashtable are 8-byte integers.
+
+the mpi-1 implementation is based on mpi send andrecv using an active message scheme. each process that is going to perform a remote operation sends the element to be inserted to the owner process which invokes a handle to process the message. termination detection is performed using a simple protocol where each process notifies all other processes of its local termination. in upc, table and overflow list are placed in shared arrays. inserts are based on proprietary (cray-specific extensions) atomic compare and swap (cas) operations. if a collision happens, the losing thread acquires a new element in the overflow list by atomically incrementing the next free pointer. it also updates the last pointer using a second cas. upc_fences are used to ensure memory consistency. the mpi-3.0 implementation is rather similar to the upc implementation, however, it uses mpi-3.0's standard atomic operations combined with flushes.
+
+figure 7a shows the inserts per second for a batch of 16k operations per process, each adding an element to a random key (which resides at a random process). mpi-1's performance is competitive for intra-node communications but inter-node overheads significantly impact performance and the insert rate of a single node cannot be achieved with even  $32\mathrm{k}$  cores (optimizations such as coalescing or message routing and reductions [37] would improve this rate but significantly complicate the code). fompi and upc exhibit similar performance characteristics with fompi being slightly faster for shared memory accesses. the spikes at 4k and 16k nodes are caused by different job layouts in the gemini torus and different network congestion.
+
+# 4.2 dynamic sparse data exchange
+
+the dynamic sparse data exchange (dsde) represents a common pattern in irregular applications [15]. dsde is used when a set of senders has data destined to arbitrary target processes but no process knows the volume or sources of data it needs to receive. the dsde pattern is very common in graph-based computations, n-body simulations, and
+
+adaptive mesh refinement codes. due to the lack of space, we use a dsde microbenchmark as proxy for the communication performance of such applications [15].
+
+in the dsde benchmark, each process picks  $k$  targets randomly and attempts to send eight bytes to each target. the dsde protocol can either be implemented using alloall, reduce_scan, a nonblocking barrier combined with synchronous sends, or one sided accumulates in active target mode. the algorithmic details of the protocols are described in [15]. here, we compare all protocols of this application microbenchmark with the cray mpi-2.2 and fompi mpi-3.0 implementations. figure 7b shows the times for the complete exchange using the four different protocols (the accumulate protocol is tested with cray's mpi-2.2 implementation and fompi) and  $k = 6$  random neighbors per process. the rma-based implementation is competitive with the nonblocking barrier, which was proved optimal in [15]. fompi's accumulates have been tuned for cray systems while the nonblocking barrier we use is a generic dissemination algorithm. the performance improvement relative to other protocols is always significant and varies between a factor of two and nearly two orders of magnitude.
+
+# 4.3 3d fast fourier transform
+
+we now discuss how to exploit overlap of computation and communication with our low-overhead implementation in a three-dimensional fast fourier transformation. we use the mpi and upc versions of the nas 3d fft benchmark. nishtala et al. and bell et al. [7,28] demonstrated that overlap of computation and communication can be used to improve the performance of a 2d-decomposed 3d fft. we compare the default "nonblocking mpi" with the "upc slab" decomposition, which starts to communicate the data of a plane as soon as it is available and completes the communication as late as possible. for a fair comparison, our fompi implementation uses the same decomposition and communication scheme like the upc version and required minimal code changes resulting in the same code complexity.
+
+figure 7c shows the performance for the strong scaling class d benchmark  $(2048\times 1024\times 1024)$  on different core counts. upc achieves a consistent speedup over mpi-1, mostly due to the overlap of communication and computation. fompi
+
+has a slightly lower static overhead than upc and thus enables better overlap (cf. figure 5a), resulting in a slightly better performance of the fft.
+
+# 4.4 mimd lattice computation
+
+the mimd lattice computation (milc) collaboration studies quantum chromodynamics (qcd), the theory of strong interaction [8]. the group develops a set of applications, known as the milc code. in this work, we use version 7.6.3 as a base. that code regularly gets one of the largest allocations of computer time at us nsf supercomputer centers. the su3_rmd code, which is part of the spec cpu2006 and spec mpi benchmarks, is included in the milc code.
+
+the code performs a stencil computation on a four-dimensional rectangular grid. domain decomposition is performed in all four dimensions to minimize the surface-to-volume ratio. in order to keep data consistent, neighbor communication is performed in all eight directions, in addition, global allreductions are done regularly to check convergence of a solver. the most time consuming part of milc is the conjugate gradient solver which uses nonblocking mpi communication overlapped with local computations.
+
+the performance of the full code and the solver have been analyzed in detail in [4]. several optimizations have been applied, and a upc version that demonstrated significant speedups is available [34]. this version replaces the mpi communication with a simple remote memory access protocol. a process notifies all neighbors with a separate atomic add as soon as the data in the "send" buffer is initialized. then all processes wait for this flag before they get (using cray's proprietary upc_memget_nb) the communication data into their local buffers. this implementation serializes the data from the application buffer into upc's communication buffers. our mpi-3.0 implementation follows the same scheme to ensure a fair comparison. we place the communication buffers into mpi windows and use mpi_fetch_and_op and mpi_get with a single lock all epoch and mpi_win flush to perform the communications. the necessary changes are small and the total number of source code lines is equivalent to the upc version. we remark that additional optimizations may be possible with mpi, for example, one could use mpi datatypes to communicate the data directly from the application buffers resulting in additional performance gains [13]. however, since our goal is to compare to the upc version, we only investigate the packed version here.
+
+figure 8 shows the execution time of the whole application for a weak-scaling problem with a local lattice of  $4^{3} \times 8$ , a size very similar to the original blue waters petascale benchmark. some phases (e.g., cg) of the computation execute up to  $45\%$  faster, however, we chose to report full-application performance. the upc and fompi codes exhibit essentially the same performance, while the upc code uses cray-specific tuning and the mpi-3.0 code is portable to different architectures. the full-application performance gain over the mpi-1 version is more than  $15\%$  for some configurations. the application was scaled successfully up to 524,288 processes with all implementations. this result and our microbenchmark demonstrate the scalability and performance of our protocols and that the new rma semantics can be used to improve full applications to achieve perfor
+
+![](images/0b9443e64d28ecb1eeb993aca95900203716131eb842c5fc1ecd6c6b10ab0635.jpg)  
+figure 8: milc: full application execution time. the annotations represent the improvement of fompi and upc over mpi-1.
+
+mance close to the hardware limitations in a fully portable way. since most of those existing applications are written in mpi, a step-wise transformation can be used to optimize most critical parts first.
+
+# 5. related work
+
+the intricacies of mpi-2.2 rma implementations over infiniband networks have been discussed by jian et al. and santhanaraman et al. [17,33]. zhao et al. describe an adaptive strategy to switch from eager to lazy modes in active target synchronizations in mpich 2 [41]. this mode could be used to speed up fompi's atomics that are not supported in hardware.
+
+pgas programming has been investigated in the context of upc and fortran coarrays. an optimized upc barnes hut implementation shows similarities to mpi-3.0 rma programming by using bulk vectorized memory transfers combined with vector reductions instead of shared pointer accesses [40]. nishtala at al. and bell et al. used overlapping and one sided accesses to improve fft performance [7,28]. highly optimized pgas applications often use a style that can easily be adapted to mpi-3.0 rma.
+
+the applicability of mpi-2.2 one sided has also been demonstrated for some applications. mirin et al. discuss the usage of mpi-2.2 one sided coupled with threading to improve the community atmosphere model (cam) [25]. potluri et al. show that mpi-2.2 one sided with overlap can improve the communication in a seismic modeling application [31]. however, we demonstrated new mpi-3.0 features that can be used to further improve performance and simplify implementations.
+
+# 6. discussion and conclusions
+
+in this work, we demonstrated how mpi-3.0 can be implemented over rdma networks to achieve similar performance to upc and fortran coarrays while offering all of mpi's convenient functionality (e.g., topologies and datatypes). we provide detailed performance models, that help choosing among the multiple options. for example, a user can use our models to decide whether to use fence or pscw synchronization (if  $\mathcal{p}_{fence} > \mathcal{p}_{post} + \mathcal{p}_{complete} + \mathcal{p}_{start} + \mathcal{p}_{wait}$
+
+which is true for large  $k$ ). this is just one example for the possible uses of our detailed performance models.
+
+we studied all overheads in detail and provide instruction counts for all critical synchronization and communication functions, showing that the mpi interface adds merely between 150 and 200 instructions in the fast path. this demonstrates that a library interface like mpi is competitive with compiled languages such as upc and fortran coarrays. our implementation proved to be scalable and robust while running on 524,288 processes on blue waters speeding up a full application run by  $13.8\%$  and a 3d fft on 65,536 processes by a factor of two.
+
+we expect that the principles and extremely scalable synchronization algorithms developed in this work will act as a blue print for optimized mpi-3.0 rma implementations over future large-scale rdma networks. we also expect that the demonstration of highest performance to users will quickly increase the number of mpi rma programs.
+
+# acknowledgments
+
+we thank timo schneider for early help in the project, greg bauer and bill kramer for support with blue waters, cray's duncan roweth and roberto ansaloni for help with cray's pgas environment, nick wright for the upc version of milc, and paul hargrove for the upc version of nas-ft. this work was supported in part by the doe office of science, advanced scientific computing research, under award number de-fc02-10er26011, program manager lucy nowell. this work is partially supported by the blue waters sustained-petascale computing project, which is supported by the national science foundation (award number oci 07-25070) and the state of illinois.
+
+# 7. references
+
+[1] r. alverson, d. roweth, and l. kaplan. the gemini system interconnect. in proceedings of the ieee symposium on high performance interconnects (hoti'10), pages 83-87. ieee computer society, 2010.  
+[2] b. arimilli, r. arimilli, v. chung, s. clark, w. denzel, b. drerup, t. hoefler, j. joyner, j. lewis, j. li, n. ni, and r. rajamony. the percs high-performance interconnect. in proceedings of the ieee symposium on high performance interconnects (hoti'10), pages 75-82. ieee computer society, 2010.  
+[3] r. barriuso and a. knies. shmem user's guide for c, 1994.  
+[4] g. bauer, s. gottlieb, and t. hoefler. performance modeling and comparative analysis of the milc lattice qcd application su3 rmd. in proceedings of the ieee/acm international symposium on cluster, cloud and grid computing (ccgrid'12), pages 652-659. ieee computer society, 2012.  
+[5] m. beck and m. kagan. performance evaluation of the rdma over ethernet (roce) standard in enterprise data centers infrastructure. in proceedings of the workshop on data center - converged and virtual ethernet switching (dc-caves'11), pages 9-15. itcp, 2011.  
+[6] c. bell, d. bonachea, y. cote, j. duell, p. hargrove,
+
+p. husbands, c. iancu, m. welcome, and k. yelick. an evaluation of current high-performance networks. in proceedings of the ieee international parallel and distributed processing symposium (ipdps'03). ieee computer society, 2003.  
+[7] c. bell, d. bonachea, r. nishtala, and k. yelick. optimizing bandwidth limited problems using one-sided communication and overlap. in proceedings of the international conference on parallel and distributed processing (ipdps'06), pages 1-10. ieee computer society, 2006.  
+[8] c. bernard, m. c. ogilvie, t. a. degrand, c. e. detar, s. a. gottlieb, a. krasnitz, r. sugar, and d. toussaint. studying quarks and gluons on mimd parallel computers. international journal of high performance computing applications, 5(4):61-70, 1991.  
+[9] g. faanes, a. bataineh, d. roweth, t. court, e. froese, b. alverson, t. johnson, j. kopnick, m. higgins, and j. reinhard. cray cascade: a scalable hpc system based on a dragonfly network. in proceedings of the international conference for high performance computing, networking, storage and analysis (sc'12), pages 103:1-103:9. ieee computer society, 2012.  
+[10] b. b. fraguela, y. voronenko, and m. pueschel. automatic tuning of discrete fourier transforms driven by analytical modeling. in proceedings of the international conference on parallel architecture and compilation techniques (pact'09), pages 271-280. ieee computer society, 2009.  
+[11] a. y. grama, a. gupta, and v. kumar. isoefficiency: measuring the scalability of parallel algorithms and architectures. parallel and distributed technology: systems and technology, 1(3):12-21, 1993.  
+[12] t. hoefler, j. dinan, d. buntinas, p. balaji, b. barrett, r. brightwell, w. gropp, v. kale, and r. thakur. leveraging mpi's one-sided communication interface for shared-memory programming. in *recent advances in the message passing interface (eurompi'12)*, volume lncs 7490, pages 132-141. springer, 2012.  
+[13] t. hoefer and s. gottlieb. parallel zero-copy algorithms for fast fourier transform and conjugate gradient using mpi datatypes. in *recent advances in the message passing interface (eurompi'10)*, volume lncs 6305, pages 132-141. springer, 2010.  
+[14] t. hoefler, t. schneider, and a. lumsdaine. characterizing the influence of system noise on large-scale applications by simulation. in proceedings of the international conference for high performance computing, networking, storage and analysis (sc'10), pages 1-11. ieee computer society, 2010.  
+[15] t. hoefler, c. siebert, and a. lumsdaine. scalable communication protocols for dynamic sparse data exchange. in proceedings of the acm sigplan symposium on principles and practice of parallel programming (ppopp'10), pages 159-168. acm, 2010.  
+[16] iso fortran committee. fortran 2008 standard (iso/iec 1539-1:2010). 2010.  
+[17] w. jiang, j. liu, h.-w. jin, d. k. panda, w. gropp,
+
+and r. thakur. high performance mpi-2 one-sided communication over infiniband. in proceedings of the ieee international symposium on cluster computing and the grid (ccgrid'04), pages 531-538. ieee computer society, 2004.  
+[18] s. karlsson and m. brorsson. a comparative characterization of communication patterns in applications using mpi and shared memory on an ibm sp2. in proceedings of the international workshop on network-based parallel computing: communication, architecture, and applications (canpc'98), pages 189-201. springer, 1998.  
+[19] r. m. karp, a. sahay, e. e. santos, and k. e. schauer. optimal broadcast and summation in the logp model. in proceedings of the acm symposium on parallel algorithms and architectures (spaa '93), pages 142-153. acm, 1993.  
+[20] s. kumar, a. mamidala, d. a. faraj, b. smith, m. blocksome, b. cernohous, d. miller, j. parker, j. ratterman, p. heidelberger, d. chen, and b. d. steinmacher-burrow. pami: a parallel active message interface for the blue gene/q supercomputer. in proceedings of the ieee international parallel and distributed processing symposium (ipdps'12), pages 763-773. ieee computer society, 2012.  
+[21] j. larsson traff, w. d. gropp, and r. thakur. self-consistent mpi performance guidelines. ieee transactions on parallel and distributed systems, 21(5):698-709, 2010.  
+[22] j. mellor-crummey, l. adhianto, w. n. scherer iii, and g. jin. a new vision for coarray fortran. in proceedings of the conference on partitioned global address space programming models (pgas'09), pages 5:1-5:9. acm, 2009.  
+[23] j. m. mellor-crummey and m. l. scott. scalable reader-writer synchronization for shared-memory multiprocessors. sigplan notices, 26(7):106-113, 1991.  
+[24] j. m. mellor-crummey and m. l. scott. synchronization without contention. sigplan notices, 26(4):269-278, 1991.  
+[25] a. a. mirin and w. b. sawyer. a scalable implementation of a finite-volume dynamical core in the community atmosphere model. international journal of high performance computing applications, 19(3):203-212, 2005.  
+[26] mpi forum. mpi: a message-passing interface standard. version 2.2, 2009.  
+[27] mpi forum. mpi: a message-passing interface standard. version 3.0, 2012.  
+[28] r. nishtala, p. h. hargrove, d. o. bonachea, and k. a. yelick. scaling communication-intensive applications on bluegene/p using one-sided communication and overlap. in proceedings of the ieee international parallel and distributed processing symposium (ipdps'09), pages 1-12. ieee computer society, 2009.  
+[29] openfabrics alliance (ofa). openfabrics enterprise
+
+distribution (ofed) www.openfabrics.org.  
+[30] f. petrini, d. j. kerbyson, and s. pakin. the case of the missing supercomputer performance: achieving optimal performance on the 8,192 processors of asci q. in proceedings of the international conference for high performance computing, networking, storage and analysis (sc'03). acm, 2003.  
+[31] s. potluri, p. lai, k. tomko, s. sur, y. cui, m. tatineni, k. w. schulz, w. l. barth, a. majumdar, and d. k. panda. quantifying performance benefits of overlap using mpi-2 in a seismic modeling application. in proceedings of the acm international conference on supercomputing (ics'10), pages 17-25. acm, 2010.  
+[32] r. ross, r. latham, w. gropp, e. lusk, and r. thakur. processing mpi datatypes outside mpi. in *recent advances in parallel virtual machine and message passing interface* (europvm/mpi'09), volume lncs 5759, pages 42-53. springer, 2009.  
+[33] g. santhanaraman, p. balaji, k. gopalakrishnan, r. thakur, w. gropp, and d. k. panda. natively supporting true one-sided communication in mpi on multi-core systems with infiniband. in proceedings of the ieee/acm international symposium on cluster computing and the grid (ccgrid '09), pages 380-387. ieee computer society, 2009.  
+[34] h. shan, b. austin, n. wright, e. strohmaier, j. shalf, and k. yelick. accelerating applications at scale using one-sided communication. in proceedings of the conference on partitioned global address space programming models (pgas'12), 2012.  
+[35] the infiniband trade association. infiniband architecture specification volume 1, release 1.2. infiniband trade association, 2004.  
+[36] upc consortium. upc language specifications, v1.2, 2005. lbnl-59208.  
+[37] j. willcock, t. hoefler, n. edmonds, and a. lumsdaine. active pebbles: parallel programming for data-driven applications. in proceedings of the acm international conference on supercomputing (ics'11), pages 235-245. acm, 2011.  
+[38] m. woodacre, d. robb, d. roe, and k. feind. the sgi altix tm 3000 global shared-memory architecture, 2003.  
+[39] t. s. woodall, g. m. shipman, g. bosilca, and a. b. maccabe. high performance rdma protocols in hpc. in *recent advances in parallel virtual machine and message passing interface (europvm/mp1'06)*, volume lncs 4192, pages 76-85. springer, 2006.  
+[40] j. zhang, b. behzad, and m. snir. optimizing the barnes-hut algorithm in upc. in proceedings of the international conference for high performance computing, networking, storage and analysis (sc'11), pages 75:1-75:11. acm, 2011.  
+[41] x. zhao, g. santhanaraman, and w. gropp. adaptive strategy for one-sided communication in mpich2. in recent advances in the message passing interface (eurompi'12), pages 16-26. springer, 2012.

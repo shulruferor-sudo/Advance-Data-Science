@@ -1,0 +1,726 @@
+# ansor: generating high-performance tensor programs for deep learning
+
+lianmin zheng<sup>1</sup>, chengfan jia<sup>2</sup>, minmin sun<sup>2</sup>, zhao wu<sup>2</sup>, cody hao yu<sup>3</sup>, ameer haj-ali<sup>1</sup>, yida wang<sup>3</sup>, jun yang<sup>2</sup>, danyang zhuo<sup>1,4</sup>, koushik sen<sup>1</sup>, joseph e. gonzalez<sup>1</sup>, ion stoica<sup>1</sup>
+
+<sup>1</sup> uc berkeley, <sup>2</sup> alibaba group, <sup>3</sup> amazon web services, <sup>4</sup> duke university
+
+# abstract
+
+high-performance tensor programs are crucial to guarantee efficient execution of deep neural networks. however, obtaining performant tensor programs for different operators on various hardware platforms is notoriously challenging. currently, deep learning systems rely on vendor-provided kernel libraries or various search strategies to get performant tensor programs. these approaches either require significant engineering effort to develop platform-specific optimization code or fall short of finding high-performance programs due to restricted search space and ineffective exploration strategy.
+
+we present ansor, a tensor program generation framework for deep learning applications. compared with existing search strategies, ansor explores many more optimization combinations by sampling programs from a hierarchical representation of the search space. ansor then fine-tunes the sampled programs with evolutionary search and a learned cost model to identify the best programs. ansor can find high-performance programs that are outside the search space of existing state-of-the-art approaches. in addition, ansor utilizes a task scheduler to simultaneously optimize multiple subgraphs in deep neural networks. we show that ansor improves the execution performance of deep neural networks relative to the state-of-the-art on the intel cpu, arm cpu, and nvidia gpu by up to  $3.8 \times 2.6 \times$  and  $1.7 \times$  respectively.
+
+# 1 introduction
+
+low-latency execution of deep neural networks (dnn) plays a critical role in autonomous driving [14], augmented reality [3], language translation [15], and other applications of ai. dnns can be expressed as a directed acyclic computational graph (dag), in which nodes represent the operators (e.g., convolution, matrix multiplication) and directed edges represent the dependencies between operators. existing deep learning frameworks (e.g., tensorflow [1], pytorch [39], mxnet [10]) map the operators in dnns to vendor-provided kernel libraries (e.g., cudnn [13], mkl-dnn [27]) to
+
+achieve high performance. however, these kernel libraries require significant engineering effort to manually tune for each hardware platform and operator. the significant manual effort required to produce efficient operator implementations for each target accelerator limits the development and innovation of new operators [7] and specialized accelerators [35].
+
+given the importance of dnns' performance, researchers and industry practitioners have turned to search-based compilation [2, 11, 32, 49, 58] for automated generation of tensor programs, i.e., low-level implementations of tensor operators. for an operator or a (sub-)graph of multiple operators, users define the computation in a high-level declarative language ( $\s 2$ ), and the compiler then searches for programs tailored towards different hardware platforms.
+
+to find performant tensor programs, it is necessary for a search-based approach to explore a large enough search space to cover all the useful tensor program optimizations. however, existing approaches fail to capture many effective optimization combinations, because they rely on either predefined manually-written templates (e.g., tvm [12], flextensor [58]) or aggressive pruning by evaluating incomplete programs (e.g., halide auto-scheduler [2]), which prevents them from covering a comprehensive search space ( $\s 2$ ). the rules they use to construct the search space are also limited.
+
+in this paper, we explore a novel search strategy for generating high-performance tensor programs. it can automatically generate a large search space with comprehensive coverage of optimizations and gives every tensor program in the space a chance to be chosen. it thus enables to find high-performance programs that existing approaches miss.
+
+realizing this goal faces multiple challenges. first, it requires automatically constructing a large search space to cover as many tensor programs as possible for a given computation definition. second, we need to search efficiently without comparing incomplete programs in the large search space that can be orders of magnitude larger than what existing templates can cover. finally, when optimizing an entire dnn with many subgraphs, we should recognize and prioritize the subgraphs that are critical to the end-to-end performance.
+
+to this end, we design and implement ansor, a framework for automated tensor program generation. ansor utilizes a hierarchical representation to cover a large search space. this representation decouples high-level structures and low-level details, enabling flexible enumeration of high-level structures and efficient sampling of low-level details. the space is constructed automatically for a given computation definition. ansor then samples complete programs from the search space and fine-tunes these programs with evolutionary search and a learned cost model. to optimize the performance of dnns with multiple subgraphs, ansor dynamically prioritizes subgraphs of the dnns that are more likely to improve the end-to-end performance.
+
+we evaluate ansor on both standard deep learning benchmarks and emerging new workloads against manual libraries and state-of-the-art search-based frameworks. experiment results show that ansor improves the execution performance of dnns on the intel cpu, arm cpu, and nvidia gpu by up to  $3.8 \times 2.6 \times$  and  $1.7 \times$  respectively. for most computation definitions, the best program found by ansor is outside the search space of existing search-based approaches. the results also show that, compared with existing search-based approaches, ansor searches more efficiently, generating higher-performance programs in a shorter time, despite its larger search space. ansor can match the performance of a state-of-the-art framework with an order of magnitude less search time. besides, ansor enables automatic extension to new operators by only requiring their mathematical definitions without manual templates.
+
+in summary, this paper makes the following contributions:
+
+- a mechanism to generate a large hierarchical search space of tensor programs for a computational graph.  
+- an evolutionary strategy with a learned cost model to fine-tune the performance of tensor programs.  
+- a scheduling algorithm based on gradient descent to prioritize important subgraphs when optimizing the end-to-end performance of dnns.  
+- an implementation and comprehensive evaluation of the ansor system demonstrating that the above techniques outperform state-of-the-art systems on a variety of dnns and hardware platforms.
+
+# 2 background
+
+the deep learning ecosystem is embracing a rapidly growing diversity of hardware platforms including cpus, gpus, fpgas, and asics. in order to deploy dnns on these platforms, high-performance tensor programs are needed for the operators used in dnns. the required operator set typically contains a mixture of standard operators (e.g., matmul, conv2d) and novel operators invented by machine learning researchers (e.g., capsule conv2d [23], dilated conv2d [57]).
+
+matrix multiplication  $c_{i,j} = \sum_k a_{i,k} b_{k,j}$
+
+c = compute((n, m), lambda i, j: sum(a[i, k]*b[k, j], [k]))
+
+figure 1: the computation definition of matrix multiplication.
+
+to deliver portable performance of these operators on a wide range of hardware platforms in a productive way, multiple compiler techniques have been introduced (e.g., tvm [11], halide [41], tensor comprehensions [49]). users define the computation in a form similar to mathematical expressions using a high-level declarative language, and the compiler generates optimized tensor programs according to the definition. figure 1 shows the computation definition of matrix multiplication in the tvm tensor expression language. users mainly need to define the shapes of the tensors and how each element in the output tensor is computed.
+
+however, automatically generating high-performance tensor programs from a high-level definition is extremely difficult. depending on the architecture of the target platform, the compiler needs to search in an extremely large and complicated space containing combinatorial choices of optimizations (e.g., tile structure, tile size, vectorization, parallelization). finding high-performance programs requires the search strategy to cover a comprehensive space and explore it efficiently. we describe two recent and effective approaches in this section and other related work in §8.
+
+template-guided search. in template-guided search, the search space is defined by manual templates. as shown in figure 2a, the compiler (e.g., tvm) requires the user to manually write a template for a computation definition. the template defines the structure of the tensor programs with some tunable parameters (e.g., tile size and unrolling factor). the compiler then searches for the best values of these parameters for a specific input shape configuration and a specific hardware target. this approach has achieved good performance on common deep learning operators. however, developing templates requires substantial effort. for example, the code repository of tvm already contains more than 15k lines of code for these templates. this number continues to grow as new operators and new hardware platforms emerge. besides, constructing a quality template requires expertise in both tensor operators and hardware. it takes non-trivial research effort [32, 55, 58] to develop quality templates. despite the complexity of template design, manual templates only cover limited program structures because manually enumerating all optimization choices for all operators is prohibitive. this approach typically requires defining one template for each operator. flextensor [58] proposes a general template to cover multiple operators, but its template is still designed for single operator granularity, which fails to include optimizations involving multiple operators (e.g., operator fusion). the search space of optimizing a computational graph with multiple operators should contain different ways to compose the operators. a template-based approach fails to achieve this because it cannot break down their fixed templates and re-compose them
+
+![](images/bd28cb81b62e9fbb535beda28834c18892b85bfc3c56188aaed43b60894d1f90.jpg)  
+(a) template-guided search
+
+![](images/5fd5ddd8d1dd0e19b6f6df1fc450d6bb0fb088606eb58210cb7ef1d9c90f8f1b.jpg)  
+(b) sequential construction based search
+
+![](images/a0c582dc07ef59d2f7de1222e2fc3b76e1ec476e7e8b5f50189c3da1fcca81d7.jpg)  
+(c) ansor's hierarchical approach
+
+during the search.
+
+sequential construction based search. this approach defines the search space by decomposing the program construction into a fixed sequence of decisions. the compiler then uses an algorithm such as beam search [34] to search for good decisions (e.g., halide auto-scheduler [2]). in this approach, the compiler constructs a tensor program by sequentially unfolding all nodes in the computational graph. for each node, the compiler makes a few decisions on how to transform it into low-level tensor programs (i.e., deciding computation location, storage location, tile size, etc.). when all nodes are unfolded, a complete tensor program is constructed. this approach uses a set of general unfolding rules for every node, so it can search automatically without requiring manual templates. because the number of possible choices of each decision is large, to make the sequential process feasible, this approach keeps only top- $k$  candidate programs after every decision. the compiler estimates and compares the performance of candidate programs with a learned cost model to select the top- $k$  candidates; while other candidates are pruned. during the search, the candidate programs are incomplete because only part of the computational graph is unfolded or only some of the decisions are made. figure 2b shows this process.
+
+however, estimating the final performance of incomplete programs is difficult in several respects: (1) the cost model trained on complete programs cannot accurately predict the final performance of incomplete programs. the cost model can only be trained on complete programs because we need to compile programs and measure their execution time to get the labels for training. directly using this model to compare the final performance of incomplete programs will result in poor accuracy. as a case study, we train our cost model (§5.2) on 20,000 random complete programs from our search space and use the model to predict the final performance of incomplete programs. the incomplete programs are obtained by only applying a fraction of loop transformations of the complete programs. we use two ranking metrics for evaluation: the accuracy of pairwise comparison and the recall@k
+
+![](images/76e34c34d3ecb1b5a00ad2aa0a74e58284d88fdf02bf767f1b8bcc26cdf485d5.jpg)  
+figure 2: search strategy comparison. the pseudo-code shows tensor programs with loop nests. the question marks in orange background denote low-level parameters.  
+figure 3: pairwise comparison accuracy and top- $k$  recall curve on random partial programs. in both subfigures, higher values are better.
+
+![](images/2fc966223474e03b3128d6e92337392bd4be4bffdddd1212f4d780c5818f8ce6.jpg)
+
+score of top- $k$  programs  $^1 (k = 10)$ . as shown in figure 3, the two curves start from  $50\%$  and  $0\%$  respectively, meaning that random guess with zero information gives  $50\%$  pairwise comparison accuracy and  $0\%$  top- $k$  recall. the two curves increase quickly as the programs become complete, which means the cost model performs very well for complete programs but fails to accurately predict the final performance of incomplete programs. (2) the fixed order of sequential decisions limits the design of the search space. for example, some optimization needs to add new nodes to the computational graph (e.g., adding cache nodes, using rfactor [46]). the number of decisions for different programs becomes different. it is hard to align the incomplete programs for a fair comparison. (3) sequential construction based search is not scalable. enlarging the search space needs to add more sequential construction steps, which, however, leads to a worse accumulated error.
+
+ansor's hierarchical approach as shown in figure 2c, ansor is backed by a hierarchical search space that decouples high-level structures and low-level details. ansor constructs the search space for a computational graph automatically, eliminating the need to manually develop templates. ansor then samples complete programs from the space and performs fine-tuning on complete programs, avoiding the inaccurate estimation of incomplete programs. figure 2 shows the key dif
+
+ference between ansor's approach and existing approaches.
+
+# 3 design overview
+
+ansor is an automated tensor program generation framework. figure 4 shows the overall architecture of ansor. the input of ansor is a set of to be optimized dnns. ansor uses the operator fusion algorithm from relay [42] to convert dnns from popular model formats (e.g., onnx [6], tensorflow pb) to partitioned small subgraphs. ansor then generates tensor programs for these subgraphs. ansor has three major components: (1) a program sampler that constructs a large search space and samples diverse programs from it; (2) a performance tuner that fine-tunes the performance of sampled programs; (3) a task scheduler that allocates time resources for optimizing multiple subgraphs in the dnns.
+
+program sampler. one key challenge ansor has to address is generating a large search space for a given computational graph. to cover diverse tensor programs with various high-level structures and low-level details, ansor utilizes a hierarchical representation of the search space with two levels: sketch and annotation (§4). ansor defines the high-level structures of programs as sketches and leaves billions of low-level choices (e.g., tile size, parallel, unroll annotations) as annotations. this representation allows ansor to enumerate high-level structures flexibly and sample low-level details efficiently. ansor includes a program sampler that randomly samples programs from the space to provide comprehensive coverage of the search space.
+
+performance tuner. the performance of randomly sampled programs is not necessarily good. the next challenge is to fine-tune them. ansor employs evolutionary search and a learned cost model to perform fine-tuning iteratively (§5). at each iteration, ansor uses re-sampled new programs as well as good programs from previous iterations as the initial population to start the evolutionary search. evolutionary search fine-tunes programs by mutation and crossover which perform out-of-order rewrite and address the limitation of sequential construction. querying the learned cost model is orders of magnitude faster than actual measurement, so we can evaluate thousands of programs in seconds.
+
+task scheduler. using program sampling and performance fine-tuning allows ansor to find high-performance tensor programs for a computational graph. intuitively, treating a whole dnn as a single computational graph and generating a full tensor program for it could potentially achieve the optimal performance. this, however, is inefficient because it has to deal with the unnecessary exponential explosion of the search space. typically, the compiler partitions the large computational graph of a dnn into several small subgraphs [11,42]. this partition has a negligible effect on the performance thanks to the layer-by-layer construction nature of dnns. this brings the final challenge of ansor: how to allocate time resources when generating programs for multiple subgraphs.
+
+![](images/8e442241e8df04a247528802a87a51f84b9c0541f251d7a43eb59603244db90e.jpg)  
+figure 4: system overview. the gray arrows show the flow of extracting subgraphs from deep learning models and generating optimized programs for them. the green arrows mean the measurer returns profiling data to update the status of all components in the system.
+
+the task scheduler (§6) in ansor uses a scheduling algorithm based on gradient descent to allocate resources to the subgraphs that are more likely to improve the end-to-end dnn performance.
+
+# 4 program sampling
+
+the search space an algorithm explores determines the best programs it can find. the considered search spaces in existing approaches are limited by the following factors: (1) manual enumeration (e.g., tvm [12]). it is impractical to manually enumerate all possible choices by templates, so existing manual templates only cover a limited search space heuristically. (2) aggressive early pruning (e.g., halide auto-scheduler [2]). aggressive early pruning based on evaluating incomplete programs prevents the search algorithm from exploring certain regions in the space.
+
+in this section, we introduce techniques to push the boundary of the considered search space by addressing the above limitations. to solve (1), we automatically expand the search space by recursively applying a set of flexible derivation rules. to avoid (2), we randomly sample complete programs in the search space. since random sampling gives an equal chance to every point to be sampled, our search algorithm can potentially explore every program in the considered space. we do not rely on random sampling to find the optimal program, because every sampled program is later fined-tuned (§5).
+
+to sample programs that can cover a large search space, we define a hierarchical search space with two levels: sketch and annotation. we define the high-level structures of programs as sketches and leave billions of low-level choices (e.g., tile
+
+<table><tr><td>no</td><td>rule name</td><td>condition</td><td>application</td></tr><tr><td>1</td><td>skip</td><td>¬isstrictinlinable(s,i)</td><td>s&#x27; = s; i&#x27; = i - 1</td></tr><tr><td>2</td><td>always inline</td><td>isstrictinlinable(s,i)</td><td>s&#x27; = inline(s,i); i&#x27; = i - 1</td></tr><tr><td>3</td><td>multi-level tiling</td><td>hasdatareuse(s,i)</td><td>s&#x27; = multileveltiling(s,i); i&#x27; = i - 1</td></tr><tr><td>4</td><td>multi-level tiling with fusion</td><td>hasdatareuse(s,i) ∧ hasfusibleconsumer(s,i)</td><td>s&#x27; = fuseconsumer(multileveltiling(s,i),i); i&#x27; = i - 1</td></tr><tr><td>5</td><td>add cache stage</td><td>hasdatareuse(s,i) ∧ ¬hasfusibleconsumer(s,i)</td><td>s&#x27; = addcachewrite(s,i); i = i&#x27;</td></tr><tr><td>6</td><td>reduction factorization</td><td>hasmorereductionparallel(s,i)</td><td>s&#x27; = addrfactor(s,i); i&#x27; = i - 1</td></tr><tr><td>...</td><td>user defined rule</td><td>...</td><td>...</td></tr></table>
+
+table 1: derivation rules used to generate sketches. the condition runs on the current state  $\sigma = (s,i)$ . the application derives the next state  $\sigma^{\prime} = (s^{\prime},i^{\prime})$  from the current state  $\sigma$ . note that some function (e.g., addrfactor, fuseconsumer) can return multiple possible values of  $s^{\prime}$ . in this case we collect all possible  $s^{\prime}$ , and return multiple next states  $\sigma^{\prime}$  for a single input state  $\sigma$ .
+
+size, parallel, unroll annotations) as annotations. at the top level, we generate sketches by recursively applying a few derivation rules. at the bottom level, we randomly annotate these sketches to get complete programs. this representation summarizes a few basic structures from billions of low-level choices, enabling the flexible enumeration of high-level structures and efficient sampling of low-level details.
+
+while ansor supports both cpu and gpu, we explain the sampling process for cpus in §4.1 and §4.2 as an example. we then discuss how the process is different for gpu in §4.3.
+
+# 4.1 sketch generation
+
+as shown in figure 4, the program sampler accepts partitioned subgraphs as input. the first column in figure 5 shows two examples of the input. the input has three equivalent forms: the mathematical expression, the corresponding naive program obtained by directly expanding the loop indices, and the corresponding computational graph (directed acyclic graph, or dag).
+
+to generate sketches for a dag with multiple nodes, we visit all the nodes in a topological order and build the structure iteratively. for computation nodes that are compute-intensive and have a lot of data reuse opportunities (e.g., conv2d, matmul), we build basic tile and fusion structures for them as the sketch. for simple element-wise nodes (e.g., relu, elementwise add), we can safely inline them. note that new nodes (e.g., caching nodes, layout transform nodes) may also be introduced to the dag during the sketch generation.
+
+we propose a derivation-based enumeration approach to generate all possible sketches by recursively applying several basic rules. this process takes a dag as an input and returns a list of sketches. we define the state  $\sigma = (s,i)$ , where  $s$  is the current partially generated sketch for the dag, and  $i$  is the index of the current working node. the nodes in a dag are sorted in a topological order from output to input. the derivation begins from the initial naive program and the last node, or the initial state  $\sigma = (\text{naive program},\text{index of the last node})$ . then we try to apply all derivation rules to the states recursively. for each rule, if the current state satisfies the application condition, we apply the rule to  $\sigma = (s,i)$  and get  $\sigma' = (s',i')$  where  $i' \leq i$ . this way the index  $i$  (working node)
+
+decreases monotonically. a state becomes a terminal state when  $i = 0$ . during enumeration, multiple rules can be applied to one state to generate multiple succeeding states. one rule can also generate multiple possible succeeding states. so we maintain a queue to store all intermediate states. the process ends when the queue is empty. all  $\sigma .s$  in terminal states form a sketch list at the end of the sketch generation. the number of sketches is less than 10 for a typical subgraph.
+
+derivation rules. table 1 lists derivation rules we used for the cpu. we first provide the definition of the used predicates and then describe the functionality of each rule. isstrictinliable(s,i) indicates if the node  $i$  in  $s$  is a simple element-wise operator that can always be inlined (e.g., element-wise add,relu).hasdatareuse(s,i) indicates if the node  $i$  in  $s$  is a compute-intensive operator and has plentiful intra-operator data reuse opportunity (e.g.,matmul,conv2d).hasfusibleconsumer(s,i) indicates if the node  $i$  in  $s$  has only one consumer  $j$  and node  $j$  can be fused into node  $i$  (e.g.,matmul + bias_add,conv2d + relu).hasmorereductionparallel(s,i) indicates if the node  $i$  in  $s$  has little parallelism in space dimensions but has ample parallelism opportunity in reduction dimensions. (e.g., computing 2-norm of a matrix,matmul  $c_{2\times 2} = a_{2\times 512}\cdot b_{512\times 2}$ ).we perform static analysis on the computation definitions to get the values for these predicates. the analysis is done automatically by parsing the read/write pattern in the mathematical expressions. next, we introduce the functionality of each derivation rule.
+
+rule 1 just simply skips a node if it is not strictly inlnable. rule 2 always inlines strictly inlnable nodes. since the conditions of rule 1 and rule 2 are mutually exclusive, a state with  $i > 1$  can always satisfy one of them and continue to derive.
+
+rules 3, 4, and 5 deal with the multi-level tiling and fusion for nodes that have data reuse. rule 3 performs multi-level tiling for data reusable nodes. for cpu, we use a "ssrsrs" tile structure, where "s" stands for one tile level of space loops and "r" stands for one tile level of reduction loops. for example, in the matmul  $c(i,j) = \sum_{k} a[i,k] \times b[k,j]$ ,  $i$  and  $j$  are space loops and  $k$  is a reduction loop. the "ssrsrs" tile structure for matmul expands the original 3-level loop  $(i,j,k)$  into a 10-level loop  $(i_0,j_0,i_1,j_1,k_0,i_2,j_2,k_1,i_3,j_3)$ . although we do not permute the loop order, this multi-level
+
+tiling can also cover some cases of reordering. for example, the above 10-level loop can be specialized to just a simple reorder  $(k_0,j_2,i_3)$  by setting the length of other loops to one. the "ssrsrs" tile structure is general for compute-intensive dense operators (e.g., matmul, conv2d, conv3d) in deep learning, because they all consist of space loops and reduction loops.
+
+rule 4 performs multi-level tiling and also fuses the fusible consumers. for example, we fuse the element-wise nodes (e.g., relu, bias add) into the tiled nodes (e.g., conv2d, matmul). rule 5 adds a caching node if the current data-reusable node does not have a fusible consumer. for example, the final output node in a dag does not have any consumer, so it directly writes results into main memory by default and this is inefficient due to the high latency of memory accesses. by adding a cache node, we introduce a new fusible consumer into the dag, then rule 4 can be applied to fuse this newly added cache node into the final output node. with the cache node fused, now the final output node writes its results into a cache block, and the cache block will be written to the main memory at once when all data in the block is computed.
+
+rule 6 can use rfactor [46] to factorize a reduction loop into a space loop to bring more parallelism.
+
+examples. figure 5 shows three examples of the generated sketches. the sketches are different from the manual templates in tvm, because the manual templates specify both high-level structures and low-level details while sketches only define high-level structures. for the example input 1, the sorted order of the four nodes in the dag is  $(a,b,c,d)$ . to derive the sketches for the dag, we start from output node  $d(i = 4)$  and apply rules to the nodes one by one. specifically, the derivation for generated sketch 1 is:
+
+$$
+\begin{array}{l} i n p u t 1 \rightarrow \sigma (s _ {0}, i = 4) \xrightarrow {\text {r u l e} 1} \sigma (s _ {1}, i = 3) \xrightarrow {\text {r u l e} 4} \\ \sigma \left(s _ {2}, i = 2\right) \xrightarrow {\text {r u l e} 1} \sigma \left(s _ {3}, i = 1\right) \xrightarrow {\text {r u l e} 1} \text {s k e t c h} 1 \\ \end{array}
+$$
+
+for the example input 2, the sorted order of the five nodes is  $(a,b,c,d,e)$ . similarly, we start from the output node  $e(i = 5)$  and apply rules recursively. the generated sketch 2 is derived by:
+
+$$
+\begin{array}{l} i n p u t 2 \rightarrow \sigma (s _ {0}, i = 5) \xrightarrow {\text {r u l e} 5} \sigma (s _ {1}, i = 5) \xrightarrow {\text {r u l e} 4} \\ \sigma \left(s _ {2}, i = 4\right) \xrightarrow {\text {r u l e} 1} \sigma \left(s _ {3}, i = 3\right) \xrightarrow {\text {r u l e} 1} \\ \sigma \left(s _ {4}, i = 2\right) \xrightarrow {\text {r u l e} 2} \sigma \left(s _ {5}, i = 1\right) \xrightarrow {\text {r u l e} 1} \text {s k e t c h} 2 \\ \end{array}
+$$
+
+similarly, the generated sketch 3 is derived by:
+
+$$
+\begin{array}{l} i n p u t 2 \rightarrow \sigma (s _ {0}, i = 5) \xrightarrow {\text {r u l e} 6} \sigma (s _ {1}, i = 4) \xrightarrow {\text {r u l e} 1} \\ \sigma \left(s _ {2}, i = 3\right) \xrightarrow {\text {r u l e} 1} \sigma \left(s _ {3}, i = 2\right) \xrightarrow {\text {r u l e} 2} \\ \sigma \left(s _ {4}, i = 1\right) \xrightarrow {\text {r u l e} 1} \text {s k e t c h} 3 \\ \end{array}
+$$
+
+customization. while the presented rules are practical enough to cover the structures for most operators, there are always exceptions. for example, some special algorithms (e.g.,
+
+winograd convolution [30]) and accelerator intrinsics (e.g., tensorcore [37]) require special tile structures to be effective. although the template-guided search approach (in tvm) can craft a new template for every new case, it needs a great amount of design effort. on the other hand, the derivation-based sketch generation in ansor is flexible enough to generate the required structures for emerging algorithms and hardware, as we allow users to register new derivation rules and integrate them seamlessly with existing rules.
+
+# 4.2 random annotation
+
+the sketches generated by the previous subsection are incomplete programs because they only have tile structures without specific tile sizes and loop annotations, such as parallel, unroll, and vectorization. in this subsection, we annotate sketches to make them complete programs for fine-tuning and evaluation.
+
+given a list of generated sketches, we randomly pick one sketch, randomly fill out tile sizes, parallelize some outer loops, vectorize some inner loops, and unroll a few inner loops. we also randomly change the computation location of some nodes in the program to make a slight tweak to the tile structure. all "random" in this subsection means a uniform distribution over all valid values. if some special algorithms require custom annotations to be effective (e.g., special unrolling), we allow users to give simple hints in the computation definition to adjust the annotation policy. finally, since changing the layout of constant tensors can be done in compilation time and brings no runtime overhead, we rewrite the layouts of the constant tensors according to the multi-level tile structure to make them as cache-friendly as possible. this optimization is effective because the weight tensors of convolution or dense layers are constants for inference applications.
+
+examples of random sampling are shown in figure 5. the sampled program might have fewer loops than the sketch because the loops with length one are simplified.
+
+# 4.3 gpu support
+
+for gpu, we change the multi-level tiling structure from "ssrsrs" to "sssrrsrs" to match the architecture of gpu. the loops in the first three space tiles are bound to blockidx, virtual thread (for reducing bank conflicts), and threadidx, respectively. we add two sketch derivation rules, one for utilizing shared memory by inserting a caching node (similar to rule 5) and the other for cross-thread reduction (similar to rule 6).
+
+# 5 performance fine-tuning
+
+the programs sampled by the program sampler have good coverage of the search space, but their qualities are not guaranteed. this is because the optimization choices, such as tile structure and loop annotations, are all randomly sampled. in this
+
+# example input 1:
+
+* the mathematical expression:  $c[i,j] = \sum_{k} a[i,k] \times b[k,j]$
+
+$d[i,j] = \max (c[i,j],0.0)$
+
+where  $0\leq i,j,k <   512$
+
+* the corresponding naive program:
+
+for i in range(512):  
+    for j in range(512):  
+        for k in range(512):  
+            c[i, j] += a[i, k] * b[k, j]
+
+for i in range(512):  
+    for j in range(512):  
+        d[i, j] = max(c[i, j], 0.0)
+
+* the corresponding dag:
+
+![](images/572f95e94097e81241a308e60cd1ec68fd48b985810414b74cd558a6fd311c50.jpg)
+
+# example input 2:
+
+* the mathematical expression:
+
+$b[i,l] = \max (a[i,l],0.0)$
+
+[ c[i,k] = \left\{ \begin{array}{cc} b[i,k], & k < 400 \\ 0, & k \geq 400 \end{array} \right. ]
+[ e[i,j] = \sum_{k} c[i,k] \times d[k,j] ]
+
+where  $0\leq i <   8,0\leq j <   4,$ $0\leq k <   512,0\leq l <   400$
+
+* the corresponding naive program:
+
+for i in range(8):  
+    for l in range(400):  
+        b[i, l] = max(a[i, l], 0.0)  
+for i in range(8):  
+    for k in range(512):  
+        c[i, k] = b[i, k] if k < 400 else 0  
+for i in range(8):  
+    for j in range(4):  
+        for k in range(512):  
+            e[i, j] += c[i, k] * d[k, j]
+
+![](images/9234e1e3c0e47482e6a26017202ed1aa998fb5d67bb90f1d2dfb2a2103f1b9b7.jpg)  
+figure 5: examples of generated sketches and sampled programs. this figure shows two example inputs, three generated sketches and four sampled programs. the code example is pseudo code in a python-like syntax.
+
+# generated sketch 1
+
+for i.0 in range(tile_i0):  
+    for j.0 in range(tile_j0):  
+        for i.1 in range(tile_i1):  
+            for j.1 in range(tile_j1):  
+                for k.0 in range(tile_k0):  
+                    for i.2 in range(tile_i2):  
+                        for j.2 in range(tile_j2):  
+                            for k.1 in range(tile_i1):  
+                                for i.3 in range(tile_i3):  
+                        for j.3 in range(tile_j3):  
+                           c[...] += a[...] * b[...]  
+    for i.4 in range(tile_i2 * tile_i3):  
+        for j.4 in range(tile_j2 * tile_j3):  
+            d[...] = max(c[...], 0.0)
+
+# generated sketch 2
+
+for i in range(8):  
+    for k in range(512):  
+        c[i, j] = max(a[i, k], 0.0) if k < 400 else 0  
+for i.0 in range(tile_i0):  
+    for j.0 in range(tile_j0):  
+        for i.1 in range(tile_i1):  
+            for j.1 in range(tile_j1):  
+                for k.0 in range(tile_k0):  
+                    for i.2 in range(tile_i2):  
+                        for j.2 in range(tile_j2):  
+                            for k.1 in range(tile_i1):  
+                                for i.3 in range(tile_i3):  
+                                    for j.3 in range(tile_j3):  
+                    e.cache[...] += c[...] * d[...]  
+for i.4 in range(tile_i2 * tile_i3):  
+    for j.4 in range(tile_j2 * tile_j3):  
+        e[...] = e.cache[...]
+
+# generated sketch 3
+
+for i in range(8):  
+    for k in range(512):  
+        c[i, k] = max(a[i, k], 0.0) if k < 400 else 0  
+for i in range(8):  
+    for j in range(4):  
+        for k_o in range(tile_k0):  
+            for k_i in range(tile_ki):  
+                e.rf[...] += c[...] * d[...]  
+for i in range(8):  
+    for j in range(4):  
+        for k_i in range(tile_ki):  
+            e[...] += e.rf[...]
+
+# sampled program 1
+
+parallel i.0@j.0@i.18j.1 in range(256):  
+for k.0 in range(32):  
+    for i.2 in range(16):  
+        unroll k.1 in range(16):  
+            unroll i.3 in range(4):  
+                vectorize j.3 in range(16):  
+                    c[...] += a[...] * b[...]  
+for i.4 in range(64):  
+    vectorize j.4 in range(16):  
+        d[...] = max(c[...], 0.0)
+
+# sampled program 2
+
+```cpp
+parallel i.2 in range(16):
+    for j.2 in range(128):
+        for k.1 in range(512):
+            for i.3 in range(32):
+                vectorize j.3 in range(4):
+                    c[...] += a[...] * b[...]
+
+# sampled program 3
+
+```cpp
+parallel i.0 in range(8):
+    for k in range(512):
+        c[i, j] = max(a[i, k], 0.0)
+        if k < 400 else 0
+    for k.0 in range(512):
+        vectorize j.3 in range(4):
+            e-cache[...] += c[...] * d[...] + c[...] + d[...] + c[...] + d[...] + c[...] + d[...] + c[...] + d[...] + c[...] + d[...] + c[...] + d[...] + c[...] + d[...] + c[...] + d[...] + c[...] + d[...] + c[...] + d[...] + c[...] + d[...] + c[...] + d[...] + c[...] + d[...]
+
+# sampled program 4
+
+```cpp
+parallel i in range(8):
+    for k in range(512):
+        c[i, k] = ...
+    for j in range(4):
+        unroll k_o in range(32):
+            vectorized k_i in range(16):
+                e.rf[...] += c[...] * d[...]
+parallel i in range(8):
+    for j in range(4):
+        unroll k_i in range(16):
+            e[...] += e.rf[...]
+
+section, we introduce the performance tuner that fine-tunes the performance of the sampled programs via evolutionary search and a learned cost model.
+
+the fine-tuning is performed iteratively. at each iteration, we first use evolutionary search to find a small batch of promising programs according to a learned cost model. we then measure these programs on hardware to get the actual execution time cost. finally, the profiling data got from measurement is used to re-train the cost model to make it more accurate.
+
+the evolutionary search uses randomly sampled programs as well as high-quality programs from the previous measurement as the initial population and applies mutation and crossover to generate the next generation. the learned cost model is used to predict the fitness of each program, which is the throughput of one program in our case. we run evolution for a fixed number of generations and pick the best programs found during the search. we leverage a learned cost model because the cost model can give relatively accurate estimations of the fitness of programs while being orders of magnitudes
+
+faster than the actual measurement. it allows us to compare tens of thousands of programs in the search space in seconds, and pick the promising ones to do actual measurements.
+
+# 5.1 evolutionary search
+
+evolutionary search [54] is a generic meta-heuristic algorithm inspired by biological evolution. by iteratively mutating high-quality programs, we can generate new programs with potentially higher quality. the evolution starts from the sampled initial generation. to generate the next generation, we first select some programs from the current generation according to certain probabilities. the probability of selecting a program is proportional to its fitness predicted by the learned cost model ( $\s 5.2$ ), meaning that the program with a higher performance score has a higher probability to be selected. for the selected programs, we randomly apply one of the evolution operations to generate a new program. basically, for decisions we made during sampling ( $\s 4.2$ ), we design corresponding evolution
+
+operations to rewrite and fine-tune them.
+
+tile size mutation. this operation scans the program and randomly selects a tiled loop. for this tiled loop, it divides a tile size of one tile level by a random factor and multiplies this factor to another level. since this operation keeps the product of tile sizes equal to the original loop length, the mutated program is always valid.
+
+parallel mutation. this operation scans the program and randomly selects a loop that has been annotated with parallel. for this loop, this operation changes the parallel granularity by either fusing its adjacent loop levels or splitting it by a factor.
+
+pragma mutation. some optimizations in a program are specified by compiler-specific pragma. this operation scans the program and randomly selects a pragma. for this pragma, this operation randomly mutates it into another valid value. for example, our underlying code generator supports auto unrolling with a maximum number of steps by providing an auto_unroll_max_step=n pragma. we randomly tweak the number  $n$ .
+
+computation location mutation. this operation scans the program and randomly selects a flexible node that is not multilevel tiled (e.g., a padding node in the convolution layer). for this node, the operation randomly changes its computation location to another valid attach point.
+
+node-based crossover. crossover is an operation to generate new offspring by combining the genes from two or more parents. the genes of a program in ansor are its rewriting steps. every program generated by ansor is rewritten from its initial naive implementation. ansor preserves a complete rewriting history for each program during sketch generation and random annotation. we can treat rewriting steps as the genes of a program because they describe how this program is formed from the initial naive one. based on this, we can generate a new program by combining the rewriting steps of two existing programs. however, arbitrarily combining rewriting steps from two programs might break the dependencies in steps and create an invalid program. as a result, the granularity of crossover operation in ansor is based on nodes in the dag, because the rewriting steps across different nodes usually have less dependency. ansor randomly selects one parent for each node and merges the rewriting steps of selected nodes. when there are dependencies between nodes, ansor tries to analyze and adjust the steps with simple heuristics. ansor further verifies the merged programs to guarantee the functional correctness. the verification is simple because ansor only uses a small set of loop transformation rewriting steps, and the underlying code generator can check the correctness by dependency analysis.
+
+the evolutionary search leverages mutation and crossover to generate a new set of candidates repeatedly for several rounds and outputs a small set of programs with the highest scores. these programs will be compiled and measured on the target hardware to obtain the real running time cost. the col
+
+lected measurement data is then used to update the cost model. in this way, the accuracy of the learned cost model is gradually improved to match the target hardware. consequently, the evolutionary search gradually generates higher-quality programs for the target hardware platform.
+
+unlike the search algorithms in tvm and flextensor that can only work in a fixed grid-like parameter space, the evolutionary operations in ansor are specifically designed for tensor programs. they can be applied to general tensor programs and can handle a search space with complicated dependency. unlike the unfolding rules in halide auto-scheduler, these operations can perform out-of-order modifications to programs, addressing the sequential limitations.
+
+# 5.2 learned cost model
+
+a cost model is necessary for estimating the performance of programs quickly during the search. we adopt a learned cost model similar to related works [2, 12] with newly designed program features. a system based on learned cost models has great portability because a single model design can be reused for different hardware backends by feeding in different training data.
+
+since our target programs are mainly data parallel tensor programs, which are made by multiple interleaved loop nests with several assignment statements as the innermost statements, we train the cost model to predict the score of one innermost non-loop statement in a loop nest. for a full program, we make predictions for each innermost non-loop statement and add the predictions up as the score. we build the feature vector for an innermost non-loop statement by extracting features in the context of a full program. the extracted features include arithmetic features and memory access features. a detailed list of extracted features is in appendix b.
+
+we use weighted squared error as the loss function. because we mostly care about identifying the well-performing programs from the search space, we put more weight on the programs that run faster. specifically, the loss function of the model  $f$  on a program  $p$  with throughput  $y$  is  $loss(f, p, y) = w_{p} (\sum_{s \in s(p)} f(s) - y)^{2} = y (\sum_{s \in s(p)} f(s) - y)^{2}$  where  $s(p)$  is the set of innermost non-loop statements in  $p$ . we directly use the throughput  $y$  as weight. we train a gradient boosting decision tree [9] as the underlying model  $f$ . a single model is trained for all tensor programs coming from all dags, and we normalize the throughput of all programs coming from the same dag to be in the range of [0, 1]. when optimizing a dnn, the number of measured programs are typically less than 30,000. training a gradient boosting decision tree is very fast on such a small data sets, so we train a new model every time instead of doing incremental updates.
+
+# 6 task scheduler
+
+a dnn can be partitioned into many independent subgraphs (e.g., conv2d + relu). for some subgraphs, spending time in tuning them does not improve the end-to-end dnn performance significantly. this is due to two reasons: either (1) the subgraph is not a performance bottleneck, or (2) tuning brings only minimal improvement in the subgraph's performance.
+
+to avoid wasting time on tuning unimportant subgraphs, ansor dynamically allocates different amounts of time resources to different subgraphs. take resnet-50 for example, it has 29 unique subgraphs after the graph partitioning. most of these subgraphs are convolution layers with different shapes configurations (input size, kernel size, stride, etc). we need to generate different programs for different convolution layers because the best tensor program depends on these shape configurations. in reality, users may have multiple dnns for all their applications. this leads to more subgraphs as well as more opportunities to reduce the total tuning time, because we can share and reuse knowledge between subgraphs. a subgraph can also appear multiple times in a dnn or across different dnns.
+
+we define a task as a process performed to generate high-performance programs for a subgraph. it means that optimizing a single dnn requires finishing dozens of tasks (e.g., 29 tasks for resnet-50). ansor's task scheduler allocates time resources to tasks in an iterative manner. at each iteration, ansor selects a task, generates a batch of promising programs for the subgraph, and measures the program on hardware. we define such an iteration as one unit of time resources. when we allocate one unit of time resources to a task, the task obtains an opportunity to generate and measure new programs, which also means the chance to find better programs. we next present the formulation of the scheduling problem and our solution.
+
+# 6.1 problem formulation
+
+when tuning a dnn or a set of dnns, a user can have various types of goals, for example, reducing a dnn's latency, meeting latency requirements for a set of dnns, or minimizing tuning time when tuning no longer improves dnn performance significantly. we thus provide users a set of objective functions to express their goals. users can also provide their own objective functions.
+
+suppose there are  $n$  tasks in total. let  $t \in \mathbf{z}^n$  be the allocation vector, where  $t_i$  is the number of time units spent on task  $i$ . let the minimum subgraph latency task  $i$  achieves be a function of the allocation vector  $g_i(t)$ . let the end-to-end cost of the dnns be a function of the latency of the subgraphs  $f(g_1(t), g_2(t), \dots, g_3(t))$ . our objective is to minimize the end-to-end cost:
+
+$$
+\text {m i n i m i z e} f \left(g _ {1} (t), g _ {2} (t), \dots , g _ {3} (t)\right)
+$$
+
+$$
+\begin{array}{l} f _ {1} = \sum_ {j = 1} ^ {m} \sum_ {i \in s (j)} w _ {i} \times g _ {i} (t) \\ f _ {2} = \sum_ {j = 1} ^ {m} \max  \left(\sum_ {i \in s (j)} w _ {i} \times g _ {i} (t), l _ {j}\right) \\ f _ {3} = - \left(\prod_ {j = 1} ^ {m} \frac {b _ {j}}{\sum_ {i \in s (j)} w _ {i} \times g _ {i} (t)}\right) ^ {\frac {1}{m}} \\ f _ {4} = \sum_ {j = 1} ^ {m} \sum_ {i \in s (j)} w _ {i} \times \max  \left(g _ {i} (t), e s \left(g _ {i}, t\right)\right) \\ \end{array}
+$$
+
+table 2: examples of objective functions for multiple neural networks
+
+to minimize the end-to-end latency of a single dnn, we can define  $f(g_{1},g_{2},\dots,g_{n}) = \sum_{i = 1}^{n}w_{i}\times g_{i}$ , where  $w_{i}$  is the number of appearances of task  $i$  in the dnn. this formulation is straightforward because  $f$  is an approximation of the end-to-end dnn latency.
+
+when tuning a set of dnns, there are several options. table 2 shows a number of example objective functions for tuning multiple dnns. let  $m$  be the number of dnns,  $s(j)$  is the set of tasks that belong to dnn  $j$ .  $f_{1}$  adds up the latency of every dnn, which means to optimize the cost of a pipeline that sequentially runs all dnns once. in  $f_{2}$ , we define  $l_{j}$  as the latency requirement of dnn  $j$ , meaning that we do not want to spend time on a dnn if its latency has already met the requirement. in  $f_{3}$ , we define  $b_{j}$  as the reference latency of a dnn  $j$ . as a result, our goal is to maximize the geometric mean of speedup against the given reference latency. finally in  $f_{4}$ , we define a function  $es(g_{i},t)$  that returns an early stopping value by looking at the history of latency of task  $i$ . it can achieve the effect of per-task early stopping.
+
+# 6.2 optimizing with gradient descent
+
+we propose a scheduling algorithm based on gradient descent to efficiently optimize the objective function. given the current allocation  $t$ , the idea is to approximate the gradient of the objective function  $\frac{\partial f}{\partial t_i}$  in order to choose the task  $i$  such that  $i = \operatorname{argmax}_i \left| \frac{\partial f}{\partial t_i} \right|$ . we approximate the gradient by making an optimistic guess and considering the similarity between tasks.
+
+the derivation is in appendix a. we approximate the gradient by
+
+$$
+\begin{array}{l} \frac {\partial f}{\partial t _ {i}} \approx \frac {\partial f}{\partial g _ {i}} (\alpha \frac {g _ {i} (t _ {i}) - g _ {i} (t _ {i} - \delta t)}{\delta t} + \\ (1 - \alpha) (\min  (- \frac {g _ {i} (t _ {i})}{t _ {i}}, \beta \frac {c _ {i}}{\max  _ {k \in n (i)} v _ {k}} - g _ {i} (t _ {i}))) \\ \end{array}
+$$
+
+where  $\delta t$  is a small backward window size,  $g_{i}(t_{i})$  and  $g_{i}(t_{i} - \delta t)$  are known from the history of allocations.  $n(i)$  is the set of similar tasks of  $i$ ,  $c_i$  is the number of floating point operation in task  $i$  and  $v_{k}$  is the number of floating point operation per second we can achieve in task  $k$ . the parameter  $\alpha$  and  $\beta$  control the weight to trust some predictions.
+
+to run the algorithm, ansor starts from  $t = \mathbf{0}$  and warms up with a round of round-robin to get an initial allocation vector  $t = (1, 1, \dots, 1)$ . after the warm-up, at each iteration, we
+
+compute the gradient of each task and pick  $\mathrm{argmax}_i\left|\frac{\partial f}{\partial t_i}\right|$ . then we allocate the resource unit to task  $i$  and update the allocation vector  $t_i = t_i + 1$ . the optimization process continues until we run out of the time budget. to encourage exploration, we adopt a  $\varepsilon$ -greedy strategy [47], which preserves a probability of  $\varepsilon$  to randomly select a task.
+
+taking the case of optimizing for a single dnn's end-to-end latency for example, ansor prioritizes a subgraph that has a high initial latency because our optimistic guess says we can reduce its latency quickly. later, if ansor spends many iterations on it without observing a decrease in its latency, ansor leaves the subgraph because its  $\left|\frac{\partial f}{\partial t_i}\right|$  decreases.
+
+# 7 evaluation
+
+the core of ansor is implemented in  $\mathrm{c + + }$  with about 12k lines of code (3k for the search policy and 9k for other infrastructure). ansor generates programs in its own intermediate representation (ir). these programs are then lowered to tvm ir for code generation targeting various hardware platforms. ansor only utilizes tvm as a deterministic code generator.
+
+we evaluate the performance of generated programs on three levels: single operator, subgraph, and entire neural network. for each level of evaluation, we compare ansor against the state-of-the-art search frameworks and hardware-specific manual libraries. we also evaluate the search efficiency and the effectiveness of each component in ansor.
+
+the generated tensor programs are benchmarked on three hardware platforms: an intel cpu (18-core platinum 8124m@3.0 ghz), an nvidia gpu (v100), and an arm cpu (4-core cortex-a53@1.4ghz on the raspberry pi 3b+). we use float32 as the data type for all evaluations.
+
+# 7.1 single operator benchmark
+
+workloads. we first evaluate ansor on a set of common deep learning operators, including 1d, 2d, and 3d convolution (c1d, c2d, and c3d respectively), matrix multiplication (gmm), group convolution (grp), dilated convolution (dil) [57], depth-wise convolution (dep) [24], transposed 2d convolution (t2d) [40], capsule 2d convolution (cap) [23], and matrix 2-norm (nrm). for each operator, we select 4 common shape configurations and evaluate them with two batch sizes (1 and 16). in total, there are 10 operators  $\times 4$  shape configurations  $\times 2$  batch size  $= 80$  test cases. the shape configurations used can be found in appendix c. we run these test cases on the intel cpu.
+
+baselines. we include pytorch (v1.5) [39], halide autoscheduler (commit: 1f875b0) [2], flextensor (commit: 7ac302c) [58], and autotvm (commit: 69313a7) [12] as baselines. pytorch is backed by the vendor-provided kernel library mkl-dnn [27]. halide auto-scheduler is a sequential construction based search framework for halide. autotvm and flextensor are template-guided search frameworks based
+
+on tvm. since halide auto-scheduler does not have a pretrained cost model for avx-512, we disabled avx-512 for the evaluation in §7.1 and §7.2. for every operator, we use the best layout available in each framework, but the input and output tensors must not be packed.
+
+search settings. we let search frameworks (i.e., halide auto-scheduler, flextensor, autotvm, and ansor) to run search or auto-tuning with up to 1,000 measurement trials per test case. this means each framework can measure at most  $80 \times 1,000$  programs for auto-tuning in this evaluation. using the same number of measurement trials makes it a fair comparison without involving implementation details. in addition, using 1,000 measurement trials per test case is typically enough for the search to converge in these frameworks.
+
+normalization. figure 6 shows the normalized performance. for each test case, we normalize the throughputs to the best performing framework. we then plot the geometric mean of the four shapes of each operator. the geometric mean is also normalized to the best performing framework, so the best framework has a normalized performance of 1 in the figure. the error bar denotes the standard deviation of the normalized throughput of four shapes of each operator.
+
+results. as shown in the figure 6, ansor performs the best or equally the best in all operator and batch size settings. ansor outperforms existing search frameworks by  $1.1 - 22.5 \times$ . the performance improvements of ansor come from both its large search space and effective exploration strategy. for most operators, we found the best program generated by ansor is outside the search space of existing search frameworks because ansor is able to explore more optimization combinations. for example, the significant speedup on nrm is because ansor can parallelize reduction loops, while other frameworks do not. the large speedup on t2d is because ansor can use correct tile structures and unrolling strategies to let the code generator simplify the multiplication of zeros in striped transposed convolution. in contrast, other frameworks fail to capture many effective optimizations in their search space, making them unable to find the programs that ansor does. for example, the unfolding rules in halide do not split the reduction loop in gmm and do not split reduction loops in c2d when padding is computed outside of reduction loops. the templates in autotvm have limited tile structures, as they cannot cover the structure of "generated sketch 1" in figure 5. the template in flextensor does not change the computation location of padding. the template in flextensor fails to run for reduction operators like nrm.
+
+ablation study. we run four variants of ansor on a convolution operator and report the performance curve. we pick the last convolution operator in resnet-50 with batch size=16 as the test case, because its search space is sufficiently large to evaluate the search algorithms. other operators share a similar pattern. in figure 7, each curve is the median of 5 runs. "ansor (ours)" uses all our introduced techniques. "beam search" means we prune incomplete programs with the cost
+
+![](images/7406fae9190845ee60dcca6c1f65b9b5933a76dff22f1253003ffc362c939d8d.jpg)  
+figure 6: single operator performance benchmark on a 20-core intel-platinum-8269cy. the y-axis is the throughput normalized to the best throughput for each operator.
+
+![](images/63d8e39f70da88e7709933b9d8f161ebb86b3bd163cd508c45910f5521e50300.jpg)  
+figure 7: ablation study of four variants of ansor on a convolution operator. the y-axis is the throughput relative to the throughput of the best program.
+
+model during the sampling process and do not use fine-tuning. "no fine-tuning" is based on "ansor (ours)" but disables fine-tuning and only relies on random sampling. "limited space" is also based on "ansor (ours)" but limits the search space to make it similar to the space in existing manual templates (e.g., limit tiling level, innermost tile sizes, and computation location). as demonstrated by figure 7, dropping either the large search space or efficient fine-tuning decreases the final performance significantly. the aggressive early pruning in "beam search" throws away incomplete programs with good final performance due to inaccurate estimation.
+
+# 7.2 subgraph benchmark
+
+we perform the subgraph benchmark on two common subgraphs in dnns. the "convlayer" is a subgraph consisting of 2d convolution, batch normalization [28], and relu activation, which is a common pattern in convolutional neural networks. the "tbs" is a subgraph consisting of two matrix transposes, one batch matrix multiplication, and a softmax, which is a pattern in the multi-head attention [51] in language models. similar to the single operator benchmark (§7.1), we select four different shape configurations and two batch sizes, run auto-tuning with up to 1,000 measurement trails per test case, and report the normalized performance. we use the same set of baseline frameworks and run the benchmark on
+
+![](images/b72451c8d9f9821aee11197fd6e6c2585ac9cfba52523bf216fd369d9d9bd6fa.jpg)  
+figure 8: subgraph performance benchmark on a 20-core intel-platinum-8269cy and an nvidia v100. "@c" denotes cpu results and "@g" denotes gpu results. the y-axis is the throughput normalized to the best throughput for each subgraph.
+
+the intel cpu and the nvidia gpu. we do not report the performance of halide auto-scheduler on gpu because as of writing the paper its gpu support is still in an experimental stage. flextensor fails to run on complicated subgraphs like "tbs".
+
+figure 8 shows that ansor outperforms manual libraries and other search frameworks by  $1.1 - 14.2 \times$ . ansor can generate high-performance programs consistently for these subgraphs on both platforms. flextensor performs well for single operators but shows less advantage for subgraphs because it lacks the support of operator fusion.
+
+# 7.3 end-to-end network benchmark
+
+workloads. we benchmark the end-to-end inference execution time of several dnns, which include resnet-50 [22] and mobilenet-v2 [43] for image classification, 3d-resnet-18 [21] for action recognition, dcgan [40] generator for image generation, and bert [15] for language understanding. we benchmark these dnns on three hardware platforms. for the server-class intel cpu and nvidia gpu, we report the results for batch size 1 and batch size 16. for the arm cpu in the edge device, real-time feedback is typically desired, so we only report the results for batch size 1.
+
+baselines and settings. we include pytorch (v1.5 with torch script), tensorflow (v2.0 with graph mode), tensorrt (v6.0 with tensorflow integration) [38], tensorflow lite (v2.0), and autotvm as baseline frameworks. we do not include halide auto-scheduler or flextensor because they lack the support of widely-used deep learning model formats (e.g., onnx, tensorflow pb) and high-level graph optimizations. as a result, we expect that the end-to-end execution time they can achieve will be the sum of the latency of all subgraphs in a dnn. in contract, autotvm can optimize a whole dnn with its manual templates and various graph-level optimizations (e.g., graph-level layout search [32], graph-level constant folding [42]) which improve the performance significantly.
+
+![](images/087ccdd0952606d425966688bc82015eba54bd96e4accfd1cea4d05746691f14.jpg)  
+(a) intel cpu
+
+![](images/420a8e79bddf8ef1a1773f095df3651352b883fbc068b6cf3ec16fe568301ae5.jpg)  
+(b) nvidia gpu
+
+![](images/1b38e5b39f285245ef3eaa74aea2f61add8a3d29ec86757631042b9b22040c34.jpg)  
+(c) arm cpu  
+figure 9: network inference performance benchmark on three hardware platforms. the y-axis is the throughput relative to the best throughput for each network.
+
+ansor also performs layout rewrite as described in §4.2. we let both autotvm and ansor run auto-tuning until they use to  $1000 \times n$  measurement trials on each dnn, where  $n$  is the number of subgraphs in the dnn. this is typically enough for them to converge. we set the objective of the task scheduler as minimizing the total latency of one dnn and generate programs for these networks one by one. on the other hand, pytorch, tensorflow, tensorrt, and tensorflow lite are all backed by static kernel libraries (mkl-dnn on intel cpu, cudnn on nvidia gpu, and eigen on arm cpu) and do not need auto-tuning. we enable avx-512 for all frameworks on the intel cpu in this network benchmark.
+
+results. figure 9 shows the results on the intel cpu, nvidia gpu and arm  $\mathrm{cpu}^2$ . overall, ansor performs the
+
+![](images/1b90b06865d6c446307f283af35032938958004ad3fd6d898951792a29913673.jpg)  
+figure 10: network performance auto-tuning curve. the y-axis is the speedup relative to autotvm.
+
+best or equally the best in all cases. compared with search-based autotvm, ansor matches or outperforms it in all cases with  $1.0 - 21.8 \times$  speedup. compared with the best alternative, ansor improves the execution performance of dnns on the intel cpu, arm cpu, and nvidia gpu by up to  $3.8 \times$ ,  $2.6 \times$ , and  $1.7 \times$ , respectively. the reason for the significant speedup on dcgan is that dcgan mainly consists of transposed 2d convolution (t2d), which can be well optimized by ansor, as shown and explained in the single operator benchmark ( $\s 7.1$ ). autotvm performs very well for resnet-50 on the intel cpu thanks to its highly-optimized templates for 2d convolution and global layout search [32]. ansor does not run a global layout search but does rewrite the layout of weight tensors as described in  $\s 4.2$ . ansor uses more levels of tiling so it packs weight tensors into more levels. the layout rewrite brings about  $40\%$  improvement to resnet-50 in ansor. compared with vendor-specific static libraries, ansor has more advantages on uncommon shapes and small batch sizes, because it is not easy to manually optimize for these cases.
+
+ablation study. we run variants of ansor on two test cases in figure 10. in the left figure, we run four variants of ansor to generate programs for a single mobilenet-v2. in the right figure, we run these variants for both mobilenet-v2 and resnet-50. we set the objective function of the task scheduler to be the geometric mean of speedup against autotvm. as shown in figure 10, "no task scheduler" means we use a round-robin strategy to allocate equal time resources to all subgraphs. "limited space" is based on "ansor (ours)" but limits the search space. "no fine-tuning" is also based on "ansor (ours)" but disables fine-tuning and relies on random sampling only. as can be seen in figure 10, "limited space" performs the worst in terms of the final achieved performance, proving that the best programs are not included in the limited space. the final achieved performance can be improved by enlarging the search space, as depicted in "no fine-tuning". however, in the right figure, randomly assigning tile sizes and annotations still cannot beat autotvm in the given time budget. after enabling fine-tuning, "no task scheduler" outperforms autotvm in both cases. finally, "ansor (ours)" em
+
+ploys the task scheduler to prioritize performance bottlenecks (e.g., subgraphs contain  $3 \times 3$  convolution), so it performs the best in both search efficiency and the final achieved performance.
+
+# 7.4 search time
+
+ansor searches efficiently and can outperform or match autotvm with less search time. ansor slices the time and utilizes the task scheduler to simultaneously optimize all subgraphs together. in contrast, autotvm and other systems do not have a task scheduler, so they generate programs for all subgraphs one by one with a predefined budget of measurement trials for each subgraph. ansor saves the search time by prioritizing important subgraphs, while autotvm spends predefined time budget on every subgraph, which may be a waste on the unimportant subgraphs.
+
+table 3 shows the search time required for ansor to match the performance of autotvm on the intel cpu network benchmark (§7.3). we list the search time in two metrics: number of measurements and wall-clock time. "number of measurements" is a metric agnostic to the implementation of measurement and the overhead of search algorithm, while "wall-clock time" takes these factors into account. as shown in the table, ansor can match the performance of autotvm with an order of magnitude less search time. in table 3a the saving in search time comes from the task scheduler, efficient fine-tuning, and comprehensive coverage of effective optimizations. in table 3b, ansor shows more time-saving in wall-clock time. this is because ansor does not introduce much search overhead and has a better implementation of the measurement (on the intel cpu, ansor can get accurate measurement results with fewer repetitions by explicitly flushing the cache for some tensors). on other backends, ansor can match the performance of autotvm with a similar saving in search time.
+
+typically, it takes several hours for ansor to generate fully-optimized programs for a dnn on a single machine. this is acceptable for inference applications because it is a one-shot effort before deployment. in addition, the whole architecture of ansor can be parallelized very easily.
+
+# 7.5 cost model evaluation
+
+in this subsection, we evaluate the prediction quality of the learned cost model. we use 25,000 programs measured during tuning resnet-50 on the intel cpu as the data set. we randomly pick 20,000 programs as the training set and use the remaining 5,000 programs as the test set. we train the cost model and let it make predictions for the test set.
+
+figure 11 plots the predicted throughputs vs. measured throughputs. the measured throughputs are normalized to the best performing programs in the test set. the predicted
+
+<table><tr><td></td><td>autotvm</td><td>ansor</td><td>time-saving</td></tr><tr><td>resnet-50</td><td>21,220</td><td>6,403</td><td>3.3 ×</td></tr><tr><td>mobilenet-v2</td><td>31,272</td><td>1,892</td><td>16.5 ×</td></tr><tr><td>3d-resnet</td><td>5,158</td><td>1,927</td><td>2.7 ×</td></tr><tr><td>dcgan</td><td>3,003</td><td>298</td><td>10.1 ×</td></tr><tr><td>bert</td><td>6,220</td><td>496</td><td>12.5 ×</td></tr></table>
+
+(a) the number of measurements.  
+
+<table><tr><td></td><td>autotvm</td><td>ansor</td><td>time-saving</td></tr><tr><td>resnet-50</td><td>39,250</td><td>4,540</td><td>8.6 ×</td></tr><tr><td>mobilenet-v2</td><td>58,468</td><td>660</td><td>88.6 ×</td></tr><tr><td>3d-resnet</td><td>7,594</td><td>2,296</td><td>3.3 ×</td></tr><tr><td>dcgan</td><td>4,914</td><td>420</td><td>11.7 ×</td></tr><tr><td>bert</td><td>12,007</td><td>266</td><td>45.1 ×</td></tr></table>
+
+(b) wall-clock time (seconds)
+
+table 3: the number of measurements and wall-clock time used for ansor to match the performance of autotvm on the intel cpu (batch size=1).
+
+![](images/3e9c0f1d0175a6da2da3446371c686805064566c5d6061ea2d4297de85bc58be.jpg)
+
+![](images/f574ae1fc593e1905a4f43b21c452aaad3b24a56c92a23edce351b4ee67c4204.jpg)  
+figure 11: measured throughputs vs. predicted throughputs.
+
+throughputs are the output of the model, so they can be negative. in figure 11a, the points scatter around the diagonal line, meaning that the model makes accurate predictions. the distribution is not uniform because the data set is collected during the search. good programs have a higher probability to be chosen for measurements, so most of the programs are in the top right corner. the points with measured throughput 0.0 are programs that are invalid or killed due to timeout during measurements. in figure 11b, we sort the 5000 points according to the predictions from the slowest to the fastest, and use the relative ranking as x-axis. so the points are distributed uniformly over x-axis. it shows the distribution of performance of the explored programs better.
+
+the model archives 0.079 rmse,  $0.958r^2$  correlation, 0.851 pairwise comparison accuracy, and 0.624 recall@30 of top-30 programs (see the definition at footnote 1) on the test set.
+
+# 8 related work
+
+automatic tensor program generation based on scheduling languages. halide [41] introduces a scheduling language that can describe loop optimization primitives. this language
+
+is suitable for both manual optimization and automatic search. halide has three versions of auto-scheduler based on different techniques [2, 31, 36]. the latest one with beam search and learned cost model performs the best among them, which is also used in our evaluation. tvm [11] utilizes a similar scheduling language and includes a template-guided search framework autotvm [12]. flextensor [58] proposes general templates that can target a set of operators, but its templates are designed for single operators. it is hard to use these templates for optimizations involving multiple operators (e.g., operator fusion). a concurrent work protuner [19] uses monte carlo tree search to solve the inaccurate estimation problem in halide auto-scheduler. protuner mainly targets image processing workloads, while ansor targets deep learning workloads and introduces new search space and other optimizations.
+
+polyhedral compilation models. the polyhedral compilation model [8,52,53] formulates the optimization of programs as an integer linear programming (ilp) problem. it optimizes a program with affine loop transformation that minimizes the data reuse distance between dependent statements. tiramisu [5] and tensorcomprehensions [49] are two polyhedral compilers that also target the deep learning domain. tiramisu provides a scheduling language similar to the halide language, and it needs manual scheduling. tensorcomprehensions can search for gpu code automatically, but it is not yet meant to be used for compute-bounded problems [11]. it cannot outperform tvm on operators like conv2d and matmul [11,48]. this is because of the lack of certain optimizations [50] and the inaccurate implicit cost model in the polyhedral formulation.
+
+graph-level optimization for deep learning. graph-level optimizations treat an operator in the computational graph as a basic unit and perform optimization at graph level without changing the internal implementations of operators. the common optimizations at graph level include layout optimizations [32], operator fusion [11, 38, 59], constant folding [42], auto-batching [33], automatic generation of graph substitution [29] and so forth. the graph-level optimizations are typically complementary to operator-level optimizations. graph-level optimizations can also benefit from high-performance implementations of operators. for example, general operator fusion relies on the code generation ability of ansor. we leave the joint optimization of ansor and more graph-level optimization as future work.
+
+search-based compilation and auto-tuning. search based compilation and auto-tuning have already shown their effectiveness in domains other than deep learning. stock [44] is a super-optimizer based on random search. stock searches for loop-free hardware instruction sequences, while ansor generates tensor programs with nests of loops. opentuner [4] is a general framework for program auto-tuning based on multi-armed bandit approaches. opentuner relies on user-specified search space, while ansor constructs the search space automatically. traditional high-performance libraries such as
+
+atlas [56] and fftw [16] also utilize auto-tuning. more recent works neurovectorizer [18] and autophase [20, 26] use deep reinforcement learning to automatically vectorize programs and optimize the compiler phase ordering.
+
+# 9 limitations and future work
+
+one of ansor's limitations is that ansor cannot optimize graphs with dynamic shapes [45]. ansor requires the shapes in the computational graph to be static and known in advance to do analysis, construct the search space, and perform measurements. how to generate programs for symbolic or dynamic shape is an interesting future direction. another limitation is that ansor only supports dense operators. to support sparse operators (e.g., spmm) that are commonly used in sparse neural networks [17] and graph neural networks [25], we expect that a large portion of ansor can still be reused, but we need to redesign the search space. lastly, ansor only performs program optimizations at a high level but relies on other code generators (e.g., llvm and nvcc) to do platform-dependent optimizations (e.g., instruction selection). ansor comes short of utilizing the special instructions, such as intel vnni, nvidia tensor core, and arm dot for mixed-precision and low-precision operators, which are not handled well by the off-the-shelf code generators currently.
+
+# 10 conclusion
+
+we propose ansor, an automated search framework that generates high-performance tensor programs for deep neural networks. by efficiently exploring a large search space and prioritizing performance bottlenecks, ansor finds high-performance programs that are outside the search space of existing approaches. ansor outperforms existing manual libraries and search-based frameworks on a diverse set of neural networks and hardware platforms by up to  $3.8 \times$ . by automatically searching for better programs, we hope that ansor will help bridge the gap between the increasing demand in computing power and limited hardware performance. ansor is integrated into the apache tvm open-source project<sup>3</sup>.
+
+# 11 acknowledgement
+
+we would like to thank weizhao xian, tianqi chen, frank luan, anonymous reviewers, and our shepherd, derek murray, for their insightful feedback. in addition to nsf cise expeditions award ccf-1730628, this research is supported by gifts from alibaba group, amazon web services, ant group, capitalone, ericsson, facebook, futurewei, google, intel, microsoft, nvidia, scotiabank, splunk, and vmware.
+
+# references
+
+[1] martin abadi, paul barham, jianmin chen, zhifeng chen, andy davis, jeffrey dean, matthieu devin, sanjay ghemawat, geoffrey irving, michael isard, et al. tensorflow: a system for large-scale machine learning. in 12th usenix symposium on operating systems design and implementation (osdi 16), pages 265-283, 2016.  
+[2] andrew adams, karima ma, luke anderson, riyadh baghdadi, tzu-mao li, michael gharbi, benoit steiner, steven johnson, kayvon fatahalian, fredo durand, et al. learning to optimize halide with tree search and random programs. acm transactions on graphics (tog), 38(4):1-12, 2019.  
+[3] hassan abu alhaija, siva karthik mustikovela, lars mescheder, andreas geiger, and carsten rother. augmented reality meets deep learning for car instance segmentation in urban scenes. in *british machine vision conference*, volume 1, page 2, 2017.  
+[4] jason ansel, shoaib kamil, kalyan veeramachaneni, jonathan ragan-kelley, jeffrey bosboom, una-may o'reilly, and saman amarasinghe. opentuner: an extensible framework for program autotuning. in proceedings of the 23rd international conference on parallel architectures and compilation, pages 303-316, 2014.  
+[5] riyadh baghdadi, jessica ray, malek ben romdhane, emanuele del sozzo, abdurrahman akkas, yunming zhang, patricia suriana, shoaib kamil, and saman amarasinghe. tiramisu: a polyhedral compiler for expressing fast and portable code. in 2019 ieee/acm international symposium on code generation and optimization (cgo), pages 193-205. ieee, 2019.  
+[6] junjie bai, fang lu, ke zhang, et al. onnx: open neural network exchange, 2019.  
+[7] paul barham and michael isard. machine learning systems are stuck in a rut. in proceedings of the workshop on hot topics in operating systems, pages 177-183, 2019.  
+[8] uday bondhugula, albert hartono, jagannathan ramanujam, and ponnuswamy sadayappan. a practical automatic polyhedral parallelizer and locality optimizer. in proceedings of the 29th acm sigplan conference on programming language design and implementation, pages 101-113, 2008.  
+[9] tianqi chen and carlos guestrin. xgboost: a scalable tree boosting system. in proceedings of the 22nd acm sigkdd international conference on knowledge discovery and data mining, pages 785-794, 2016.
+
+[10] tianqi chen, mu li, yutian li, min lin, naiyan wang, minjie wang, tianjun xiao, bing xu, chiyuan zhang, and zheng zhang. mxnet: a flexible and efficient machine learning library for heterogeneous distributed systems. arxiv preprint arxiv:1512.01274, 2015.  
+[11] tianqi chen, thierry moreau, ziheng jiang, lianmin zheng, eddie yan, haichen shen, meghan cowan, leyuan wang, yuwei hu, luis ceze, et al. tvm: an automated end-to-end optimizing compiler for deep learning. in 13th usenix symposium on operating systems design and implementation (osdi 18), pages 578-594, 2018.  
+[12] tianqi chen, lianmin zheng, eddie yan, ziheng jiang, thierry moreau, luis ceze, carlos guestrin, and arvind krishnamurthy. learning to optimize tensor programs. in advances in neural information processing systems, pages 3389-3400, 2018.  
+[13] sharan chetlur, cliff woolley, philippe vandermersch, jonathan cohen, john tran, bryan catanzaro, and evan shelhamer. codnn: efficient primitives for deep learning. arxiv preprint arxiv:1410.0759, 2014.  
+[14] marius cordts, mohamed omran, sebastian ramos, timo rehfeld, markus enzweiler, rodrigo benenson, uwe franke, stefan roth, and bernt schiele. the cityscapes dataset for semantic urban scene understanding. in proceedings of the ieee conference on computer vision and pattern recognition, pages 3213-3223, 2016.  
+[15] jacob devlin, ming-wei chang, kenton lee, and kristina toutanova. bert: pre-training of deep bidirectional transformers for language understanding. arxiv preprint arxiv:1810.04805, 2018.  
+[16] matteo frigo and steven g johnson. fftw: an adaptive software architecture for the fft. in proceedings of the 1998 ieee international conference on acoustics, speech and signal processing, icassp'98 (cat. no. 98ch36181), volume 3, pages 1381-1384. ieee, 1998.  
+[17] trevor gale, erich elsen, and sara hooker. the state of sparsity in deep neural networks. arxiv preprint arxiv:1902.09574, 2019.  
+[18] ameer haj-ali, nesreen k ahmed, ted willke, yakun sophia shao, krste asanovic, and ion stoica. neurovectorizer: end-to-end vectorization with deep reinforcement learning. in proceedings of the 18th acm/ieee international symposium on code generation and optimization, pages 242-255, 2020.  
+[19] ameer haj-ali, hasan genc, qijing huang, william moses, john wawrzynek, krste asanovic, and ion stoica. protuner: tuning programs with monte carlo tree search. arxiv preprint arxiv:2005.13685, 2020.
+
+[20] ameer haj-ali, qijing huang, william moses, john xiang, john wawrzynek, krste asanovic, and ion stoica. autophase: juggling hls phase orderings in random forests with deep reinforcement learning. in third conference on machine learning and systems (ml-sys), 2020.  
+[21] kensho hara, hirokatsu kataoka, and yutaka satoh. can spatiotemporal 3d cnns retrace the history of 2d cnns and imagenet? in proceedings of the ieee conference on computer vision and pattern recognition (cvpr), pages 6546-6555, 2018.  
+[22] kaiming he, xiangyu zhang, shaoqing ren, and jian sun. deep residual learning for image recognition. in proceedings of the ieee conference on computer vision and pattern recognition, pages 770-778, 2016.  
+[23] geoffrey e hinton, sara sabour, and nicholas frosst. matrix capsules with em routing. 2018.  
+[24] andrew g howard, menglong zhu, bo chen, dmitry kalenichenko, weijun wang, tobias weyand, marco andreetto, and hartwig adam. mobilenets: efficient convolutional neural networks for mobile vision applications. arxiv preprint arxiv:1704.04861, 2017.  
+[25] yuwei hu, zihao ye, minjie wang, jiali yu, da zheng, mu li, zheng zhang, zhiru zhang, and yida wang. featgraph: a flexible and efficient backend for graph neural network systems. arxiv preprint arxiv:2008.11359, 2020.  
+[26] qijing huang, ameer haj-ali, william moses, john xiang, ion stoica, krste asanovic, and john wawrzynek. autophase: compiler phase-ordering for hls with deep reinforcement learning. in 2019 ieee 27th annual international symposium on field-programmable custom computing machines (fccm), pages 308–308. ieee, 2019.  
+[27] intel. intel® math kernel library for deep learning networks, 2017.  
+[28] sergey ioffe and christian szegedy. batch normalization: accelerating deep network training by reducing internal covariate shift. arxiv preprint arxiv:1502.03167, 2015.  
+[29] zhihao jia, oded padon, james thomas, todd warszawski, matei zaharia, and alex aiken. taso: optimizing deep learning computation with automatic generation of graph substitutions. in proceedings of the 27th acm symposium on operating systems principles, pages 47-62, 2019.
+
+[30] andrew lavin and scott gray. fast algorithms for convolutional neural networks. in proceedings of the ieee conference on computer vision and pattern recognition, pages 4013-4021, 2016.  
+[31] tzu-mao li, michael gharbi, andrew adams, frédo durand, and jonathan ragan-kelley. differentiable programming for image processing and deep learning in halide. acm transactions on graphics (tog), 37(4):139, 2018.  
+[32] yizhi liu, yao wang, ruofei yu, mu li, vin sharma, and yida wang. optimizing cnn model inference on cpus. in 2019 usenix annual technical conference (usenix atc 19), pages 1025-1040, 2019.  
+[33] moshe looks, marcello herreshoff, delesley hutchins, and peter norvig. deep learning with dynamic computation graphs. arxiv preprint arxiv:1702.02181, 2017.  
+[34] mark f. medress, franklin s cooper, jim w. forgie, cc green, dennis h. klatt, michael h. o'malley, edward p neuburg, allen newell, dr reddy, b ritea, et al. speech understanding systems: report of a steering committee. artificial intelligence, 9(3):307-316, 1977.  
+[35] thierry moreau, tianqi chen, luis vega, jared roesch, eddie yan, lianmin zheng, josh fromm, ziheng jiang, luis ceze, carlos guestrin, et al. a hardware-software blueprint for flexible deep learning specialization. ieee micro, 39(5):8-16, 2019.  
+[36] ravi teja mullapudi, andrew adams, dillon sharlet, jonathan ragan-kelley, and kayvon fatahalian. automatically scheduling halide image processing pipelines. acm transactions on graphics (tog), 35(4):83, 2016.  
+[37] nvidia. nvidia tensor cores, 2017.  
+[38] nvidia. nvidia tensor: programmable inference accelerator, 2017.  
+[39] adam paszke, sam gross, francisco massa, adam lerer, james bradbury, gregory chanan, trevor killeen, zeming lin, natalia gimelshein, luca antiga, et al. pytorch: an imperative style, high-performance deep learning library. in advances in neural information processing systems, pages 8024-8035, 2019.  
+[40] alec radford, luke metz, and soumith chintala. unsupervised representation learning with deep convolutional generative adversarial networks. arxiv preprint arxiv:1511.06434, 2015.  
+[41] jonathan ragan-kelley, connelly barnes, andrew adams, sylvain paris, frédo durand, and saman amarasinghe. halide: a language and compiler for optimizing parallelism, locality, and recomputation in image
+
+processing pipelines. acm sigplan notices, 48(6):519-530, 2013.  
+[42] jared roesch, steven lyubomirsky, marisa kirisame, josh pollock, logan weber, ziheng jiang, tianqi chen, thierry moreau, and zachary tatlock. relay: a high-level compiler for deep learning. arxiv preprint arxiv:1904.08368, 2019.  
+[43] mark sandler, andrew howard, menglong zhu, andrey zhmoginov, and liang-chieh chen. *mobilenetv2: inverted residuals and linear bottlenecks*. in *proceedings of the ieee conference on computer vision and pattern recognition*, pages 4510–4520, 2018.  
+[44] eric schkufza, rahul sharma, and alex aiken. stochastic superoptimization. acm sigarch computer architecture news, 41(1):305-316, 2013.  
+[45] haichen shen, jared roesch, zhi chen, wei chen, yong wu, mu li, vin sharma, zachary tatlock, and yida wang. nimble: efficiently compiling dynamic neural networks for model inference. arxiv preprint arxiv:2006.03031, 2020.  
+[46] patricia suriana, andrew adams, and shoaib kamil. parallel associative reductions in halide. in 2017 ieee/acm international symposium on code generation and optimization (cgo), pages 281-291. ieee, 2017.  
+[47] richard s sutton and andrew g barto. reinforcement learning: an introduction. mit press, 2018.  
+[48] philippe tillet, ht kung, and david cox. triton: an intermediate language and compiler for tiled neural network computations. in proceedings of the 3rd acm sigplan international workshop on machine learning and programming languages, pages 10-19, 2019.  
+[49] nicolas vasilache, oleksandr zinenko, theodoros theodoridis, priya goyal, zachary devito, william s moses, sven verdoolaege, andrew adams, and albert cohen. tensor comprehensions: framework-agnostic high-performance machine learning abstractions. arxiv preprint arxiv:1802.04730, 2018.  
+[50] nicolas vasilache, oleksandr zinenko, theodoros theodoridis, priya goyal, zachary devito, william s moses, sven verdoolaege, andrew adams, and albert cohen. the next 700 accelerated layers: from mathematical expressions of network computation graphs to accelerated gpu kernels, automatically. acm transactions on architecture and code optimization (taco), 16(4):1-26, 2019.
+
+[51] ashish vaswani, noam shazeer, niki parmar, jakob uszkoreit, llion jones, aidan n gomez, lukasz kaiser, and illia polosukhin. attention is all you need. in advances in neural information processing systems, pages 5998-6008, 2017.  
+[52] sven verdoolaege. presburger formulas and polyhedral compilation. 2016.  
+[53] sven verdoolaege, juan carlos juega, albert cohen, jose ignacio gomez, christian tenllado, and francky catthoor. polyhedral parallel code generation for cuda. acm transactions on architecture and code optimization (taco), 9(4):1-23, 2013.  
+[54] pradnya a vikhar. evolutionary algorithms: a critical review and its future prospects. in 2016 international conference on global trends in signal processing, information computing and communication (icgtspicc), pages 261-265. ieee, 2016.  
+[55] leyuan wang, zhi chen, yizhi liu, yao wang, lianmin zheng, mu li, and yida wang. a unified optimization approach for cnn model inference on integrated gpus. in proceedings of the 48th international conference on parallel processing, pages 1-10, 2019.  
+[56] r clinton whaley and jack j dongarra. automatically tuned linear algebra software. in sc'98: proceedings of the 1998 acm/ieee conference on supercomputing, pages 38-38. ieee, 1998.  
+[57] fisher yu and vladlen koltun. multi-scale context aggregation by dilated convolutions. arxiv preprint arxiv:1511.07122, 2015.  
+[58] size zheng, yun liang, shuo wang, renze chen, and kaiwen sheng. flextensor: an automatic schedule exploration and optimization framework for tensor computation on heterogeneous systems. in proceedings of the twenty-fifth international conference on architectural support for programming languages and operating systems, pages 859-873, 2020.  
+[59] zhen zheng, pengzhan zhao, guoping long, feiwen zhu, kai zhu, wenyi zhao, lansong diao, jun yang, and wei lin. fusionstitching: boosting memory intensive computations for deep learning workloads. arxiv preprint arxiv:2009.10924, 2020.
+
+# a gradient approximation for the task scheduler
+
+now we show how to approximate the gradient for the objective function  $f$ . first, do the approximation  $g_{i}(t) \approx g_{i}(t_{i})$ . this means we assume the best cost of task  $i$  depends only on
+
+the resource units spent on it. this may not be true because all tasks share a cost model. different resource allocations lead to different collections of training data, which then leads to different cost models. here we make this approximation to continue derivation:
+
+$$
+\begin{array}{l} \frac {\partial f}{\partial t _ {i}} = \frac {\partial f}{\partial g _ {i}} \frac {\partial g _ {i}}{\partial t _ {i}} \\ \approx \frac {\partial f}{\partial g _ {i}} (\alpha \frac {g _ {i} (t _ {i}) - g _ {i} (t _ {i} - \delta t)}{\delta t} + (1 - \alpha) \frac {g _ {i} (t _ {i} + \delta t) - g _ {i} (t _ {i})}{\delta t}) \\ \approx \frac {\partial f}{\partial g _ {i}} \left(\alpha \frac {g _ {i} \left(t _ {i}\right) - g _ {i} \left(t _ {i} - \delta t\right)}{\delta t} + (1 - \alpha) \left(g _ {i} \left(t _ {i} + 1\right) - g _ {i} \left(t _ {i}\right)\right)\right) \\ \end{array}
+$$
+
+in this expression,  $\delta t$  is a small backward window size,  $g_{i}(t_{i})$  and  $g_{i}(t_{i} - \delta t)$  are known from the history allocations. but  $g_{i}(t_{i} + 1)$  is unknown because we have not allocated  $t_i + 1$  units of resource to this task. so we have to predict this value. the parameter  $\alpha$  controls the weight to trust the prediction. we predict  $g_{i}(t_{i} + 1)$  in two ways. first, we have an optimistic guess that if we spend extra  $t_i$ , we can decrease the latency of task  $i$  to 0. this means  $g_{i}(t_{i} + 1) \approx g_{i}(t_{i}) - \frac{g_{i}(t_{i})}{t_{i}}$ . second, if subgraphs are structurally similar, their latency is also similar per floating point operation. considering both factors, we have the following approximation:
+
+$$
+g _ {i} \left(t _ {i} + 1\right) \approx \min  \left(g _ {i} \left(t _ {i}\right) - \frac {g _ {i} \left(t _ {i}\right)}{t _ {i}}, \beta \frac {c _ {i}}{\max  _ {k \in n (i)} v _ {k}}\right)
+$$
+
+where  $n(i)$  is the set of similar tasks of  $i$ ,  $c_i$  is the number of floating point operations in task  $i$  and  $v_k$  is the number of floating point operation per second we can achieve in task  $k$ . the parameter  $\beta$  controls the weight to trust the prediction based on similarity.
+
+# b the list of extracted features
+
+we extract the following features for one innermost non-loop statement in the context of a full tensor program. the features include categorical features and numerical features. we use one-hot encoding to encode category features. the length of a feature vector including all the listed features for one statement is 164. we use the same set of features for both cpu and gpu.
+
+- numbers of float operations. the numbers of addition, subtraction, division, modulo operation, comparison, intrinsic math function call (e.g., exp, sqrt) and other math function call respectively, with floating point operands.  
+- number of integer operations. similar to the above one, but for operations with integer operands.  
+- vectorization related features. the length of the innermost vectorized loop. the type of vectorization position
+
+(innerspatial, middlespatial, outerspatial, innerreduce, middlereduce, outerreduce, mixed, none). the product of the lengths of all vectorized loops. the number of vectorized loops.
+
+- unrolling related features. similar to the vectorization related features, but for unrolling.  
+- parallelization related features. similar to the vectorization related features, but for parallelization.  
+- gpu thread binding related features. the lengths of blockidx.x, blockidx.y, blockidx.z, threadidx.x, threadidx.y, threadidx.z and virtual threads [11].  
+- arithmetic intensity curve. arithmetic intensity is defined as  $\frac{\text{the number of floating point operations}}{\text{the number of bytes accessed}}$ . we compute the arithmetic intensity for each loop level and draw a curve with linear interpolation. then we sample 10 points from this curve.  
+- buffer access feature. for each buffer this statement accesses, we extract features for it. while different statements can access different numbers of buffers, we perform feature extraction for at most five buffers. we pad zeros if a statement accesses less than five buffers and remove small buffers if a statement accesses more than five buffers.
+
+- access type. the type of access (read, write, read + write).  
+- bytes. the total number of bytes accessed by this statement.  
+- unique bytes. the total number of unique bytes accessed by this statement.  
+- lines. the total number of cache lines accessed by this statement.  
+- unique lines. the total number of unique cache lines accessed by this statement.  
+- reuse type. the type of data reuse (loopmultipleread, serialmultipleread, noreuse).  
+- reuse distance. the distance between data reuse in terms of number of for loop iterations and total accessed bytes.  
+- reuse counter. the number of happening of data reuse.  
+- stride. the stride of access.  
+- accessed bytes divided by reuse. we compute the following values: bytes, unique bytes, lines, unique lines, reuse counter, reuse counter.
+
+- allocation related features. the size of the allocated buffer for the output buffer of this statement. the number of allocations.  
+- other features. the number of outer loops. the product of the lengths of outer loops. the value of the "auto_unroll_max_step" specified by the pragma in outer loops.
+
+# c shape configurations in the evaluation
+
+- c1d (1d convolution). format = (length, input channel, output channel, kernel size, stride, padding)
+
+$$
+\begin{array}{l} - (2 5 6, 6 4, 1 2 8, 3, 2, 1) \\ - (1 2 8, 1 2 8, 2 5 6, 1, 2, 0) \\ - (6 4, 2 5 6, 2 5 6, 5, 1, 2) \\ - (3 2, 5 1 2, 5 1 2, 3, 1, 1) \\ \end{array}
+$$
+
+- c2d (2d convolution). format = (height, width, input channel, output channel, kernel size, stride, padding)
+
+$$
+\begin{array}{l} - (2 2 4, 2 2 4, 3, 6 4, 7, 2, 3) \\ - (5 6, 5 6, 6 4, 6 4, 1, 1, 0) \\ - (1 4, 1 4, 2 5 6, 2 5 6, 3, 1, 1) \\ - (7, 7, 5 1 2, 5 1 2, 3, 1, 1) \\ \end{array}
+$$
+
+- c3d (3d convolution). format = (depth, height, width, input channel, output channel, kernel size, stride, padding)
+
+$$
+\begin{array}{l} - (1 6, 2 2 4, 2 2 4, 3, 6 4, 7, 2, 3) \\ - (1 6, 5 6, 5 6, 6 4, 6 4, 1, 1, 0) \\ - (1 6, 1 4, 1 4, 2 5 6, 2 5 6, 3, 1, 1) \\ - (1 6, 7, 7, 5 1 2, 5 1 2, 3, 1, 1) \\ \end{array}
+$$
+
+gmm (matrix multiply). format  $= \left( {\mathrm{n},\mathrm{m},\mathrm{k}}\right)$
+
+$$
+\begin{array}{l} - (1 2 8, 1 2 8, 1 2 8) \\ - (5 1 2, 3 2, 5 1 2) \\ - (5 1 2, 5 1 2, 5 1 2) \\ - (1 0 2 4, 1 0 2 4, 1 0 2 4) \\ \end{array}
+$$
+
+- grd (group convolution). format = (height, width, input channel, output channel, kernel size, stride, padding, groups)
+
+$$
+\begin{array}{l} - (2 2 4, 2 2 4, 3, 6 4, 7, 2, 3, 4) \\ - (5 6, 5 6, 6 4, 6 4, 1, 1, 0, 4) \\ - (1 4, 1 4, 2 5 6, 2 5 6, 3, 1, 1, 4) \\ - (7, 7, 5 1 2, 5 1 2, 3, 1, 1, 4) \\ \end{array}
+$$
+
+- dil (dilated convolution). format = (height, width, input channel, output channel, kernel size, stride, padding, dilation)
+
+$$
+\begin{array}{l} - (2 2 4, 2 2 4, 3, 6 4, 7, 2, 3, 2) \\ - (5 6, 5 6, 6 4, 6 4, 1, 1, 0, 2) \\ - (1 4, 1 4, 2 5 6, 2 5 6, 3, 1, 1, 2) \\ - (7, 7, 5 1 2, 5 1 2, 3, 1, 1, 2) \\ \end{array}
+$$
+
+- dep (depthwise convolution). format = (height, width, channel, kernel size, stride, padding)
+
+$$
+\begin{array}{l} - (1 1 2, 1 1 2, 3 2, 3, 1, 1) \\ - (1 1 2, 1 1 2, 6 4, 3, 2, 1) \\ - (1 4, 1 4, 5 1 2, 3, 2, 1) \\ - (7, 7, 1 0 2 4, 3, 1, 1) \\ \end{array}
+$$
+
+- t2d (transposed 2d convolution). format = (height, width, input channel, output channel, kernel size, stride, padding)
+
+$$
+\begin{array}{l} - (4, 4, 5 1 2, 2 5 6, 4, 2, 1) \\ - (8, 8, 2 5 6, 1 2 8, 4, 2, 1) \\ - (1 6, 1 6, 1 2 8, 6 4, 4, 2, 1) \\ - (3 2, 3 2, 6 4, 3, 4, 2, 1) \\ \end{array}
+$$
+
+- cap (capsule 2d convolution). format = (height, width, input channel, output channel, kernel size, stride, padding, capsule size)
+
+$$
+\begin{array}{l} - (1 6, 1 6, 3 2, 3 2, 3, 2, 1, 4) \\ - (8, 8, 3 2, 3 2, 3, 1, 1, 4) \\ - (1 6, 1 6, 8, 1 6, 3, 2, 1, 4) \\ - (8, 8, 1 6, 1 6, 3, 1, 1, 4) \\ \end{array}
+$$
+
+- nrm (matrix 2-norm). format = (n, m)
+
+$$
+\begin{array}{l} - (2 5 6, 2 5 6) \\ - (5 1 2, 5 1 2) \\ - (1 0 2 4, 1 0 2 4) \\ - (4 0 9 6, 4 0 9 6) \\ \end{array}
+$$
+
+- convlayer (convolution layer). format = (height, width, input channel, output channel, kernel size, stride, padding)
+
+$$
+\begin{array}{l} - (2 2 4, 2 2 4, 3, 6 4, 7, 2, 3) \\ - (5 6, 5 6, 6 4, 6 4, 3, 2, 1) \\ - (2 8, 2 8, 1 2 8, 2 5 6, 1, 2, 0) \\ - (7, 7, 5 1 2, 5 1 2, 3, 1, 1) \\ \end{array}
+$$
+
+- tbs (transposed + batchmatmul + softmax in the multi-head attention). format = (sequence length, number of heads, hidden dimension))
+
+$$
+\begin{array}{l} - (1 2 8, 1 2, 6 4) \\ - (1 2 8, 1 6, 6 4) \\ - (6 4, 1 2, 1 2 8) \\ - (1 2 8, 1 2, 1 2 8) \\ \end{array}
+$$

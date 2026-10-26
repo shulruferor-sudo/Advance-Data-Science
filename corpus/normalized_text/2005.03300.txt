@@ -1,0 +1,586 @@
+# reducing communication in graph neural network training
+
+alok tripathy, katherine yelick, aydin buluc
+
+* electrical engineering and computer sciences, university of california, berkeley
+
+† computational research division, lawrence berkeley national laboratory
+
+abstract—graph neural networks (gnns) are powerful and flexible neural networks that use the naturally sparse connectivity information of the data. gnns represent this connectivity as sparse matrices, which have lower arithmetic intensity and thus higher communication costs compared to dense matrices, making gnns harder to scale to high concurrencies than convolutional or fully-connected neural networks.
+
+we introduce a family of parallel algorithms for training gnns and show that they can asymptotically reduce communication compared to previous parallel gnn training methods. we implement these algorithms, which are based on 1d, 1.5d, 2d, and 3d sparse-dense matrix multiplication, using torch.distributed on gpu-equipped clusters. our algorithms optimize communication across the full gnn training pipeline. we train gnns on over a hundred gpus on multiple datasets, including a protein network with over a billion edges.
+
+index terms—graph neural networks, distributed training, communication-avoiding algorithms
+
+# i. introduction
+
+graph neural networks (gnns) [25] are types of neural networks that use the connectivity information that is natural in datasets that can be represented as graphs, such as molecules, transportation and social networks, the power grid, and proteins. the neighborhood connectivity information in gnns is unrestricted and potentially irregular giving them greater applicability than convolutional neural networks (cnns), which impose a fixed regular neighborhood structure. gnns have been successful in many application domains and often take advantage of specialized variations such as recurrent gnns, spatial-temporal gnns, graph convolutional networks, and graph autoencoders. high-quality surveys of gnns describe these variations and their applications in more detail [30], [33]. gnns are also provably quite powerful and, for example, are known to be equivalent to the powerful weisfeiler-lehman algorithm for graph isomorphism when the gnns' underlying aggregation and combination operators are sufficiently flexible [31].
+
+two dominant uses of gnns are node embedding, which predicts certain properties of individual vertices in a large graph, and graph embedding, which predicts certain properties of whole graphs. the presentation of this work follows the node embedding case but the general techniques we introduce are applicable to the graph embedding case as well.
+
+as with cnns, the training algorithms for gnns are based on variations of gradient descent, and typically use the idea of mini-batching in which a small set of training
+
+samples are evaluated and then used to update the model in a single step. mini-batching has two purposes. first, it allows the neural neural to train on a smaller memory footprint. second, it strikes a good balance between achieving high-performance through higher arithmetic intensity and achieving good convergence. unlike images in a database, vertices of a graph are dependent on each other, which is one reason behind gnns expressiveness. however in the case of gnns, this dependency makes it hard to process a mini-batch of vertices. after only a few layers, the chosen mini-batch ends up being dependent on the whole graph. this phenomenon, known as the neighborhood explosion, completely nullifies the memory reduction goals.
+
+to overcome neighborhood explosion, researchers resort to sophisticated sampling-based algorithms that can help gnn training have a smaller memory footprint by reducing the number of  $k$ -hop neighbors considered. sampling algorithms, however, come with approximation errors. here, we use the aggregate memory of a cluster or supercomputer to train gnns without mini-batching, similar to other work that use distributed memory to train gnns [34], [18]. in particular, roc [18] showed that (1) full gradient descent can be competitive with mini-batching in terms of performance, and (2) sampling based methods can lead to lower accuracy. we build on this work by presenting distributed algorithms with reduced communication. our distributed algorithms are general and while presented for full gradient descent, they can be easily modified to operate on a mini-batch setting.
+
+training of gnns can be memory limited on single node machines, and we support training on distributed-memory architectures where two primary challenges are communication costs and load balance. this paper primarily focuses on minimizing communication costs for gnn training. some of the best algorithms presented in this paper, namely the 2d and 3d algorithms, also automatically address load balance through a combination of random vertex permutations and the implicit partitioning of the adjacencies of high-degree vertices.
+
+the primary contribution of our paper is the presentation of parallel gnn training algorithms that reduce communication, which are fundamentally different than existing approaches for gnn training. on  $p$  processes, our 2d algorithm, which consumes optimal memory, communicate a factor of  $o(\sqrt{p})$  fewer words than commonly utilized vertex-partitioning based approaches. the 3d algorithm we describe reduces the number
+
+of words communicated by another factor of  $o(p^{1/6})$  at the expense of higher memory consumption. finally, our 1.5d algorithm optimizes communication for a given memory footprint, reducing communication volume by a factor of  $o(c)$  and latency cost by a factor of  $o(c^2)$  at the expense of asymptotically increasing memory footprint by  $o(c)$ . our work presents algorithmic recipes to get the fastest gnn implementations at large scale.
+
+our distributed algorithms can be implemented in any system that allows arbitrary divisions of tensors to processes, such as mesh-tensorflow [26]. we opted to use pytorch for our demonstration due to its ubiquity and excellent support for existing gnn models through pytorch geometric. all of our experiments are run on the summit supercomputer at the oak ridge leadership computing facility (olcf). we used the existing single-node kernel implementations in cusparse that are easily called from pytorch. faster implementations of key kernels such as sparse matrix times tall-skinny dense matrix (spmm) exist [32], [2] and would decrease our overall runtime. faster single node kernels are equivalent from a relative cost perspective to running on clusters with slower networks; both would make our reduced-communication algorithms more beneficial.
+
+our current implementations operate on the standard real field, but they can be trivially extended to support arbitrary aggregate operations to increase the expressive power of gnns [31]. for example, many distributed libraries such as cyclops tensor framework [27] and combinatorial blas [8] allow the user to overload scalar addition operations through their semiring interface, which is exactly the neighborhood aggregate function when applied to graphs. finally, we note that while our focus is on gnn training, all of our algorithms are applicable to gnn inference. all of our code is available publicly as the cagnet (communication-avoiding graph neural network) package at https://github.com/passionlab/cagnet.
+
+# ii. related work
+
+parallelism opportunities in the training of deep neural networks (dnns) have been studied intensively in the recent years [6]. for dnns generally, the two broad cases of parallelism are model and data parallelism. data parallelism replicates the dnn model in the memory of each process and only partitions the data. data parallelism can be sub-classified into sample (also called batch) and domain parallelism. in the particular case of convolutional neural networks (cnns), domain parallelism is often referred to as spatial parallelism [12]. model parallelism, on the other hand, partitions the model explicitly. in the common case, each dnn layer can be partitioned into all processes and layers can be computed in their original order. alternatively, interlayer pipeline parallelism can be exploited for certain parts of the computation, but not all. for cnns, further dimensions of parallelism in the form of filter and channel are exploitable as special cases of model parallelism [13].
+
+this might seem like a daunting list of parallelism opportunities to consider for gnn training. fortunately, as shown in the next section, gnn training is simply a series of algebraic transformations on sparse and dense matrices. consequently, one can achieve highly-parallel algorithms without even considering the semantic meaning of the dimensions that are partitioned by the algorithm. ours is similar to an approach taken in earlier work in parallelizing the training of fully-connected and convolutional neural networks [15]. differently for gnns, the issues of sparsity and load balance play a prominent role in performance and scalability. our paper provides several different classes of algorithms that take advantage of many different parallelism opportunities available. we asymptotically analyze the communication costs of the algorithms we present, as well as potential alternatives.
+
+existing work in parallel gnn training implement their algorithms in specialized frameworks [18], [22], [34]. this requires practitioners to port their models and code to that framework, which might be impossible given the lack of an ecosystem to rapidly implement different gnn algorithms. we implement our algorithms using pytorch [24], utilizing torch.distributed and pytorch geometric libraries. given the wide availability and popularity of pytorch, not to mention the vast set of gnn variants implemented in pytorch geometric [14], any practitioner with access to a distributed cluster can easily utilize our algorithms to scale their models.
+
+the other pytorch based distributed graph embedding libraries we are aware of are pytorch-biggraph (pbg) [21] and deep graph library (dgl) [29]. pbg's website explicitly says that it is not for use with models such as graph convolutional networks and deep networks. consequently, while it presents some interesting ideas, pbg does not seem to have the expressiveness required to implement gnns. by contrast, our distributed algorithms can be used to implement anything that is supported by pytorch geometric, which already implements a vast majority of top gnn models in the literature. on the other hand, dgl is an active large-scale project that provides a convenient graph-based interface instead of exposing sparse matrices to the user, and it automatically fuses operations to avoid unnecessary data movement and computation. our algorithmic work is complementary and can incorporated into dgl in the future.
+
+the details of data partitioning in various gnn training systems are light. roc [18] advocates a specialized graph partitioning method, and shows that it scales better than random vertex and edge partitioning. aligraph [34] mentions that it implements both a graph partitioning based approach and a 2d partitioning approach, but does not give any details or provide communication cost analyses.
+
+# iii. background
+
+# a. notation
+
+table i summarizes the notation used in our paper. there is a unique sparse matrix  $\mathbf{a}$  that represents the graph structure but there are  $l$  distinct  $\mathbf{h}$  and  $\mathbf{g}$  matrices, indexed  $l = 0\ldots l - 1$ ,
+
+tablei list of symbols and notations used by our algorithm  
+
+<table><tr><td colspan="2">symbols and notations</td></tr><tr><td>symbol</td><td>description</td></tr><tr><td>a</td><td>modified adjacency matrix of graph (n × n)</td></tr><tr><td>hl</td><td>embedding matrix in layer l (n × f)</td></tr><tr><td>wl</td><td>weight matrix in layer l (f × f)</td></tr><tr><td>yl</td><td>matrix form of ∂l/∂wl ij (f × f)</td></tr><tr><td>zl</td><td>input matrix to activation function (n × f)</td></tr><tr><td>gl</td><td>matrix form of ∂l/∂zl ij (n × f)</td></tr><tr><td>σ</td><td>activation function</td></tr><tr><td>f</td><td>length of feature vector per vertex</td></tr><tr><td>fu</td><td>feature vector for vertex u</td></tr><tr><td>l</td><td>total layers in gnn</td></tr><tr><td>p</td><td>total number of processes</td></tr><tr><td>α</td><td>latency</td></tr><tr><td>β</td><td>reciprocal bandwidth</td></tr></table>
+
+which are embedding matrices and their derivatives, respectively. finally there are  $l - 1$  weight matrices  $\mathbf{w}$  and  $\mathbf{y}$ , indexed  $l = 0\ldots l - 2$ , because the number of transitions between feature vectors are one less than the number of embedding matrices.
+
+when analyzing communication costs we use the  $\alpha - \beta$  model where each message takes a constant  $\alpha$  time units latency regardless of its size plus an inverse bandwidth term that takes  $\beta$  time units per word in the message, to reach its destination. thus, sending a message of  $k$  words takes  $\alpha + \beta k$  time. in addition, we use  $nnz(\mathbf{a})$  when referring to the number of nonzeros in the sparse adjacency matrix  $\mathbf{a}$ , which is equal to the number of edges in the graph with self loops added. we also use  $d$  for the average degree of a vertex in  $\mathbf{a}$ , i.e.  $nnz(\mathbf{a}) = dn$ .
+
+# b. graph neural networks
+
+consider a dataset that is represented as a graph  $g(v, e)$ , such as a protein network, social network, grid transmission network, or the union of tangled high-energy particle tracks. here,  $v$  is the set of vertices (nodes) and  $e$  is the set of edges. we can consider the classification of the nodes or the edges. without loss of generality, we will describe a gnn for node classification. the goal of the so-called node embedding problem is to map the nodes of a graph into a low-dimensional embedding space such that the similarity of two nodes  $u, v \in v$  is approximated by their similarity in the low-dimensional space  $z_u^{\top}z_v$ . here,  $z_v$ , which is typically a  $k$ -dimensional vector of floating-point values, is the embedding of vertex  $v$ . in addition to node and edge classification, gnns can also be used to classify graphs or perform regression on graphs. in this case, the input would be a set of graphs such as the atomistic structures of a set of molecules.
+
+let  $\mathbf{a}$  be the  $n\times n$  sparse adjacency matrix of the graph with added self-connections. the addition of self-connections ensures that each node does not forget its embedding when going from layer  $i$  to layer  $i + 1$ . the rows and columns of  $\mathbf{a}$  are also often normalized [19], so for an undirected graph one actually uses  $\mathbf{d}^{-1 / 2}(\mathbf{a} + \mathbf{i})\mathbf{d}^{-1 / 2}$  due to its
+
+favorable spectral properties. here,  $\mathbf{i}$  is the identity matrix and  $\mathbf{d}$  is a diagonal matrix of modified vertex degrees. to avoid notational burden, we will still refer to this modified adjacency matrix with  $\mathbf{a}$ . we also distinguish between  $\mathbf{a}$  and its transpose  $\mathbf{a}^{\top}$  explicitly in order to present a general training algorithm that works for both directed and undirected graphs.  $\mathbf{h}^{0}$  is a dense  $n\times d$  matrix of input node features. these features are application dependent attributes on graph nodes. a high-quality embedding can be achieved by using a neural network that uses the topology of the graph. in particular, the gnn forward propagation processes t he input features matrix  $\mathbf{h}^{(l)}$  at level  $l$  using following simple equation:  $\mathbf{h}^{(l)} = \sigma (\mathbf{a}^{\top}\mathbf{h}^{(l - 1)}\mathbf{w}^{l})$
+
+here,  $\mathbf{w}^{(l)}$  is the trainable matrix that holds the model parameters at the  $l$ th level of the neural network, and  $\sigma$  is the activation function such as relu. consequently, the most time consuming operations are the multiplication of a sparse matrix with a dense matrix (spmm) and dense matrix multiply. backpropagation also relies on the same computational primitives. we provide backpropagation derivations in section iii-d.
+
+# c. forward propagation
+
+at each node, the product  $\mathbf{a}^{\top}\mathbf{h}^{(l - 1)}$  combines the  $(i - 1)$ th feature vectors of its neighbors while the subsequent multiplication with  $\mathbf{w}^l$  mixes the features and maps them into the new feature space at the  $i$ th level. finally, nonlinearity is achieved via the  $\sigma (\cdot)$  function on the output.
+
+$$
+\mathbf {z} ^ {l} = \mathbf {a} ^ {\top} \mathbf {h} ^ {(l - 1)} \mathbf {w} ^ {l}
+$$
+
+$$
+\mathbf {h} ^ {l} = \sigma (\mathbf {z} ^ {l})
+$$
+
+# d. backpropagation derivations
+
+equation 1: here we derive the gradient of the loss with respect to  $\mathbf{z}^l$ , leveraging the chain rule and that  $\mathbf{z}^l = \sigma(h^l)$ .
+
+$$
+\begin{array}{l} \frac {\partial \mathcal {l}}{\partial z _ {i j} ^ {l}} = \sum_ {u \in v} \sum_ {v \in f _ {u}} \frac {\partial \mathcal {l}}{\partial h _ {u v} ^ {l}} \frac {\partial h _ {u v} ^ {l}}{\partial z _ {i j} ^ {l}} \\ = \frac {\partial \mathcal {l}}{\partial h _ {i j} ^ {l}} \frac {\partial h _ {i j} ^ {l}}{\partial z _ {i j} ^ {l}} \quad (\frac {\partial h _ {u v} ^ {l}}{\partial z _ {i j} ^ {l}} = 0 \text {i f f} u \neq i \text {a n d} v \neq j) \\ = \frac {\partial \mathcal {l}}{\partial h _ {i j} ^ {l}} \sigma^ {\prime} (z _ {i j} ^ {l}) \\ \end{array}
+$$
+
+$$
+\boxed {g ^ {l} = \frac {\partial \mathcal {l}}{\partial z _ {i j} ^ {l}} = \nabla_ {h ^ {l}} \mathcal {l} \odot \sigma^ {\prime} (z ^ {l})}
+$$
+
+equation 2: here we derive a recurrence to propagate the gradient backwards through the neural network, leveraging the
+
+chain rule and the lemma stated below.
+
+$$
+\begin{array}{l} g _ {i j} ^ {l - 1} = \frac {\partial \mathcal {l}}{\partial z _ {i j} ^ {l - 1}} = \sum_ {u \in v} \sum_ {v \in f _ {u}} \frac {\partial \mathcal {l}}{\partial z _ {u v} ^ {l}} \frac {\partial z _ {u v} ^ {l}}{\partial z _ {i j} ^ {l - 1}} \\ = \sum_ {u \in v} \sum_ {v \in f _ {u}} \frac {\partial z _ {u v} ^ {l}}{\partial z _ {i j} ^ {l - 1}} g _ {u v} ^ {l} \\ = \sum_ {u \in v} \sum_ {v \in f _ {u}} w _ {j v} ^ {l} g _ {u v} ^ {l} \sigma^ {\prime} \left(z _ {i j} ^ {l - 1}\right) \\ \end{array}
+$$
+
+(see lemma below)
+
+$$
+\boxed {\mathbf {g} ^ {l - 1} = \mathbf {a g} ^ {l} (\mathbf {w} ^ {l}) ^ {\top} \odot \sigma^ {\prime} (\mathbf {z} ^ {l - 1})}
+$$
+
+lemma for equation 2:
+
+$$
+z _ {u v} ^ {l} = \sum_ {i \in n (u)} \sum_ {j \in f _ {i}} h _ {i j} ^ {l - 1} w _ {j v} ^ {l}
+$$
+
+(see forward prop equations)
+
+$$
+= \sum_ {i \in n (u)} \sum_ {j \in f _ {i}} \sigma \left(z _ {i j} ^ {l - 1}\right) w _ {j v} ^ {l}
+$$
+
+$$
+\frac {\partial z _ {u v} ^ {l}}{\partial z _ {i j} ^ {l - 1}} = w _ {j v} ^ {l} \sigma^ {\prime} (z _ {i j} ^ {l - 1})
+$$
+
+equation 3: this final equation represents the gradient  $\mathbf{y}^l$  of the loss with respect to the weights in the network, and this gradient is used in gradient descent.
+
+$$
+\mathbf {y} ^ {l - 1} = \left(\frac {\partial \mathcal {l}}{\partial w ^ {l}}\right) _ {i j} = (\mathbf {h} ^ {l - 1}) ^ {\intercal} \mathbf {a} \mathbf {g} ^ {l}
+$$
+
+$$
+\mathbf {w} ^ {l - 1} = \mathbf {w} ^ {l - 1} - \mathbf {y} ^ {l - 1}
+$$
+
+the second step in equation 3 is simply the gradient descent step. this step does not require communication, so it is not discussed in our analysis in the following section.
+
+# iv. communication schemes and their analyses
+
+in this section, we present 1d, 1.5d, 2d, and 3d parallel algorithms for gnn training and analyze their communication costs. table iv summarizes the matrix partitioning used by these algorithms. the presented communication costs are for one epoch, which is a single pass over the whole dataset.
+
+ideally, a distributed-memory parallel gnn training algorithm consumes  $o(nfl + nnz(\mathbf{a}))$  total memory across all processes. our 1d and 2d algorithms achieve this bound up to constant factors, while 1.5d and 3d algorithms, whose exact memory consumption is provided in their respective subsections, do not. to avoid expensive transposing, our 1d and 1.5d algorithms store both  $\mathbf{a}$  and  $\mathbf{a}^{\top}$  when the input graph is directed. this decision does not increase storage costs asymptotically and is currently immaterial due to almost all gnn-based learning being performed on undirected graphs.
+
+all pseudocodes (algorithms 1,2,3) take the inputs
+
+1)  $\mathbf{a} \in \mathbb{r}^{n \times n}$ : sparse adjacency matrix,  
+2)  $\mathbf{h}^{l - 1}\in \mathbb{r}^{n\times f^{l - 1}}$  : dense input activations matrix,  
+3)  $\mathbf{w} \in \mathbb{r}^{f^{\iota - 1} \times f^{\iota}}$ : dense training matrix,
+
+and output  $\mathbf{h}^l:\mathbb{r}^{n\times f^l}$  : dense output activations matrix.
+
+# a. a one-dimensional (1d) algorithm
+
+in this regime, matrices  $\mathbf{a}^{\top}$  and  $\mathbf{h}$  are distributed to processes in block rows, where each process receives  $n / p$  consecutive rows. for example, given a matrix  $\mathbf{a}^{\top}$ , we write  $\mathbf{a}_i^{\top} = \mathbf{a}^{\top}(i(n / p):(i + 1)(n / p) - 1,:)$  to denote the block row owned by the  $i$ th process, assuming  $n / p$  is an integer. to simplify the algorithm description, we use  $\mathbf{a}_{ij}^{\top}$  to denote  $\mathbf{a}_i^{\top}(:,j(n / p):(j + 1)(n / p) - 1)$ , the  $j$ th block column of  $\mathbf{a}_i^{\top}$ , although the whole block row is owned by a single process.
+
+$$
+\mathbf {a} ^ {\top} = \left( \begin{array}{c} \mathbf {a} _ {1} ^ {\top} \\ \vdots \\ \mathbf {a} _ {p} ^ {\top} \end{array} \right) = \left( \begin{array}{c c c} \mathbf {a} _ {1 1} ^ {\top} & \dots & \mathbf {a} _ {1 p} ^ {\top} \\ \vdots & \ddots & \vdots \\ \mathbf {a} _ {p 1} ^ {\top} & \dots & \mathbf {a} _ {p p} ^ {\top} \end{array} \right), \mathbf {h} = \left( \begin{array}{c} \mathbf {h} _ {1} \\ \vdots \\ \mathbf {h} _ {p} \end{array} \right) \tag {1}
+$$
+
+let  $\mathbf{t}$  be the intermediate product  $\mathbf{a}^{\top}\mathbf{h}^{l - 1}$ . for each process  $p(i)$ , the computation is:
+
+$$
+\mathbf {t} _ {i} = \mathbf {t} _ {i} + \mathbf {a} _ {i} ^ {\top} \mathbf {h} = \mathbf {t} _ {i} + \sum_ {j = 1} ^ {p} \mathbf {a} _ {i j} ^ {\top} \mathbf {h} _ {j}
+$$
+
+the row-wise algorithm forms one row of output at a time, and each process may potentially need to access all of  $\mathbf{h}$  to form a single row of  $\mathbf{t}$ . however, only a portion of  $\mathbf{h}$  is locally available at any time in parallel algorithms. the algorithm, thus, performs multiple iterations to fully form one row of  $\mathbf{t}$ . algorithm 1 shows the pseudocode of the algorithm.
+
+algorithm 1 parallel algorithm for gnn forward propagation, which computes  $\mathbf{h}^l\gets \sigma (\mathbf{a}^\top \mathbf{h}^{l - 1}\mathbf{w}^l)$ , using the 1d block row decomposition
+
+1: procedure blockrowfw(a $^{\top}$ , h $^{l-1}$ , w, h $^{l}$ )  
+2: for all processes  $p(i)$  in parallel do  
+3: for  $j = 1$  to  $p$  do  
+4: broadcast  $(\mathbf{h}_j^{l - 1})$  
+5:  $\mathbf{t}_{ij} \gets \mathbf{a}_{ij}^{\mathrm{t}}\mathbf{h}_{j}^{l-1}$  
+6:  $\mathbf{z}_i\gets \mathbf{t}_{ij}\mathbf{w}^{\circ}$  
+7:  $\mathbf{h}_i^l\gets \mathbf{h}_i^l +\sigma (\mathbf{z}_i)$
+
+1) equation  $\mathbf{z}^l = \mathbf{a}^\top \mathbf{h}^{l - 1}\mathbf{w}^l$ :
+
+communication is 1d block row:  $\mathbf{a}^{\top}$  is partitioned by rows, and  $\mathbf{h}^{l-1}$  is partitioned by rows. this yields a 1d block row multiplication.  $\mathbf{w}^l$  is fully-replicated on each process, and is multiplied with  $\mathbf{a}^{\top}\mathbf{h}^{l-1}$  after communication. the first multiplication is essentially a sparse matrix times (tall-skinny) dense matrix, also known as sparse matrix times multiple dense vectors (spmm).
+
+our 1d algorithm moves the dense matrix in this spmm operation using a broadcast. the alternative approach of moving the sparse matrix would yield a similar communication cost in practice because the dense feature matrices in gnns have approximately the same size (in terms of bytes) as the graphs they are run on. as input and model trends change in the future, a simple heuristic can determine the matrix to be broadcasted in practice, without increasing code complexity.
+
+table ii data distribution for all the algorithms considered in our paper  
+
+<table><tr><td>matrix</td><td>1d algorithm</td><td>1.5d algorithm</td><td>2d algorithm</td><td>3d algorithm</td></tr><tr><td>a</td><td>block row</td><td>block row, replicated c times</td><td>block 2d</td><td>block split 3d</td></tr><tr><td>a^t</td><td>block row</td><td>block row, replicated c times</td><td>not stored</td><td>not stored</td></tr><tr><td>h^l</td><td>block row</td><td>block row, replicated c times</td><td>block 2d</td><td>block split 3d</td></tr><tr><td>g^l</td><td>block row</td><td>block row, replicated c times</td><td>block 2d</td><td>block split 3d</td></tr><tr><td>w^l</td><td>fully-replicated</td><td>fully-replicated</td><td>fully-replicated</td><td>fully-replicated</td></tr></table>
+
+alternatively, one could shift matrices as opposed to broadcasting them. point-to-point communication is still in beta in nccl, the library we use for communication. the cost of a single broadcast of an  $m$  word message to  $p$  processes has a lower bound of  $o(\alpha \lg p + \beta m)$  [9], but high-level algorithms such as summa [28] can avoid the  $\lg p$  factor in the latency term through pipelining. in fact, nccl uses a pipelined ring algorithm for its broadcasts, which in fact achieves the same link utilization as matrix shifting when the message sizes are large enough to fill the pipeline. consequently, we will also not spell out the additional  $\lg p$  factor for our broadcasts.
+
+the per-process communication cost is thus
+
+$$
+t _ {c o m m} = \alpha (p - 1) + \frac {p - 1}{p} \beta n f \approx \alpha p + \beta n f
+$$
+
+# 2) equation  $\mathbf{h}^l = \sigma (\mathbf{z}^l)$ :
+
+no communication:  $\mathbf{h}^l$ , the result of activation, is partitioned by rows as is  $\mathbf{h}^{l - 1}$ . no further communication is necessary here to use  $\mathbf{h}^l$  in eq. 1 for layer  $l$ .
+
+# 3) equation  $\mathbf{g}^{l - 1} = \mathbf{a}\mathbf{g}^l (\mathbf{w}^l)^\top \odot \sigma '(z^{l - 1})$
+
+communication is 1d block row: because we also partition  $\mathbf{a}$  in block rows, the communication pattern and the cost is identical to the forward propagation. the intermediate product  $\mathbf{ag}^l$  is naturally block row partitioned. the last step of multiplying the block row distributed  $\mathbf{ag}^l$  with replicated  $\mathbf{w}^l$  to yield a block row distributed  $\mathbf{g}^{l-1}$  does not require any communication.
+
+# 4) equation  $\mathbf{y}^{l - 1} = (\mathbf{h}^{l - 1})^{\top}\mathbf{a}\mathbf{g}^{l}$ :
+
+communication is (small) 1d outer product: algebraically, there are two matrix multiplications in this step of the backpropagation. however, we can reuse the intermediate product  $\mathbf{a}\mathbf{g}^l$  that we computed in the previous equation at the expense of increasing the memory footprint slightly. then the only task is to multiply  $(\mathbf{h}^{l - 1})^{\mathrm{t}}$  and  $\mathbf{a}\mathbf{g}^l$ , which is a small 1d outer product that requires an all-reduce on low-rank matrices of size  $f\times f$ . this multiplication has communication cost  $t_{comm} = \alpha \lg p + \beta f^2$ .
+
+5) total communication of our 1d algorithm: given that the embedding (i.e., feature vector) lengths are different for each layer of the gnn, we use the superscript to denote the length of the feature vector  $f^l$  in layer  $l$ . this results in the following communication bound.
+
+$$
+t _ {c o m m} = \sum_ {l = 1} ^ {l} \big (\alpha (\lg p + 2 p) + \beta \big (n f ^ {l - 1} + n f ^ {l} + f ^ {l - 1} f ^ {l}) \big) \big)
+$$
+
+to reduce clutter, we can consider the "average" feature vector length  $f$ , resulting in the simplified formula.
+
+$$
+t _ {c o m m} = l \left(\alpha (\lg p + 2 p) + \beta (2 n f + f ^ {2})\right)
+$$
+
+6) potential for graph partitioning: since we are moving dense matrices and keeping the sparse matrix stationary, graph and hypergraph partitioning tools can be applied as pre-processing to heuristically minimize communication. we experimented with graph partitioning to evaluate its potential for us. we ran metis on the reddit data, which is described in section v-a. for 64 processes, metis' partitions suggested a  $72\%$  total communication reduction over random block row distribution. however, the total runtime of our bulk-synchronous algorithm would be dictated by the maximum communication per process, which was only a  $29\%$  percent reduction over random 1d block row partitioning. these numbers are actually optimistic and do not take into account the need to perform individualized "request and send" operations for exploiting the graph partitioning results.
+
+for example, instead of relying on more efficient broadcast operations as done in algorithm 1, each process that owns a part of  $\mathbf{a}$  would (depending on its sparsity structure) individually request a subset of rows of  $\mathbf{h}$  from its owner during forward propagation. this increases latency as well as the bandwidth costs due to the communication of request indices, and makes it impossible to benefit from collective communication libraries such as nccl and gloo. further, given the scale free nature of most graph datasets, graph partitioning is unlikely to produce an asymptotic improvement despite its added computational costs.
+
+# b. 1.5d block row algorithm
+
+for 1.5d algorithms [20], processes are organized in a rectangular  $p = p / c \times c$  grid. matrices are, however, partitioned into block rows and columns as done in 1d. the difference between 1d and 1.5d algorithms is that these partitions are now replicated across process rows. for instance, processes across the  $i$ th process row  $p(i,:)$  collectively store the  $i$ th block row of  $\mathbf{a}^{\mathrm{t}}$ . because of this difference, while matrices are partitioned into block rows and columns, there are only  $p / c$  such blocks.
+
+$$
+\mathbf {a} ^ {\top} = \left( \begin{array}{c} \mathbf {a} _ {1} ^ {\top} \\ \vdots \\ \mathbf {a} _ {p / c} ^ {\top} \end{array} \right) \mathbf {h} = \left( \begin{array}{c} \mathbf {h} _ {1} \\ \vdots \\ \mathbf {h} _ {p / c} \end{array} \right) \tag {2}
+$$
+
+similar to 1d, each submatrix  $\mathbf{a}_i^{\top}$  is further partitioned in  $p / c$  block columns.
+
+let  $\mathbf{t}$  be the intermediate product of  $\mathbf{a}^{\top}\mathbf{h}^{l - 1}$ . each process row  $p(i,:)$  computes the following:
+
+$$
+\mathbf {t} _ {i} = \mathbf {t} _ {i} + \mathbf {a} _ {i} ^ {\top} \mathbf {h} = \mathbf {t} _ {i} + \sum_ {j = 1} ^ {p / c} \mathbf {a} _ {i j} ^ {\top} \mathbf {h} _ {j}
+$$
+
+however, each process computes a subset of the terms in the above summation. these partial sums are then added within process rows with a reduction on  $p(i,:)$ . if  $q = p / c^2$ , then the computation done by process  $p(i,j)$  is
+
+$$
+\mathbf {t} _ {i} = \mathbf {t} _ {i} + \mathbf {a} _ {i} ^ {\top} \mathbf {h} = \mathbf {t} _ {i} + \sum_ {k = j q} ^ {(j + 1) q} \mathbf {a} _ {i k} ^ {\top} \mathbf {h} _ {k} \tag {3}
+$$
+
+these steps are outlined in detail in algorithm 2. while our pseudocode only outlines the special case where  $c^2$  perfectly divides  $p$ , our implementation is more general, and assigns more stages to the last process column if necessary.
+
+algorithm 2 block 1.5d algorithm for gnn forward propagation, which computes  $\mathbf{h}^l\gets \sigma (\mathbf{a}^\top \mathbf{h}^{l - 1}\mathbf{w}^l)$  in parallel. a and h are distributed on a  $p / c\times c$  process grid, w is replicated.
+
+<table><tr><td>1:</td><td>procedure block1.5dfw(a^t, h^{l-1}, w, h^l)</td></tr><tr><td>2:</td><td>for all processes p(i,j) in parallel do</td></tr><tr><td>3:</td><td>s = p/c^2 ▷ number of stages</td></tr><tr><td>4:</td><td>for k = 0 to s - 1 do</td></tr><tr><td>5:</td><td>q = js + k</td></tr><tr><td>6:</td><td>\(\hat{\mathbf{h}}^{l-1} \leftarrow \text{bcast}(\mathbf{h}_{qj}^{l-1}, p(:, j))\)</td></tr><tr><td>7:</td><td>z^l \leftarrow z^l + \text{spmm}(\mathbf{a}_{iq}^t, \hat{\mathbf{h}}^{l-1})</td></tr><tr><td>8:</td><td>\(\hat{\mathbf{z}}^l \leftarrow \text{allreduce}(\mathbf{z}^l,+, p(i,:) )\)</td></tr><tr><td>9:</td><td>\(\hat{\mathbf{h}}^l \leftarrow \text{gemm}(\mathbf{z}^l, \mathbf{w}^{l-1})\)</td></tr></table>
+
+1) equation  $\mathbf{z}^l = \mathbf{a}^\top \mathbf{h}^{l - 1}\mathbf{w}^l$ :
+
+a) communication: 1.5d block row.: both  $\mathbf{a}^t$  and  $\mathbf{h}$  are partitioned by rows in a  $p / c\times c$  process grid. we group process rows into  $c$  "chunks", with  $p / c^2$  process rows per chunk. these chunks represent the block rows of  $\mathbf{h}$  that a particular process column accesses, as per equation 3. to compute a submatrix of  $\mathbf{a}^{\mathrm{t}}\mathbf{h}$ , we broadcast each block row to a process column based on its chunk. if a block row is in chunk  $i$ , we broadcast it to  $i$ th process column  $p(:,i)$ . since there are  $p / c^2$  chunks with  $c$  blocks row each, each process participates in only  $p / c^2$  broadcasts. after these iterations of broadcasts complete, each process within a process row has a partial sum for its submatrix. we run an all-reduction to compute the final block row. note that  $\mathbf{w}^l$  is fully-replicated, so we do not need to communicate data to multiply with  $\mathbf{w}^l$ . the overall communication cost for this equation is
+
+$$
+t _ {c o m m} = \alpha \left(\frac {p}{c ^ {2}} \lg \frac {p}{c ^ {2}}\right) + \beta \left(\frac {n f}{c} + \frac {n f c}{p}\right)
+$$
+
+2) equation  $\mathbf{h}^l = \sigma (\mathbf{z}^l)$ :
+
+no communication:  $\mathbf{h}^l$ , the result of activation, is partitioned by rows as is  $\mathbf{h}^{l - 1}$ . no further communication is necessary here to use  $\mathbf{h}^l$  in eq. 1 for layer  $l$ .
+
+3) equation  $\mathbf{g}^{l - 1} = \mathbf{a}\mathbf{g}^l (\bar{\mathbf{w}}^l)^\top \odot \sigma '(\mathbf{z}^{l - 1})$
+
+communication: 1.5 block row: recall that  $\mathbf{a}$  is partitioned by rows and stored separately from  $\mathbf{a}^{\top}$  if graph is directed.  $\mathbf{g}$  is also partitioned by rows. hence, we can apply the same 1.5d algorithm used in equation 1. we also need to account for  $\sigma^{\prime}(\mathbf{z}^{l - 1})$ . recall that, as in equation 2, this step requires no communication as  $\mathbf{z}^{l - 1}$  is partitioned by rows. the communication cost for this equation is
+
+$$
+t _ {c o m m} = \alpha \left(\frac {p}{c ^ {2}} \lg \frac {p}{c ^ {2}}\right) + \beta \left(\frac {n f}{c} + \frac {n f c}{p}\right)
+$$
+
+4) equation  $\mathbf{y} = (\mathbf{h}^{l - 1})^{\top}\mathbf{a}\mathbf{g}^{l}$ :
+
+communication: (small) 1.5d outer product: we store the intermediate product  $\mathbf{a}\mathbf{g}^l$  that was computed in the previous step and reuse it here. multiplying  $(\mathbf{h}^{l - 1})^{\mathrm{t}}$  with  $\mathbf{a}\mathbf{g}^l$  is a dense 1.5d outer product on two matrices with  $nf$  elements, resulting in a small  $f\times f$  output. because of the small output, this outer product is neither compute nor memory-intensive. the resulting communication cost is:
+
+$$
+t _ {c o m m} = \alpha \left(\lg \frac {p}{c}\right) + \beta (f ^ {2})
+$$
+
+5) total communication: ignoring  $\lg p$  latency terms and  $f^2$  bandwidth terms, we have a total communication cost of
+
+$$
+t _ {c o m m} = \sum_ {l = 1} ^ {l} \left(\alpha \left(2 \frac {p}{c ^ {2}} \log \frac {p}{c ^ {2}}\right) + \beta \left(\frac {2 n f}{c} + \frac {2 n f c}{p}\right)\right)
+$$
+
+while our 1d algorithm did not scale with increasing process counts, we see here that our 1.5d algorithm scales in proportion to the harmonic mean of  $p / c$  and  $c$ . this performance benefit, however, comes at a memory cost. the input for the 1.5d algorithm is replicated, evidenced by multiple processes storing the same data across process rows. formally, the per-process memory and the total memory are
+
+$$
+m _ {p r o c} ^ {1. 5 d} = l \left(\frac {n n z (\mathbf {a})}{p / c} + \frac {n f}{p / c}\right)
+$$
+
+$$
+m _ {t o t a l} ^ {1. 5 d} = l c (n n z (\mathbf {a}) + n f)
+$$
+
+the total input memory used by the 1.5d algorithm is  $c$  times more than the input for 1d. this is not negligible, as gnn models tend to be big. in addition, gpus tend to have less memory, making input replication prohibitive.
+
+# c. block two-dimensional (2d) algorithms
+
+processes are logically organized on a square  $p = p_r \times p_c$  mesh, indexed by their row and column indices so that the  $(i,j)$ th process is denoted by  $p(i,j)$ . matrices are assigned to process according to a 2d block decomposition. for a given  $n \times m$  matrix, each process gets a submatrix of dimensions  $n / p_r \times m / p_c$  in its local memory. for example,  $\mathbf{a}^{\top}$  is
+
+partitioned as shown below and  $\mathbf{a}_{ij}^{\top}$  is assigned to process  $p(i,j)$ .
+
+$$
+\mathbf {a} ^ {\top} = \left( \begin{array}{c c c} \mathbf {a} _ {1 1} ^ {\top} & \dots & \mathbf {a} _ {1 p _ {c}} ^ {\top} \\ \vdots & \ddots & \vdots \\ \mathbf {a} _ {p _ {r} 1} ^ {\top} & \dots & \mathbf {a} _ {p _ {r} p _ {c}} ^ {\top} \end{array} \right) \tag {4}
+$$
+
+the pseudocode for the general rectangular case is listed in algorithm 3. the first phase of the algorithm is based on a variant of the scalable universal matrix multiplication (summa) algorithm [28]. when  $\mathrm{bcast}(\mathbf{a}_{ic}, p(i,:))$  is called, the owner of  $\mathbf{a}_{ic}$  becomes the root and broadcasts its submatrix to all the processes along the  $i$ th process row. symmetrically,  $\mathrm{bcast}(\mathbf{h}_{rj}, p(:, j))$  means that whomever is the owner of  $\mathbf{h}_{rj}$  broadcasts its submatrix along the  $j$ th process column.
+
+variables lcols and lrows, which are significant only at the broadcasting processes, are the local column and row ranges for matrices that are to be broadcast. here we used the colon notation where the range  $i, i + 1, \ldots, i + k$  is denoted by  $(i: i + k)$  and empty colon (:) specifies the full possible range. for example,  $m(:, j)$  denotes the  $j$ th column, and  $m(1: k,:)$  denotes the first  $k$  rows of any two-dimensional object  $m$ . the spmm and gemm are local sparse-dense and dense-dense matrix multiplications, respectively.
+
+algorithm 3 block 2d algorithm for gnn forward propagation, which computes  $\mathbf{h}^l\gets \sigma (\mathbf{a}^\top \mathbf{h}^{l - 1}\mathbf{w}^l)$  in parallel. a and h are distributed on a  $p_r\times p_c$  process grid, w is replicated. blocking parameter  $b$  is required to evenly divide  $f^{l - 1} / p_r$  and  $f^{l - 1} / p_{c}$
+
+1: procedure block2dfw(a^t, h^{l-1}, w, h^l)  
+2: for all processes  $p(i,j)$  in parallel do  
+3: for  $q = 1$  to  $f^{l-1}/b$  do  $\triangleright$  1st summa phase  
+4:  $c = (qb)/p_c$ $\triangleright$  broadcasting process column  
+5:  $r = (qb)/p_r$ $\triangleright$  broadcasting process row  
+6: actv = (qb : (q + 1)b)  $\triangleright$  active columns/rows  
+7: lcols = actv (mod (n/p_c))  
+8: lrows = actv (mod (n/p_r))  
+9:  $\hat{\mathbf{a}}^t \leftarrow \mathbf{bcast}(\mathbf{a}_{ic}^t(:, lcols), p(i,:))$   
+10:  $\hat{\mathbf{h}}^{l-1} \leftarrow \mathbf{bcast}(\mathbf{h}_{rj}^{l-1}(lrows,:), p(:, j))$   
+11:  $\mathbf{t}_{ij} \leftarrow \mathbf{t}_{ij} + \mathbf{spmm}(\hat{\mathbf{a}}^t, \hat{\mathbf{h}}^{l-1})$   
+12: for  $q = 1$  to  $f^{l-1}/b$  do  $\triangleright$  2nd phase  
+13:  $c = (qb)/p_c$   
+14: actv = (qb : (q + 1)b)  
+15: lcols = actv (mod (n/p_c))  
+16:  $\hat{\mathbf{t}} \leftarrow \mathbf{bcast}(\mathbf{t}_{ic}(:, lcols), p(i,:))$   
+17: colrange = (jf^l/p_c + 1 : (j + 1)f^l/p_c)  
+18:  $\mathbf{h}_{ij}^l \leftarrow \mathbf{h}_{ij}^l + \mathbf{gemm}(\hat{\mathbf{t}}, \mathbf{w}(\text{actv}, \text{colrange}))$
+
+we start by analyzing the special  $p_r = p_c = \sqrt{p}$  case to give the intuition. for each process  $p(i,j)$ , the computation of the intermediate product  $\mathbf{t} = \mathbf{a}^{\mathsf{t}}\mathbf{h}^{l - 1}$  is:
+
+$$
+\mathbf {t} _ {i j} = \sum_ {k = 1} ^ {\sqrt {p}} \mathbf {a} _ {i k} ^ {\mathsf {t}} \mathbf {h} _ {k j}
+$$
+
+1) equation  $\mathbf{z}^l = \mathbf{a}^\top \mathbf{h}^{l - 1}\mathbf{w}^l$ :
+
+communication: 2d summa spmm + partial summa: both  $\mathbf{a}^t$  and  $\mathbf{h}^{l - 1}$  are partitioned into a  $\sqrt{p}\times \sqrt{p}$  process grid. this yields a 2d multiplication which we can do with an optimized summa algorithm. to compute a submatrix of  $\mathbf{a}^t\mathbf{h}^{l - 1}$ , each process in the submatrix's row must broadcast their  $\mathbf{a}$  and each submatrix's column must broadcast their  $\mathbf{h}^{l - 1}$ .  $\mathbf{w}^l$  is fully-replicated on each process, and is multiplied with  $\mathbf{t} = \mathbf{a}^t\mathbf{h}^{l - 1}$  after communication. however, this also requires communicating  $n\times f$  sized  $\mathbf{t}$  along the process row, something we label as "partial summa".
+
+$$
+t _ {c o m m} = \alpha 2 \sqrt {p} + \beta \big (\frac {n n z (\mathbf {a})}{\sqrt {p}} + \frac {2 n f}{\sqrt {p}} \big)
+$$
+
+2) equation  $\mathbf{h}^l = \sigma (\mathbf{z}^l)$ :
+
+communication: all-gather:  $\mathbf{h}^l$  is partitioned in a 2d process grid. when  $\sigma$  is element-wise, no communication is needed. however, when  $\sigma$  is not element-wise, in particular for logsoftmax, each process needs to broadcast its  $\mathbf{h}^{l - 1}$  with the entire process row.
+
+$$
+t _ {c o m m} = \alpha \lg p + \beta \frac {n f}{\sqrt {p}}
+$$
+
+3) equation  $\mathbf{g}^{l - 1} = \mathbf{a}\mathbf{g}^l (\mathbf{w}^l)^\top \odot \sigma '(z^{l - 1})$
+
+communication: 2d summa spmm + partial summa + all-gather: a and  $\mathbf{g}^l$  are partitioned in a 2d process grid, and results in the same communication pattern as equation 1. we also need to account for  $\sigma'(\mathbf{z}^{l-1})$ . recall that this needs communication when  $\sigma$  is not elementwise. this has the same communication pattern as equation 2. the communication cost is
+
+$$
+t _ {c o m m} = \alpha (2 \sqrt {p} + \lg p) + \beta \left(\frac {n n z (\mathbf {a})}{\sqrt {p}} + \frac {3 n f}{\sqrt {p}}\right).
+$$
+
+4) equation  $\mathbf{y} = (\mathbf{h}^{l - 1})^{\top}\mathbf{a}\mathbf{g}^{l}$ :
+
+communication: 2d dense summa + all-gather: strictly speaking, there are two matrix multiplications here. the first is multiplying  $\mathbf{a}$  and  $\mathbf{g}^l$ , which would have been a 2d summa spmm. however, we can reuse the same intermediate product from the previous equation, as we have done in the case of 1d block row algorithm. this increases storage by an additive  $nf / p$  term on each process. the intermediate product  $\mathbf{ag}^l$  is already partitioned on a  $\sqrt{p} \times \sqrt{p}$  process grid. the second multiplication, which is the only multiplication we have to pay for computing this equation, is between  $(\mathbf{h}^{l - 1})^\top$  and the previously saved intermediate product  $\mathbf{ag}^l$ . this is a 2d dense summa on two matrices with  $nf$  elements, resulting in a small  $f \times f$  output. the final allgather is to keep  $\mathbf{y}$  replicated. overall, the communication cost due to this equation is
+
+$$
+t _ {c o m m} = \alpha (\sqrt {p} + \lg p) + \beta \left(\frac {2 n f}{\sqrt {p}} + f ^ {2}\right).
+$$
+
+# 5) total communication:
+
+$$
+\begin{array}{l} = \sum_ {l = 1} ^ {l} \left(\alpha (5 \sqrt {p} + 3 \lg p) + \beta \left(\frac {8 n f ^ {l}}{\sqrt {p}} + \frac {2 n n z (\mathbf {a})}{\sqrt {p}} + (f ^ {l}) ^ {2}\right)\right) \\ \approx l \left(\alpha (5 \sqrt {p} + 3 \lg p) + \beta \left(\frac {8 n f}{\sqrt {p}} + \frac {2 n n z (\mathbf {a})}{\sqrt {p}} + f ^ {2}\right)\right) \\ \end{array}
+$$
+
+the communication volume scales with  $\sqrt{p}$ . however, the constants in the 2d algorithm are significantly larger than the constants in 1d and 1.5d algorithms. the latency cost of the 2d algorithm is asymptotically better than the 1d algorithm but worse than the 1.5d algorithm when  $c = \sqrt{p}$ . finally, the 2d algorithm also moves the sparse matrix, creating additional costs. this is not a problem asymptotically as long as  $nnz(a) = o(nf)$  but can be a bottleneck if the graph is larger than the aggregate embedding size across all vertices.
+
+6) the rectangular grid case: when the process grid is non-square, the 2d summa algorithm is still well-defined and relatively easy to implement. consider the forward propagation equation where  $\mathbf{a}^{\top}$  and  $\mathbf{h}$  are 2d block partitioned on a  $p_r \times p_c$  grid. each process needs to access  $(1 / p_r)\mathrm{th}$  of  $\mathbf{a}^{\top}$  and  $(1 / p_c)\mathrm{th}$  of  $\mathbf{h}$  to form its own  $n / p_r \times f / p_c$  piece of the intermediate output  $\mathbf{t} = \mathbf{a}^{\top}\mathbf{h}$ . however, we now need to consider the communication due to the 2nd phase of algorithm 3, which communicates this  $\mathbf{t}$  matrix along the process row. the forward propagation communication cost becomes:
+
+$$
+t _ {c o m m} = \alpha \operatorname * {g c f} (p _ {r}, p _ {c}) + \beta \big (\frac {n n z (\mathbf {a})}{p _ {r}} + \frac {n f}{p _ {c}} + \frac {n f}{p _ {r}} \big),
+$$
+
+where gcf denotes greatest common factor. this suggests that if the average vertex degree of the graph is significantly larger than the feature vector length, then there are potential savings is terms of sparse matrix communication by increasing the  $p_{r} / p_{c}$  ratio. however, this comes at the expense of increasing the sum of other two terms, which correspond to dense matrix communication. this is because the sum of two numbers whose product is fixed is minimized when those numbers are equal, or put differently, square has the smallest perimeter of all rectangles of a given area. consequently, given the unclear benefit to cost ratio of using non-square grids, our implementations focus on square grids in this work.
+
+# d. block 3d algorithms
+
+for ease of presentation, let us assume that processes are logically organized on a 3d  $\sqrt[3]{p} \times \sqrt[3]{p} \times \sqrt[3]{p}$  mesh, indexed by three indices, though in general each of the three process dimensions can be different. our matrix to process mesh assignment follows the split-3d-spgemm approach of azad et al. [3]. we call our variation split-3d-spmm, because the primary gnn operation is spmm as opposed to spgemm. each 2d plane in this 3d process mesh is called a "layer".
+
+considering a single spmm such as the  $\mathbf{a}\mathbf{h}^{l - 1}$  in forward propagation, we note that two input matrices are split differently. after 3d distribution, each local submatrix  $\mathbf{a}_{ijk}$  of  $\mathbf{a}$  is of dimensions  $n / \sqrt[3]{p} \times n / \sqrt[3]{p}^2$ . that means the number of rows of each  $\mathbf{a}_{ijk}$  is  $\sqrt[3]{p}$  times its number of columns. by
+
+contrast,  $\mathbf{h}$  is split along the rows across layers and each local piece  $\mathbf{h}_{ijk}$  is of dimensions  $n / \sqrt[3]{p^2} \times f / \sqrt[3]{p}$ . this data distribution choice makes each  $\mathbf{h}_{ijk}^{l-1}$  shorter and fatter than 2d distribution makes, potentially alleviating some of the issues with local spmm scaling we observe with our 2d implementation.
+
+we note that each process only holds  $(1 / p)\mathrm{th}$  of the input matrices in split-3d-spmm, so there is no replication at the input stage. the replication happens in intermediate stages, as we explain in detail below.
+
+# 1) equation  $\mathbf{z}^l = \mathbf{a}^\top \mathbf{h}^{l - 1}\mathbf{w}^l$ :
+
+communication: one full and one partial split-3d-spmm: the easiest way to think about a 3d multiplication algorithm is to consider it as independent 2d algorithms executing at each layer, followed by a reduction. to compute a submatrix of  $\mathbf{a}^{\top}\mathbf{h}^{l - 1}$ , each submatrix in  $\mathbf{a}_{jk}^{\top}$  broadcasts itself to the rest of the process row, and each submatrix  $\mathbf{h}_{i:k}$  broadcasts itself to the rest of the process column. in each 2d summa iteration, each process on a given layer receives a submatrix from  $\mathbf{a}^t$  and a submatrix from  $\mathbf{h}^{l - 1}$ , multiplies them, and adds them to a running sum.
+
+once these 2d summa iterations that have been executing independently at each layer complete, processes have partial sums for  $\mathbf{a}^t\mathbf{h}^{l-1}$  that need to be reduced across the third process dimension (also called a "fiber"). the partial sums after the 2d summa iterations complete are  $n / \sqrt[3]{p} \times f / \sqrt[3]{p}$  dense matrices, with  $nf / p^{2/3}$  elements each. these partial sums are then reduce-scattered along the fiber dimension to get the product  $\mathbf{a}^{\top}\mathbf{h}^{l-1}$  in a block split 3d format. this results in the following communication cost just to form  $\mathbf{a}^{\top}\mathbf{h}^{l-1}$ :
+
+$$
+t _ {c o m m} = \alpha \left(p ^ {1 / 3} + \lg p\right) + \beta \left(\frac {n n z (\mathbf {a})}{p ^ {2 / 3}} + \frac {2 n f}{p ^ {2 / 3}}\right)
+$$
+
+note that the aggregate memory consumption over all processes prior to the fiber reduction would be  $p\left( {nf/{p}^{2/3}}\right)  =$ ${p}^{1/3}{nf}$  ,where  ${p}^{1/3}$  is the well-known memory replication cost factor of 3d algorithms [1], [5].
+
+we now need to multiply this intermediate product  $\mathbf{a}^{\top}\mathbf{h}^{l - 1}$  with  $\mathbf{w}^l$ . similar to the block 2d case, we will perform a partial 3d dense matrix multiply where the second input matrix does not need to be communicated because it is replicated. the total communication cost, with this partial step added, is:
+
+$$
+t _ {c o m m} = 2 \alpha \left(p ^ {1 / 3} + \lg p\right) + \beta \left(\frac {n n z (\mathbf {a})}{p ^ {2 / 3}} + \frac {4 n f}{p ^ {2 / 3}}\right)
+$$
+
+# 2) equation  $\mathbf{h}^l = \sigma (\mathbf{z}^l)$ :
+
+communication: all-gather:  $\mathbf{h}^l$  is partitioned in a 3d process mesh. when  $\sigma$  is elementwise, no communication is needed. however, when  $\sigma$  is not elementwise, in particular for logsoftmax, each process needs to broadcast its  $\mathbf{h}^l$  with the entire process row within a layer. this is equivalent to an all-gather per layer. no cross-layer or cross-row communication is needed as the output of logsoftmax for a row of  $\mathbf{z}$  is only dependent on the values within that row.
+
+$$
+t _ {c o m m} = \alpha \lg p + \beta \big (\frac {n f}{p ^ {2 / 3}} \big)
+$$
+
+3) equation  $\mathbf{g}^{l - 1} = \mathbf{a}\mathbf{g}^l (\mathbf{w}^l)^\top \odot \sigma '(\mathbf{z}^{l - 1})$  ..
+
+a) communication: one full and one partial split-3d-spmm, and all-gather: a and  $\mathbf{g}^l$  are partitioned in a 3d process grid, and results in the same communication pattern as equation 1. we also need to account for  $\sigma'(\mathbf{z}^l)$ . recall that this needs communication when  $\sigma$  is not elementwise. this has the same communication pattern as equation 2, hence totalling:
+
+$$
+t _ {c o m m} = \alpha \left(2 p ^ {1 / 3} + 3 \lg p\right) + \beta \left(\frac {n n z (\mathbf {a})}{p ^ {2 / 3}} + \frac {5 n f}{p ^ {2 / 3}}\right)
+$$
+
+4) equation  $\mathbf{y} = (\mathbf{h}^{l - 1})^{\top}\mathbf{a}\mathbf{g}^{l}$ :
+
+communication: 3d dense summa + all-gather: we store the intermediate product  $\mathbf{a}\mathbf{g}^l$  that has been computed in the previous step, and reuse it here as we have done in other algorithms. multiplying  $(\mathbf{h}^{l - 1})^{\top}$  with  $\mathbf{a}\mathbf{g}^l$  is a dense 3d summa on two matrices with  $n f$  elements, resulting in a small  $f\times f$  output. note that each of these inputs are block split 3d. as before, the final allgather is to keep  $\mathbf{y}$  replicated. the bandwidth cost of all-gather strictly dominates the bandwidth cost of fiber reduction, so we do not include the cost of fiber reduction in the bandwidth term. the resulting communication cost is:
+
+$$
+t _ {c o m m} = \alpha 2 \lg p + \beta \left(\frac {2 n f}{p ^ {2 / 3}} + f ^ {2}\right).
+$$
+
+5) total communication: ignoring  $\lg p$  latency terms that are strictly dominated by the  $p^{1/3}$  terms, we have
+
+$$
+t _ {c o m m} \approx l \left(\alpha \left(4 p ^ {1 / 3}\right) + \beta \left(\frac {2 n n z (\mathbf {a})}{p ^ {2 / 3}} + \frac {1 2 n f}{p ^ {2 / 3}}\right)\right)
+$$
+
+although the 3d algorithm provides an asymptotic reduction in communication costs, it has several disadvantages compared to the 2d algorithm, which are (1) its high constants, (2) its implementation complexity, and (3) its need to do a factor of  $\sqrt[3]{p}$  replication in its intermediate stages.
+
+the exact impact of this intermediate replication to the overall memory consumption of gnn training depends on several factors such as (1) the number of layers, (2) the ratio of the maximum number of activations in a layer to the total number of activations, and (3) the ratio of the number of total activations to the number of edges (i.e.  $nnz(\mathbf{a})$ ) in the graph. an implementation of full-batch gnn training that is optimal with respect to memory usage has the following memory footprint:
+
+$$
+m _ {t o t a l} ^ {*} = n n z (\mathbf {a}) + \sum_ {l = 1} ^ {l} (n f ^ {l}) \approx n n z (\mathbf {a}) + n f l
+$$
+
+the memory consumption of the 2d algorithm asymptotically matches this bound and the only overheads are in the communication buffers. however, the 3d algorithm replicates the activations while processing a layer. the important point is that this replication only impacts the current layer that is being processed, either during forward or backward propagation, because the intermediate matrices are discarded after layer-wise reduction. suppose the maximum number of activations
+
+(e.g., features) is  $f^{max} = \max_{l=1}^{l} f^{l}$ , and the layer with the highest number of activations is  $k = \arg \max_{l=1}^{l} f^{l}$ . then the memory footprint of the 3d algorithm is
+
+$$
+\begin{array}{l} m _ {t o t a l} ^ {3 d} = n n z (\mathbf {a}) + \sum_ {l = 1, l \neq k} ^ {l} (n f ^ {l}) + \sqrt [ 3 ]{p} n f ^ {m a x} \\ \approx n n z (\mathbf {a}) + n f (l - 1) + \sqrt [ 3 ]{p} n f ^ {m a x} \\ \end{array}
+$$
+
+when the network is deep or when the maximum number of activations in a layer is much smaller than the input graph size, this memory overhead is unlikely to be an impediment. however, many existing gnn networks are rather shallow at the moment.
+
+# v. experimental setup
+
+# a. datasets and compute platform
+
+we ran our experiments on two of the largest datasets used in gnn research previously, the reddit and amazon datasets. in addition, we use a much larger protein similarity network which pushes the boundaries of large-scale gnn training. this 'protein' network comes from the data repository of the hipmcl algorithm [4]. it is an induced subgraph, which contains 1/8th of the original vertices, of the sequence similarity network that contained all the isolate genomes from the img database at the time. the characteristics of the datasets are documented in table iii. the feature (input) and label (output) embedding lengths of the protein dataset largely follows the literature on this topic [16] where the protein sequences are assumed to be initially processed independently to obtain their 128-length embeddings (via cnns or lstms) before running gnns on those embeddings. for load balancing, graph vertices are randomly permuted prior to training.
+
+table iii datasets used in our experiments  
+
+<table><tr><td>name</td><td>vertices</td><td>edges</td><td>features</td><td>labels</td></tr><tr><td>reddit</td><td>232,965</td><td>114,848,857</td><td>602</td><td>41</td></tr><tr><td>amazon</td><td>14,249,639</td><td>230,788,269</td><td>300</td><td>24</td></tr><tr><td>protein</td><td>8,745,542</td><td>2,116,240,124</td><td>128</td><td>256</td></tr></table>
+
+we use the same 3-layer gnn architecture presented by kipf and welling [19] though deeper and wider networks are certainly possible as done by roc [18] given the similar performance we achieve.
+
+we verified that our parallel implementation not only achieves the same training accuracy in the same number of epochs as the serial implementations in pytorch, but it also outputs the same embeddings up to floating point accumulation errors. consequently, we only provide performance numbers as the accuracy numbers are identical to the serial cases.
+
+# b. system details
+
+all of our experiments are run on the summit supercomputer at ornl, which has ibm ac922 nodes with 6 nvidia v100 gpus. each gpu has 16gb of hbm2 memory. each summit node has two sockets, each with 1 power9 cpu and 3 gpus each. within a socket, each gpu is connected to
+
+each other and the host cpu with nvlink 2.0 with  $50\mathrm{gb / s}$  unidirectional bandwidth. across sockets, summit uses the ibm x-bus interconnect with  $64\mathrm{gb / s}$ . each socket has a  $16\mathrm{gb / s}$  link to the network interface card (nic). across nodes, summit uses dual-rail edr infiniband with  $25\mathrm{gb / s}$  node injection bandwidth [23], but each socket has access to half  $(12.5\mathrm{gb / s})$  of this node injection bandwidth.
+
+# c. implementation details
+
+we implement our 3-layer gnn architecture mostly in pytorch geometric (pyg) 1.3 [14]. within pyg, we use torch.distributed with a nccl backend for our communication primitives. nccl implements broadcasts and reductions using a ring algorithm, and splits an outgoing message to smaller chunks for pipelining [10]. nccl collectives have different completion semantics than mpi. for example, when the broadcasting process receives the delivery confirmation of its own data from its peer process, its function call returns without waiting for the completion of the broadcast on subsequent nodes. this relaxed completion combined with pipelining allows broadcasting using nccl to be as high-performance as using manual shifting when implementing matrix multiplication, provided that the messages can be divided into enough chunks to hide the latency of filling the pipeline.
+
+for our spmm calls, we separately call cusparse's csrmm2 function in a  $\mathrm{c + + }$  extension. we compile our  $\mathrm{c + + }$  backend with cuda 10.1. recall each node on summit has 6 gpus. as such, our implementation is single-node multi-gpu when  $p = 4$ , but multi-node multi-gpu in all other cases. in particular, a  $p$  process job allocates  $\lceil p / 6\rceil$  nodes so that we utilize all 6 gpus except for the last node. we only deviate from this setup for exposing the topological limitations of summit interconnect in figure 2
+
+for reddit, we use the input feature vectors and training split used by hamilton et al. [17] as they are already provided within pyg. for the amazon and protein datasets, we randomly generate feature values for simplicity and use the whole graph as the training set. this does not affect performance, and in practice, users could use any values for the feature vectors. we run reddit and amazon for 100 epochs and protein for 10 epochs. we do not report numbers for amazon on 4 devices or numbers for protein on 4 or 16 devices as the data does not fit in memory for those configurations. jia et al. [18] observed the same behavior with pyg. we are unable to compare our results directly with neugraph or roc because neither code is currently publicly available.
+
+# vi. results
+
+# a. performance of the 1d and 1.5d implementations
+
+the performance of 1d  $(c = 1)$  as well as 1.5d implementations  $(c > 1)$  are shown in figure 1. since our 1d and 1.5d implementations only move the dense matrices, the communication volume is proportional to the product of the number of vertices and the number of features. due to its small vertex count, gnn training on reddit dataset is increasingly latency bound at large concurrencies. consequently when  $p$  is large,
+
+increasing  $c$  directly translates into lower communication costs for reddit, due to quadratic decrease in latency costs. on a single node, our 1.5d gnn training algorithm achieves more than 20 epochs/sec throughput, higher than all previously published results.
+
+for amazon and protein, which are mostly bandwidth bound, our analysis expects communication volume in the broadcast stage to decrease linearly with increasing  $c$ . however, our results showed minimal decrease in broadcast time when fully utilizing all 6 gpus on each summit node. diving into the specifics of summit architecture [23], as explained in section v-b, we conclude this is due to sharing network injection bandwidth. recall that each socket on summit has 3 gpus and they share the same 12.5 gb/s network injection bandwidth. also recall that broadcasts in nccl are implemented using a pipelined ring algorithm. when only a single broadcast is active ( $c = 1$  aka 1d), the whole 12.5 gb/s injection bandwidth is used by a single gpu because the last gpu on the  $i$ th node is peered with the first gpu on the  $(i + 1)$ th node. when  $c = 2$ , there are two simultaneous broadcasts happening on two virtual rings. two gpus on a socket now has to share the network injection bandwidth to communicate with their peers on the neighboring node. this cuts down the effective available bandwidth by half, so even though the communication volume is reduced to half we do not see any appreciable decrease in broadcast times with increasing  $c$  from 1 to 2.
+
+further increasing  $c$  to 4 increases the load node injection to its maximum where all 3 gpus on the socket compete for  $12.5\mathrm{gb / s}$  injection bandwidth. we confirmed that node injection bandwidth is indeed the bottleneck by running our 1d and 1.5d implementations on 1 gpu/node configuration. figure 2 shows close-to-linear scaling for broadcast times when  $c$  is increased, for the bandwidth-bound datasets amazon and protein.
+
+# b. performance of the 2d implementation
+
+the performance and scaling of our 2d implementation is covered by both figure 1 (comparing with the 1d and 1.5d implementations) and figure 3 (comparing with the 3d implementation). figure 1 covers the process counts  $p = 16, 36, 64, 100$  and uses the default 16 middle layer dimension. figure 3 covers the process counts  $p = 25, 64, 121$  and uses 64 as the middle layer dimension. when comparing our 2d and 3d implementations in figure 3, we used a middle layer dimension of 64 instead of 16 because the 3d algorithm needs to partition dimension 16 across  $p^{2/3}$  processes in some cases, which is impossible with  $p > 64$ . consequently, the average feature length  $f$  is  $\approx 10\%$  larger in figure 3, translating into a marginal runtime difference between figures 1 and 3 for  $p = 64$ . we note that dbcast is the total time to broadcast dense matrices in any step of the 2d algorithm and is not restricted to distributed gemm calls. in fact, dbcast time is dominated by the time it takes to communicate dense matrices (e.g., h and g) during distributed spmm calls.
+
+![](images/5119a1db7edca10496a73ce6af9ceb91fd26e2ab458efbf302bbdeb2167d998e.jpg)  
+fig. 1. 1d  $(c = 1)$ , 1.5d  $(c = 2,4)$ , and 2d performance results when using all 6 gpus on each node. the x-axis in each subplot is the number of gpus used. dbcast refers to the broadcast of dense embedding matrices, sbcast refers to the broadcast of sparse adjacency matrix (only for 2d), reduce is the allreduce (only for 1.5d), local is the local computation including cusparse spmm calls, small dgemm calls, transpose (only for 2d), and sparse matrix assembly after communication (only for 2d). missing bars for  $c = 4, p = 16$  on amazon and  $c = 4, p = 36$  on protein means that those runs ran out of memory.
+
+![](images/3b1585bd8e011579d14ca7758393f0fc7d32af12260bd95283fda74021fab51d.jpg)  
+fig. 2. 1d  $(c = 1)$ , 1.5d  $(c = 2,4)$  performance results when only one gpu is used per node. the x-axis for each subplot is the number of gpus used. dbcast refers to the broadcast of dense embedding matrices, reduce is the allreduce (only for 1.5d), local is the local computation including cusparse spmm calls, small dgemm calls
+
+![](images/c0eaac21739758210611968ee24962fed423a58f86d77c2ff2e1fb1ca4f8b80b.jpg)  
+fig. 3. runtime of 2d implementation vs. 3d implementations across gpu counts. the x-axis for each subplot is the number of gpus used. 2d was run on perfect square process counts, while 3d was run on perfect cubes. reduce is the allreduce (only for 3d), dbcast refers to the broadcast of dense embedding matrices, sbcast refers to the broadcast of the sparse adjacency matrix, and local is the local computation including cusparse spmm calls, small dgemm calls, transpose, and sparse matrix assembly after communication.
+
+in terms of scaling with increasing process counts, the 2d algorithm shows noteworthy speedups up until 36 gpus on all three datasets. beyond that, reddit shows slowdowns whereas amazon and protein stagnates. for amazon and protein, dbcast time continues scaling but that is offset by the increase in local computation and/or sbcast times. there are two fundamental reasons why local spmm does not scale with increasing process counts. (1) spmm performance degrades as
+
+the matrix gets sparser. yang et al. [32] demonstrate that when the average number of nonzeros per row (i.e., degree,  $d = nnz / n$ ) goes down from 62 to 8, the sustained gflops rates are cut by a factor of 3. they specifically evaluated cusparse's csrmm2 function, which is the same spmm function we use, but the performance degradation due to increased sparsity is present for all spmm implementations they evaluated. the average number of nonzeros per row goes down when a sparse matrix is 2d partitioned across larger device counts. this phenomenon is known as hypersparsity [7] and decreases the average degree of 2d partitioned submatrices by a factor of  $\sqrt{p}$ . (2) since the dense matrices (e.g., the activation matrix) are also 2d partitioned, the number of columns in each local dense submatrix also goes down by a factor of  $\sqrt{p}$ , making the dense matrix "skinnier". the performance degradation at this extremely skinny regime is also well documented [2].
+
+in terms of absolute performance, the 2d algorithm is never faster than the 1.5d algorithm. this might come surprising given the asymptotically better communication scaling per analysis in section iv-c5. however, even when considering dbcast costs alone, the constants in the 2d algorithm are  $4 \times$  larger than the 1d and 1.5d algorithms. in addition, the 2d algorithm has to communicate the sparse matrix, which has packing and unpacking costs in addition to the costs associated with actually moving the data.
+
+# c. performance of the 3d implementation
+
+we run both 2d and 3d implementations on 20 epochs for amazon and 10 epochs for protein. for 2d, we run on process counts 25, 64, and 121. for 3d, we run on process counts 27, 64, and 125. we specifically choose these counts to permit a fair comparison. we also do not run the 3d algorithm on reddit as it was already latency-bound and, thus, cannot leverage the benefits of the 3d algorithm.
+
+overall, we see that the 3d implementation enjoys a consistent speedup on both datasets all the way until 125 gpus, unlike the 2d algorithm. while the 3d algorithms is slower than the 2d for smaller process counts on amazon, it matches
+
+the 2d implementation when  $p = 121 / 125$ . for protein, the 3d algorithm generally outperforms 2d. the difference here lies in the computation. with 2d, as discussed above, scaling computation to large process counts is difficult since the  $nnz$  per row shrinks as  $p$  increases. while in 2d, each row is partitioned across  $p^{1/2}$  processes, in 3d they are partitioned across  $p^{2/3}$  processes. thus, the average  $nnz$  per row is lower in 3d than in 2d.
+
+for both datasets, 3d communication scales roughly  $5 - 10\%$  better than 2d, to the point where they both perform equally well at  $p = 121 / 125$ . while this is a small difference, this trend is consistent with the analysis in sections iv-c and iv-d. while the bandwidth in 2d scales by a factor of  $p^{1 / 2}$ , the bandwidth in 3d scales by  $p^{2 / 3}$ . the 3d analysis also has larger constant factors. coupled together, we expect the 3d implementation to scale only slightly better than the 2d implementation. we expect that, for larger process counts, the 3d implementation will leverage additional scaling to outperform 2d for amazon.
+
+# vii. conclusions and future work
+
+we presented distributed-memory parallel gnn training algorithms that asymptotically reduce communication costs by dividing two or three dimensions (1.5d, 2d, or 3d) of the iteration space across the training pipeline when compared to the commonly used (1d) vertex partitioning methods. we evaluated these algorithms on three datasets that differ in graph size and structure, revealing a set of trade-offs in memory use, local node efficiency, and communication volume, latency (number of messages), and efficiency.
+
+our experimental results show that even simple variants of our algorithms can be scalable when implemented using off-the-shelf tools such as pytorch and cusparse. on a flat execution model that uses only a single gpu per node, there are clear benefits to the communication avoiding approach. on the other hand, the memory hierarchy on a six-gpu node leads to some surprising results due to issues such as injection bandwidth limitations, and the anomalies suggest opportunities to improve collective communication through hierarchical algorithms so that compute nodes' injection bandwidth to the network does not become a bottleneck. overall, we show that the 1.5d algorithm, which can scale with available memory in the second dimension, is the most effective given the implementation environment on the summit machine. we believe our communication-avoiding algorithms will show their true benefit on better connected architectures such as perlmutter [11] where each gpu gets its own  $25~\mathrm{gb / s}$  injection bandwidth. at that point, new local spmm implementations whose throughput degrades more gracefully with increasing sparsity will be crucial for scaling the computation part of gnn training.
+
+the memory consumption of gnns can be high due to the need to store activations generated during forward propagation so they can be used for backpropagation. if full-batch gradient descent is used or if graph sampling does not provide an asymptotic reduction, the memory costs become  $o(nfl)$ ,
+
+which is prohibitive for deep networks. consequently, we envision future work where our distributed training algorithms are carefully combined with sophisticated sampling based methods to achieve the best of worlds.
+
+# acknowledgments
+
+this material is based upon work supported by the national science foundation graduate research fellowship under grant no. dge 1752814 and by the national science foundation under award no. 1823034. this work is also supported in part by the advanced scientific computing research (ascr) program of the department of energy office of science under contract no. de-ac02-05ch11231, and in part by the exascale computing project (17-sc-20-sc), a collaborative effort of the u.s. department of energy office of science and the national nuclear security administration.
+
+this research used resources of the oak ridge leadership computing facility at the oak ridge national laboratory, which is supported by the office of science of the u.s. department of energy under contract no. de-ac05-00or22725.
+
+# references
+
+[1] ramesh c agarwal, susanne m balle, fred g gustavson, mahesh joshi, and prasad palkar. a three-dimensional approach to parallel matrix multiplication. ibm journal of research and development, 39(5):575-582, 1995.  
+[2] h. metin aktulga, aydin buluc, samuel williams, and chao yang. optimizing sparse matrix-multiple vectors multiplication for nuclear configuration interaction calculations. in proceedings of the ipdps. ieee computer society, 2014.  
+[3] ariful azad, grey ballard, aydin buluc, james demmel, laura grigori, oded schwartz, sivan toledo, and samuel williams. exploiting multiple levels of parallelism in sparse matrix-matrix multiplication. siam journal on scientific computing, 38(6):c624-c651, 2016.  
+[4] ariful azad, georgios a pavlopoulos, christos a ouzounis, nikos c kyrpides, and aydin buluc. hipmcl: a high-performance parallel implementation of the markov clustering algorithm for large-scale networks. *nucleic acids research*, 46(6):e33-e33, 01 2018.  
+[5] grey ballard, james demmel, olga holtz, and oded schwartz. minimizing communication in numerical linear algebra. siam journal on matrix analysis and applications, 32(3):866-901, 2011.  
+[6] tal ben-nun and torsten hoefler. demystifying parallel and distributed deep learning: an in-depth concurrency analysis. acm computing surveys (csur), 52(4):1-43, 2019.  
+[7] aydin buluc and john r gilbert. on the representation and multiplication of hypersparse matrices. in ieee international symposium on parallel and distributed processing, pages 1-11. ieee, 2008.  
+[8] aydin buluc and john r gilbert. the combinatorial blas: design, implementation, and applications. the international journal of high performance computing applications, 25(4):496-509, 2011.  
+[9] ernie chan, marcel heimlich, avi purkayastha, and robert van de geijn. collective communication: theory, practice, and experience. *concurrency and computation: practice and experience*, 19(13):1749-1783, 2007.  
+[10] nvidia corporation. nccl: optimized primitives for collective multi-gpu communication. https://github.com/nvidia/ncl, 2020.  
+[11] jack deslippe. perlmutter - a 2020 pre-exascalegpu-accelerated system for nersc. architecture and early application performance optimization results. gpu technology conference, 2019.  
+[12] nikoli dryden, naoya maruyama, tom benson, tim moon, marc snir, and brian van essen. improving strong-scaling of cnn training by exploiting finer-grained parallelism. in international parallel and distributed processing symposium (ipdps), pages 210-220. ieee, 2019.
+
+[13] nikoli dryden, naoya maruyama, tim moon, tom benson, marc snir, and brian van essen. channel and filter parallelism for large-scale cnn training. in proceedings of the international conference for high performance computing, networking, storage and analysis, pages 1-20, 2019.  
+[14] matthias fey and jan e. lenssen. fast graph representation learning with pytorch geometric. in iclr workshop on representation learning on graphs and manifolds, 2019.  
+[15] amir gholami, ariful azad, peter jin, kurt keutzer, and aydin buluc. integrated model, batch, and domain parallelism in training neural networks. in spaa'18: 30th acm symposium on parallelism in algorithms and architectures, 2018.  
+[16] vladimir gligorijevic, p douglas renfrew, tomasz koscielek, julia koehler leman, kyunghyun cho, tommi vatanen, daniel berenberg, bryn c taylor, ian m fisk, ramnik j xavier, et al. structure-based function prediction using graph convolutional networks. biorxiv, page 786236, 2019.  
+[17] will hamilton, zhitao ying, and jure leskovec. inductive representation learning on large graphs. in i. guyon, u. v. luxburg, s. bengio, h. wallach, r. fergus, s. vishwanathan, and r. garnett, editors, advances in neural information processing systems 30, pages 1024-1034. curran associates, inc., 2017.  
+[18] zhihao jia, sina lin, mingyu gao, matei zaharia, and alex aiken. improving the accuracy, scalability, and performance of graph neural networks with roc. in proceedings of machine learning and systems (mlsys), pages 187-198. 2020.  
+[19] thomas n. kipf and max welling. semi-supervised classification with graph convolutional networks. in proceedings of the 5th international conference on learning representations (iclr), 2017.  
+[20] penporn koanantakool, ariful azad, aydin buluc, dmitriy morozov, sang-yun oh, leonid oliker, and katherine yelick. communication-avoiding parallel sparse-dense matrix-matrix multiplication. in proceedings of the ipdps, 2016.  
+[21] adam lerer, ledell wu, jiajun shen, timothee lacroix, luca wehrstedt, abhijit bose, and alexander peysakhovich. pytorch-biggraph: a large-scale graph embedding system. in proceedings of the 2nd sysml conference, 2019.  
+[22] lingxiao ma, zhi yang, youshan miao, jilong xue, ming wu, lidong zhou, and yafei dai. neugraph: parallel deep neural network computation on large graphs. in usenix annual technical conference (usenix atc 19), pages 443-458, renton, wa, 2019. usenix association.  
+[23] tom papatheodore. summit architecture overview. introduction to summit, 2019.  
+[24] adam paszke, sam gross, francisco massa, adam lerer, james bradbury, gregory chanan, trevor killeen, zeming lin, natalia gimelshein, luca antiga, et al. pytorch: an imperative style, high-performance deep learning library. in advances in neural information processing systems, pages 8024-8035, 2019.  
+[25] franco scarselli, marco gori, ah chung tsoi, markus hagenbuchner, and gabriele monfardini. the graph neural network model. ieee transactions on neural networks, 20(1):61-80, 2008.  
+[26] noam shazeer, youlong cheng, niki parmar, dustin tran, ashish vaswani, penporn koanantakool, peter hawkins, hyoukjoong lee, mingsheng hong, cliff young, et al. mesh-tensorflow: deep learning for supercomputers. in advances in neural information processing systems, pages 10414-10423, 2018.  
+[27] edgar solomonik, devin matthews, jeff hammond, and james demmel. cyclops tensor framework: reducing communication and eliminating load imbalance in massively parallel contractions. in 27th international symposium on parallel and distributed processing, pages 813-824. ieee, 2013.  
+[28] robert a van de geijn and jerrell watts. summa: scalable universal matrix multiplication algorithm. *concurrency: practice and experience*, 9(4):255-274, 1997.  
+[29] minjie wang, lingfan yu, da zheng, quan gan, yu gai, zihao ye, mufei li, jinjing zhou, qi huang, chao ma, ziyue huang, qipeng guo, hao zhang, haibin lin, junbo zhao, jinyang li, alexander j. smola, and zheng zhang. deep graph library: towards efficient and scalable deep learning on graphs. corr, abs/1909.01315, 2019.  
+[30] zonghan wu, shirui pan, fengwen chen, guodong long, chengqi zhang, and s yu philip. a comprehensive survey on graph neural networks. ieee transactions on neural networks and learning systems, 2020.
+
+[31] keyulu xu, weihua hu, jure leskovec, and stefanie jegelka. how powerful are graph neural networks? in international conference on learning representations, 2019.  
+[32] carl yang, aydin buluc, and john d owens. design principles for sparse matrix multiplication on the gpu. in european conference on parallel processing, pages 672-687. springer, 2018.  
+[33] jie zhou, ganqu cui, zhengyan zhang, cheng yang, zhiyuan liu, lifeng wang, changcheng li, and maosong sun. graph neural networks: a review of methods and applications. arxiv preprint arxiv:1812.08434, 2018.  
+[34] rong zhu, kun zhao, hongxia yang, wei lin, chang zhou, baole ai, yong li, and jingren zhou. aligraph: a comprehensive graph neural network platform. proceedings of the vldb endowment, 12(12):2094-2105, 2019.

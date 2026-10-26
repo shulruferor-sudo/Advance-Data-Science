@@ -1,0 +1,338 @@
+# fast and accurate neural crf constituency parsing
+
+yu zhang*, houquan zhou*, zhenghua li
+
+institute of artificial intelligence, school of computer science and technology, soochow university, suzhou, china
+
+yzhang.cs@outlook.com, hqzhou@stu.suda.edu.cn, zhli13@suda.edu.cn
+
+# abstract
+
+estimating probability distribution is one of the core issues in the nlp field. however, in both deep learning (dl) and pre-dl eras, unlike the vast applications of linear-chain crf in sequence labeling tasks, very few works have applied tree-structure crf to constituency parsing, mainly due to the complexity and inefficiency of the inside-outside algorithm. this work presents a fast and accurate neural crf constituency parser. the key idea is to batchify the inside algorithm for loss computation by direct large tensor operations on gpu, and meanwhile avoid the outside algorithm for gradient computation via efficient back-propagation. we also propose a simple two-stage bracketing-then-labeling parsing approach to improve efficiency further. to improve the parsing performance, inspired by recent progress in dependency parsing, we introduce a new scoring architecture based on boundary representation and biaffine attention, and a beneficial dropout strategy. experiments on ptb, ctb5.1, and ctb7 show that our two-stage crf parser achieves new state-of-the-art performance on both settings of w/o and w/ bert, and can parse over 1,000 sentences per second. we release our code at https://github.com/yzhangcs/crfpar.
+
+# 1 introduction
+
+given an input sentence, constituency parsing aims to build a hierarchical tree as depicted in figure 1(a), where the leaf or terminal nodes correspond to input words and non-terminal nodes are constituents (e.g.,  $\mathsf{vp}_{3,5}$ ). as a fundamental yet challenging task in the natural language processing (nlp) field, constituency parsing has attracted a lot of research attention since large-scale treebanks were annotated, such as penn treebank (ptb), penn chinese treebank (ctb), etc. parsing outputs are also proven to be extensively useful for a wide range of downstream applications [akoury et al., 2019; wang et al., 2018].
+
+![](images/e9b76e8a93473cdd321065033df24a78e35144fd762fad6d197e34ecb525bc10.jpg)  
+(a) original tree
+
+![](images/85f7b76655b466cca4208307c80be0a084212d5b559ff59c11e477f4a0d3d7e6.jpg)  
+(b) cnf tree (left binarized)  
+figure 1: example constituency trees. part-of-speech (pos) tags are not used as inputs in this work and thus excluded.
+
+as one of the most influential works, collins [1997] extends methods from probabilistic context-free grammars (pcfgs) to lexicalized grammars. since then, constituency parsing has been dominated by such generative models for a long time, among which the widely used berkeley parser adopts an unlexicalized pcfg with latent non-terminal splitting annotations [matsuzaki et al., 2005; petrov and klein, 2007]. as for discriminative models, there exist two representative lines of research. the first line adopts the graph-based view based on dynamic programming decoding, using either local max-entropy estimation [kaplan et al., 2004] or global max-margin training [taskar et al., 2004]. the second group builds a tree via a sequence of shift-reduce actions based on greedy or beam decoding, known as the transition-based view [sagae and lavie, 2005; zhu et al., 2013].
+
+recently, constituency parsing has achieved significant progress thanks to the impressive capability of deep neural networks in context representation. two typical and popular works are respectively the transition-based parser of cross and huang [2016] and the graph-based parser of stern et al. [2017]. as discriminative models, the two parsers share several commonalities, both using 1) multi-layer bilstm as encoder; 2) minus features from bilstm outputs as span representations; 3) mlp for span scoring; 4) max-margin training loss. most works [gaddy et al., 2018; kitaev and klein, 2018] mainly follow the two parsers and achieve much higher parsing accuracy than traditional non-neural models, especially with contextualized word representations trained with language modeling loss on large-scale unlabeled data [peters et al., 2018; devlin et al., 2019].
+
+despite the rapid progress, existing constituency parsing research suffers from two closely related drawbacks. first, parsing (also for training) speed is slow and can hardly satisfy the requirement of real-life systems. second, the lack of explicitly modeling tree/subtree probabilities may hinder the effectiveness of utilizing parsing outputs. on the one hand, estimating probability distribution is one of the core issues in the nlp field [le and zuidema, 2014]. on the other hand, compared with unbounded tree scores, tree probabilities can better serve high-level tasks as soft features [jin et al., 2020], and marginal probabilities of subtrees can support the more sophisticated minimum bayes risk (mbr) decoding [smith and smith, 2007].
+
+in fact, finkel et al. [2008] and durrett and klein [2015] both propose crf-based constituency parsing by directly modeling the conditional probability. however, both models are extremely inefficient due to the high time-complexity of the inside-outside algorithm for loss and gradient computation, especially the outside procedure. the issue becomes more severe in the dl era since all previous works perform the inside-outside computation on cpus according to our knowledge and switching between gpu and cpu is expensive.
+
+this work proposes a fast and accurate crf constituency parser by substantially extending the graph-based parser of stern et al. [2017]. the key contribution is that we batchify the inside algorithm for direct loss and gradient computation on gpu. meanwhile, we find that the outside algorithm can be efficiently fulfilled by automatic backpropagation, which is shown to be equally efficient with the inside (forward) procedure, naturally verifying the great theoretical work of eisner [2016]. similarly, we batchify the cocke-kasami-younger (cky) algorithm for fast decoding.
+
+in summary, we make the following contributions.
+
+- we for the first time propose a fast and accurate crf constituency parser for directly modeling (marginal) probabilities of trees and subtrees. the efficiency issue, which bothers the community for a long time, is well solved by elegantly batchifying the inside and cky algorithms for direct computation on gpu.  
+- we propose a two-stage bracketing-then-labeling parsing approach that is more efficient and achieves slightly better performance than the one-stage method.  
+- we propose a new span scoring architecture based on span boundary representation and biaffine attention scoring, which performs better than the widely used minus-feature method. we also show that the parsing performance can be improved by a large margin via better parameter settings such as dropout configuration.  
+- experiments on three english and chinese benchmark datasets show that our proposed two-stage crf parser achieves new state-of-the-art parsing performance under both settings of w/o and w/ bert [devlin et al., 2019]). in terms of parsing speed, our parser can parse over 1,000 sentences per second.
+
+![](images/c5427308f9be633cc4c9ffba941ded30ec2a856192d8f6149e631f0bf4c1de21.jpg)  
+figure 2: model architecture.
+
+# 2 two-stage crf parsing
+
+formally, given a sentence consisting of  $n$  words  $x = w_0, \ldots, w_{n-1}$ , a constituency parse tree, as depicted in figure 1(a), is denoted as  $t$ , and  $(i, j, l) \in t$  is a constituent spanning  $w_i \ldots w_j$  with a syntactic label  $l \in \mathcal{l}$ . alternatively, a tree can be factored into two parts, i.e.,  $t = (y, l)$ , where  $y$  is an unlabeled (a.k.a. bracketed) tree and  $l$  is a label sequence for all constituents in a certain order. interchangeably, (3,5,vp) is also denoted as  $\mathrm{vp}_{3,5}$ .
+
+to accommodate the inside and cky algorithms, we transform the original tree into those of chomsky normal form (cnf) using the nltk tool<sup>1</sup>, as shown in figure 1(b). particularly, consecutive unary productions such as  $\mathrm{x}_{i,j} \rightarrow \mathrm{y}_{i,j}$  are collapsed into one  $\mathrm{x} + \mathrm{y}_{i,j}$ . we adopt left binarization since preliminary experiments show it is slightly superior to right binarization. after obtaining the 1-best tree via cky decoding, the cnf tree is recovered into the  $n$ -ary form.
+
+# 2.1 model definition
+
+in this work, we adopt a two-stage bracketing-then-labeling framework for constituency parsing, which we show not only simplifies the model architecture but also improves efficiency, compared with the traditional one-stage approach adopted in previous works [stern et al., 2017; gaddy et al., 2018].
+
+first stage: bracketing. given  $\mathbf{x}$ , the goal of the first stage is to find an optimal unlabeled tree  $\mathbf{y}$ . the score of a tree is decomposed into the scores of all contained constituents.
+
+$$
+s (\boldsymbol {x}, \boldsymbol {y}) = \sum_ {(i, j) \in \boldsymbol {y}} s (i, j) \tag {1}
+$$
+
+under crf, the conditional probability is
+
+$$
+p (\boldsymbol {y} \mid \boldsymbol {x}) = \frac {e ^ {s (\boldsymbol {x} , \boldsymbol {y})}}{z (\boldsymbol {x}) \equiv \sum_ {\boldsymbol {y} ^ {\prime} \in \mathcal {t} (\boldsymbol {x})} e ^ {s (\boldsymbol {x} , \boldsymbol {y} ^ {\prime})}} \tag {2}
+$$
+
+where  $z(\pmb{x})$  is known as the normalization term, and  $\mathcal{t}(\pmb{x})$  is the set of legal trees.
+
+given all constituent scores  $s(i,j)$ , we use the cky algorithm to find the optimal tree  $\hat{\pmb{y}}$ .
+
+$$
+\hat {\boldsymbol {y}} = \arg \max  _ {\boldsymbol {y}} s (\boldsymbol {x}, \boldsymbol {y}) = \arg \max  _ {\boldsymbol {y}} p (\boldsymbol {y} \mid \boldsymbol {x}) \tag {3}
+$$
+
+second stage: labeling. given a sentence  $x$  and a tree  $y$ , the second stage independently predicts a label for each constituent  $(i,j) \in y$ .
+
+$$
+\hat {l} = \underset {l \in \mathcal {l}} {\arg \max } s (i, j, l) \tag {4}
+$$
+
+note that we use gold-standard unlabeled trees for loss computation during training. for a sentence of length  $n$ , all cnf trees contain the same  $2n - 1$  constituents. therefore, this stage has a time complexity of  $o(n|\mathcal{l}|)$ .
+
+time complexity analysis. the cky algorithm has a time complexity of  $o(n^{3})$ . therefore, the time complexity of our two-stage parsing approach is  $o(n^{3} + n|\mathcal{l}|)$ . in contrast, for the one-stage parsing approach, the cky algorithm needs to determine the best label for all  $n^2$  spans and thus needs  $o(n^{3} + n^{2}|\mathcal{l}|)$ , where  $|\mathcal{l}|$  is usually very large (e.g., 138 for english in table 1).
+
+# 2.2 scoring architecture
+
+this subsection introduces the network architecture for scoring spans and labels, as shown in figure 2, which mostly follows stern et al. [2017] with two important modifications: 1) boundary representation and biaffine attention for score computation; 2) better parameter settings following dozat and manning [2017].
+
+inputs. for the  $i$ th word, its input vector  $\mathbf{e}_i$  is the concatenation of the word embedding and character-level representation:
+
+$$
+\mathbf {e} _ {i} = \mathbf {e} _ {i} ^ {\text {w o r d}} \oplus \operatorname {c h a r l s t m} (w _ {i}) \tag {5}
+$$
+
+where  $\mathrm{charlstm}(w_i)$  is the output vectors after feeding the character sequence into a bilstm layer [lample et al., 2016]. previous works show that replacing pos tag embeddings with  $\mathrm{charlstm}(w_i)$  leads to consistent improvement [kitaev and klein, 2018]. this can also simplify the model without the need of predicting pos tags (n-fold jack-knifing on training data).
+
+bilstm encoder. we employ three bilstm layers over the input vectors for context encoding. we denote as  $\mathbf{f}_i$  and  $\mathbf{b}_i$  respectively the output vectors of the top-layer forward and backward lstms for  $w_i$ .
+
+in this work, we borrow most parameter settings from the dependency parser of dozat and manning [2017]. we find that the dropout strategy is very crucial for parsing performance, which differs from the vanilla implementation of stern et al. [2017] in two aspects.
+
+first, for each word  $w_i$ ,  $\mathbf{e}_i^{word}$  and  $\mathrm{charlstm}(w_i)$  are dropped as a whole, either unchanged or becoming a 0 vector. if one vector is dropped into 0, the other is compensated with a ratio of 2. second, the same lstm layer shares the same dropout masks at different timesteps (words).
+
+boundary representation. for each word  $w_{i}$ , we compose the context-aware word representation following stern et al. [2017].<sup>2</sup>
+
+$$
+\mathbf {h} _ {i} = \mathbf {f} _ {i} \oplus \mathbf {b} _ {i + 1} \tag {6}
+$$
+
+the dimensions of  $\mathbf{h}_i$  is 800.
+
+instead of directly applying a single mlp to  $\mathbf{h}_i$ , we observe that a word must act as either left or right boundaries in all constituents in a given tree. therefore, we employ two mlps to make such distinction and obtain left and right boundary representation vectors.
+
+$$
+\mathbf {r} _ {i} ^ {l}; \mathbf {r} _ {i} ^ {r} = \mathrm {m l p} ^ {l} \left(\mathbf {h} _ {i}\right); \mathrm {m l p} ^ {r} \left(\mathbf {h} _ {i}\right) \tag {7}
+$$
+
+the dimension  $d$  of  $\mathbf{r}_i^{l / r}$  is 500. as pointed out by dozat and manning [2017], mlps reduce the dimension of  $\mathbf{h}_i$  and, more importantly, detain only syntax-related information, thus alleviating the risk of over-fitting.
+
+biaffine scoring. given the boundary representations, we score each candidate constituent  $(i,j)$  using biaffine operation over the left boundary representation of  $w_{i}$  and the right boundary representation of  $w_{j}$ .
+
+$$
+s (i, j) = \left[ \begin{array}{l} \mathbf {r} _ {i} ^ {l} \\ 1 \end{array} \right] ^ {\mathrm {t}} \mathbf {w r} _ {j} ^ {r} \tag {8}
+$$
+
+where  $\mathbf{w}\in \mathbb{r}^{d\times d}$
+
+it is analogous to compute scores of constituent labels  $s(i,j,l)$ . two extra mlps are applied to  $\mathbf{h}_i$  to obtain boundary representations  $\bar{\mathbf{r}}_i^{l / r}$  (with dimension  $\bar{d}$ ). we then use  $|\mathcal{l}|$  bioaffines  $(\mathbb{r}^{\bar{d}\times \bar{d}})$  to obtain all label scores. since  $|\mathcal{l}|$  is large, we use a small dimension  $\bar{d}$  of 100 for  $\bar{\mathbf{r}}_i^{l / r}$  (vs. 500 for  $\mathbf{r}_i^{l / r}$ ) to reduce memory and computation cost.
+
+previous scoring method. stern et al. [2017] use minus features of bilstm outputs as span representations [wang and chang, 2016; cross and huang, 2016] and apply mlps to compute span scores.
+
+$$
+s (i, j) = \operatorname {m l p} \left(\mathbf {h} _ {i} - \mathbf {h} _ {j}\right) \tag {9}
+$$
+
+we show that our new scoring method is clearly superior in the experiments.
+
+# 2.3 training loss
+
+for a training instance  $(\pmb{x},\pmb{y},\pmb{l})$ , the training loss is composed of two parts.
+
+$$
+l (\boldsymbol {x}, \boldsymbol {y}, \boldsymbol {l}) = l ^ {\text {b r a c k e t}} (\boldsymbol {x}, \boldsymbol {y}) + l ^ {\text {l a b e l}} (\boldsymbol {x}, \boldsymbol {y}, \boldsymbol {l}) \tag {10}
+$$
+
+the first term is the sentence-level global crf loss, trying to maximize the conditional probability:
+
+$$
+l ^ {b r a c k e t} (\boldsymbol {x}, \boldsymbol {y}) = - s (\boldsymbol {x}, \boldsymbol {y}) + \log z (\boldsymbol {x}) \tag {11}
+$$
+
+where  $\log z(\pmb{x})$  can be computed using the inside algorithm in  $o(n^{3})$  time complexity.
+
+the second term is the standard constituent-level cross-entropy loss for the labeling stage.
+
+# algorithm 1 batchified inside algorithm.
+
+1: define:  $s \in \mathbb{r}^{n \times n \times b}$ $\triangleright b$  is #sents in a batch  
+2: initialize: all  $s_{\cdot \cdot \cdot} = 0$  
+3: for  $w = 1$  to  $n$  do  
+4: parallel computation on  $0 \leq i, j < n$ ,  $r, 0 \leq b < b$  
+5:  $s_{i,j = i + w} = \log \sum_{i\leq r <   j}\exp (s_{i,r} + s_{r + 1,j}) + s(i,j)$  
+6: end for  
+7: return  $s_{0,n-1} \equiv \log z$
+
+# 3 efficient training and decoding
+
+this section describes how we perform efficient training and decoding via batchifying the inside and cky algorithms for direct computation on gpu. we also show that the very complex outside algorithm can be avoided and fulfilled by the back-propagation process.
+
+# 3.1 the batchified inside algorithm
+
+to compute  $\log z$  in equation 11 and feature gradients, all previous works on crf parsing [finkel et al., 2008; durrett and klein, 2015] explicitly perform the inside-outside algorithm on cpus. unlike linear-chain crf, it seems very difficult to batchify tree-structure algorithms.
+
+in this work, we find that it is feasible to propose a batchified version of the inside algorithm, as shown in algorithm 1. the key idea is to pack the scores of same-width spans for all instances in the data batch into large tensors. this allows us to do computation and aggregation simultaneously via efficient large tensor operation. since computation for all  $0 \leq i,j < n$ ,  $r, 0 \leq b < b$  is performed in parallel on gpu, the algorithm only needs  $o(n)$  steps. our code will give more technical details.
+
+# 3.2 outside via back-propagation
+
+traditionally, the outside algorithm is considered as indispensable for computing marginal probabilities of subtrees, which further compose feature gradients. in practice, the outside algorithm is more complex and at least twice slower than the inside algorithm. though possible, it is more complicated to batchify the outside algorithm. fortunately, this issue is erased in the deep learning era since the back-propagation procedure is designed to obtain gradients. in fact, eisner [2016] proposes a theoretical discussion on the equivalence between the back-propagation and outside procedures.
+
+since we use a batchified inside algorithm during the forward phase, the back-propagation is conducted based on large tensor computation, which is thus equally efficient.
+
+it is also noteworthy that, by setting the loss to  $\log z$  and performing back-propagation, we can obtain the marginal probabilities of spans  $(i,j)$ , which is exactly the correspond-
+
+<table><tr><td></td><td>#train</td><td>#dev</td><td>#test</td><td colspan="2">#labels</td></tr><tr><td></td><td></td><td></td><td></td><td>original</td><td>cnf</td></tr><tr><td>ptb</td><td>39,832</td><td>1,700</td><td>2,416</td><td>26</td><td>138</td></tr><tr><td>ctb5.1</td><td>18,104</td><td>352</td><td>348</td><td>26</td><td>162</td></tr><tr><td>ctb7</td><td>46,572</td><td>2,079</td><td>2,796</td><td>28</td><td>265</td></tr></table>
+
+table 1: data statistics, including the number of sentences and constituent labels. for "#labels", we list the number of labels in both original and converted cnf trees.
+
+ing gradients.
+
+$$
+p ((i, j) \mid \boldsymbol {x}) = \sum_ {\boldsymbol {y}: (i, j) \in \boldsymbol {y}} p (\boldsymbol {y} \mid \boldsymbol {x}) = \frac {\partial \log z (\boldsymbol {x})}{\partial \mathrm {s} (i , j)} \tag {12}
+$$
+
+marginal probabilities are also useful in many subsequent nlp tasks as soft features. please refer to eisner [2016] for more details.
+
+# 3.3 decoding
+
+as mentioned above, we employ the cky algorithm to obtain the 1-best tree during the parsing phase, as shown in equation 3. the cky algorithm is almost identical to the inside algorithm except for replacing the sum-product with a max product (refer to line 5 in algorithm 1) and thus can also be efficiently batchified.
+
+to perform mbr decoding, we simply replace the span scores  $s(i,j)$  with the marginal probabilities  $p((i,j) \mid x)$  in equation 1 and 3. however, we find this has little influence on parsing performance.
+
+# 4 experiments
+
+data. we conduct experiments on three english and chinese datasets. the first two datasets, i.e., ptb and ctb5.1, are widely used in the community. we follow the conventional train/dev/test data split. considering that both ctb5.1-dev/test only have about 350 sentences, we also use the larger ctb7 for more robust investigations, following the data split suggested in the official manual. table 1 shows the data statistics. we can see that cnf introduces many new constituent label types, most (about  $75\%$ ) of which are from the collapsing process of consecutive unary rules.
+
+evaluation. as mentioned earlier, we convert 1-best cnf trees into  $n$ -ary trees after parsing for evaluation. here, it may be useful to mention a small detail. the predicted 1-best cnf tree may contain inconsistent productions since the decoding algorithm does not have such constraints. taking figure 1(b) as an example, the model may output  $\mathsf{vp}_{3,5} \rightarrow \mathsf{pp}_{3,3}^{*} \mathsf{np}_{4,5}$ , where  $\mathsf{vp}$  is incompatible with  $\mathsf{pp}^{*}$ . during the  $n$ -ary post-processing, we simply ignore the concrete label string  $\mathbb{p}\mathbb{p}$  before the “*” symbol. in view of this, performance may be slightly improved by adding such constraints during decoding.
+
+we use the standard constituent-level labeled precision, recall, f-score  $(\mathrm{p} / \mathrm{r} / \mathrm{f})$  as the evaluation metrics with the evalb tool. specifically, a predicted constituent such as
+
+<table><tr><td></td><td colspan="3">ptb</td><td colspan="3">ctb5.1</td><td colspan="3">ctb7</td></tr><tr><td></td><td>p</td><td>r</td><td>f</td><td>p</td><td>r</td><td>f</td><td>p</td><td>r</td><td>f</td></tr><tr><td>max-margin (one-stage)</td><td>93.70</td><td>93.73</td><td>93.72</td><td>90.60</td><td>90.48</td><td>90.54</td><td>86.85</td><td>86.08</td><td>86.47</td></tr><tr><td>crf (one-stage)</td><td>93.44</td><td>93.75</td><td>93.60</td><td>91.08</td><td>90.98</td><td>91.03</td><td>87.10</td><td>86.75</td><td>86.93</td></tr><tr><td>crf (two-stage)</td><td>93.77</td><td>93.96</td><td>93.86</td><td>90.91</td><td>91.09</td><td>91.00</td><td>87.27</td><td>87.00</td><td>87.13</td></tr><tr><td>w/o mbr</td><td>93.75</td><td>93.85</td><td>93.80</td><td>90.93</td><td>91.10</td><td>91.02</td><td>87.21</td><td>86.89</td><td>87.05</td></tr><tr><td>minus features</td><td>93.40</td><td>93.35</td><td>93.37</td><td>90.60</td><td>90.51</td><td>90.56</td><td>86.96</td><td>86.24</td><td>86.60</td></tr><tr><td>vanilla dropout</td><td>92.80</td><td>93.00</td><td>92.90</td><td>89.68</td><td>89.68</td><td>89.68</td><td>85.55</td><td>85.54</td><td>85.54</td></tr></table>
+
+$\mathrm{vp}_{3,5}$  is considered correct if it also appears in the gold-standard tree.4
+
+parameter settings. we directly adopt the same hyperparameter settings of the dependency parser of dozat and manning [2017] without further tuning. the only difference is the use of charlstm word representations instead of pos tag embeddings. the dimensions of char embedding, word embedding, and charlstm outputs are 50, 100, 100, respectively. all dropout ratios are 0.33. the mini-batch size is 5,000 words. the training process continues at most 1,000 epochs and is stopped if the peak performance on dev data does not increase in 100 consecutive epochs.
+
+# 4.1 model comparison on dev data
+
+we conduct the model study on dev data from two aspects: 1) crf vs. max-margin training loss; 2) two-stage vs. one-stage parsing. the first three lines of table 2 shows the results. the three models use the same scoring architecture and parameters. following previous practice [stern et al., 2017], one-stage models use only scores of labeled constituents  $s(i,j,l)$ . in order to verify the effectiveness of the two-stage parsing, we also list the results of "crf (one-stage)", which directly scores labeled constituents.
+
+$$
+s (\boldsymbol {x}, \boldsymbol {y}, l) = \sum_ {(i, j, l) \in (\boldsymbol {y}, l)} s (i, j, l) \tag {13}
+$$
+
+as discussed in the last paragraph of section 2.1, the inside and cky algorithms become a bit more complicated for the one-stage parser that two-stage.
+
+from the first two rows, we can see that under the one-stage parsing framework, the crf loss leads to similar performance on english but consistently outperforms the max-margin loss by about 0.5 f-score on both chinese datasets. the max-margin loss has one extra hyper-parameter, namely the margin value, which is set to 1 according to preliminary results on english and not tuned on chinese for simplic
+
+table 2: results on dev data. all models use randomly initialized word embeddings.  
+
+<table><tr><td></td><td>sents/sec</td></tr><tr><td>petrov and klein [2007] (berkeley parser)</td><td>6</td></tr><tr><td>zhu et al. [2013] (zpar)</td><td>90</td></tr><tr><td>stern et al. [2017]</td><td>76</td></tr><tr><td>shen et al. [2018]</td><td>111</td></tr><tr><td>kitaev and klein [2018]</td><td>332</td></tr><tr><td>gómez-rodríguez and vilares [2018]</td><td>780</td></tr><tr><td>crf (one-stage)</td><td>990</td></tr><tr><td>crf (two-stage) w/ mbr</td><td>743</td></tr><tr><td>crf (two-stage) w/o mbr</td><td>1092</td></tr></table>
+
+table 3: speed comparison on ptb test.
+
+ity. we suspect that the performance on chinese with max-margin loss may be improved with more tuning. overall, we can conclude that the two training loss settings achieve very close performance, and crf has an extra advantage of probabilistic modeling.
+
+comparing the second and third rows, the two crf parsers achieve nearly the same performance on ctb5.1 and the two-stage parser achieves modest improvement over the one-stage parser by about 0.2 f-score on both ptb and ctb7. therefore, we can conclude that our proposed two-stage parsing approach is superior in simplicity and efficiency (see table 3) without hurting performance.
+
+# 4.2 ablation study on dev data
+
+to gain insights into the contributions of individual components in our proposed framework, we then conduct the ablation study by undoing one component at a time. results are shown in the bottom four rows of table 2.
+
+impact of mbr decoding. by default, we employ cky decoding over marginal probabilities, a.k.a. mbr decoding. the "w/o mbr" row presents the results of performing decoding over span scores. such comparison is very interesting since it is usually assumed that mbr decoding is theoretically superior to vanilla decoding. however, the results clearly show that the two decoding methods achieve nearly identical performance.
+
+impact of scoring architectures. in order to measure the effectiveness of our new scoring architecture, we revert the biaffine scorers to the "minus features" method adopted by stern et al. [2017] (refer to equation 9). it is clear that our proposed scoring method is superior to the widely used
+
+<table><tr><td rowspan="2"></td><td colspan="3">ptb</td><td colspan="3">ctb5.1</td><td colspan="3">ctb7</td></tr><tr><td>p</td><td>r</td><td>f</td><td>p</td><td>r</td><td>f</td><td>p</td><td>r</td><td>f</td></tr><tr><td>stern et al. [2017]</td><td>92.98</td><td>90.63</td><td>91.79</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr><tr><td>gaddy et al. [2018]</td><td>92.41</td><td>91.76</td><td>92.08</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr><tr><td>kitaev and klein [2018]</td><td>93.90</td><td>93.20</td><td>93.55</td><td>88.09</td><td>86.78</td><td>87.43</td><td>-</td><td>-</td><td>-</td></tr><tr><td>gómez-rodríguez and vilarres [2018]</td><td>-</td><td>-</td><td>90.0</td><td>-</td><td>-</td><td>84.4</td><td>-</td><td>-</td><td>-</td></tr><tr><td>shen et al. [2018]</td><td>92.0</td><td>91.7</td><td>91.8</td><td>86.6</td><td>86.4</td><td>86.5</td><td>-</td><td>-</td><td>-</td></tr><tr><td>teng and zhang [2018]</td><td>92.5</td><td>92.2</td><td>92.4</td><td>87.5</td><td>87.1</td><td>87.3</td><td>-</td><td>-</td><td>-</td></tr><tr><td>vilarres et al. [2019]</td><td>-</td><td>-</td><td>90.60</td><td>-</td><td>-</td><td>85.61</td><td>-</td><td>-</td><td>-</td></tr><tr><td>zhou and zhao [2019] w/ pretrained</td><td>93.92</td><td>93.64</td><td>93.78</td><td>89.70</td><td>89.09</td><td>89.40</td><td>-</td><td>-</td><td>-</td></tr><tr><td>ours</td><td>93.84</td><td>93.58</td><td>93.71</td><td>89.18</td><td>89.03</td><td>89.10</td><td>87.66</td><td>87.21</td><td>87.43</td></tr><tr><td>ours w/ pretrained</td><td>94.23</td><td>94.02</td><td>94.12</td><td>89.71</td><td>89.89</td><td>89.80</td><td>88.84</td><td>88.36</td><td>88.60</td></tr><tr><td>kitaev and klein [2018] w/ elmo</td><td>95.40</td><td>94.85</td><td>95.13</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr><tr><td>kitaev et al. [2019] w/ bert</td><td>95.73</td><td>95.46</td><td>95.59</td><td>91.96</td><td>91.55</td><td>91.75</td><td>-</td><td>-</td><td>-</td></tr><tr><td>ours w/ bert</td><td>95.85</td><td>95.53</td><td>95.69</td><td>92.51</td><td>92.04</td><td>92.27</td><td>91.73</td><td>91.38</td><td>91.55</td></tr></table>
+
+table 4: results on test data.
+
+minus-feature method, and achieves a consistent and substantial improvement of about 0.5 f-score on all three datasets.
+
+impact of dropout strategy. we keep other model settings unchanged and only replace the dropout strategy borrowed from dozat and manning [2017] with the vanilla dropout strategy adopted by stern et al. [2017]. this leads to a very large and consistent performance drop of 0.96, 1.39 and 1.59 in f-score on the three datasets, respectively. kitaev and klein [2018] replaced bilstms with a self-attention encoder in stern et al. [2017] and achieved a large improvement of 1.0 f-score by separating content and position attention. similarly, this work shows that the bilstm-based parser can be very competitive with proper parameter settings.
+
+# 4.3 speed comparison
+
+table 3 compares different parsing models in terms of parsing speed. our models are both run on a machine with intel xeon e5-2650 v4 cpu and nvidia geforce gtx 1080 ti gpu. berkeley parser and zpar are two representative nonneural parsers without access to gpu. stern et al. [2017] employ max-margin training and perform cky-like decoding on cpus. kitaev and klein [2018] use a self-attention encoder and perform decoding using cython for acceleration.
+
+we can see that our one-stage crf parser is much more efficient than previous parsers by directly performing decoding on gpu. our two-stage parser can parse 1,092 sentences per sentence, which is three times faster than kitaev and klein [2018]. of course, it is noteworthy that those parsers [stern et al., 2017; kitaev and klein, 2018] may be equally efficient by adopting our batchifying techniques.
+
+the parser of gómez-rodríguez and vilares [2018] is also very efficient by treating parsing as a sequence labeling task. however, the parsing performance is much lower, as shown in table 4.
+
+the two-stage parser is only about  $10\%$  faster than the one-stage counterpart. the gap seems small considering the significant difference in time complexity as discussed (see section 2.1). the reason is that the two parsers share the same
+
+encoding and scoring components, which consume a large portion of the parsing time.
+
+using mbr decoding requires an extra run of the inside and back-propagation algorithms for computing marginal probabilities, and thus is less efficient. as shown in table 2, the performance gap is very slight between w/ and w/o mbr.
+
+# 4.4 results and comparison on test data
+
+table 4 shows the final results on the test datasets under two settings, i.e., w/o and w/ elmo/bert.
+
+most previous works do not use pretrained word embedding but use randomly initialized ones instead, except for zhou and zhao [2019], who use glove for english and structured skip-gram embeddings. for pretrained word embeddings, we use glove (100d) for english ptb<sup>5</sup>, and adopt the embeddings of li et al. [2019] trained on gigaword 3rd edition for chinese. it is clear that our parser benefits substantially from the pretrained word embeddings.<sup>6</sup>
+
+we also make comparisons with recent related works on constituency parsing, as discussed in section 5. we can see that our bilstm-based parser outperforms the basic stern et al. [2017] by a very large margin, mostly owing to the new scoring architecture and better dropout settings. compared with the previous state-of-the-art self-attentive parser [kitaev and klein, 2018], our parser achieves an absolute improvement of 0.16 on ptb and 1.67 on ctb5.1 without any language-specific settings.
+
+the ctb5.1 results of zhou and zhao [2019] is obtained by rerunning their released code using predicted pos tags. we follow their descriptions<sup>7</sup> to produce the pos tags. it is noteworthy that their reported results accidentally use gold pos tags on ctb5.1, which is confirmed after several turns of email communication. we are grateful for their patience
+
+and help. we reran their released code using gold pos tags, and got 92.14 in f-score on ctb5-test, very close to the results reported in their paper. our parser achieves 92.66 f-score with gold pos tags. another detail about their paper should be clarified: for dependency parsing on chinese, they adopt two different data split settings, both using stanford dependencies 3.3.0 and gold pos tags.
+
+the bottom three rows list the results under the setting of using elmo/bert. we use bert-large-cased $^{8}$  (24 layers, 1024 dimensions, 16 heads) for ptb following kitaev et al. [2019], and bert-base-chinese (12 layers, 768 dimensions, 12 heads) for ctb. it is clear that using bert representations can help our parser by a very large margin on all datasets. our parser also outperforms the multilingual parser of kitaev et al. [2019], which uses extra multilingual resources. in summary, we can conclude that our parser achieves state-of-the-art performance in both languages and both settings.
+
+# 5 related works
+
+because of the inefficiency issue, there exist only a few previous works on crf constituency parsing. finkel et al. [2008] propose the first non-neural feature-rich crf constituency parser. durrett and klein [2015] extend the work of finkel et al. [2008] and use a feedforward neural network with nonlinear activation for scoring anchored production rules. both works perform explicit inside-outside computations on cpus and suffer from a severe inefficiency issue.
+
+this work is built on the high-performance modern neural parser based on a bilstm encoder [stern et al., 2017], which first applies minus features [cross and huang, 2016] for span scoring to graph-based constituency parsing. several recent works follow stern et al. [2017]. gaddy et al. [2018] try to analyze what and how much context is implicitly encoded by bilstms. kitaev and klein [2018] replace two-layer bilstm with self-attention layers and find considerable improvement via separated content and position attending. in contrast, this work shows that the parser of stern et al. [2017] outperforms kitaev and klein [2018] by properly configuring bilstms such as the dropout strategy (see table 2). please also kindly notice that kitaev and klein [2018] use very large word embeddings.
+
+batchification is straightforward and well-solved for sequence labeling tasks, as shown in the implementation of ncrf++ $^{9}$ . however, very few works turned sight to tree-structures. in a slightly earlier work, we for the first time propose to batchify tree-structured inside and viterbi (eisner) computation for gpu acceleration for the dependency parsing [zhang et al., 2020]. this work is an extension to the constituency parsing with different inside and viterbi (cky) algorithms.
+
+as an independent and concurrent work to ours, torch-struct $^{10}$ , kindly brought up by a reviewer, has also implemented batchified treecrf algorithms for constituency parsing [rush, 2020]. however, torch-struct aims to provide
+
+general-purpose basic implementations for structure prediction algorithms. in contrast, we work on sophisticated parsing models, and aim to advance the state-of-the-art crf constituency parsing in both accuracy and efficiency.
+
+meanwhile, there is a recent trend of extremely simplifying the constituency parsing task without explicit structural consideration or the use of cky decoding. gómez-rodríguez and vilares [2018] propose a sequence labeling approach for constituency parsing by designing a complex tag encoding tree information for each input word. vilares et al. [2019] further enhance the sequence labeling approach via several augmentation strategies such as multi-task learning and policy gradients. shen et al. [2018] propose to predict a scalar distance in the gold-standard parse tree for each neighboring word pairs and employ bottom-up greedy search to find an optimal tree. however, all the above works lag behind the mainstream approaches by a large margin in terms of parsing performance.
+
+# 6 conclusions
+
+in this work, we propose a fast and accurate neural crf constituency parser. we show that the inside and cky algorithms can be effectively batchified to accommodate direct large tensor computation on gpu, leading to dramatic efficiency improvement. the back-propagation procedure is equally efficient and erases the need for the outside algorithm for gradient computation. experiments on three english and chinese benchmark datasets lead to several promising findings. first, the simple two-stage bracketing-then-labeling approach is more efficient than one-stage parsing without hurting performance. second, our new scoring architecture achieves higher performance than the previous method based on minus features. third, the dropout strategy we introduce can improve parsing performance by a large margin. finally, our proposed parser achieves new state-of-the-art performances with a parsing speed of over 1,000 sentences per second.
+
+# acknowledgments
+
+the authors would like to thank the anonymous reviewers for their helpful comments. this work was supported by national natural science foundation of china (grant no. 61525205, 61876116) and a project funded by the priority academic program development (papd) of jiangsu higher education institutions.
+
+# references
+
+[akoury et al., 2019] nader akoury, kalpesh krishna, and mohit iyyer. syntactically supervised transformers for faster neural machine translation. in proceedings of acl, pages 1269-1281, 2019.  
+[collins, 1997] michael collins. three generative, lexicalised models for statistical parsing. in proceedings of acl, pages 16-23, 1997.  
+[cross and huang, 2016] james cross and liang huang. span-based constituency parsing with a structure-label system and provably optimal dynamic oracles. in proceedings of emnlp, pages 1-11, 2016.
+
+[devlin et al., 2019] jacob devlin, ming-wei chang, kenton lee, and kristina toutanova. bert: pre-training of deep bidirectional transformers for language understanding. in proceedings of naacl, pages 4171–4186, 2019.  
+[dozat and manning, 2017] timothy dozat and christopher d. manning. deep bioaffine attention for neural dependency parsing. in proceedings of iclr, 2017.  
+[durrett and klein, 2015] greg durrett and dan klein. neural crf parsing. in proceedings of acl-ijcnlp, pages 302-312, 2015.  
+[eisner, 2016] jason eisner. inside-outside and forward-backward algorithms are just backprop (tutorial paper). in proceedings of ws, pages 1-17, 2016.  
+[finkel et al., 2008] jenny rose finkel, alex kleeman, and christopher d. manning. efficient, feature-based, conditional random field parsing. in proceedings of acl, pages 959-967, 2008.  
+[gaddy et al., 2018] david gaddy, mitchell stern, and dan klein. what's going on in neural constituency parsers? an analysis. in proceedings of naacl, pages 999-1010, 2018.  
+[gómez-rodríguez and vilares, 2018] carlos gómez-rodríguez and david vilares. constituent parsing as sequence labeling. in proceedings of emnlp, pages 1314-1324, 2018.  
+[jin et al., 2020] lifeng jin, linfeng song, yue zhang, kun xu, wei yun ma, and dong yu. relation extraction exploiting full dependency forests. in proceedings of aaai, 2020.  
+[kaplan et al., 2004] ron kaplan, stefan riezler, tracy h. king, john t. maxwell iii, alex vasserman, and richard crouch. speed and accuracy in shallow and deep stochastic parsing. in proceedings of hlt-naacl, pages 97–104, 2004.  
+[kitaev and klein, 2018] nikita kitaev and dan klein. constituency parsing with a self-attentive encoder. in proceedings of acl, pages 2676–2686, 2018.  
+[kitaev et al., 2019] nikita kitaev, steven cao, and dan klein. multilingual constituency parsing with self-attention and pre-training. in proceedings of acl, pages 3499–3505, 2019.  
+[lample et al., 2016] guillaume lample, miguel ballesteros, sandeep subramanian, kazuya kawakami, and chris dyer. neural architectures for named entity recognition. in proceedings of naacl, pages 2475-2485, 2016.  
+[le and zuidema, 2014] phong le and willem zuidema. the inside-outside recursive neural network model for dependency parsing. in proceedings of emnlp, pages 729-739, 2014.  
+[li et al., 2019] ying li, zhenghua li, min zhang, rui wang, sheng li, and luo si. self-attentive biaffine dependency parsing. in proceedings of ijcai, pages 5067-5073, 2019.
+
+[matsuzaki et al., 2005] takuya matsuzaki, yusuke miyao, and jun'ichi tsujii. probabilistic cfg with latent annotations. in proceedings of acl, pages 75-82, 2005.  
+[peters et al., 2018] matthew peters, mark neumann, mohit iyyer, matt gardner, christopher clark, kenton lee, and luke zettlemoyer. deep contextualized word representations. in proceedings of naacl, pages 2227-2237, 2018.  
+[petrov and klein, 2007] slav petrov and dan klein. improved inference for unlexicalized parsing. in proceedings of naacl, pages 404-411, 2007.  
+[rush, 2020] alexander m. rush. torch-struct: deep structured prediction library. arxiv:2002.00876, 2020.  
+[sagae and lavie, 2005] kenji sagae and alon lavie. a classifier-based parser with linear run-time complexity. in proceedings of iwpt, pages 125-132, 2005.  
+[shen et al., 2018] yikang shen, zhouhan lin, athul paul jacob, alessandro sordoni, aaron courville, and yoshua bengio. straight to the tree: constituency parsing with neural syntactic distance. in proceedings of acl, pages 1171-1180, 2018.  
+[smith and smith, 2007] david a. smith and noah a. smith. probabilistic models of nonprojective dependency trees. in proceedings of emnlp, pages 132-140, 2007.  
+[stern et al., 2017] mitchell stern, jacob andreas, and dan klein. a minimal span-based neural constituency parser. in proceedings of acl, pages 818-827, 2017.  
+[taskar et al., 2004] ben taskar, dan klein, mike collins, daphne koller, and christopher manning. max-margin parsing. in proceedings of emnlp, pages 1-8, 2004.  
+[teng and zhang, 2018] zhiyang teng and yue zhang. two local models for neural constituent parsing. in proceedings of coling, pages 119-132, 2018.  
+[vilares et al., 2019] david vilares, mostafa abdou, and anders søgaard. better, faster, stronger sequence tagging constituent parsers. in proceedings of naacl, pages 3372-3383, 2019.  
+[wang and chang, 2016] wenhui wang and baobao chang. graph-based dependency parsing with bidirectional lstm. in proceedings of acl, pages 2475-2485, 2016.  
+[wang et al., 2018] xinyi wang, hieu pham, pengcheng yin, and graham neubig. a tree-based decoder for neural machine translation. in proceedings of emnlp, pages 4772-4777, 2018.  
+[zhang et al., 2020] yu zhang, zhenghua li, and zhang min. efficient second-order treecrf for neural dependency parsing. in proceedings of acl, 2020.  
+[zhou and zhao, 2019] junru zhou and hai zhao. head-driven phrase structure grammar parsing on penn treebank. in proceedings of the acl, pages 2396-2408, 2019.  
+[zhu et al., 2013] muhua zhu, yue zhang, wenliang chen, min zhang, and jingbo zhu. fast and accurate shift-reduce constituent parsing. in proceedings of acl, pages 434-443, 2013.

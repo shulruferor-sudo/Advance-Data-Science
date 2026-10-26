@@ -1,0 +1,438 @@
+# memory-efficient pipeline-parallel dnn training
+
+deepak narayanan  $^{1}$  * amar phanishayee  $^{2}$  kaiyu shi  $^{3}$  xie chen  $^{3}$  matei zaharia  $^{1}$
+
+# abstract
+
+many state-of-the-art ml results have been obtained by scaling up the number of parameters in existing models. however, parameters and activations for such large models often do not fit in the memory of a single accelerator device; this means that it is necessary to distribute training of large models over multiple accelerators. in this work, we propose pipedream-2bw, a system that supports memory-efficient pipeline parallelism. pipedream-2bw uses a novel pipelining and weight gradient coalescing strategy, combined with the double buffering of weights, to ensure high throughput, low memory footprint, and weight update semantics similar to data parallelism. in addition, pipedream-2bw automatically partitions the model over the available hardware resources, while respecting hardware constraints such as memory capacities of accelerators and interconnect topologies. pipedream-2bw can accelerate the training of large gpt and bert language models by up to  $20\times$  with similar final model accuracy.
+
+# 1. introduction
+
+in the quest to achieve higher accuracy across a range of tasks, dnn models have grown in size, often by scaling up the number of parameters in existing architectures (devlin et al., 2018; radford et al., 2018; brown et al., 2020). it is challenging to train large models with billions of parameters. modern accelerators have limited memory, which means that the model parameters and intermediate outputs that need to be in accelerator memory during training might not fit on a single accelerator. one of the solutions researchers and practitioners have turned to is model-parallel training (dean et al., 2012; chilimbi et al., 2014), where a model is partitioned over multiple accelerator devices. how
+
+*work done in part as intern at microsoft research. 1stanford university 2microsoft research 3microsoft. correspondence to: deepak narayanan <deepakn@cs.stanford.edu>.
+
+proceedings of the  $38^{th}$  international conference on machine learning, pmlr 139, 2021. copyright 2021 by the author(s).
+
+ever, model parallelism, when traditionally deployed, can either lead to resource under-utilization (narayanan et al., 2019) or high communication overhead with good scaling only within a multi-gpu server (shoeybi et al., 2019), and consequently an increase in training time and dollar cost.
+
+recent work has proposed pipelined model parallelism to accelerate model-parallel training. for example, gpipe (huang et al., 2019) and pipedream (harlap et al., 2018; narayanan et al., 2019) push multiple inputs in sequence through a series of workers that each manage one model partition, allowing different workers to process different inputs in parallel. naïve pipelining can harm model convergence due to inconsistent weight versions between the forward and backward passes of a particular input. existing techniques trade off memory footprint and throughput in different ways to avoid this. gpipe maintains a single weight version, but has periodic pipeline flushes where the pipeline is drained of inputs to update weights (figure 1a); these flushes limit overall throughput as resources are idle. pipedream does not periodically flush the pipeline but stores multiple weight versions, which increases throughput but also increases the memory footprint, making the training of large models infeasible due to memory constraints. efficient training of large models requires an approach with both high throughput and low memory footprint.
+
+additionally, the performance of a pipeline-parallel system is dependent on how dnn model operators are partitioned over workers. this is challenging for three reasons:
+
+- memory capacity constraints: parameters and intermediate activations associated with a model partition need to fit in the main device memory of the accelerator.  
+- heterogeneous network interconnects: training deployments today feature heterogeneous network topologies, with higher-bandwidth links between devices on the same server.  
+- large search space for operator placement: as model sizes increase, splitting an operator graph becomes computationally expensive since the number of distinct partitionings is exponential in the model size.
+
+in this paper, we introduce pipedream-2bw, a system for efficient pipeline-parallel training of dnn models with billions of parameters. pipedream-2bw achieves high through
+
+first, we propose double-buffered weight updates (2bw), a technique that reduces the memory footprint of training while avoiding pipeline flushes. we leverage the fact that every input's generated gradient does not need to be applied to weights immediately, and instead can be accumulated into a "coalesced" gradient to limit the number of weight versions maintained. instead of flushing the pipeline before using newly updated weights, 2bw uses the new weights for inputs newly admitted into the pipeline, while using the previous weight version, called the shadow version, for already in-flight inputs. this double buffering of weights at each worker yields a pipelining scheme with higher throughput than gpipe (no pipeline flushes) and better memory efficiency than pipedream (2 weight versions, versus worst case of  $d$  in pipedream for a depth- $d$  pipeline). 2bw introduces a constant weight delay term of 1, consistent across stages, while updating weights (weight update equation of  $w^{(t + 1)} = w^{(t)} - \nu \cdot \nabla f(w^{(t - 1)})$ ), which we show has empirically similar model convergence to vanilla weight updates ( $\s 5.1$ ). we also present a variant of 2bw (called pipedream-flush) that trades off throughput for even lower memory footprint and vanilla semantics (weight update equation of  $w^{(t + 1)} = w^{(t)} - \nu \cdot \nabla f(w^{(t)})$ ).
+
+second, pipedream-2bw provides a planning algorithm that yields effective parallelization schemes for many of today's large model architectures. pipedream-2bw's planner partitions dnn operators over the available workers while taking into account the memory capacities of the accelerator devices, and addresses the three challenges highlighted earlier. pipedream-2bw's planner exploits the repetitive structure of large dnns, e.g., transformer layers in bert (devlin et al., 2018), to explore the space of schedules where each stage in the pipeline is replicated equally. this choice reduces the size of the search space explored drastically compared to existing work like pipedream and flexflow (jia et al., 2018), while still providing effective model splits in practice. pipedream-2bw's planner determines the size of each model partition, batch size, and whether to use memory-saving optimizations like activation recomputation (chen et al., 2016; griewank & walther, 2000). pipedream-2bw's planner considers the impact of these decisions on both throughput and memory footprint, unlike pipedream and flexflow. finally, the planner tries to ensure expensive communication stays on high-speed intra-server interconnects.
+
+we find that the adam optimizer with 2bw has a similar training loss trajectory to vanilla adam with the same batch size, with similar accuracy on downstream finetuning tasks. pipedream-2bw achieves end-to-end speedups of  $1.3 \times$  to  $20 \times$  for various gpt models compared to an optimized model-parallel baseline. pipedream-2bw is up to  $3.2 \times$  faster than gpipe, and is able to train large transformer models that vanilla pipedream cannot fit in memory.
+
+# 2. background
+
+in this section, we provide a brief overview of related techniques for distributed training of dnn models.
+
+data parallelism. data parallelism is used to scale up model training. with data parallelism (xing et al., 2015), every worker has a copy of the entire model and the input dataset is sharded across workers. data parallelism cannot be used to train large models that do not fit on a single worker, but can be used on smaller model partitions.
+
+model parallelism. model parallelism is used traditionally to train large models that do not fit on a single worker. with model parallelism (dean et al., 2012; chilimbi et al., 2014), the weight parameters in a model are split over available workers, with intermediate activations and gradients communicated across workers. inter-layer model parallelism underutilizes resources since at most a single worker is active at any point in time. tensor (intra-layer) model parallelism (shoeybi et al., 2019) leads to expensive all-to-all communication in the critical path, limiting the number of model partitions to the number of gpus in a single server flexflow (jia et al., 2018) shows how to split a model graph using model and data parallelism, but still suffers from poor resource utilization when model parallelism is used.
+
+pipeline parallelism. to address the shortcomings of model parallelism, recent work like pipedream and gpipe have proposed pipeline parallelism. with pipeline parallelism, multiple inputs (instead of 1) are injected into a pipeline composed of inter-layer model partitions. this ensures that compute resources are better utilized. however, naive pipelining can lead to weight version mismatches between forward and backward passes for a particular input. specifically, if weight updates are immediately applied to the latest weight version, then an input might see weight updates in the backward pass that it did not see in the forward pass, leading to incorrect gradient computations.
+
+gpipe maintains a single version of the model's weights. an input batch is split into smaller microbatches. weight gradients are accumulated and not applied immediately, and the pipeline is periodically flushed to ensure that multiple weight versions do not need to be maintained. gpipe provides weight update semantics similar to data parallelism. figure 1a shows a timeline of gpipe execution. the periodic pipeline flushes can be expensive, limiting throughput. one way to mitigate this overhead is to perform additional accumulation within the pipeline, but this is not always practical: a) at large scale factors, the minimum supported batch size is large (proportional to the scale factor), and large batch sizes affect convergence for all models (e.g., megatron (shoeybi et al., 2019) uses a batch size of 1024 for bert and 512 for gpt with 512 gpus), b) gpipe needs to maintain activation stashes proportional to the batch size.
+
+![](images/b1a53c9d5389b2c9c0017ae94a2d27746baa5ee4dbcaf62c9aacd58c031c72bc.jpg)  
+(a) gpipe.
+
+![](images/77faf3c96f04c2169badab901527180c20fa11112819d8883f55e4e78fa11fca.jpg)  
+(b) pipedream.  
+figure 1. timelines of different pipeline-parallel executions. without loss of generality, forward and backward passes are assumed to take twice as long as forward passes; forward passes are shown in blue and backward passes are shown in green. numbers indicate microbatch id, time is shown along  $x$ -axis, per-worker utilization is shown along the  $y$ -axis. gpipe maintains a single weight version, but periodically flushes the pipeline. pipedream does not introduce periodic pipeline flushes, but maintains multiple weight versions.
+
+pipedream uses a weight stashing scheme to ensure that the same weight version is used in both the forward and backward passes for the same input (figure 1b). the total number of weight versions stashed is  $d$  in the worst case, where  $d$  is the pipeline depth, which is too high for large models. with pipedream's default weight update semantics, weight updates at each stage have different delay terms, and no accumulation is performed within the pipeline.
+
+# 3. pipedream-2bw system design
+
+pipedream-2bw uses memory-efficient pipeline parallelism to train large models that do not fit on a single accelerator. its double-buffered weight update (2bw) and flush mechanisms ensure high throughput, low memory footprint, and weight update semantics similar to data parallelism. pipedream-2bw splits models into stages over multiple workers, and replicates each stage an equal number of times (with data-parallel updates across replicas of the same stage). such parallel pipelines work well for models where each layer is repeated a fixed number of times (e.g., transformer models).
+
+# 3.1. double-buffered weight updates (2bw)
+
+pipedream-2bw uses a novel double-buffered weight update (2bw) scheme in conjunction with 1f1b scheduling (narayanan et al., 2019), where each worker alternates between forward and backward passes for different inputs, to ensure that the same weight version is used in both the forward and the backward pass for a particular input (figure 2). 2bw has a lower memory footprint than pipedream and gpipe, and also avoids gpipe's expensive pipeline flushes.
+
+gradients are computed at the granularity of smaller microbatches. for any input microbatch, pipedream-2bw uses the same weight version for an input's forward and backward passes. updates are accumulated over multiple microbatches before being applied at the granularity of a batch, limiting the number of weight versions generated and
+
+maintained. figure 2 shows an example timeline of  $2\mathrm{bw}$ . pipedream-2bw generates a new weight version once every  $m$  microbatches ( $m \geq d$ , the pipeline depth). for simplicity, we will initially assume that  $m = d$  ( $d = 4$  in figure 2). a new weight version cannot be used immediately. in particular, in-flight inputs cannot use the newest weight version for their backward passes (for example, input 7 on worker 3 at  $t = 21$ ), since the forward pass for these inputs was already initiated using an older weight version on a different stage. thus, newly generated weight versions need to be buffered for future use. however, the total number of weight versions that need to be maintained is at most 2, since the weight version used to generate a new weight version can immediately be discarded (no future inputs that pass through that stage use the old weight version any longer). for example, in figure 2, each worker can discard  $w_{i}^{(0)}$  once they are done processing the backward pass for input 8 since all subsequent inputs use a later weight version for both their forward and backward passes.
+
+the weight version a given input microbatch  $k$  (1-indexed) uses is  $\max(\lfloor (k - 1) / m \rfloor - 1, 0)$ , where  $m$  is the number of microbatches in a batch (4 in figure 2). this weight version is the same for both the forward and backward passes for input  $k$ .  $m$  can be any number  $\geq d$ ; additional gradient accumulation (larger  $m$ ) increases the global batch size.
+
+memory footprint. pipedream-2bw maintains 2 weight versions, and activation stashes for all in-flight microbatches. the number of in-flight microbatches at any stage is at most the pipeline depth  $(d)$ . with activation recomputation, pipedream-2bw's memory footprint can be decreased, since only input activations (as opposed to the full intermediate activation) need to be maintained for all in-flight microbatches. with activation recomputation, pipedream-2bw's worst-case memory footprint is  $\frac{2|w|}{d} + \frac{|a^{\mathrm{total}}(b)|}{d} + d|a^{\mathrm{input}}(b)|$ .  $|w|$  is the size of weight parameters for the full model,  $|a^{\mathrm{total}}(b)|$  is the size of intermediate activations for micro-batch size  $b$  for the full model, and  $|a^{\mathrm{input}}(b)|$  is the size of
+
+![](images/b7e1f9c38e59b55b093abf384e6069720efeeae75f8e33397c967fa964282581.jpg)  
+figure 2. timeline showing pipedream-2bw's double-buffered weight update (2bw) scheme with time along  $x$ -axis. without loss of generality, backward passes are assumed to take twice as long as forward passes. pipedream-2bw only stashes two weight versions at every worker, reducing the total memory footprint while no longer requiring expensive pipeline stalls.  $w_{i}^{(v)}$  indicates weights on worker  $i$  with version  $v$  (contains weight gradient generated from input  $v$ ). new weight versions are generated in checkered green boxes;  $w_{4}^{(4)}$  is first used for input 9's forward pass.
+
+![](images/cbc1e41960a769d7e0e3b1f1f41c4b1aa9d064d7fa18655987c99c2f34f16fe5.jpg)
+
+![](images/277ecba40ff4dfc5da98f33458ad8987a01a5a4178e0dc2c165a0ae2c9ae5951.jpg)  
+(a) gpipe.  
+(b) pipedream-flush.  
+figure 3. timelines of gpipe and pipedream-flush for 2 stages. both gpipe and pipedream-flush use pipeline flushes; pipedream-flush alternates between forward and backward passes in steady state to keeping memory footprint low compared to gpipe by limiting activation stashes to only in-flight microbatches.
+
+input activations for microbatch size  $b$  for a pipeline stage.
+
+in comparison, gpipe needs to checkpoint potentially a much larger number of input activations – proportional to the total number of microbatches accumulated within the pipeline before applying a weight update  $(m)$ . with activation recomputation, gpipe's memory footprint with a per-gpu microbatch size  $b$  is  $\frac{|w|}{d} + \frac{|a^{\text{total}}(b)|}{d} + m |a^{\text{input}}(b)|$ . since  $|w| \ll |a(b)|$  for even small  $b$  for most models (jain et al., 2018), the memory savings from maintaining one fewer weight version is small. to achieve high throughput, gpipe must use a large value of  $m$  to amortize away the cost of pipeline flushes; at such high  $m$ , its memory footprint is higher than pipedream-2bw. additionally, due to its higher memory footprint, gpipe must always use activation recomputation. activation recomputation, however, reduces throughput by about  $33\%$ , and should be avoided if possible.
+
+semantics. we can also formalize the semantics of 2bw.
+
+![](images/6b231f8a299758429ea28b8eb6c873ecc5686fc1a66452148c94a067984e82a5.jpg)  
+figure 4. example pipedream-2bw (2,3) configuration. the model is partitioned into 3 stages  $(d = 3)$  and each pipeline is replicated twice  $(w = 2)$ . each pipeline replica is shown in a different color.
+
+for this discussion, we assume an unreplicated pipeline with  $d$  stages. if  $b$  is the per-gpu microbatch size, then gradients are averaged over  $m$  microbatches; thus, the effective batch size is  $b = b \cdot m$ .
+
+we denote  $w^{(t)}$  as the weight version after  $t$  batches of size  $b$ .  $\nabla f(w)$  is the gradient averaged over the  $b$  samples in the batch. vanilla minibatch sgd (  $f$  is the loss function,  $\nu$  is the learning rate) then has the following weight update equation:  $w^{(t + 1)} = w^{(t)} - \nu \cdot \nabla f(w^{(t)})$ . 2bw's weight update semantics (with a delay term of 1 across all stages) are almost unchanged:
+
+$$
+w ^ {(t + 1)} = w ^ {(t)} - \nu \cdot \nabla f (w ^ {(t - 1)}).
+$$
+
+we show that this delay term does not affect model convergence significantly in §5.1. intuitively, the parameters of the model do not change significantly across single iterations, so  $w^{(t)} \approx w^{(t-1)}$ . the semantics with a replication factor greater than 1 is similar, with the batch size multiplied by the number of replicas (as with regular data parallelism). other momentum-based optimizers such as adam can be similarly analyzed (momentum term uses a weight gradient computed on a 1-stale weight version instead of latest version). extra shadow variables are not needed. for example,  $m_t$  in minibatch sgd with momentum can be computed as (ignoring bias corrections)
+
+$m_{t} = \beta \cdot m_{t - 1} + (1 - \beta)\cdot \nabla f(w^{(t - 1)})$  . the final weight update equation is then  $w^{(t + 1)} = w^{(t)} - \nu \cdot m_t$
+
+# 3.2. weight updates with flushes (pipedream-flush)
+
+we also propose a second memory-efficient pipeline schedule called pipedream-flush. it has lower memory footprint than 2bw and vanilla optimizer semantics, at the cost of lower throughput. this schedule reuses the 1f1b schedule from pipedream (narayanan et al., 2019), but maintains a single weight version and introduces periodic pipeline flushes to ensure consistent weight versions across weight updates. timelines for pipedream-flush and gpipe with 2 pipeline stages are shown in figure 3.
+
+memory footprint. with pipedream-flush, the total number of in-flight "active" input activations is less than or equal to the pipeline depth, giving it lower memory footprint than gpipe, which has to maintain input activations proportional to the number of microbatches over which gradients are averaged  $(m)$ . pipedream-flush's memory footprint is also lower than pipedream-2bw since it only needs to maintain a single weight version (versus 2 with pipedream-2bw).
+
+semantics. periodic pipeline flushes ensure that weight updates can be performed with gradients computed using the latest weight version. this results in weight updates of the form  $w^{(t + 1)} = w^{(t)} - \nu \cdot \nabla f(w^{(t)})$ . we compare 2bw's statistical efficiency (rate of model convergence) to the vanilla semantics of pipedream-flush, gpipe, and data parallelism, in §5.1.
+
+# 3.3. equi-replicated stages (parallel pipelines)
+
+pipedream-2bw executes dnn training using a hybrid parallelization scheme which combines data and model parallelism with input pipelining. since large deep models today feature extremely repetitive structures, with the same block repeated multiple times, a simple way of load balancing computation and communication involves breaking up a model into stages with an equal number of blocks and replication factors. model training in pipedream-2bw can thus be thought of as a collection of parallel pipelines (figure 4), where inputs and intermediate output activations within a pipeline do not ever need to be sent to workers responsible for a different pipeline. intermediate activations and gradients can be communicated within a pipeline using point-to-point communication primitives, such as send and recv. as with pipedream, weight gradients need to be aggregated across stage replicas in different pipelines. figure 4 shows an example: each model copy is split across 3 workers (number of stages or depth,  $d = 3$ ), and each stage is replicated twice (number of pipelines or width,  $w = 2$ ). stage replicas can be placed on the same server so that expensive all-reduce updates are between gpus on the same server with high-bandwidth interconnects.
+
+# 4. planner
+
+pipedream-2bw's planner determines how to split a model over the available compute devices by exhaustively searching over the reduced search space of all possible parallel-pipeline configurations. the planner also determines whether memory-saving optimizations should be deployed, and the per-gpu microbatch size and degree of gradient accumulation, given a maximum safe global batch size verified to not compromise model convergence (e.g., determined from past hyperparameter sweeps without pipelining).
+
+pipedream-2bw's planner uses a cost model for the compute times and memory footprints of individual blocks in the model. time and memory cost functions allow pipedream-2bw to reason about the impact of pipeline width / depth and memory-saving optimizations (such as activation recomputation) on throughput and memory footprint. for example, a deeper configuration has additional memory capacity, allowing for a larger maximum per-gpu microbatch size; this can increase the arithmetic intensity (number of floating point operations performed per memory load) of kernels (jouppi et al., 2017), and consequently throughput. communication times for tensors can be estimated by dividing the size of the tensor by the respective bandwidth. expensive communication (e.g., large tensors, or all-reduce communication needed to coalesce weight gradients across stage replicas) can be placed on high-bandwidth links within the server by orienting pipelines appropriately.
+
+profiling for cost modeling can be done in two ways: end-to-end for each distinct configuration, or extrapolating from an individual block's measurements. end-to-end profiling is cheap (2 to 3 minutes per configuration), which means total profiling time is still a couple of hours (compared to the days to weeks needed for model training). optimal configurations can be reused for a given server and model deployment. we describe how per-block time and memory measurements can be extrapolated in appendix §a – this is even cheaper, but provides less accurate cost estimates. the highest-throughput-configuration is chosen that also fits within the memory capacity of the target accelerators.
+
+# 4.1. activation recomputation
+
+activation recomputation is a common technique (huang et al., 2019; chen et al., 2016; griewank & walther, 2000) that trades off extra computation for a lower memory footprint. with activation recomputation, activation stashes are not left materialized on the device between forward and backward passes; instead, only input activations on each stage are stashed, and the remaining activations needed in the backward pass are recomputed when required by rerunning the forward pass. activation recomputation trades off extra computation for a lower memory footprint.
+
+activation recomputation is useful for two reasons: it can enable larger per-gpu microbatch sizes to fit in memory, which can improve device throughput by increasing the arithmetic intensity of kernel. it can also enable the training of large models. concretely, in some cases, the target accelerator device does not have sufficient memory capacity to store full activation stashes for all in-flight microbatches. this is especially true for deep pipelines, since the number of in-flight inputs is proportional to the depth of the pipeline (narayanan et al., 2019).
+
+# 4.2. partitioning algorithm
+
+putting it all together, given a total memory capacity  $m$ , pipedream-2bw's planner first determines the largest per-gpu microbatch size that fits on a given worker (and the corresponding throughput) with and without each memory-savings optimization deployed using a memory cost function. the partitioning algorithm also verifies that the resulting global batch size is lower than the maximum safe batch size  $b$ . each memory-savings optimization can be integrated into pipedream-2bw's planner by specifying a corresponding throughput and memory cost function.
+
+pipedream-2bw's planner then sweeps all  $(w, d)$  values to determine the best pipeline configuration for a given model and hardware deployment. configurations with memory footprint higher than the memory capacity  $m$  of the device (modeled by the memory(. cost function) are discarded. gradient accumulation can be used to increase the batch size to  $b$ . the partitioning algorithm aims to pick a configuration that has a high compute-to-communication ratio, while accounting for the communication time across stages in the same pipeline and across replicated stages (modeled by the throughput(. cost function). the full algorithm is shown in appendix §a.
+
+# 5. evaluation
+
+in this section, we show that the adam optimizer with 2bw has similar semantics to vanilla adam, and that pipedream-2bw and pipedream-flush are able to train large models faster than existing model-parallel approaches including megatron (shoeybi et al., 2019), and existing pipelining approaches like gpipe (huang et al., 2019).
+
+hardware. we show results on two different hardware setups on aws: eight  $8 \times \mathrm{v}100$  servers (64 gpus) with nvlink and 16gb of per-gpu memory, and a single  $8 \times \mathrm{v}100$  server. we use p3.16xlarge instances.
+
+implementation. our implementation uses pytorch and is adapted from the megatron repository (meg); we verified that single-worker performance with this implementation achieves about 45 tflops on a 355m-parameter gpt model and is competitive with existing state-of-the-art open
+
+![](images/df9611e9c2d624df821419112c10a79496b5d86f47a03deb1e9d187d227c7c92.jpg)
+
+![](images/384e22377ac82e19d144d8a81ac7bcfddec4ab0df7860e73d67c722f3911f2da.jpg)
+
+![](images/822904368cf574509d111396420896c9968e227b2711a31fde4d3bad8d055da2.jpg)  
+(a) bert, 355m (batch size = 1024).  
+(b) gpt, 355m (batch size = 512).
+
+![](images/ba3e2ea55fa296485783cee41faf46b32fdeb2cbacba46a520db57400022d139.jpg)  
+figure 5. training and validation loss when pre-training bert and gpt models with vanilla adam and adam with 2bw.
+
+source implementations from nvidia (nvi). all results shown are with mixed precision.
+
+models. we evaluate pipedream-2bw on bert (devlin et al., 2018) and gpt (radford et al., 2019), large transformer-based language models used for a number of nlp applications. in particular, most of our experiments are performed with gpt models with 1.3, 2.2, and 3.9 billion parameters, with similar layer dimensions to those used in the megatron paper (shoeybi et al., 2019).
+
+baselines. we compare pipedream-2bw to two types of baselines: (a) model parallelism without pipelining (tensor model parallelism used in megatron, and inter-layer model parallelism); and (b) gpipe (we extend gpipe to use parallel pipelines, and refer to this enhanced version as gpipe in the rest of this paper), which performs pipeline parallelism. we do not compare to pipedream or data parallelism for the entire model since they cannot fit the above models in memory when using 16-gb v100 gpus. with 64 gpus, we use data parallelism across stages to scale up training.
+
+main takeaways. we make the following observations:
+
+- quality of convergence: 2bw weight update semantics yield pre-trained models which produce comparable accuracy on downstream finetuning tasks to vanilla adam (gpipe and pipedream-flush) with the same batch size.  
+- comparison to model parallelism: pipedream-2bw is able to train a 3.8 billion-parameter gpt model up to  $20 \times$  faster compared to non-pipelining approaches.  
+- comparison to other pipelined approaches: pipedream-2bw is up to  $3.2 \times$  faster than gpipe.
+
+# 5.1. quality of convergence of 2bw
+
+we pre-trained 355m-parameter bert and gpt models with vanilla adam and adam with 2bw; we then finetuned
+
+<table><tr><td>task</td><td>metric</td><td>vanilla</td><td>vanilla (90%)</td><td>2bw</td></tr><tr><td>mnli</td><td>overall acc.</td><td>87.77%</td><td>n/a</td><td>87.82%</td></tr><tr><td>race</td><td>overall acc.</td><td>80.06%</td><td>79.30%</td><td>79.48%</td></tr></table>
+
+table 1. comparison of bert models pre-trained with vanilla (all and  $90\%$  of iterations) and 2bw optimizers on finetuning tasks.
+
+the resulting bert models. we note that gpipe, pipedreamflush, and dp have identical semantics, and hence are equivalent baselines ("vanilla"). to provide a fair comparison, we use the same hyperparameters, including batch size, used by megatron (shoeybi et al., 2019) to train these bert and gpt models. for bert, we use a batch size of 1024, and for gpt, we use a batch size of 512. we use the adam optimizer with standard hyperparameters (learning rate of  $10^{-4}$  with initial warmup and subsequent linear decay, maximum sequence length of 512), and mixed precision. we used the opentext dataset (ope) for pretraining. figure 5 shows the training and validation loss for the two models. the training and validation losses for the 2bw runs track the vanilla runs almost identically after the first 100k iterations (when the model is changing more rapidly and the delay term matters more).
+
+to further validate the quality of the pre-trained model, we finetuned the pre-trained vanilla and 2bw bert models on downstream mnli and race tasks (wang et al., 2019; lai et al., 2017). both pre-training and fine-tuning were performed with the same hyperparameter and training setups, and we did not perform hyperparameter tuning for either our goal here is to show that 2bw has nearly identical semantics to the corresponding vanilla optimizer. as shown in table 1, the accuracy on each of these tasks is similar after finetuning. we also evaluated the vanilla and 2bw gpt models on the wikitext-103 test dataset and got similar test perplexities (19.28 vs. 19.56); test perplexities match exactly when "vanilla" is run for  $20\%$  fewer iterations.
+
+# 5.2. throughput
+
+figure 6 shows the throughputs of various pipedream-2bw, pipedream-flush, and baseline configurations using 8 and 64 v100s with a sequence length of 512 for various large gpt models. results with bert models are similar and included in appendix §b.1. we compare to two different forms of model parallelism, as well as gpipe. data parallelism is not a viable baseline for these large models due to its high memory overhead. in these experiments, we use activation recomputation, and the largest per-gpu microbatch size that fits on the 16-gb v100 gpus. we use the best configuration recommended by pipedream-2bw's planner for all comparisons: 8-deep configurations for the model with 2.2 billion parameters, and 16-deep configurations for the model with 3.8 billion parameters. for each model, we show two different batch sizes to show the impact of batch
+
+![](images/a6640a65f941d335bba1a99b8682e5454b1bc75cd04aa90da91f84755e29d1a9.jpg)  
+(a) gpt, 2.2b, 8-way model parallelism  $(8\times \mathrm{v}100\mathrm{s})$
+
+![](images/455fe85c70efb0698f6c1e20dc13c5a5d64648d31c35191db8198fa8aec31211.jpg)  
+(b) gpt, 2.2b, 8-way model parallelism  $(64\times \mathrm{v}100\mathrm{s})$
+
+![](images/1e3216bdd7d18718375459c1171ca7683b4c3df5969ff6f8ee3767cffef34b53.jpg)  
+(c) gpt, 3.8b, 16-way model parallelism  $(64\times \mathrm{v}100\mathrm{s})$  
+figure 6. throughput of various systems for different batch sizes for gpt models, using  $8 \times 16$  gb-v100 servers.
+
+size on throughput for approaches that use periodic flushes.
+
+model parallelism without pipelining: we compare against two model parallelism approaches: tensor model parallelism used by megatron (shoeybi et al., 2019) where each layer is divided among all model-parallel workers, and inter-layer model parallelism where layers are sharded over the workers but inputs are not pipelined. on a single node, pipedream-2bw is faster than tensor mp by  $1.3 \times$ . this grows to  $20 \times$  on 64 gpus for the model with 3.8 billion parameters, when the all-to-all communication used by tensor mp needs to be performed across servers, which is expensive using aws instances (bandwidth across multi-gpu servers is much lower than the bandwidth within server). compared to inter-layer mp, pipelining with flushes increases throughput by up to  $4.1 \times$  for small batch sizes, and by up to  $5.3 \times$  for large batch sizes, on the 2.2-billion model. 2bw is up to  $6.1 \times$  faster than inter-layer mp.
+
+gpipe: pipedream-2bw outperforms corresponding gpipe configurations at the same global batch size by up to  $3.2 \times$  due to the lack of periodic pipeline flushes. gpipe natively has high memory footprint due to a large number of activation stashes: consequently, the maximum number of microbatches it can admit is small, leading to a larger pipeline bubble and  $2.1 \times$  worse throughput than pipedream-flush at low batch sizes, and  $3 \times$  at high batch sizes.
+
+pipedream-flush and pipedream-2bw: figure 6 also compares pipedream-2bw and pipedream-flush for two different batch sizes with different numbers of microbatches over which gradients are averaged ( $m = d \cdot g$ ) within the pipeline. at low batch size, pipedream-2bw is up to  $1.6 \times$
+
+![](images/021a07191806c67bddc3423146cfec4c72f0f1fecaac7f83f1798c1a1998aa6e.jpg)  
+figure 7. worst-case memory footprint (in gb) of various systems with 8 v100 gpus for a gpt model with 2.2 billion parameters.
+
+![](images/b991f4a549a4b676b7b23c02aa9d06b118e72999617368d366bcd5e185e3e10f.jpg)  
+figure 8. throughput of two pipedream-2bw configurations vs. global batch size for a 1.3-billion parameter gpt model using 64 v100 gpus. the legend shows  $(d, b)$ : the number of pipeline-parallel stages and the microbatch size.
+
+faster. with more gradient accumulation (batch size of 2048), this speedup drops to  $15\%$ . however, high  $g$  is not always practical. both pipedream-flush and pipedream-2bw have weight updates with a batch size of  $b \cdot w \cdot d \cdot g$ , where the total number of workers is  $w \cdot d$ . for a large number of workers ( $\gg$  64), the batch size is high even with  $g = 1, m = d$ , making additional gradient accumulation infeasible (batch size cannot scale to  $\infty$  without affecting model convergence). indeed, systems like megaatron (shoeybi et al., 2019), that train large transformer models using 512 gpus, show state-of-the-art results across tasks using a global batch size  $\leq 1024$ .
+
+# 5.3. memory footprint
+
+we measured the worst-case memory footprint of different systems on a gpt model, shown in figure 7. gpipe runs out of memory at a batch size of 64, due to a larger number of activation stashes from its all-forward-all-backward schedule, even with activation recomputation (worst case of  $m$  input activation stashes with activation recomputation, compared to  $d$  for pipedream-flush). pipedream-flush has a slightly higher memory footprint compared to interlayer model parallelism, since it needs to maintain activation stashes for more in-flight microbatches. pipedream-2bw has a higher memory footprint than pipedream-flush due to an additional weight version (but still lower than gpipe's).
+
+# 5.4. planning decisions
+
+in this sub-section, we analyze the implications of pipeline depth and width on performance. we show experiments demonstrating the impact of activation recomputation on performance in appendix §b.2. figure 8 shows the throughputs of two pipedream-2bw configurations for different batch sizes. we highlight relevant takeaways below.
+
+![](images/1c1391f4d1fbe092ede073a19f66c624ab01341a240db3474d2d25d57aa60c14.jpg)  
+figure 9. maximum model size supported by various pipeline-parallel depths with 64 16-gb v100 gpus.
+
+inter-stage communication: as the global batch size increases with gradient accumulation, throughput for each configuration increases due to less communication across stage replicas. this is especially true for configurations with communication across servers ( $w > 8$ ,  $d < 8$  for 8-gpu servers, e.g.  $d = 4$ ) where inter-stage all-to-all communication is cross-node and more expensive.
+
+compute-communication ratio: increasing the pipeline depth decreases the amount of computation in each pipeline stage while keeping the number of bytes communicated between stages constant. this makes the pipeline more communication-bound, decreasing throughput.
+
+maximum per-gpu microbatch size: increasing the pipeline depth increases the maximum microbatch size that fits in gpu memory. this leads to possibly higher arithmetic intensity and throughput. in figure 8, we show throughput for two microbatch sizes for the  $d = 8$  configuration; the larger microbatch size  $(b = 32)$  has higher throughput. smaller pipeline depths cannot fit large microbatch sizes.
+
+maximum model size: deeper pipelines support the training of larger models. we show the empirically measured maximum model size that can be trained with 2bw using different values of  $d$  in figure 9.
+
+these observations illustrate the complexity in picking a configuration. for example, increasing pipeline depth leads to two effects (decreased compute-communication ratio within the pipeline and increased arithmetic intensity) that have opposing effects on throughput. pipedream-2bw's planner automates this process for each combination of model, batch size, and number of gpus.
+
+# 5.5. maximum model size supported
+
+figure 9 shows the empirically measured maximum model size supported by various pipeline depths while using 2bw. as can be seen in the figure, deeper configurations provide additional memory capacity. pipedream-2bw is able to train models of up to almost 30 billion parameters using 64 16-gb gpus. as a point of comparison, megatronlm (shoeybi et al., 2019) was able to train a model with 8.3 billion parameters with 8 32-gb gpus ( $2 \times$  more memory).
+
+# 6. related work and discussion
+
+in this section, we expand on work related to pipedream-2bw, and place pipedream-2bw's speedups in context.
+
+model parallelism in real deployments. nvidia used a custom intra-layer model parallelism scheme in its megatron system (shoeybi et al., 2019) to train a gpt-2 model with 8.3 billion parameters on 64 32-gb v100 servers by parallelizing matrix multiplications across multiple workers. this approach can be combined with data parallelism. all-reductions are needed to coalesce partial results produced on different gpus, thus making training communication-bound at high numbers of model partitions. in comparison, pipedream-2bw trades off additional memory footprint (an extra weight version) for lower communication overhead  $(20\times$  faster training when using multiple multi-gpu servers on amazon aws with limited inter-node bandwidth).
+
+pipeline parallelism. we discussed the existing approaches to pipeline parallelism in §2, and showed quantitative comparisons in §5.2. pipedream-2bw trains large models up to  $3.2 \times$  faster than gpipe at low batch sizes, due to a lack of periodic pipeline flushes, and lower memory footprint that allows more input microbatches to be pushed into the pipeline. pipedream cannot train these large models. pipedream-2bw's lower memory footprint does come with tradeoffs, however - pipedream-2bw accumulates weight gradients over multiple microbatches, increasing the minimum batch size that pipedream-2bw supports. thus, for models that only support very small batch sizes, pipedream-2bw, pipedream-flush, and gpipe, which perform gradient accumulation within the pipeline, may not be viable.
+
+pipemare (yang et al., 2019) uses asynchronous pipeline parallelism to provide high throughput (no pipeline flushes) with asynchronous weight update semantics. pipemare offers two theoretically-motivated techniques to ensure good statistical efficiency. in contrast, pipedream-2bw and all the baselines we compare against in the paper (traditional data parallel training, pipedream, gpipe), use synchronous execution where the weights used for computation during forward propagation are the same as those used during backward propagation. pipedream-2bw's double buffered weight updates use a 1-stale gradient update that does not require any hyperparameter tuning to generate comparable results. pipemare also does not describe how computation should be partitioned among the available workers.
+
+memory-saving optimizations. a rich line of work attempts to decrease the memory footprint of dnn training. gist (jain et al., 2018) employs lossless and lossy layers-specific encoding schemes to compress stashed activations. systems such as checkmate (jain et al., 2020) systematically determine when activation recomputation (chen et al., 2016; griewank & walther, 2000) should be performed.
+
+deepspeed (rajbhandari et al., 2019) partitions optimizer state over data-parallel replicas instead of replicating it, using a technique called zero. such orthogonal optimizations can be combined and incorporated in pipedream-2bw.
+
+planning algorithms. pipedream, dapple (fan et al., 2021), and flexflow (jia et al., 2018) use planning algorithms to partition operator graphs over multiple accelerators to maximize throughput. unfortunately, these planners do not exploit the repetitive nature of modern transformer-based models. for example, pipedream's planner explores  $o(n^{3}m^{2})$  configurations (assuming  $n$  layers in the model and  $m$  workers). furthermore, these planners do not consider the effect of memory-saving optimizations, which are critical for training large models efficiently (e.g., always applying activation recomputation can make the system  $1.33 \times$  slower). pipedream-2bw's planner, on the other hand, performs an exhaustive search of a much reduced search space since it only considers parallel pipelines (all possible  $(w,d)$  pairs with  $m$  workers is  $o(m^2)$ ). given this small number of explored configurations, bagpipe's planner takes a fraction of a second with a closed-form cost model; pipedream's partitioning algorithm with the same cost model takes about 30 minutes for large models.
+
+# 7. conclusion
+
+in this work, we proposed and implemented pipedream-2bw, a system for memory-efficient pipeline-parallel training that achieves high throughput, low memory footprint, and data parallelism-like semantics through a novel weight update double buffering strategy called 2bw. pipedream-2bw also uses a planner to determine how to partition a model's operator graph over training resources in a memory-aware way. pipedream-2bw accelerates the training of models with billions of trainable parameters by up to  $20\times$  compared to model-parallel baselines, and by up to  $3.2\times$  compared to gpipe, on commodity hardware.
+
+# acknowledgements
+
+we thank the anonymous reviewers, aditya grover, paroma varma, members of futuredata, and our colleagues at msr for their feedback that improved this work. we thank msr for their generous support of deepak's internship, and for resources to develop and evaluate pipedream-2bw. this research was also supported in part by affiliate members and other supporters of the stanford dawn project-ant financial, facebook, google,infosys, nec, and vmware-as well as northrop grumman, amazon web services, cisco, nsf graduate research fellowship grant dge-1656518, and the nsf career grant cns-1651570. any opinions, findings, and conclusions or recommendations expressed in this material are those of the authors alone.
+
+# references
+
+megatron repository. https://github.com/nvidia/megatron-lm.  
+nvidia deep learning examples, bert. https://github.com/nvidia/ deeplearningexamples/blob/master/ pytorch/languagemodeling/bert/readme. md#results.  
+openwebtext dataset. https://github.com/jcpeterson/openwebtext.  
+brown, t., mann, b., ryder, n., subbiah, m., and et al. language models are few-shot learners. arxiv preprint arxiv:2005.14165, 2020.  
+chen, t., xu, b., zhang, c., and guestrin, c. training deep nets with sublinear memory cost. arxiv preprint arxiv:1604.06174, 2016.  
+chilimbi, t. m., suzue, y., apacible, j., and kalyanaraman, k. project adam: building an efficient and scalable deep learning training system. in 11th usenix symposium on operating systems design and implementation (osdi '14), volume 14, pp. 571-582, 2014.  
+dean, j., corrado, g., monga, r., chen, k., devin, m., mao, m., senior, a., tucker, p., yang, k., le, q. v., et al. large scale distributed deep networks. in advances in neural information processing systems, pp. 1223-1231, 2012.  
+devlin, j., chang, m.-w., lee, k., and toutanova, k. bert: pre-training of deep bidirectional transformers for language understanding. arxiv preprint arxiv:1810.04805, 2018.  
+fan, s., rong, y., meng, c., cao, z., wang, s., zheng, z., wu, c., long, g., yang, j., xia, l., et al. dapple: a pipelined data parallel approach for training large models. in proceedings of the 26th acm sigplan symposium on principles and practice of parallel programming, pp. 431-445, 2021.  
+griewank, a. and walther, a. revolve: an implementation of checkpointing for the reverse or adjoint mode of computational differentiation. acm transactions on mathematical software (toms), 26(1):19-45, 2000.  
+harlap, a., narayanan, d., phanishayee, a., seshadri, v., devanur, n., ganger, g., and gibbons, p. pipedream: fast and efficient pipeline parallel dnn training. arxiv preprint arxiv:1806.03377, 2018.  
+huang, y., cheng, y., bapna, a., first, o., chen, d., chen, m., lee, h., ngiam, j., le, q. v., wu, y., et al. gpipe: efficient training of giant neural networks using pipeline
+
+parallelism. in advances in neural information processing systems, pp. 103-112, 2019.  
+jain, a., phanishayee, a., mars, j., tang, l., and pekhimenko, g. gist: efficient data encoding for deep neural network training. in 2018 acm/ieee 45th annual international symposium on computer architecture (isca), pp. 776-789. ieee, 2018.  
+jain, p., jain, a., nrusimha, a., gholami, a., abbeel, p., gonzalez, j., keutzer, k., and stoica, i. breaking the memory wall with optimal tensor rematerialization. in proceedings of machine learning and systems 2020, pp. 497-511. 2020.  
+jia, z., zaharia, m., and aiken, a. beyond data and model parallelism for deep neural networks. in proceedings of the 2nd conference on machine learning and systems (mlsys), 2018.  
+jouppi, n. p., young, c., patil, n., patterson, d., agrawal, g., bajwa, r., bates, s., bhatia, s., boden, n., borchers, a., et al. in-datacenter performance analysis of a tensor processing unit. in proceedings of the 44th annual international symposium on computer architecture, pp. 1-12, 2017.  
+lai, g., xie, q., liu, h., yang, y., and hovy, e. race: large-scale reading comprehension dataset from examinations. arxiv preprint arxiv:1704.04683, 2017.  
+narayanan, d., harlap, a., phanishayee, a., seshadri, v., devanur, n. r., ganger, g. r., gibbons, p. b., and zaharia, m. pipedream: generalized pipeline parallelism for dnn training. in proceedings of the 27th acm symposium on operating systems principles, pp. 1-15, 2019.  
+radford, a., narasimhan, k., salimans, t., and sutskever, i. improving language understanding by generative pre-training. url https://s3-us-west-2. amazonaws. com/openai-assets/researchcovers/languageunsupervised/language understanding paper.pdf, 2018.  
+radford, a., wu, j., child, r., luan, d., amodei, d., and sutskever, i. language models are unsupervised multitask learners. openai blog, 1(8):9, 2019.  
+rajbhandari, s., rasley, j., ruwase, o., and he, y. zero: memory optimization towards training a trillion parameter models. arxiv preprint arxiv:1910.02054, 2019.  
+shoeybi, m., patwary, m., puri, r., legresley, p., casper, j., and catanzaro, b. megatron-lm: training multi-billion parameter language models using gpu model parallelism. arxiv preprint arxiv:1909.08053, 2019.
+
+wang, a., singh, a., michael, j., hill, f., levy, o., and bowman, s. r. glue: a multi-task benchmark and analysis platform for natural language understanding. 2019. in the proceedings of iclr.  
+xing, e. p., ho, q., dai, w., kim, j. k., wei, j., lee, s., zheng, x., xie, p., kumar, a., and yu, y. petuum: a new platform for distributed machine learning on big data. ieee transactions on big data, 1(2):49-67, 2015.  
+yang, b., zhang, j., li, j., ré, c., aberger, c. r., and de sa, c. pipemare: asynchronous pipeline parallel dnn training. arxiv preprint arxiv:1910.05124, 2019.
+
+# a. planner, additional details
+
+for every possible configuration of width and depth, pipedream-2bw's planner explores the benefit of pipelining and each space-saving optimization. for example, with activation recomputation as a target memory-savings optimization, pipedream-2bw considers three possible executions:
+
+- model and data parallelism without pipelining (with the largest per-gpu microbatch size that fits in memory).  
+- hybrid parallelism with pipelining and without activation recomputation (all required weight versions and activation stashes in memory for in-flight microbatches).  
+- hybrid parallelism with pipelining and recomputation.
+
+pipedream-2bw's planner estimates the throughput and memory footprint of each of these possible executions using a cost model. pipedream-2bw's planner then tries to find the configuration with highest throughput that also fits in main device memory of the accelerators used (memory capacity provided as input). in this section, we show one such cost model for throughput and memory.
+
+# a.1. closed-form cost functions
+
+in our experiments, we used profile-based cost functions that run configurations end-to-end for a couple of hundred iterations. however, performance of different parallel configurations can also be estimated using closed-form expressions that use more fine-grained profile information (e.g., time and memory footprint of each transformer block). we present one such cost model here.
+
+# a.1.1. throughput(.) cost function
+
+the throughput of various hybrid-parallel setups with and without pipelining can be modeled using the times of forward and backward passes obtained from a simple profiling step. let  $b$  be the largest per-gpu microbatch size without additional weight and activation versions, and  $b'$  be the largest per-gpu microbatch size that can fit on the device when multiple versions are needed ( $b' \leq b$ ). as before,  $w$  and  $d$  are the pipeline width and depth.
+
+let  $t_{i}^{\mathrm{comp}}(b, w, d)$  represent the compute time of stage  $i$  with a per-gpu microbatch size  $b$ ,  $t_{i \rightarrow j}^{\mathrm{comm}}(b, w, d)$  represent the communication time of activations and gradients between stages  $i$  and  $j$  with microbatch size  $b$ , and  $t_{i}^{\mathrm{comm}}(b, w, d)$  represent the communication time of exchanging gradients between  $w$  replicas of stage  $i$  with microbatch size  $b$ . we assume that the global batch size used is  $b$ . with pipeline width  $w$  and microbatch size  $b$ , data-parallel communication is required every  $m(b) = b / (w \cdot b)$  microbatches.
+
+then, without pipelining, each microbatch of size  $b$  takes
+
+the following computation time,  $t$ :
+
+$$
+\begin{array}{l} t = \sum_ {i} \max  \left(t _ {i} ^ {\operatorname {c o m p}} (b, w, d) + \sum_ {j} t _ {j \rightarrow i} ^ {\operatorname {c o m m}} (b, w, d), \right. \\ \frac {1}{m (b)} \cdot t _ {i} ^ {\mathrm {c o m m}} (b, w, d)) \\ \end{array}
+$$
+
+with pipelining, computation of different stages can be overlapped. a microbatch of size  $b'$  can then be processed every  $t$  seconds, where  $t$  is given by the expression:
+
+$$
+\begin{array}{l} t = \max  _ {i} \max  \left(t _ {i} ^ {\operatorname {c o m p}} \left(b ^ {\prime}, w, d\right) + \right. \\ \sum_ {j} t _ {j \rightarrow i} ^ {\mathrm {c o m m}} (b ^ {\prime}, w, d), \\ \frac {1}{m (b ^ {\prime})} \cdot t _ {i} ^ {\mathrm {c o m m}} (b ^ {\prime}, w, d)) \\ \end{array}
+$$
+
+with activation recomputation, the number of floating point operations increases, since forward passes need to be repeated to recompute the activation stashes needed in the backward pass. we use a constant multiplier  $c^{\mathrm{extra}}$  to represent this.  $c^{\mathrm{extra}} = 4 / 3$  is a reasonable value for this constant, since the backward pass typically takes twice as long as the forward pass.  $c^{\mathrm{extra}}$  can also be measured empirically. arithmetic intensity might also increase, which is captured by  $t_{i}^{\mathrm{comp}}(.)$  being a function of the microbatch size  $b$ . communication time remains unchanged from before. every  $b$  inputs can now be processed in time  $t$ , where  $t$  is given by,
+
+$$
+\begin{array}{l} t = \max  _ {i} \max  (c ^ {\text {e x t r a}} \cdot t _ {i} ^ {\text {c o m p}} (b, w, d) + \\ \sum_ {j} t _ {j \rightarrow i} ^ {\mathrm {c o m m}} (b, w, d), \\ \frac {1}{m (b)} \cdot t _ {i} ^ {\mathrm {c o m m}} (b, w, d)) \\ \end{array}
+$$
+
+the throughput in samples per second of each of these setups is then the corresponding per-gpu microbatch size  $(b$  or  $b^{\prime})$  divided by  $t$ .
+
+estimating  $t^{\mathrm{comp}}(.)$ .  $t_{i}^{\mathrm{comp}}(b, w, d)$  is the compute time of stage  $i$  with per-gpu microbatch size  $b$ , and can be computed by summing up the forward and backward pass times of all blocks within the stage. if the depth of the pipeline is  $d$  and the total number of blocks in the model is  $b$ , then the total number of blocks in a given stage is  $b / d$ . forward and backward pass times for each stage can be estimated by profiling 100-200 iterations of training.
+
+estimating  $t^{\mathrm{comm}}(.)$ . communication times can be similarly modeled. let the size of the associated parameter with  $b$  total blocks be  $|w|$ , and the size of the block's input and output activations be  $|a^{\mathrm{inp.+out.}}(b)|$ . with a pipeline of depth  $d$ , each pipeline stage has  $1 / d$  of the total model parameters.
+
+# algorithm 1 partitioning algorithm
+
+input: model  $m$ , memory capacity  $m$ ,  $m$ 's associated search function search(),  $m$ 's associated throughput cost function throughput(),  $m$ 's memory footprint cost function memory(), maximum safe batch size  $b$ .
+
+return: optimal width and depth  $w^{\mathrm{opt}}$  and  $d^{\mathrm{opt}}$ , optimal per-gpu microbatch size  $b^{\mathrm{opt}}$ , boolean whether activations should be recomputed  $r^{\mathrm{opt}}$ , optimal degree of gradient accumulation  $g^{\mathrm{opt}}$ .
+
+initialize  $t^{\mathrm{max}} = 0$ ,  $w^{\mathrm{opt}} = \mathrm{null}$ ,  $d^{\mathrm{opt}} = \mathrm{null}$
+
+for  $w = 1$  to  $n$  do
+
+for  $d = 1$  to  $n / w$  do
+
+// for given width  $w$ , depth  $d$ , and batch size  $b$ , find optimal microbatch size and whether activation recomputation should be performed.
+
+$b,r = m.\mathrm{search}(w,d,b)$
+
+$t = m.\mathrm{throughput}(w,d,b,r)$
+
+if  $m.\mathrm{memory}(w,d,b,r) > m$  then
+
+continue
+
+end if
+
+if  $t > t^{\max}$  then
+
+$$
+t ^ {\max } = t, w ^ {\operatorname {o p t}} = w, d ^ {\operatorname {o p t}} = d, b ^ {\operatorname {o p t}} = b, r ^ {\operatorname {o p t}} = r
+$$
+
+end if
+
+end for
+
+end for
+
+$g^{\mathrm{opt}} = b / (n\cdot b^{\mathrm{opt}}) / / t o r e a c h b a t c h s i z e b.$
+
+the time to communicate activations across stages can be computed as (factor of 2 for gradients in the backward pass),
+
+$$
+t _ {i \rightarrow j} ^ {\mathrm {c o m m}} (b, w, d) = \frac {2 \left| a ^ {\mathrm {i n p . + o u t .}} (b) \right| \cdot \mathbb {i} (d > 1)}{\operatorname {b w d t h} _ {\mathrm {d e p t h}} (d)}
+$$
+
+the time to communicate weight gradients across stage replicas can be computed similarly given a bandwidth function  $\mathrm{bwidth}_{\mathrm{width}}(w)$ , and the number of bytes communicated during all-reduce. the number of byes communicated in an all-reduction can either be explicitly measured, or estimated using a closed-form expression (narayanan et al., 2019).
+
+$\mathrm{bwdth}_{\mathrm{depth}}(d)$  and  $\mathrm{bwdth}_{\mathrm{width}}(w)$  represent the bandwidths for inter-stage and intra-stage communication. these bandwidth functions can respect hierarchical network topologies. for example, if  $w$  is less than the number of workers in a single server, communication can be performed entirely within a server, using the higher intra-server bandwidth.
+
+$\mathrm{bwdth_{width}(w) = \left\{ \begin{array}{ll}b_{\mathrm{high}}\text{if} w <   \mathrm{number~of~gpu s in~server}\\ b_{\mathrm{low}}\text{otherwise} \end{array} \right.}$
+
+# a.1.2. memory(.) cost function
+
+the memory footprint can similarly be modeled using the sizes of activations and weights obtained from a profiling step. let the total size of the weight parameters for the entire model be  $|w|$ , let the total size of the activations given a microbatch size  $b$  for the entire model be  $|a^{\mathrm{total}}(b)|$  and let the size of the input activations for a single stage be  $|a^{\mathrm{input}}(b)|$ . with a pipeline of  $d$  stages, each pipeline stage has weight parameters of size  $|w| / d$ , and activations of size  $|a^{\mathrm{total}}(b)| / d$ .
+
+without activation recomputation. as discussed in §3.1, 2bw maintains 2 different versions of the weight parameters. pipedream-2bw also maintains  $d$  versions of activations (the total number of in-flight activations). this means the total pipedream-2bw memory footprint is:
+
+$$
+\frac {2 | w |}{d} + \frac {d | a ^ {\text {t o t a l}} (b) |}{d} + d | a ^ {\text {i n p u t}} (b) |.
+$$
+
+with activation recomputation. with activation recomputation, the total number of activation versions in gpu memory at any point in time is 1. this means that the pipedream-2bw memory footprint with  $d$  stages is:
+
+$$
+\frac {2 | w |}{d} + \frac {| a ^ {\text {t o t a l}} (b) |}{d} + d | a ^ {\text {i n p u t}} (b) |.
+$$
+
+# a.2. partitioning algorithm
+
+we show pseudocode for the full partitioning algorithm in algorithm 1.
+
+# b. evaluation, additional graphs
+
+in this section, we present additional results we could not fit in the main paper due to space.
+
+# b.1. throughput and memory footprint with bert models
+
+we also ran pipedream-2bw on two bert models: one with 2.2 billion parameters, and another with 3.8 billion parameters. figure 10 compares pipedream-2bw's throughput against the same baselines as before, and figure 11 compares pipedream-2bw's memory footprint for these bert models. we see that results are similar to gpt. one point of difference is that gpipe does not run out of memory at the batch size of 64 (for gpt, only a batch size of 32 fits in memory, leading to a larger pipeline bubble); however, gpipe still has higher memory footprint compared to all other baselines.
+
+# b.2. impact of activation recomputation
+
+figure 12 shows the effect of activation recomputation on throughput for various gpt models. for a given per
+
+![](images/ec5d54c6581f40189ff0c6a35d6cb2f3d95c12cb421a3f4580006fe63385512b.jpg)  
+(a) bert, 2.2b, 8-way model parallelism  $(8\times \mathrm{v}100\mathrm{s})$
+
+![](images/672b8646d3fcc398ebb2115601a06d62051a8a9c77638b5f629c840f1ce30486.jpg)  
+(b) bert, 2.2b, 8-way model parallelism  $(64\times \mathrm{v}100\mathrm{s})$
+
+![](images/55c6c3c543b6dd3f2a3ca3ae2db9d49f2d7a98201dd42758e19945d47a4d3248.jpg)  
+(c) bert, 3.8b, 16-way model parallelism  $(64\times \mathrm{v}100\mathrm{s})$
+
+![](images/25edc4a71ccc1559dec0e5766fc033187434a7c77757ee77c2602839c9872fa1.jpg)  
+figure 10. throughput of various systems for different batch sizes for bert models. results are shown with a single  $8 \times \mathrm{v}100$  server, and with eight  $8 \times \mathrm{v}100$  servers (with 16gb).  
+figure 11. worst-case memory footprint (in gb) of various systems with 8 v100 gpus for a bert model with 2.2b parameters.
+
+![](images/43bf48f171bd602ac05ae575598295b8e6fd85e9df15c4303273a084df5843c3.jpg)  
+(a) gpt, 1.3b.  
+figure 12. throughput of (1,8) pipedream-2bw configurations vs. per-gpu microbatch size for gpt models using a maximum sequence length of 512 and 8 16-gb-v100 gpus, with and without activation recomputation. activation recomputation helps increase the maximum per-gpu microbatch size that fits, especially for larger models, leading to higher throughput in some cases.
+
+![](images/0534c1ae9bfa353fcc2f0b74635bec2ed4c4481059fad99867571ce537b7c2ad.jpg)  
+(b) gpt, 2.2b.
+
+gpu microbatch size, recomputation introduces overhead (capped at  $33\%$  since the backward pass takes twice as long as the forward pass for most operators). however, recomputation allows for a larger per-gpu microbatch to fit on the worker, sometimes leading to higher throughput than
+
+without activation recomputation: activation recomputation leads to higher throughput in figure 12b, but not in figure 12a. in the extreme case (not pictured), recomputation makes it possible to train large models by reducing peak memory footprint of training, at the cost of extra compute operations due to an extra forward pass.

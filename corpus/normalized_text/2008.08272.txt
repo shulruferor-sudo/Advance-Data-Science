@@ -1,0 +1,404 @@
+# compiling onnx neural network models using mlir
+
+tian jin $^{1,\dagger 1,*}$  gheorghe-teodor bercea $^{1}$  tung d. le $^{2,*}$  tong chen $^{1}$   
+gong su $^{1}$  haruki imai $^{2}$  yasushi negishi $^{2}$  anh leu $^{1}$  kevin o'brien $^{1}$   
+kiyokuni kawachiya $^{2}$  alexandre e. eichenberger $^{1}$
+
+abstract: deep neural network models are becoming increasingly popular and have been used in various tasks such as computer vision, speech recognition, and natural language processing. machine learning models are commonly trained in a resource-rich environment and then deployed in a distinct environment such as high availability machines or edge devices. to assist the portability of models, the open-source community has proposed the open neural network exchange (onnx) standard. in this paper, we present a high-level, preliminary report on our onnx-mlr compiler, which generates code for the inference of deep neural network models described in the onnx format. onnx-mlr is an open-source compiler implemented using the multi-level intermediate representation (mlir) infrastructure recently integrated in the llvm project. onnx-mlr relies on the mlir concept of dialects to implement its functionality. we propose here two new dialects: (1) an onnx specific dialect that encodes the onnx standard semantics, and (2) a loop-based dialect to provide for a common lowering point for all onnx dialect operations. each intermediate representation facilitates its own characteristic set of graph-level and loop-based optimizations respectively. we illustrate our approach by following several models through the proposed representations and we include some early optimization work and performance results.
+
+# 1. introduction
+
+deep neural network models have been used widely for various tasks such as computer vision, speech recognition, and natural language processing. the success of such models was mainly originated from the development of accelerators, especially gpu accelerators, back in 2012 [3]. since then, many deep learning frameworks, such as torch, caffe, theano, and tensorflow, have been developed to facilitate the training and inferencing of deep neural network models, which significantly speeds up the explosion of deep learning in many areas. however, training and inferencing are often done on different environments due to their different optimization characteristics. for example, a model is trained using a large-scale distributed system since it might need weeks or months to finish, and can then be used on lightweight devices such as internet of things or mobile phones for inferencing. hence, it is desirable to dynamically rewrite a trained model so that it runs efficiently on a target environment.
+
+many deep learning frameworks utilize a highly-optimized
+
+library written for a target accelerator. rewriting a model for inferencing consists of replacing the operations in the model with the function calls in the library. while such a library-call approach simplifies the rewritten procedure and would lead to improved performance, it exposes the following drawbacks. firstly, the number of models that can be rewritten is limited by the provided functions in the library. secondly, it is often the case that users need to install additional packages to make the library work well. thirdly, it lacks the ability to tailor code specific to different problems since the same function may be used for them.
+
+we tackle these drawbacks by developing a compiler that rewrites a trained model to native code for a target hardware. it uses many mature optimization techniques developed during the long history of compiler, such as the ability to tailor code for a specific problem, memory optimizations, and parallelization. our compiler is completely based on open-source software. in particular, we chose open neural network exchange (onnx) [1] as a format to represent the input model of our compiler. onnx is an open-source machine-independent format and widely used for exchanging neural network models. it has been actively maintained by and contributed from open source communities. our compiler was written using multi-level intermediate representation (mlir) [5], a modern open source compiler infrastructure for multi-level intermediate representations and a subproject inside llvm [4].
+
+our compiler is completely open-sourced and a subproject
+
+inside the onnx project $^{1}$ . although it is still under development, it can already compile some popular models such mnist and resnet50 to native code on x86 machines, ibm power systems $^{12}$ , and ibm system z $^{13}$ . in this paper, we will introduce our compiler by
+
+- presenting its overall design and architecture of the compiler,  
+- introducing two new dialects: onnx dialect to encode the onnx standard semantics, and krnl dialect to provide for a common lowering point for all onnx dialect operations.  
+- introducing optimization passes such as graph rewriting, constant propagation, and memory management, and  
+- discussing some problems we encountered when emitting native code for different architectures.
+
+the remainder of the paper is organized as follows. in sec. 2, we briefly discuss onnx and mlir on which our compiler is based. in sec. 3, we introduce our compiler, its design principle, and architecture. we also discuss in this section two new dialects, i.e., onnx and krnl, and some optimization passes. in sec. 4, we present some preliminary experimental results for mnist and resnet50 models on ibm power systems. finally, we conclude our paper and discuss future work in sec. 5.
+
+# 2. background
+
+# 2.1 onnx
+
+open neural network exchange (onnx) [1] is an open source format for artificial intelligence models, including both deep learning and traditional machine learning. it defines an extensible computational graph model, operators, and standard data types, which provides a common ir for different frameworks. there are two onnx variants: the neural-network-only onnx variant recognizes only tensors as input and output types, while the classic machine learning onnx-ml also recognizes sequences and maps. onnx-ml extends the onnx operator set with machine learning algorithms that are not based on neural networks. in this paper, we focus on the neural-network-only onnx variant and refer to it as just onnx.
+
+in onnx, the top-level structure is a 'model' to associate metadata with a graph. operators in onnx are divided into a set of primitive operators and functions, where a function is an operator whose calculation can be expressed via a subgraph of other operators. a graph is used to describe a function. there are lists of nodes, inputs, outputs, and initializers (constant values or default values for inputs) in a graph. an acyclic dataflow graph is constructed as a topological sort of the list of nodes in the graph. each node
+
+listing 1: onnx model for leakyrelu operator (printed using 'protoc' command).
+
+```textproto
+1 ir_version: 3  
+2 producer_name: "frontend-test"  
+3 graph {  
+4 node {  
+5 input: "x"  
+6 output: "y"  
+7 op_type: "leakyrelu"  
+8 attribute {  
+9 name: "alpha"  
+10 f: 0.1  
+11 type: float  
+12 }  
+13 }  
+14 name: "test_leakyrelu"  
+15 input {  
+16 name: "x"  
+17 type {  
+18 tensor_type {  
+19 elem_type: 1  
+20 shape {  
+21 dim {  
+22 dim_value: 3  
+23 }  
+24 dim {  
+25 dim_value: 4  
+26 }  
+27 dim {  
+28 dim_value: 5  
+29 }  
+30 }  
+31 }  
+32 }  
+33 }  
+34 output {  
+35 name: "y"  
+36 type {  
+37 tensor_type {  
+38 elem_type: 1  
+39 shape {  
+40 dim {  
+41 dim_value: 3  
+42 }  
+43 dim {  
+44 dim_value: 4  
+45 }  
+46 dim {  
+47 dim_value: 5  
+48 }  
+49 }  
+50 }  
+51 }  
+52 }  
+53 }  
+54 offset-import {  
+55 version: 9  
+56}
+```
+
+in a graph contains the name of the operator it invokes, inputs, outputs, and attributes associated with the operator. inputs and outputs can be marked as variadic or optional. there are three data types used to define inputs and outputs, i.e., 'tensor', 'sequence', and 'map'.
+
+onnx uses the protocol buffers $^{4}$  definition language for its syntax. listing 1 shows an example of an onnx model for the leakyrelu operator. there is one node in the graph (lines 4-13), which is associated with leakyrelu, and has
+
+![](images/963843ef602de74208c336d1c4245d250e11546f8d31623731806f50a338cf00.jpg)  
+fig. 1: operations and regions in mlir.
+
+![](images/ce451eb0feab72165b47d2f43191a5a98b9af71a4c5af3d56612f8902b72540c.jpg)
+
+one input, one output, and one attribute. the input and output tensors have the shape of  $\langle 3\times 4\times 5\rangle$  and element type of float32 (elem_type: 1 at lines 19 and 38).
+
+# 2.2 mlir
+
+multi-level intermediate representation (mlir) [5] is a modern compiler infrastructure which is reusable and extensible. it reduces the cost of building domain-specific compilers by facilitating the design and implementation of code generators, translators, and optimizers at different abstraction levels. mlir is a subproject of the llvm project [6] and has many similarities to the llvm compiler infrastructure [4]. in this section, we briefly review some of the features in mlir that were used to build our compiler. for more information about mlir, one can refer to a previous study [5]. readers who are familiar with mlir can skip this section.
+
+similar to livm, mlir is a three-address static single assignment (ssa)-based ir, where values are defined before use and have a scope defined by their dominance relations. operations may produce zero or more results, and each operation is a distinct ssa value with its own type defined by the type system. the type system in mlir is open, and one can define application-specific types. there are a number of primitive types, e.g., integers, as well as aggregate types for tensors and memory buffers, e.g., 'tensor' and 'memref' types. a tensor type is abstracted and does not have a pointer to the data while a memref type is a lower representation, referring to a region of memory. in mlir, tensor and memref types are syntactically represented as tensor  $\langle \mathsf{d}_1\times \mathsf{d}_2\times \ldots \times \mathsf{d}_n\times \mathsf{d}$  tye\rangle and memref  $\langle \mathsf{d}_1\times \mathsf{d}_2\times \ldots \times \mathsf{d}_n\times \mathsf{d}$  tye\rangle, respectively, where  $d_{1},d_{2},\dots ,d_{n}$  are intergers representing the dimensions of a tensor or memref, and dtype is the type of the elements in a tensor or memref, e.g., f32 for float32.  $\langle \mathsf{d}_1\times \mathsf{d}_2\times \ldots \times \mathsf{d}_n\rangle$  is called the shape of a tensor or memref. tensor and memref types can be unranked when their shapes are unknown. in mlir, unranked tensor and memref types are syntactically represented as tensor  $\langle *\times \text{dtype}\rangle$  and memref  $\langle *\times \text{dtype}\rangle$  respectively.
+
+an operation is the unit of code in mlir. to define an operation, a tablegen-based [7] specification for an operation descriptor is used. figure 1 shows the structure of an operation. an operation has a list of ssa operands and may have attributes that store static information. an operation
+
+can hold a region which is a list of blocks. a block contains a list of operations and ends with a terminator operation that may have successor blocks to which the control flow may be transferred. that being said, nested regions becomes a first-class concept in mlir, which is efficient to represent control flow graphs. a function is an operation with a single region and attributes. a module is an operation with a single region containing a single block and terminated by a dummy operation.
+
+to develop a compiler using mlir, users often need to define dialects and optimization passes. a dialect serves as an abstraction level or intermediate representation, and an optimization pass is to enable optimization at an abstraction level or transformation among abstraction levels.
+
+there are dialects in mlir that are ready to use, e.g., llvm, std, scf, and affine. the llvm dialect is a low-level dialect. it wraps the llvm ir types and instructions into mlir types and operations. the std dialect includes standard operations such as load, store, addi, addf, absf, and call. the scf dialect defines control flow operations such as for and if. the affine dialect provides an abstraction for affine operations and analyses.
+
+optimization passes can be roughly classified into three categories: general transformation, conversion, and dialect-specific. general transformation passes includes common passes such as 'canonicalize' pass for operation canonicalization, 'cse' pass to eliminate common sub-expressions, and passes to print ir information such as 'print-op-graph', 'print-op-stats', and 'printcfg-graph'. conversion passes are to convert operations in one dialect to operations in another dialect, e.g., 'convert-standard-to-llvm' pass to convert standard operations into llvm instructions. finally, dialect-specific passess are for transformation in a dialect, e.g., 'affine-loop-unroll-jam' pass to unroll and jam affine loops in the affine dialect. mlir passes can be expressed via declarative rewriting rules (drrs) using tablegen records or via writing code in  $\mathrm{c}++$ .
+
+to denote an operation in a dialect, we explicitly use a form of dialect_name operation_name. for example, std.load means the operation load of dialect std. optimization passes are named with prefix `--`, for example, --canonicalize is the canonicalization pass.
+
+listing 2 shows an example for calculating the exponential of a given input tensor, element-wise, using std and affine dialects. the top level is a module containing a function 'exp'. the function 'exp' accepts one input that is of memref type, and produces an output of the same type. the memory for the output is allocated via stdalloc (line 3). there is a nested loop (lines 4-10), iterating over dimensions of the inputs using affine.for, loading each element from the input using affine.load (line 6), computing the exponential using std.exp (line 7), and storing the result in the output using affine.store (line 8). the output of the function is finally returned using std.return.
+
+```txt
+1 module {  
+2 func @exp(arg0: memref<3x4xf32>) -> memref<3x4xf32> {  
+3 %1 = std_alloc(); memref<3x4xf32>  
+4 affine.for %arg1 = 0 to 3 {  
+5 affine.for %arg2 = 0 to 4 {  
+6 %2 = affine.load %arg0[%arg1, %arg2] : memref<3x4xf32>  
+7 %3 = std.exp %2 : f32  
+8 affine.store %3, %1[%arg1, %arg2] : memref<3x4xf32>  
+9 }  
+10 }  
+11 std.return %1 : memref<3x4xf32>  
+12 }  
+13 }
+```
+
+![](images/a8c9758c3d7dcb4c0c7e05a6ea107693a28c7cb9c19c0e3d693b2e8b96b2a08b.jpg)  
+fig. 2: architecture of onnx-mlir. names prefixed with `--' are passes.
+
+![](images/599b72567081b9feba4e4a9216c57b4a7aa3f88cf6e7dc4278c79c3c1a0bbc30.jpg)  
+fig. 3: onnx model for element-wise addition.
+
+# 3. compiling onnx models
+
+this section introduces our compiler, onnx-mlir. we first discuss its overall architecture. we then introduce two new dialects, onnx and krnl dialects. finally, we present mlir passes for carrying out optimization.
+
+# 3.1 overview
+
+figure 2 shows the overall architecture of onnx-mlir. the input is an onnx model, and the output is a library containing the compiled code. the output library contains an entry function called `dyn-entry-point_main-graph` whose inputs and outputs are similar to the onnx model's inputs
+
+and outputs, respectively. to carry out inference with the output library, users write their program to call the entry function by passing inputs to the function and obtain results.
+
+there are five main dialects in onnx-mlir, i.e., onnx, krnl, affine, std and llvm, organized into four abstraction levels. two new dialects, onnx and krnl, are discussed in sections 3.2 and 3.3, respectively. the first abstraction level is a high-level representation of onnx operations. it consists of operations in onnx and std dialects, where the onnx dialect is automatically generated via an importer that is a python script. the second abstraction level includes krnl, affine and std dialects. krnl dialect provides a representation that is suitable for loop optimizations, which is able to carry out affine transformations such as tile, skew, and permutation easily. it plays as an intermediate dialect for efficiently lowering the onnx dialect into low-level dialects (e.g., affine, std and llvm). the third abstraction level includes affine and std dialects where existing optimization passes in mlir can be freely applied. the forth abstraction level includes only llvm dialect that is ready to generate bitmap.
+
+there are mlir passes for converting one dialect to another, and for doing optimizations at a specific dialect. onnx dialect is converted to krnl dialect via pass --convert-onn-to-krnl. then krnl dialect (except some of its operations) is converted into affine and std dialects via pass --convert-krnl-to-affine. the remaining operations in krnl dialect and operations in affine and std dialects are directly converted into instructions in llvm via pass --convert-krnl-to-llvm. the right side of fig. 2 shows optimization passes that can be carried out at each abstraction level.
+
+we only enumerate the important optimizations here, and the list of optimization passes is not exhaustive.
+
+before discussing dialects and optimization passes in detail, we give a brief running example and go through dialects in onnx-mlir. this example is a testcase model in onnx that performs element-wise binary addition. figure 3 shows this onnx model of the testcase. operation add accepts two tensors of type  $\langle 3\times 4\times 5\times 32\rangle$  (element type is float 32) and returns a result tensor, i.e., sum, of the same type. listings 3, 4, and 5 show emitted programs in different dialects onnx, krnl, affine, respectively. we omit the program in llvm
+
+listing 3: operation add in onnx dialect, generated using importer.  
+```txt
+1 module {  
+2 func @main_graph(%arg0: tensor<3x4x5xf32>, %arg1: tensor<3x4x5xf32>) -> tensor<\*xf32> {  
+3  $\% 0 =$  "onnx.add"%arg0, %arg1) : (tensor<3x4x5xf32>, tensor<3x4x5xf32>) -> tensor<\*xf32>  
+4 std.return  $\% 0$  : tensor<\*xf32>  
+5 }  
+6 "onnx.entrypoint"(）{func  $=$  @main_graph，numinputs  $= 2$  ：i32，numoutputs  $= 1$  ：i32}：（）->（）  
+7 }
+```
+
+listing 4: operation add in krnl dialect, generated by applying passes --shape-inference and --convert-onnx-to-krnl.  
+```txt
+1 module {   
+2 func @main_graph(%arg0: memref  $<  3x4x5xf32>$  ，%arg1: memref  $<  3x4x5xf32>$  ) -> memref  $<  3x4x5xf32>$  {   
+3  $\% 0 =$  alloc(）：memref  $<  3x4x5xf32>$    
+4  $\% 1:3 =$  krnldefine_loops3   
+5 krnliterate(%1#0，%1#1，%1#2）with(%1#0->%arg2=0to3，%1#1->%arg3=0to4，%1#2-> $\% \mathrm{arg4} = 0$  to5）{   
+6  $\% 2 =$  affine.load %arg0[%arg2，%arg3，%arg4]：memref  $<  3x4x5xf32>$    
+7  $\% 3 =$  affine.load %arg1[%arg2，%arg3，%arg4]：memref  $<  3x4x5xf32>$    
+8  $\% 4 =$  std.addf  $\% 2$  ，%3：f32   
+9 affine store  $\% 4$  ，%0[%arg2，%arg3，%arg4]：memref  $<  3x4x5xf32>$    
+10 }   
+11 std.return  $\% 0$  ：memref  $<  3x4x5xf32>$    
+12 }   
+13 "krnl entry point"(）{func  $=$  @main_graph，numinputs  $= 2$  ：i32，numoutputs  $= 1$  ：i32}：（）->（）   
+14 }
+```
+
+listing 5: operation add in affine dialect, generated by applying the pass --convert-krnl-to-affine.  
+```txt
+1 module {   
+2 func @main_graph(%arg0: memref  $<  3x4x5xf32>$  ，%arg1: memref  $<  3x4x5xf32>$  ) ->memref  $<  3x4x5xf32>$  {   
+3  $\% 0 =$  alloc(）：memref  $<  3x4x5xf32>$    
+4 affine.for %arg2  $= 0$  to 3{   
+5 affine.for %arg3  $= 0$  to 4{   
+6 affine.for %arg4  $= 0$  to 5{   
+7  $\% 1 =$  affine.load %arg0[%arg2，%arg3，%arg4]：memref  $<  3x4x5xf32>$    
+8  $\% 2 =$  affine.load %arg1[%arg2，%arg3，%arg4]：memref  $<  3x4x5xf32>$    
+9  $\% 3 =$  std.addf  $\% 1$  ，%2：f32   
+10 affine store  $\% 3$  ，  $\% 0[\% \mathrm{arg}2$  ，%arg3，%arg4]：memref  $<  3x4x5xf32>$    
+11 }   
+12 }   
+13 }   
+14 std.return  $\% 0$  ：memref  $<  3x4x5xf32>$    
+15 }   
+16 "krnl entry_point"(）{func  $=$  @main_graph，numinputs  $= 2$  ：i32，numoutputs  $= 1$  ：i32}：（）->（）   
+17 }
+```
+
+due to space limitations.
+
+in onnx dialect, operations are represented similarly to their descriptions in onnx. the onnx model is converted into the function main_graph. to generate an entry point function into which users feed their inputs, we create a helper operation in the onnx dialect, i.e., onnx.entrypoint, which keeps meta-data in the operation's attributes such as function name to call and the number of inputs and outputs.
+
+in krnl dialect, operation onnx.add is translated into a loop-based computation represented by operations in the krnl dialect, where scalar computation is represented by primitive operations in the affine and std dialects. we can apply loop optimizations, such as tile, skew, or transpose, to loop-based computation. at this level, we allocate memory for output tensors, and memory management can be performed.
+
+in affine dialect, optimized loop-based computation in knrl dialect is translated into affine.for loops. at this level, we
+
+still have an operation in krnl, i.e., krnl.entry_point. such an operation is not related to the main computation and will be directly converted to llvm. operations in the affine dialect will be converted to operations in the std and scf dialects before being lowered to instructions in the llvm dialect.
+
+# 3.2 onnx dialect
+
+onnx dialect is the first abstraction level in onnx-mlir and represents an onnx model in mlir language. we wrote a python script to automatically import onnx operations into the tablegen-based operation definitions in mlir. these imported operations are organized into the onnx dialect. thanks to tablegen, the operation definition in the onnx dialect is quite similar to the operation description in onnx, where we are able to represent all necessary information, such as inputs, outputs, attributes, and description, into a single tablegen-based definition in human-readable textual form.
+
+listing 6: tablegen-based definition for operation relu.  
+```ocaml
+1 def onnxleakyreluop:onnx_op < "leakyrelu",  
+2 [nosideeffect, declareopinterfacemethods<shapeinferenceopinterface>] > {  
+3 let summary = "onnx leakyrelu operation";  
+4 let description = ["leakyrelu takes ... "}];  
+5 let arguments = (ins anytypeof < [tensor0f < [f16] >, tensor0f < [f32] >, tensor0f < [f64] >]>: $x, ← defaultvaluedattr <f32attr, "0.01">: $alpha);  
+6 let results = (outs anytypeof < [tensor0f < [f16] >, tensor0f < [f32] >, tensor0f < [f64] >]>: $y);  
+7 let extraclassdeclaration = [{ ... }];  
+8}
+```
+
+we also created a new operation in the onnx dialect, i.e., onnx.entrypoint to keep information related to the dynamic list of inputs in an onnx model. this operation will be lowered to generate the entry function 'dyn_entry_point_main_graph' of the generated library.
+
+listing 6 shows a tablegen-based definition for the relu operation imported via the importer in onnx-mlir. the operation description is represented in the 'description' field (line 4). inputs and attributes are represented in the 'arguments' field, while outputs were represented in the 'results' field (lines 5-6). all inputs and outputs will be imported as a tensor in mlir. the importer automatically infers element types for inputs, attributes, and outputs. however, the shape of a tensor will be inferred via the --shape-inference pass, which is a trait in the leakyrelu operation (line 2). mlir generates a  $\mathrm{c}++$  class definition for an operation from its tablegen-based definition. if users want to define custom declaration in the class, it can be done via the 'extraclassdeclaration' field (line 7).
+
+# 3.3 krnl dialect
+
+a computation kernel in a neural network workload has local structural simplicity in which loop nests are often simple, e.g., hyper-rectangle and statements carry quite straightforward arithmetic semantics. such a characteristic is quite suitable to be represented in a polyhedral model for optimization [8]. krnl dialect aims to host both loop optimization and scalar semantic optimization in a single representation. it is expected to provide interpretability where not only is polyhedral representation readable but it also makes program semantics (or what to execute) and program schedules (how and when to execute) independent. in other words, our goal is to optimize not only programs but also the composition of individual schedules, which is a feature that is often lacking in other existing systems.
+
+below is an example that defines a nested loop in krnl:
+
+```txt
+1%ii，%jj  $\equiv$  krnldefine_loops2   
+2krnliterate(%ii，%jj）with(%ii->%i  $= 0\leftrightarrow$  to10，%jj->%j  $= 0$  to10）{   
+3  $\% \mathrm{foo} =$  std.addi  $\% \mathrm{i}$  ，%j：index   
+4}
+```
+
+where krnldefine_loops defines two loops, called ii and jj. these loop variables will be used to express both program semantics and schedules. operation krnl(iterate semantically accepts two types of loop variables: variables for original
+
+loops and variables for scheduled loops. in syntactic sugar form, we separate the two types of loops by the keyword with, i.e. (scheduled loops) with (original loops). induction variables, e.g., i and j in the above example, will be defined by using original loops. if there is no schedule (e.g. block, skew, etc.), the scheduled loops are similar to the original loops.
+
+now, we insert a schedule for blocking or tiling. without loss of generality, we define just one loop instead of two.
+
+```txt
+1  $\% \mathrm{ii} =$  krnldefine_loops 1   
+2  $\% \mathrm{ib}$  ，  $\% \mathrm{il} =$  krnl.block  $\% \mathrm{ii}2:\longleftrightarrow$  （!krnl.loop）->(！krnl.loop，！krnl.loop)   
+3 krnliterate(%ib，%il）with(%ii->%i=0← to10）{   
+4  $\% \mathrm{foo} =$  std.addi  $\% \mathrm{i}$  ，  $\% \mathrm{i}$  ：index   
+5}
+```
+
+operation krnl.block (line 2) takes a loop and integer as inputs, where the integer is the tile size with which we want to carry out blocking. results are two loop variables: one for the outer loop and the other for the inner loop. the two loops will be used as the result of scheduling and be passed to krnl(iterate (line 3). it is worth noting that the original loops and computation in krnl(iterate remained unchanged while inserting a schedule, which is exactly what we want for seperating program semantics and schedules in our krnl dialect.
+
+the --convert-krn1-to-affine pass automatically generates optimized affine.for based loops as follows.
+
+```txt
+1 #map0 = affine_map<(d0) -> (d0)>  
+2 #map1 = affine_map<(d0) -> (d0 + 2)>  
+3 affine.for %arg0 = 0 to 10 step 2 {  
+4 affine.for %arg1 = #map0(%arg0) to ←  
+    #map1(%arg0) {  
+5     %0 = addi %arg1, %arg1 : index  
+6 }  
+7}
+```
+
+the outer affine.for iterates with step 2 i.e., the tile size, and the inner affine.for iterates over the elements in a tile.
+
+other schedules, such as skew and permutation are used in a similar manner. all schedules are composable and can be nested.
+
+# 3.4 optimization passes
+
+in this section, we discuss some of the optimization passes in onnx-mlir. thanks to the expressive power of mlir, many optimizations can be expressed easily via declarative rewriting rules (rrs) using tablegen records or writing
+
+code in  $\mathrm{c} + +$
+
+# 3.4.1 operation decomposition
+
+in onnx, many operations can be expressed using other basic operations. for example, reducel1 over a vector  $x$  is mathematically calculated by summing up the absolute values of the elements in  $x$ . in other words, we have
+
+$$
+\operatorname {r e d u c e l 1} = \operatorname {r e d u c e s u m} (\operatorname {a b s} x)
+$$
+
+we only need to lower a subset of operations in the onnx dialect to krln dialect, while the remaining operations in the onnx dialect will be decomposed into operations in the subset.
+
+using the drrs in mlir, operation decomposition is concisely written as the following pattern:
+
+```txt
+1 def reducel1pattern: pat<2 (reducel1op $x, $axes, $keepdims),3 (reducesumop (absop $x), $axes, $keepdims)4 >;
+```
+
+where reducel1op, reducesumop, and absop are programmable forms of operations onnx.reducel1, onnx.reducesum, and onnx.abs respectively. variables  $x$ , axes, and keepdims are for keeping input values of operation reducel1op. the pattern 'reducel1pattern' contains a source pattern to match a graph of one operation reducel1op (line 2) and a destination pattern to generate a graph of two operations reducesumop and absop (line 3). whenever an operation reducel1op appears in an onnx model, it will be replaced with a combination of reducesumop and absop.
+
+# 3.4.2 shape inference
+
+the --shape-inference pass attempts to infer shapes for all tensors in a program at onnx. the pass traverses all operations in a program, infers the shapes of tensors with unrank shapes (i.e. tensor $\langle *xf32 \rangle$ ), propagates the ranked shapes to consuming operations, and terminates once all tensors have ranked shapes. for one operation, if its inputs have static shapes, it is likely that the --shape-inference pass will be able to infer static shapes for its outputs. if the inputs have dynamic shapes (e.g. tensor $\langle ?x?x?xf32 \rangle$ ), the outputs will also have dynamic shapes also, except for some operations whose output tensors' shapes are specified in the operation attributes.
+
+# 3.4.3 graph rewriting
+
+graph rewriting is a powerful optimization tool. it is intensively applied to neural networks since calculation in a neural network is expressed via a dataflow graph. in mlir, graph rewriting rules are conveniently represented using drrs.
+
+for example, the following rule is to fuse onnx.add and onnx.matmul into a single operation onnx.gemm under the condition that the result of matmulop is only consumed by addop:
+
+```perl
+1 def muladdtogemmpattern : pat<  
+2 (addop (matmulop:$res $m1, $m2), $m3),  
+3 (gemmop $m1, $m2, $m3),  
+4 [(hasoneuse $res)]  
+5 >;
+```
+
+another example is to remove an identityop operation by passing its input directly to its consuming operations.
+
+```txt
+1 def identityeliminationpattern : pat<2 (onnxidentityop $arg),3 (replacewithvalue $arg)4 >;
+```
+
+users can write as many rewriting rules as possible in the same manner.
+
+# 3.4.4 constant propagation
+
+constant propagation is a well-known optimization in compilers. in onnx-mlir, we created a pass to do this during compilation. there are two key ideas in constant propagation: (1) if all the inputs of an operation are constant, compute its outputs during compilation and remove the operation, (2) if there is a mix of constant and non-constant inputs, normalize the operation. normalization is to increase the possibility of constant propagation and strongly depends on the mathematical properties of an operation. below are some normalization rules in onnx-mlir for the onnx.add operation whose properties are associative and communicative.
+
+(1)  $c + x \rightarrow x + c$  
+(2)  $(x + c_{1}) + c_{2} \rightarrow x + (c_{1} + c_{2})$  
+(3)  $(x + c) + y \rightarrow (x + y) + c$  
+(4)  $x + (y + c)\rightarrow (x + y) + c$  
+(5)  $(x + c_{1}) + (y + c_{2})\rightarrow (x + y) + (c_{1} + c_{2})$
+
+where  $x$  and  $y$  are non-constant values, and  $c, c_1,$  and  $c_2$  are constant values. normalization rules are expressed by using the drrs in mlir.
+
+# 4. preliminary experiments
+
+# 4.1 onnx operation support and testcases
+
+onnx provides a set of test cases for each operation. when we support any operation in onnx-mlir, we enable its onnx test cases to check whether the operation behaves correctly and produces correct result. at the time of writing this paper, onnx-mlir supports 51 operations out of 139 operations in onnx, including important operations such as convolution, pooling, gemm, and lstm. these are enough to compile and execute major networks such as mnist and resnet50. on the github repository of onnx-mlir, we enable continuous integration on different environments, i.e., windows, linux, and docker environments, and different systems, i.e., x86 machines, ibm power systems, and system z. all supported operations have passed tests on the above environments.
+
+# 4.2 mnist and resnet50
+
+in this section, we present some of our preliminary results for two neural network models in the onnx model zoo: mnist and resnet50 [2]. the mnist $^{\dagger 5}$  and resnet $50^{\dagger 6}$
+
+```txt
+$\dagger 5$  https://github.com/onnx/models/tree/master/vision/ classification/mnist   
+ $\dagger 6$  https://github.com/onnx/models/tree/master/vision/ classification/resnet
+```
+
+models have already been trained in the cntk and caffe2 frameworks, respectively. we ran inferences on the given test data set in each model. the experiments were conducted on a machine with 2.3-ghz power9 processors. for onnx-mlir, graph rewriting and canonicalization passes were enabled. in this paper, we only provide a reference implementation that is not optimized, thus performance measures are not applicable.
+
+table 1: run inferencing with mnist and resnet50 on a power9 machine. time in seconds.  
+
+<table><tr><td>model</td><td>compilation time</td><td>inference time</td></tr><tr><td>mnist</td><td>0.237</td><td>0.001</td></tr><tr><td>resnet50</td><td>7.661</td><td>7.540</td></tr></table>
+
+table 1 shows the running times for the mnist and resnet50 models when doing inferencing. for each model, we measured the compilation time for compiling the model to native code and inference time for running the native code with real inputs. mnist is a small model with two convolutional operations, one max pooling operation and a matrix multiplication followed by an element-wise addition. compiling the mnist model and carrying out inferencing was rather fast, i.e., finished in less than one second. in the mnist model, the graph rewriting rule muladdtogemmpattern mentioned in sec. 3.4.3 was applied to fuse matrix multiplication and element-wise addition into a gemm operation. resnet50 is a complex deep model consisting of 50 layers of operations such as convolutions and poolings. the model is about 100 megabytes including learned weights. for resnet50, the current version of onnx-mlir does not have any optimization applied to the model during compilation. however, we believe that the compilation time looks reasonable and the inference time is not so slow. we hope that once we integrate important optimizations, such as polyhedral optimizations, simd optimization, and loop fusion in near future, the inference time will be significantly reduced.
+
+# 4.3 supported systems
+
+although onnx-mlir is completely built upon widely-used open source software such as onnx and mlir, we found a problem related to supporting different systems. in particular, we could not run onnx models on linux on ibm system z (s390-linux) because the big-endian format was not well-supported in onnx and mlir. there are two reasons for such a problem. first, a large amount of public input data and models in onnx are stored in little-endian format. hence, they must be converted to big-endian format before they are used in a big-endian system. second, we found that constant values in onnx models are not correctly loaded in mlir. llvm was well-supported in big-endian, but mlir was not. we created two patches to solve this problem: one in  $\mathrm{onnx}^{\dagger 7}$  and one in  $\mathrm{mlir}^{\dagger 8}$ , and they are now
+
+available at the master branches of onnx and mlir. as a result, onnx-mlir now supports linux on x86 (x86-linux), linux on power systems (ppc64le-linux), linux on ibm z (s390-linux), and windows.
+
+# 5. conclusion
+
+we are developing an open source compiler called onnx-mlir for compiling onnx models into native code. mlir was used as an infrastructure to build the compiler, and two novel dialects were introduced, i.e., onnx and krnl. we also discussed some optimizations such as graph rewriting and constant propagation. it is worth noting that new optimizations can be easily integrated into onnx-mlir thanks to the mlir infrastructure. in the future, we will add more optimizations, e.g., polyhedral optimization, loop fusion, simd optimization, and enable code generation for accelerators.
+
+# acknowledgements
+
+we acknowledge the onnx standard for hosting the project and the external contributors for their contributions.
+
+# references
+
+[1] bai, j., lu, f., zhang, k. et al.: onnx: open neural network exchange, github (online), available from https://github.com/onthx/onnx> (accessed 2020-07-01).  
+[2] he, k., zhang, x., ren, s. and sun, j.: deep residual learning for image recognition, corr, vol. abs/1512.03385 (online), available from <http://arxiv.org/abs/1512.03385> (2015).  
+[3] krizhevsky, a., sutskever, i. and hinton, g. e.: imagenet classification with deep convolutional neural networks, international conference on neural information processing systems (nips), pp. 1097-1105 (2012).  
+[4] lattner, c. and adve, v.: llvm: a compilation framework for lifelong program analysis and transformation, san jose, ca, usa, pp. 75-88 (2004).  
+[5] lattner, c., amini, m., bondhugula, u., cohen, a., davis, a., pienaar, j., riddle, r., shpeisman, t., vasilache, n. and zinenko, o.: mlir: a compiler infrastructure for the end of moore's law, (online), available from <http://arxiv.org/abs/2002.11054> (2020).  
+[6] llvm: the llvm project, llvm (online), available from <https://github.com/llvm/llvm-project> (accessed 2020-07-01).  
+[7] llvm: tablegen, llvm (online), available from https://llvm.org/docs/tablegen/) (accessed 2020-07-01).  
+[8] pouchet, l.-n., bastoul, c., cohen, a. and cavazos, j.: iterative optimization in the polyhedral model: part ii, multidimensional time, acm sigplan notices, vol. 43, no. 6, pp. 90-100 (2008).

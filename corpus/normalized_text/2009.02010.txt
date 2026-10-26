@@ -1,0 +1,485 @@
+# confuciux: autonomous hardware resource assignment for dnn accelerators using reinforcement learning
+
+sheng-chun kao
+
+electrical and computer engineering
+
+georgia institute of technology
+
+atlanta, ga
+
+felix@gatech.edu
+
+geonhwa jeong
+
+computer science
+
+georgia institute of technology
+
+atlanta, ga
+
+geonhwa.jeong@gatech.edu
+
+tushar krishna
+
+electrical and computer engineering
+
+georgia institute of technology
+
+atlanta, ga
+
+tushar@ece.gatech.edu
+
+abstract—dnn accelerators provide efficiency by leveraging reuse of activations/weights/outputs during the dnn computations to reduce data movement from dram to the chip. the reuse is captured by the accelerator's dataflow. while there has been significant prior work in exploring and comparing various dataflows, the strategy for assigning on-chip hardware resources (i.e., compute and memory) given a dataflow that can optimize for performance/energy while meeting platform constraints of area/power for dnn(s) of interest is still relatively unexplored. the design-space of choices for balancing compute and memory explodes combinatorially, as we show in this work (e.g., as large as  $o(10^{72})$  choices for running mobilenet-v2), making it infeasible to do manual-tuning via exhaustive searches. it is also difficult to come up with a specific heuristic given that different dnns and layer types exhibit different amounts of reuse.
+
+in this paper, we propose an autonomous strategy called confucix to find optimized hw resource assignments for a given model and dataflow style. confucix leverages a reinforcement learning method, reinforce, to guide the search process, leveraging a detailed hw performance cost model within the training loop to estimate rewards. we also augment the rl approach with a genetic algorithm for further fine-tuning. confucix demonstrates the highest sample-efficiency for training compared to other techniques such as bayesian optimization, genetic algorithm, simulated annealing, and other rl methods. it converges to the optimized hardware configuration 4.7 to 24 times faster than alternate techniques.
+
+index terms—dnn accelerator; machine learning; reinforcement learning; genetic algorithm
+
+# i. introduction
+
+deep neural networks (dnns) are being deployed into many real-time applications such as autonomous driving, mobile vr/ar, and recommendation systems. however, dnns are often strictly constrained by end-to-end latency or energy. this has opened up extensive research on computationally efficient dnn models [62], [77] and hardware accelerators [3], [16], [20], [34], [39].
+
+the architecture of dnn accelerators is determined by two key components: dataflow style and total hw resources. the dataflow comprises the computation order, parallelization strategy, and tiling strategy employed by the accelerator [16], [38]. the hw resources comprise of the total on-chip compute
+
+![](images/e6be03f275c1607a32c030b980eb1c01cc6f758fada7ce1624642c444c4a94ea.jpg)  
+fig. 1: different hw resource combinations with the same nvdla-style dataflow.
+
+(hereby referred to as "pes") and on-chip memory (hereby referred to as "buffers"). the underlying network on chip (noc) bandwidth, and the corresponding implementation [16], [39] and area depends on dataflow-style and assigned hw resources. for the same dataflow strategy, multiple resource assignments are possible, as shown in figure 1. the dataflow and/or the hw resources are either fixed at design-time (which is the common-case), or can be tuned at compile time (if the accelerator is reconfigurable, such as cgra-based [39] or fpga [92]).
+
+a lot of previous research has focused on designing efficient dataflow strategies to extract reuse. for e.g., nvdla [3], eyeriss [16], and shidiannao [20] are examples of dnn accelerators that employ different dataflow strategies. frameworks like maestro [38] and timeloop [52] exist to contrast the
+
+![](images/670ccb60fc964c6080fd138468327051ea80a92d8d744d625262675f3de58b62.jpg)  
+#
+
+![](images/8fcf8dcf341f00b8e4f3072bc5c8971d404dc12b26924c51eb5cdefa46216150.jpg)  
+fig. 2: dnn deployment scenarios and corresponding hw assignments. in layer sequential (ls), each layer of the model is mapped one by one on the entire accelerator, with all on-chip compute and memory assigned to it; in layer pipelined (lp), the entire model is mapped and run in a pipelined manner, with the compute and memory partitioned across all layers.
+
+performance benefits of various dataflows. most accelerators choose a dataflow strategy based on the expected dimensions and shapes of the dnns they will run. for example, the nvdla [3] dataflow keeps weights stationary at pes, and parallelizes across input channels and output channels, as shown in figure 1, optimizing for mid and late layers of many cnns like resnet [27] that exhibit this property. the eyeriss [16] dataflow parallelizes across the activation and filter rows, and keeps filter rows stationary at the pes. reconfigurable accelerators like maeri [39] allow the dataflow strategy to be configured for every layer [95].
+
+given a dataflow, the assignment of hw resources is the next crucial part of the dnn accelerator design process. in fact, for the same dataflow, different choices for hw resources can lead to drastically different latency and energy for a given dnn, as we show later in figure 4. some recent studies have shown that hw resource assignment plays a more important role in determining the accelerators' performance than its dataflow [89]. however, determining the policy for assigning hw resources is still very much an open problem, with prior works on hw design-space exploration almost exclusively relying on exhaustive searches [15], [31], [33], [38], [42], [68], [82], [92]–[94].
+
+the focus of this work is on the aforementioned hw resource assignment problem. the hw resource assignment depends on how they will be used by the dnn during runtime. we consider two deployment scenarios in this work, shown in figure 2. layer sequential (ls) involves mapping and running the dnn layer by layer on the accelerator, while layer pipelined (lp) maps and runs the entire dnn model over the accelerator. the ls approach is typically leveraged in cloud settings for larger models [27] that do not fit on-chip, while the lp approach is popular when running smaller optimized models [62], [75], [77] on iot devices.
+
+the hw resource assignment problem is an optimization problem where the design goal is to achieve an objective such as minimum end-to-end latency or energy, while meeting some
+
+platform (iot/cloud) constraints such as maximum power or chip area. the design-space of valid solutions is non-trivial. consider an lp deployment; suppose we have a total of  $p$  pes and  $b$  buffers that fit within the area/power budget and need to be divided among  $n$  layers of the dnn. assuming each layer gets at least one pe and one buffer, the number of combinations for pes and buffers is  $\binom{p-1}{n}$  and  $\binom{b-1}{n}$  respectively [1]. this makes the total possible design choices  $\binom{p-1}{n} \times \binom{b-1}{n}$ , which is  $o(10^{72})$  for an accelerator with 128 pes, 128 buffers running the 52-layer mobilenet-v2. this design-space is nearly impossible to enumerate to search exhaustively for an optimum solution, as we discuss in section ii.
+
+in this work, we develop an autonomous mechanism to efficiently search through the hw design-space. figure 3 shows an overview of our proposed workflow called confuciux. it takes the target model, platform constraint, deployment scenario (ls or lp), and optimization objective (latency/energy) as input, and determines an optimized hw assignment strategy (number of pes and buffers). confuciux leverages reinforcement learning (rl) to perform a global coarse-grained search, followed by a genetic algorithm (ga) for fine-grained tuning.
+
+recently rl has been demonstrated within compilers/mappers [7], [24], [46], [51] for tiling and mapping dnns over accelerators. confuciux focuses on leveraging rl for exploring the search space during accelerator design.
+
+we evaluate confucix on popular dnn models, including mobilenet-v2 [62], resnet-50 [27], and mnasnet [76], gnmt [85], transformer [80] and ncf [28]. we evaluate our hw resource assignment method under three dataflow styles, nvdla-style, eyeriss-style, and shidiannao-style<sup>1</sup>. we evaluate both cloud and iot device platform constraint setting. we also demonstrate a joint search for dataflow and hw assignments. we contrast our approach against other optimization mechanisms including genetic algorithm [29], simulated annealing [35], bayesian optimization [54] and other state-of-the-art rl algorithms [23], [25], [43], [47], [66], [86] and observe that it consistently outperforms alternate schemes both in terms of solution quality (latency/energy) and search time (4.7 to  $24 \times$  faster).
+
+the paper is organized as follows. section ii provides relevant background on dnn accelerators and relevant optimization methods; section iii describes confuciux in detail; section iv presents comprehensive evaluations; section v presents related work and section vi concludes.
+
+# ii. background and motivation
+
+# a. dnn accelerator architecture
+
+we discuss and define some key terms (highlighted in bold) that we will use throughout the paper.
+
+1) hardware resources: spatial dnn accelerators comprise an array of processing elements (called pe in this paper), as shown in figure 1. each pe has a mac to compute partial
+
+![](images/94b2e1a968d8c2fa58f5e7ceafdf02a2e8d0fd86cfe8e6c433e629add41dab98.jpg)  
+fig. 3: overview of confuciux.
+
+sums, and local (aka "l1") buffers (called buffer in this paper) to store weights, activations, and partial sums. the accelerators also house a global shared (aka "l2") buffer to prefetch activations and weights from dram for the next tile of computation that will be mapped over the pes and l1 buffers. networks-on-chip (nocs) are used to distribute operands from the global l2 buffer to the l1 buffers in the pes, and collect the partial or full outputs and write them back to the global l2 buffer.
+
+2) dataflow: the mechanism for orchestrating data from the global sram to the local pe buffers (i.e., computation order, parallelization strategy across pes, and tiling strategy) is called dataflow. for example, accelerators like nvdla [3], eyeriss [17], shidiannao [20], tpu [34] all employ unique dataflow strategies [16], [38].  
+3) design-point: in this work, we assume that the number of pes and buffers are free-variables² that can be tuned independently in an accelerator during design-time/compile-time (depending on the deployment scenario discussed later in section ii-c). we call each combination of (pe, buffer) as a unique design-point in this paper. given a specific dataflow, each design-point in-turn determines the size and number of other components within the accelerator. for e.g., the number of pes and l1 buffer sizes determine the minimum size of the global l2 buffer to hold the next tile of unique data that will need to be sent to the pe buffers [38], [52]. the l2 can then be sized to be double this value to prefetch the next tile from dram while the current one is being processed. similarly, the design-point also determines the noc bandwidth for stall-free distribution of operands to the pes and collection of outputs [16], [39] for that dataflow. thus, we choose only the pe and buffer size as the independent design-parameters in this work. it is certainly possible to let the l2 size and noc bandwidth also be independent parameters, but this could lead over-provisioning (i.e., under-utilization) or under-provisioning (i.e., stalls) [38].
+
+# b. dnn accelerator performance and cost modeling
+
+the overall runtime, throughput and energy-efficiency of a dnn accelerator depends on three aspects: dnn model, mapping (dataflow and tile sizes), and hw resources [38]. we briefly discuss this cross dependence.
+
+- dnn models. there are myriads of dnn models and most of them are built using different combinations of some common layers. convolutional layers (2d/depth-wise/pointwise) dominate in dnns like resnet-50, mobilenet-v2 [62], and inceptionnet [74] targeting image processing tasks. fully connected layers or mlps are often used as the last layer in many dnns models, as hidden layers of rnns, and in language models [57] and machine translation [85]. different layer types expose different amounts of data reuse opportunities, which can be exploited by dnn accelerators depending on the mapping.  
+- mapping. a mapping [38], [52] refers to the dataflow and specific tile sizes. the dataflow is the mechanism for reusing data across time (via buffers) and space (over wires). the tile sizes are bound by the l1 and l2 buffer sizes within the accelerator. the total number of tiles depends on the dnn model size and the dataflow strategy.  
+- hardware resources. the total number of pes in the accelerator determines peak throughput, while the buffer sizes in each pe determine the amount of reuse that each pe can exploit within the tile of computation mapped on to it in each time iteration.
+
+cost models. the interdependence between dnn model layer shape, mapping strategy and hardware resources is captured by cost models like maestro [38] and timeloop [52] that can analytically determine the reuse across time/space and accordingly estimate the runtime and utilization. these cost models can also estimate the area and power of the accelerator for a given design-point.
+
+# c. dnn model deployment on accelerators
+
+we focus on two dnn model deployment scenarios illustrated in figure 2.
+
+layer sequential (ls). we use the same underlying architecture to run the dnn model layer-by-layer. the specific (pe, buffer) design-point is chosen at design-time by some heuristic
+
+![](images/8e415e8d7289bddfe36e888c3b6fbfdc03a7c9585175fcc64856d3bb1a4e717d.jpg)  
+fig. 4: hardware design space for an accelerator running a few example layers from mobilenet-v2 using nvdla-style dataflow in the maestro cost model [38]. each dot represents a design-point (number of pes, l1 buffer per pe). for the same design-point, top half plots the number of pes and bottom half plots the size of l1 buffers (in bytes). the corresponding latency, energy, and area are shown. star and triangle icons represent two same design-points, and highlight how how their performance changes across different layers. the design-space for a given area-budget and/or latency/energy target is extremely large, and no design-point is optimal for all cases. (dwconv: depth-wise conv.)
+
+such as one that performs the best for most layers of the target dnns. naturally, over-provisioning and under-utilization may happen for some of the layers during deployment since they favor different hw resource configuration [11], [21], [22], [63]. we quantify this further in section iv.
+
+layer pipelined (lp). with the advancement of technology, more computation logic can sit in a single chip. many efficient models are being designed to fit completely onto the chip for embedded platforms [62], [77]. lp maps and runs the entire dnn model over the accelerator. for this model, we assume an underlying accelerator can heterogeneously partition the (pe, buffer) resources at either design-time (e.g., asic [9], [90], [96]) or compile-time (e.g., cgra [39]/fpga [92]). the challenge becomes finding the optimum (pe, buffer) distribution for each layer, which is crucial for maximizing performance [15], [31], [33], [42], [68], [82], [93], [94].
+
+# d. challenge: design-space for hw resource assignment
+
+there can be myriad design points that fit the platform power/area constraint, each with drastically different performance/energy. as an example, we visualize the fine-grained hardware design space for a dnn accelerator in figure 4, plotting the latency and energy when running three different layers of mobilenet-v2 on different accelerator design points with nvdla-style dataflow. the numbers were obtained from maestro [4]. each point in the graphs is a design-point (i.e., {number of pes, l1 buffer per pe}). we sweep the pes from 1 to 64, and number of filters that can be mapped from 1 to 800 (which in turn sweeps the l1 buffer size from 6b to 2800b). for the same design-point, the top half of figure 4 shows the the number of pes, and the bottom half shows the size of buffers. each design-point leads to a unique latency, energy, and area consequence.
+
+from figure 4, we can conclude that for the same area, the range of possible latency and energy values is quite significant. this gets exacerbated when trying to find an optimal design point that works well across most layers in an ls deployment or for finding the combination of (pe, buffer) per layer in
+
+an lp deployment. as mentioned in section i, with just 128 pes and 128 buffers, the design-space for mobilenet-v2 deployment is  $o(10^{72})$ , making it infeasible for any hw design-space exploration (dse) to sweep exhaustively. most prior accelerator prototypes have picked specific design-points for their dataflow (e.g., 168 pes in eyeriss [17] and 64 pes in shidiannao [20]) without exploring the design-space across different area/power constraints. this is the focus of this work.
+
+# e. optimization methods for design-space exploration
+
+the following optimization methods exist today for architects to perform design-space exploration (dse) and form our baselines.
+
+exhaustive search will lead to a global optimum, but is nearly impossible to sweep for vast design spaces. grid search is an exhaustive search with a coarse-grain sampling step, which makes the process approachable.
+
+random search randomly samples design points in an unknown search space and keeps the best solution. it has been shown to be competitive for optimization problems in various fields [10], [41], [55], [61].
+
+simulated annealing [35] adds an exploitation step to random search (which is always exploring). it randomly samples and accepts points that improve the objective, but also with a certain probability accepts points that may worsen the objective. the probability is controlled by a hyper-parameter temperature. higher temperature will increase the probability to accept worse points, causing more randomness, and vice versa. simulated annealing is used for compiler optimization for cpu and software [98] and also tile and loop scheduling for dnn workload [13].
+
+genetic algorithm (ga) [29] is a method where we encode the dimension of each design point as a gene. with all the dimensions specified, a design-point is called a genome. we initialize the algorithm with several randomly sampled design points (genomes) and these genomes form a generation. then we evaluate the fitness of individuals of this generation. we keep well-performing individuals and use them to reproduce
+
+the next generation with mutation and crossover. generation by generation, ga will converge to an optimized point. stoke [65] and tensorcomprehensions [79] use ga to search the space of dnn code optimization.
+
+bayesian optimization [54] builds a surrogate for the objective and quantifies the uncertainty in that surrogate using a bayesian machine learning technique. the optimization method can be constructed by the gaussian process, random forest, or tree parzen estimator. it selects the next values to evaluate by applying criteria to the surrogate. it evolves the surrogate model and sampling criterion simultaneously. the concept is to limit the evaluation of the objective function by spending more time choosing the next values for sample efficiency. some works use bayesian optimization to search for dnn hyper-parameters [53], [69], [70].
+
+# f. reinforcement learning for design-space exploration
+
+reinforcement learning (rl) algorithms are often used in games [48], [78] as they are useful in sequential decisions. more formally, this is a markov decision process (mdp). in this work, we show that determining the appropriate number of pes and buffers for a series of dnn layers to minimize the overall platform latency/energy while staying within an area or power budget can be viewed as a mdp. therefore we find rl algorithms to be a promising approach for this problem to increase sample efficiency of the search, compared to baseline optimization methods that use no information from the current state.
+
+reinforcement learning terminology. the goal of an rl agent is to continuously interact with an environment, observe the current state, take one or more actions, observe the reward from the environment, and update its underlying policy network. with time, the policy network learns to predict actions that can maximize reward. we discuss our rl-based hw resource exploration next.
+
+# iii. confuciux
+
+in this work, we cast the dnn accelerator resource assignment dse challenge as a reinforcement learning (rl) problem using reinforce [73] for a global search, followed by a ga for local fine-tuning. figure 3 demonstrates the workflow of confuciux. we provide a high-level overview next. the inputs to confuciux are the target dnn model, the deployment scenario, the optimizing objective, and the platform constraints, and it outputs an optimized hw resource assignment strategy, as shown in figure 3. the first stage of confuciux trains a rl agent to recommend an optimized assignment of pes and buffers for a target dnn, platform constraint, and deployment scenario. the agent is trained by having it continuously generate resource assignments as "actions" which are evaluated by a detailed but fast analytical model for dnn accelerators called maestro [4] that acts as the environment (env). the "rewards" output by the environment are used to train the underlying policy network, with the aim of maximizing the reward. we incorporate platform constraints (area/power) as inputs to the environment to punish actions that violate the
+
+constraints. to speed up the search process, the rl agent searches through the hw assignments in a coarse-grained manner. once it converges to an optimized strategy, we fine-tune the assignment further using ga. we discuss the various components of confuciux next.
+
+# a. rl agent
+
+in our system, the rl agent processes the target dnn model in a layer-wise manner. we term the whole process (episode in rl parlance) as an epoch. we treat each layer as a different time-step. at each time-step, the agent makes two actions per-layer: the number of pes and buffers. it interacts with the environment to collect the rewards. we feed the rewards, along with the previous layer's actions to the policy function, to help the agent optimize sequential decisions. the policy network gets updated at the end of each epoch. an epoch terminates when the agent fails the constraint or successfully made  $2n$  actions for a  $n$ -layer model.
+
+1) choice of rl algorithm: reinforce: modern rl algorithms [23], [25], [43], [47], [66], [86] typically use two underlying neural networks - an "actor" and a "critic". the actor formulates the policy for taking actions while the critic approximates the value function that predicts expected reward to help the training of policy. we experimented with a suite of rl algorithms for confucix and found that reinforce [73] works best. we show these results in section iv-c3. reinforce only has an actor network (no critic), and updates its underlying policy network directly using rewards from the env. since the design space of hw resource assignments is extremely discrete and irregular, we observed that rl algorithms with critic networks fail to approximate the value function accurately and in turn disturb the policy learning process. we show this later in section iv-c3.
+
+2) policy network architecture: the policy network in reinforce is a neural network tasked to learn the policy to maximize the probability of receiving better reward. we use an rnn as the policy network with one lstm hidden layer of size 128. the reasoning behind an rnn-based network is as follows. we impose a hard constraint on the overall area (or power) consumption. each action (pe, buffer) adds to area/power. thus, any future action should depend on the previous action. the recurrent connections in the rnn capture this relationship and learn the constraint. we implemented and evaluated both rnn-based and mlp-based policy networks and provide a quantitative analysis in section iv-g.
+
+# b. observation (state)
+
+we construct a 10 dimensional observation space. at  $t^{th}$  time step, the observation  $(o_{t})$  is expressed as follows
+
+$$
+o _ {t} = \left(k _ {t}, c _ {t}, y _ {t}, x _ {t}, r _ {t}, s _ {t}, t _ {t}, a _ {t} ^ {p e}, a _ {t} ^ {b u f f e r}, t\right) \tag {1}
+$$
+
+the layer shape (assuming convolutions) results in the first 7 dimensions<sup>3</sup>.  $k_{t}$  and  $c_t$  are number of output and input channels.  $y_{t}$  and  $x_{t}$  are the size of y and x axis of the input
+
+table i: the level values of action pair.  
+
+<table><tr><td></td><td>action level values</td></tr><tr><td>pes</td><td>1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128</td></tr><tr><td>buffers (e.g., nvdla-style)</td><td>19, 29, 39, 49, 59, 69, 79, 89, 99, 109, 119, 129</td></tr></table>
+
+activations.  $r_{t}$  and  $s_{t}$  are the size of y and x axis of the weight kernel.  $t_{t}$  is the indicator of layer type such as conv or dwconv (depth-wise conv).  $a_{t}^{pe}$  and  $a_{t}^{buffer}$  are the actions of the previous layer which we feed into the rnn controller. the last dimension  $t$  indicates  $t^{th}$  layer. finally, we normalize all the dimensions of observation to the range of [-1, 1] to stabilize the training.
+
+# c. action space
+
+at each time step, the agent makes an action pair (pe, buffer), which formulates the action space. to efficiently step through the huge design space (section ii-d), the rl agent uses coarse-grained steps to navigate through it. in particular, we use  $l = 12$  different values for the pes and buffers, as shown in table i. we demonstrate the effect of  $l$  later in section iv-g. the specific values for pe at each level are chosen by the marginal observed return of hw performance to the number of pes. for example, increasing pe from 1 to 2 could potentially double the hw performance, while increasing pe from 64 to 65 would provide slight or mostly no improvement. we choose the buffer size value at each level according to the input of dataflow-style at design time. in nvdla-style, with  $3 \times 3$  weight as an example, we dispatch the computation to each pe along k dimension (figure 1). each pe would receive  $k$  number of  $3 \times 3$  weights,  $3 \times 3$  corresponding inputs, and generate  $k$  number of outputs, which makes the buffer size  $9 \times k + 9 \times 1 + 1 \times k$ , where  $k = 1, 2, \ldots, 12$ , as shown in table i. note that once the rl agent converges, confuciux uses fine-grained steps using ga to get to an optimized configuration, as described later in section iii-g.
+
+# d. platform constraint and objective
+
+each action pair (pes, buffers) defines the per-layer power/area constraint consumption and the per-layer energy/latency cost, which are our optimization targets. the goal of the accelerator design process is to optimize the cost for running the entire model, while meeting the platform constraint.
+
+constraint. the accelerator is constrained by the budget of the targeted platform. we consider two categories of constraints: power and chip area. we have full flexibility to design architecture such as assigning a different number of pes and buffers or changing dataflow-style, as long as the design meets the constraint. in this paper, we evaluate power and area constraints across cloud and iot platforms, as described in section iii.
+
+objective. we evaluate two design objectives in this work: minimum overall latency and minimum overall energy cost when the entire model is run on the accelerator, either via ls or lp. other objectives can also be considered (say edp or power/area for instance). while approaching the objective, the design should always fit the platform constraint. minimizing the
+
+latency and energy is a non-trivial task since their dependence on the number of pes and buffers is not straightforward. for e.g., increasing pes would increase the level of parallelism; however, it would also increase the number of fetched data, which could potentially increase the latency. as for energy, increasing pes and buffers would increase the power; however, it could potentially decrease the energy because of the shorter execution time.
+
+co-optimization of layers. the rl agent is trained to be aware of the platform constraints. the agent should learn to optimize the resource assignment for each layer and the allocation of the constraint budget at hand to each layer simultaneously. we use rnn as the backbone of rl agent to enable it to memorize its entire epoch of decisions so that it could be aware of the consumption of the total budget. the env checks the budget that is still left ( $l^{budget}$ ) at every time step, and penalizes the rl agent once it is violated.
+
+# e. reward function
+
+reward. since we are executing in a sparse reward domain, where the performance is only given at the end of the episode, we train the agent with a temporal layer-wise performance feedback for reward shaping. the sum of the layer-wise performance does not directly indicate the final entire model performance, which is our objective. however, it guides the rl agents.
+
+we construct the reward function  $r$  as follows.
+
+$$
+r = \left\{ \begin{array}{l} p _ {t} - p ^ {\text {m i n}}, \text {i f} l ^ {\text {b u d g e t}} \geq 0 \\ \text {p e n a l t y , o t h e r w i s e} \end{array} \right. \tag {2}
+$$
+
+$p_{t}$  is the hw performance $^{4}$  of the current layer.  $p^{min}$  is the current lowest layer-wise performance across all time-steps and all epochs. this is tracked during the training process.
+
+we find that the  $p^{min}$  term stabilizes the training. the insight behind it is as follows. first, as shown in figure 1, the reward value for hw performance, such as number of cycles, can be extremely large, which can make the relative improvement seem insignificant across epochs. thus, keeping a  $p^{min}$  across all epochs emphasizes the relative difference. second, the term  $p^{min}$  makes the reward always positive while the platform constraint is not violated, which makes the rl agent easier to learn from positive reward and negative penalty.
+
+penalty. we penalize the rl agent when the resource constraint is violated. to teach the rl agent to forbid the failing point with reasonable penalty, we accumulate all the rewards experiences in this episode, and use negative of the accumulated value as a penalty. the reason is that the range of reward for different hw performance (latency, energy) can have an order of magnitude difference. therefore, a threshold-based constant penalty [2], [56], [87], which is usually applied, is not feasible. also, we need the penalty that is at the correct scale so that it is large enough to penalize the agent and small
+
+enough to not deviate the learned policy too much once bad decision is made.
+
+at the end of the episode, we normalize rewards in each time step to standard distribution and use the standardized reward to train the agent. we also apply a discount factor  $(d)$ . we empirically found  $d = 0.9$  is a generic good default value for this problem.
+
+# f. interactive environment (env)
+
+structure. the env is initialized with the target model(s), dataflow, platform constraint, and the optimizing objective (latency/energy). env tracks the consumed constraints of each time step and the  $p^{min}$  across all episodes.
+
+hw performance estimator (eval). we use maestro [4], an open-source dnn accelerator microarchitectural model, to determine the performance of each accelerator design-point during the training process. maestro takes the dnn model, dataflow-style, and hw configuration as an input. internally, it estimates all possible reuse opportunities for the given dataflow and hw resources, and estimates statistics such as latency, energy, runtime, power, and area. maestro's hw model assumes a spatial dnn accelerator with pes, l1 buffers, a shared l2 buffer, and an noc between the buffers. it can support any dataflow (specified via a data-centric dsl [38]). the number of pes is an input parameter, while the l1 and l2 buffer sizes are estimated based on the tile-sizes for the dataflow. it supports both layer-wise and model-wise evaluation.
+
+# g. local fine-tuning using ga
+
+we use a two-stage optimization to search for a fine-grained solution, as shown in figure 3. the first and major part is the rl based coarse-grained global search. the second is the genetic algorithm (ga) based fine-grain local search. we use two-stage optimization for efficiency, since increasing the level of actions,  $l$  by 1 would increase the design space by  $\left(\frac{l + 1}{l}\right)^{2n}$ . using mobilenet-v2 and  $l = 12$  as an example, we would increase the design space discussed in section ii-d by another 64 times.
+
+rl shows higher sample efficiency and converges to better optimum point comparing to other optimization methods, as shown later in section iv. ga is simple and fast, but converging to less optimum value comparing to rl or sometimes cannot converge. according to the observation of the behavior of ga, it sometimes fails to learn the constraint and optimize the objective simultaneously, leading to a great portion of populations actually violating the constraint, which pollute the genomes of the future generation. however, if we start ga with a good initialization and mutate/crossover genes carefully, which decreases the complexity of the problem, ga could reach good result. therefore, ga becomes a good candidate as a second stage fine-tuning if we initialize it with the first-stage solution. even though a continuous rl algorithm [23], [25], [43] could be another candidate for the second stage, we find that the problem complexity of the second stage is simple that ga is adequate to tackle it. the details of the ga algorithm are described next.
+
+table ii: platform constraint settings.  
+
+<table><tr><td>platform constraint</td><td>descriptions</td></tr><tr><td>unlimited</td><td>no constraint. since we set each action to 12-level, we measured the maximum constraint (power/area) consumption, \(c_{power/area}^{max}\), by evaluating entire model with uniform action pair (\(p_{12th}\), \(b_{12th}\)).</td></tr><tr><td>cloud</td><td>loose constraint. we set the constraint at 50% \(c_{power/area}^{max}\).</td></tr><tr><td>iot</td><td>tight constraint. we set the constraint at 10% \(c_{power/area}^{max}\).</td></tr><tr><td>extreme small iot (iotx)</td><td>extremely tight constraint. we set the constraint at 5% \(c_{power/area}^{max}\).</td></tr></table>
+
+initialization. assuming a dnn model with  $n$  layers, a design-point would include  $n$  actions for pes and  $n$  actions for buffers. we encode this design-point into a genome with  $2n$  genes, where a gene represents an action for pe or buffers. we initialize the first population with the genome formulated by the solution from the first (rl) stage.
+
+local mutation. we mutate the gene locally. we only mutate the gene by a step difference of the current value. for e.g., for a gene representing  $\mathrm{pe} = 64$ , we could mutate it to value in the range of [60, 68] when the step is 4. this conservative mutation can reduce the number of invalid genomes, which does not conform to the constraint, and assure we have good portion of valid parents to reproduce.
+
+local crossover. the crossover of two genomes is unlikely to conform to the constraint, since it can break the learnt relationship between hw resource assignment of each layer. for e.g., suppose we have parents a and b, both with good fitness and lie within the constraint. however, a tends to assign more hw resources on early layers and b tends to assign more hw resources on late layer. when we blend their genes for the next generation, the platform constraints might get violated by some children: a child with early genes from a and late genes from b may over-request hw resources for every layer, violating the constraints. alternately, a child with early genes from b and late genes from a may under-request hw resources for each layer, leading to less performance. thus, we crossover the genome locally within a parent by exchanging genes for (pe, buffers) between two layers of a model. in other words, we pick two pairs of genes representing the (pe, buffers) of two layers of a models and swap them. this conservative self-crossover preserves most of the learnt relationship between layer and resources and adds an exploration effect.
+
+# iv. evaluations
+
+# a. methodology
+
+1) dnn models: in our evaluations, we consider three cnn models with different complexity: mobilenet-v2 [62], mnasnet [75], and resnet-50 [27]. we also evaluate three gemm-based ml models: gnmt [85] for machine translation, transformer [80] for language understanding and ncf [28] for collaborative filtering.  
+2) accelerator platforms: we consider three different classes of platforms: cloud server, iot device and extremely small iot, and, for comparison, an unconstrained platform as shown in table ii. we consider three dataflows: nvdla-style [3] (-dla) (parallelizing k and c dim.), eyeriss-style [16] (-eye) (parallelizing y and r dim.), shidiannao-style
+
+table iii: converged solution of lp deployment.  
+
+<table><tr><td rowspan="2">model</td><td rowspan="2">obj. (min.): latency cstr.: area</td><td colspan="3">optimization results (cycles)</td></tr><tr><td>ga</td><td>ppo2</td><td>con&#x27;x (global)</td></tr><tr><td>mbnetv2-dla</td><td>iot</td><td>nan</td><td>3.6e+07</td><td>3.2e+07</td></tr><tr><td>mbnetv2-eye</td><td>iotx</td><td>nan</td><td>4.1e+07</td><td>3.7e+07</td></tr><tr><td>mbnetv2-shi</td><td>iotx</td><td>nan</td><td>4.9e+07</td><td>4.0e+07</td></tr><tr><td>mnasnet-dla</td><td>cloud</td><td>2.1e+07</td><td>2.3e+07</td><td>2.1e+07</td></tr><tr><td>mnasnet-eye</td><td>iotx</td><td>nan</td><td>4.1e+07</td><td>3.9e+07</td></tr><tr><td>mnasnet-shi</td><td>iotx</td><td>nan</td><td>4.4e+07</td><td>4.3e+07</td></tr><tr><td>resnet50-dla</td><td>cloud</td><td>2.2e+08</td><td>2.4e+08</td><td>2.2e+08</td></tr><tr><td>resnet50-eye</td><td>cloud</td><td>2.3e+08</td><td>2.3e+08</td><td>2.2e+08</td></tr><tr><td>resnet50-shi</td><td>cloud</td><td>3.2e+08</td><td>3.4e+08</td><td>3.1e+08</td></tr><tr><td>gnmt-dla</td><td>iotx</td><td>nan</td><td>2.4e+08</td><td>5.4e+07</td></tr><tr><td>gnmt-eye</td><td>iot</td><td>9.8e+07</td><td>1.4e+08</td><td>9.8e+07</td></tr><tr><td>gnmt-shi</td><td>iot</td><td>2.5e+10</td><td>2.4e+10</td><td>2.4e+10</td></tr><tr><td>transformer-dla</td><td>iotx</td><td>nan</td><td>7.3e+08</td><td>1.6e+06</td></tr><tr><td>transformer-eye</td><td>iot</td><td>3.5e+06</td><td>6.6e+05</td><td>1.9e+05</td></tr><tr><td>transformer-shi</td><td>iot</td><td>7.3e+08</td><td>7.2e+08</td><td>7.2e+08</td></tr><tr><td>ncf-dla</td><td>iotx</td><td>nan</td><td>7.3e+07</td><td>7.2e+07</td></tr><tr><td>ncf-eye</td><td>cloud</td><td>1.20e+06</td><td>1.4e+06</td><td>1.1e+06</td></tr><tr><td>ncf-shi</td><td>iot</td><td>6.6e+08</td><td>6.6e+08</td><td>6.6e+08</td></tr><tr><td colspan="5">bold indicates the best results among ga, ppo2 and this work.</td></tr><tr><td colspan="5">nan indicates that constraint (area) not met in eps (5000) epochs.</td></tr></table>
+
+table iv: converged solutions after 5000 epochs for various optimization methods across four platforms with different constraints. dnn=mobilenet-v2, dataflow=nvdla-style, deployment=lp  
+
+<table><tr><td rowspan="2">objective (min.)</td><td rowspan="2">constraint</td><td colspan="6">optimization results (cycles)</td></tr><tr><td>grid</td><td>random</td><td>sa</td><td>ga</td><td>bayes. opt.</td><td>con&#x27;x (global)</td></tr><tr><td>latency</td><td>area: unlimited</td><td>5.3e+08</td><td>3.6e+07</td><td>6.2e+07</td><td>2.1e+07</td><td>3.7e+07</td><td>2.1e+07</td></tr><tr><td>latency</td><td>area: cloud</td><td>5.3e+08</td><td>3.4e+07</td><td>9.6e+07</td><td>2.1e+07</td><td>3.7e+07</td><td>2.1e+07</td></tr><tr><td>latency</td><td>area: iot</td><td>5.3e+08</td><td>7.1e+07</td><td>nan</td><td>nan</td><td>7.2e+07</td><td>3.2e+07</td></tr><tr><td>latency</td><td>area: iotx</td><td>5.3e+08</td><td>nan</td><td>nan</td><td>nan</td><td>nan</td><td>5.6e+07</td></tr><tr><td>latency</td><td>power: cloud</td><td>5.3e+08</td><td>3.6e+07</td><td>9.9e+07</td><td>2.2e+07</td><td>3.7e+07</td><td>2.2e+07</td></tr><tr><td>latency</td><td>power: iot</td><td>5.3e+08</td><td>nan</td><td>1.2e+08</td><td>nan</td><td>1.6e+08</td><td>3.7e+07</td></tr><tr><td>latency</td><td>power: iotx</td><td>5.3e+08</td><td>nan</td><td>nan</td><td>nan</td><td>nan</td><td>5.6e+07</td></tr><tr><td>energy</td><td>area: unlimited</td><td>8.5e+09</td><td>1.8e+09</td><td>1.3e+09</td><td>1.2e+09</td><td>1.5e+09</td><td>1.2e+09</td></tr><tr><td>energy</td><td>area: cloud</td><td>8.5e+09</td><td>1.8e+09</td><td>1.3e+09</td><td>1.2e+09</td><td>1.5e+09</td><td>1.2e+09</td></tr><tr><td>energy</td><td>area: iot</td><td>8.8e+09</td><td>nan</td><td>nan</td><td>nan</td><td>2.4e+09</td><td>1.4e+09</td></tr><tr><td>energy</td><td>area: iotx</td><td>8.6e+09</td><td>nan</td><td>nan</td><td>nan</td><td>nan</td><td>1.7e+09</td></tr><tr><td>energy</td><td>power: cloud</td><td>8.5e+09</td><td>1.8e+09</td><td>1.3e+09</td><td>1.2e+09</td><td>1.5e+09</td><td>1.2e+09</td></tr><tr><td>energy</td><td>power: iot</td><td>8.6e+09</td><td>nan</td><td>nan</td><td>nan</td><td>4.1e+09</td><td>1.4e+09</td></tr><tr><td>energy</td><td>power: iotx</td><td>8.6e+09</td><td>nan</td><td>nan</td><td>nan</td><td>nan</td><td>1.7e+09</td></tr><tr><td colspan="8">results: latency: (cycles), energy: (nj). bold indicates the best results among algorithms.</td></tr><tr><td colspan="8">nan indicates that constraint (area/power) not met in eps (5000) epochs.</td></tr></table>
+
+[20] (-shi)(parallelizing y and x dim). we use  $\mathrm{l} = 12$  levels of action values for pe and buffers, where  $(p_{n_{th}}, b_{k_{th}})$  represents assigning  $n_{th}$ -level of pes and  $k_{th}$ -level of buffers.
+
+3) baseline optimization/search methods: we evaluate the following optimization methods as baselines.
+
+grid search. we enumerate through the design space with the stride of  $s$  in the  $l = 12$  level, (e.g.,  $(p_{1_{th}}, b_{1_{th}}), (p_{1_{th}}, b_{(1 + s)_{th}}) \ldots$ ). we set maximum epochs  $eps$ . we emulate through the design space until the number of sampling points reached  $eps$ .
+
+random search. we randomly sample  $eps$  design points and keep the best solutions as a result.
+
+ga [29]. the baseline is a general ga algorithm, not the specially designed local fine-tuning one as described in section iii-g. the ga is set with 100 population, and  $\left[\frac{eps}{100}\right]$  generations. the mutation rate and crossover rate is set as 0.05.
+
+simulated annealing [35]. the simulated annealing is implemented with temperature of 10 with step size of 1 and adopted to discrete integer space.
+
+bayesian optimization [54]. we set the algorithm to run for  $eps$  iterations, where  $eps$  points are sampled by the algorithm. we adopt it to discrete integer space. we set the number of the optimizer to 5 for the gaussian process, since we empirically find this setting has better performance.
+
+state-of-the-art rl algorithms. we consider state-of-the-art rl algorithms that are successful in many control problems. we consider both continuous and discrete methods. we compare with a2c [47], actkr (actor critic using kronecker-factored trust region) [86], and ppo2 [66]. both continuous and discrete versions of the three algorithms are experimented. across all the experiments, we found the discrete version converge to better value. hence, we will only show the result of the discrete version in the comparisons table. we also consider ddpg [43], sac [25], and td3 [23] in continuous space. all comparisons run for  $eps$  epochs.
+
+4) confuciux (global): we only consider the first-stage global search, con'x (global), throughout the comparisons against baseline methods, for fairness. the second-stage fine-tuning can be added on top of the first-stage results. the benefit of the second-stage is explicitly discussed in section iv-e.
+
+# b. per-layer study for ls deployment
+
+we start by showing the hw performance of different action pairs  $(p_{n_{th}}, b_{k_{th}})$  with 12 level of values each, which is y-axis and x-axis in figure 5. we sweep through  $(p_{n_{th}}, b_{k_{th}})$  with exhaustive search and color it with their corresponding latency/energy value. red indicates large latency/energy values while purple indicates small ones. for each layer, the contour is drastically different. each layer requires distinct action pairs  $(p_{n_{th}}, b_{k_{th}})$  to reach optimal values (purple). the contour becomes a flat region when the pes or buffers are over-provisioned. latency of layer-12 as an example, when pe is larger than the  $9_{th}$  level and buffer is larger than the  $3_{rd}$  level, the latency remains the same because of over-provisioning. the two separate purple regions in latency of layer-34 indicate that there are two regions of tiling size, which we map to the buffer, can optimize the latency. for layer-23 (dwconv), increasing the tile size of the mapping dimension (k) does not help because of the irrelevance of each output channel (k) in dwconv. as for energy, larger number of pes and buffers can potentially decrease the energy because of shorter execution time as in layer-12 and layer-34. we can observe there are sweet spot for buffer size in layer-23, where all the channel is mapped to one pe. at this end, increasing pe would not increase the energy, since extra pe will be idle. also decreasing buffers cause more times of fetching, which increase the energy consumption.
+
+![](images/32650f9c010a8b9436240b1a8abb5cc206d5ccd54fe7ad3ec870069bcd81f1bd.jpg)  
+fig. 5: searching for per-layer pes/buffers configurations to optimize latency/energy with different techniques. purple indicates lower (better) and red indicates higher (worse) latency/energy. heuristic a: determine the pes/buffers with the most compute-intensive layer (layer-38) and apply the same configuration for all the layers. heuristic b: determine the pes/buffers by the configuration that optimizes end-to-end whole model latency/energy.
+
+table v: comparison of search-time and converged solutions across state-of-the-art rl techniques.  
+
+<table><tr><td rowspan="2">model</td><td rowspan="2">objective (min.)</td><td rowspan="2">constraint</td><td colspan="2">a2c</td><td colspan="2">acktr</td><td colspan="2">ppo2</td><td colspan="2">ddpg</td><td colspan="2">sac</td><td colspan="2">td3</td><td colspan="2">con&#x27;x (global)</td></tr><tr><td>optimized results</td><td>search time</td><td>optimized results</td><td>search time</td><td>optimized results</td><td>search time</td><td>optimized results</td><td>search time</td><td>optimized results</td><td>search time</td><td>optimized results</td><td>search time</td><td>optimized results</td><td>search time</td></tr><tr><td>mbnetv2</td><td>latency</td><td>area: iot</td><td>5.4e+07</td><td>2:45</td><td>4.0e+07</td><td>12:01</td><td>3.6e+07</td><td>1:34</td><td>1.1e+08</td><td>24:20</td><td>4.7e+07</td><td>10:23</td><td>3.8e+07</td><td>8:22</td><td>3.2e+07</td><td>0:25</td></tr><tr><td>mbnetv2</td><td>latency</td><td>area: iotx</td><td>9.6e+07</td><td>1:20</td><td>5.6e+07</td><td>3:55</td><td>5.6e+07</td><td>1:20</td><td>1.8e+08</td><td>11:41</td><td>1.0e+08</td><td>3:00</td><td>8.2e+07</td><td>2:34</td><td>5.6e+07</td><td>0:35</td></tr><tr><td>mbnetv2</td><td>latency</td><td>power: iot</td><td>6.5e+07</td><td>1:49</td><td>4.7e+07</td><td>3:59</td><td>4.5e+07</td><td>2:13</td><td>1.7e+08</td><td>27:32</td><td>6.2e+07</td><td>10:09</td><td>1.8e+08</td><td>5:56</td><td>3.7e+07</td><td>0:43</td></tr><tr><td>mbnetv2</td><td>latency</td><td>power: iotx</td><td>7.3e+07</td><td>1:00</td><td>6.6e+07</td><td>4:05</td><td>6.8e+07</td><td>1:15</td><td>6.3e+09</td><td>3:30</td><td>1.1e+08</td><td>2:30</td><td>7.6e+07</td><td>2:25</td><td>5.6e+07</td><td>0:32</td></tr><tr><td>mbnetv2</td><td>energy</td><td>area: iot</td><td>1.8e+09</td><td>0:36</td><td>1.7e+09</td><td>3:55</td><td>1.5e+09</td><td>1:25</td><td>2.3e+09</td><td>3:10</td><td>2.0e+09</td><td>1:21</td><td>1.8e+09</td><td>3:34</td><td>1.2e+09</td><td>0:48</td></tr><tr><td>mbnetv2</td><td>energy</td><td>power: iot</td><td>1.9e+09</td><td>0:31</td><td>1.8e+09</td><td>2:15</td><td>1.6e+09</td><td>0:57</td><td>2.0e+09</td><td>9:56</td><td>1.9e+09</td><td>1:40</td><td>1.4e+09</td><td>3:50</td><td>1.4e+09</td><td>0:53</td></tr><tr><td>resnet50</td><td>latency</td><td>area: cloud</td><td>3.8e+08</td><td>6:38</td><td>3.5e+08</td><td>16:51</td><td>2.4e+08</td><td>6:37</td><td>2.5e+08</td><td>25:27</td><td>2.5e+08</td><td>13:09</td><td>2.4e+08</td><td>8:36</td><td>2.2e+08</td><td>0:46</td></tr><tr><td>resnet50</td><td>latency</td><td>power: cloud</td><td>3.8e+08</td><td>6:38</td><td>3.5e+08</td><td>8:06</td><td>2.4e+08</td><td>6:47</td><td>2.5e+08</td><td>25:18</td><td>2.6e+08</td><td>8:05</td><td>2.4e+08</td><td>8:04</td><td>2.3e+08</td><td>0:46</td></tr><tr><td>resnet50</td><td>energy</td><td>area: cloud</td><td>1.4e+10</td><td>6:38</td><td>1.4e+10</td><td>14:35</td><td>9.1e+09</td><td>6:46</td><td>1.3e+10</td><td>25:11</td><td>1.1e+10</td><td>12:40</td><td>1.3e+10</td><td>9:38</td><td>7.6e+09</td><td>1:20</td></tr><tr><td>resnet50</td><td>energy</td><td>power: cloud</td><td>1.6e+10</td><td>6:45</td><td>1.3e+10</td><td>16:26</td><td>9.7e+09</td><td>6:57</td><td>1.3e+10</td><td>16:26</td><td>1.1e+10</td><td>12:12</td><td>1.3e+10</td><td>12:46</td><td>7.6e+09</td><td>1:05</td></tr><tr><td>mnasnet</td><td>latency</td><td>area: iot</td><td>4.6e+07</td><td>5:04</td><td>3.7e+07</td><td>12:32</td><td>3.3e+07</td><td>5:08</td><td>6.4e+07</td><td>23:12</td><td>3.6e+07</td><td>9:29</td><td>7.2e+07</td><td>6:32</td><td>2.8e+07</td><td>0:27</td></tr><tr><td>mnasnet</td><td>latency</td><td>power: iot</td><td>6.5e+07</td><td>5:23</td><td>4.3e+07</td><td>12:12</td><td>4.2e+07</td><td>5:40</td><td>9.8e+07</td><td>25:50</td><td>5.6e+07</td><td>13:04</td><td>9.1e+07</td><td>6:02</td><td>3.5e+07</td><td>0:42</td></tr><tr><td>mnasnet</td><td>energy</td><td>area: iot</td><td>1.8e+09</td><td>0:58</td><td>1.6e+09</td><td>3:48</td><td>1.4e+09</td><td>1:43</td><td>2.1e+09</td><td>9:52</td><td>1.8e+09</td><td>3:25</td><td>1.7e+09</td><td>2:56</td><td>1.4e+09</td><td>0:30</td></tr><tr><td>mnasnet</td><td>energy</td><td>power: iot</td><td>1.8e+09</td><td>0:36</td><td>1.8e+09</td><td>3:39</td><td>1.7e+09</td><td>1:15</td><td>2.9e+09</td><td>9:44</td><td>1.9e+09</td><td>2:50</td><td>2.7e+09</td><td>1:27</td><td>1.4e+09</td><td>0:39</td></tr><tr><td colspan="3">memory overhead (mb)</td><td colspan="2">5.3</td><td colspan="2">5.3</td><td colspan="2">5.3</td><td colspan="2">13.9</td><td colspan="2">16</td><td colspan="2">18.1</td><td colspan="2">2.1</td></tr><tr><td colspan="17">results: latency: (cycles), energy: (nj) search time: (hrs:min) bold indicates the best results among algorithms.</td></tr></table>
+
+con'x consistently finds the optimal action pair for each layer, and its solution is as-good or better (fewer pes and buffers for same latency or energy) than the baseline methods and two common heuristics. figure 5 also shows that there is no action pair that suits all the layers. thus, for a ls scenario, a designer can use con'x to find optimal configurations for each layer, and then pick the one that provides optimum values across most layers.
+
+# c. lp deployment
+
+next, we consider lp deployment (i.e., all layers of the model mapped on the accelerator) with platform constraints. for all the comparisons, we compare the algorithm performance by comparing their best solutions after  $eps = 5,000$  epochs.
+
+1) converged solutions across dnns, dataflows, and platforms: we ran baseline optimization methods and rl algorithms for a suite of dnns (cnn- and gemm-based) with varying dataflow styles and platform constraints. the objective is set to minimize the latency of the entire model. therefore the lower the reached value, the better the solution is. in the interest of space, we show the results with the best performing baselines, ga and ppo2, in table iii. ga can reach good optimized value when the constraint is loose (cloud), but it fails in some tight constraint cases (iot, iotx). both ppo2 and con'x(global) can find solutions in any type of constraint. across all the experiments, con'x(global) finds the solution with the same or better performance than ppo2 and ga.
+
+![](images/cdb0f5ab693bbf161d10e6f31e2321b7479005ddcbfe8bcb4a0d36a1d3c6bf50.jpg)  
+fig. 6: the learning curve of the critic network.  
+fig. 7: the fast convergence and sample efficiency of con'x (global).
+
+2) deep-dive with optimization methods: table iv compares the solutions attained by various optimization methods and con'x(global) for mobilenet-v2 under four platform constraints for a nvdla-style accelerator. the objective is set to minimize the latency or energy of the entire model. random, sa, and ga fail to come up with a feasible solution when faced with tight constraint (iot). also, bayesian optimization fails in extreme tight constraint (iotx). con'x(global) successfully learns the constraint behavior and optimizes the objective together. con'x(global) generates the most optimized design points with  $86\%$  lower latency and  $70\%$  lower energy, on average across baselines.  
+3) deep-dive with rl algorithms: we compare con'x(global) with other state-of-the-art rl algorithms in the same setting as the previous experiment, as shown in table v. all the rl agents are able to find feasible solutions in all situations. considering the complexity of the algorithm, ddpg [43], sac [25], and td3 [23] generally consume more search time and memory overhead. across all comparisons, we find con'x(global) and ppo2 [66] reach better objective value. con'x(global) converges to the optimized value 4.7 to 24 times faster than alternate rl algorithms.
+
+analysis of critic networks. in many advanced rl algorithms such as a2c [47], actr [86], ppo2 [66], ddpg [43], sac [25] and td3 [23], critic networks are used to approximate the underlying value functions, which in turn train the policy network. the reinforce-based used in confuciux, on the other hand, only has an actor network that learns directly from the reward. as table v shows, we found that reinforce [73] in con'x(global) converges to better solutions than all the actor-critic rl algorithms. our intuition is that this is because the function of the hw performance of the accelerator are too discrete and irregular for a critic neural network to learn well, and this in turn adversely affects the learning of the policy networks. to verify this intuition, we extract the critic network from the implemented alternate rl algorithms [23], [25], [43], [47], [66], [86] and conduct a standalone experiment to test its ability to approximate the underlying value function. the task is to take the "state values" as input and predict the corresponding reward of that state. we use per-layer latency of mobilenet-v2 as reward. we use mean square error and gradient decent to train the network. we show the root mean square error (rmse) when training with different size of data, as shown in figure 6. 260,000 is the maximum possible data
+
+![](images/035cb5ba6c4cc77b7d89ee5cdf58609aec63407e5a1a96313787d02a1106cc65.jpg)  
+(a)obj.(min.): latency, cstr.: iot area
+
+![](images/243cf4978b90c1a8d4cb2d496a74e735b0c0390004e6d2beb6804fb44f9cf473.jpg)  
+(b) obj.(min.): energy, cstr.: iot area
+
+table vi: dataflow and hardware co-automation.  
+
+<table><tr><td rowspan="2">model</td><td rowspan="2">obj. (min.): latency cstr: area</td><td colspan="4">optimization results (cycles)</td></tr><tr><td>con&#x27;x-dla (global)</td><td>con&#x27;x-shi (global)</td><td>con&#x27;x-eye (global)</td><td>con&#x27;x-mix (global)</td></tr><tr><td>mbnetv2</td><td>iot</td><td>3.2e+07</td><td>3.1e+07</td><td>2.9e+07</td><td>2.0e+07</td></tr><tr><td>mbnetv2</td><td>iotx</td><td>5.6e+07</td><td>4.0e+07</td><td>3.7e+07</td><td>3.5e+07</td></tr><tr><td>mnasnet</td><td>cloud</td><td>2.1e+07</td><td>3.0e+07</td><td>2.9e+07</td><td>6.6e+06</td></tr><tr><td>mnasnet</td><td>iot</td><td>2.8e+07</td><td>3.5e+07</td><td>3.4e+07</td><td>1.8e+07</td></tr><tr><td>resnet50</td><td>cloud</td><td>2.2e+08</td><td>3.1e+08</td><td>2.2e+08</td><td>7.7e+07</td></tr><tr><td>resnet50</td><td>iot</td><td>4.4e+08</td><td>4.3e+08</td><td>3.1e+08</td><td>3.0e+08</td></tr><tr><td>resnet50</td><td>iotx</td><td>6.3e+08</td><td>6.2e+08</td><td>4.9e+08</td><td>4.4e+08</td></tr><tr><td>gnmt</td><td>cloud</td><td>2.4e+10</td><td>1.1e+07</td><td>9.7e+07</td><td>6.0e+06</td></tr><tr><td>ncf</td><td>cloud</td><td>6.6e+08</td><td>2.6e+06</td><td>1.1e+06</td><td>6.8e+05</td></tr><tr><td>ncf</td><td>iot</td><td>2.6e+06</td><td>6.6e+08</td><td>1.2e+06</td><td>7.0e+05</td></tr></table>
+
+points critic network can experience under the rl tasks of  $eps = 5,000$  with mobilenet-v2. we can observe that the training and testing loss is hard to converge to a feasible value (the best rmse is  $5.3\mathrm{e} + 4$ , which means the predicted latency (reward) by critic network is in average  $5.3\mathrm{e} + 4$  cycles difference to the ground-truth ones) which means the critic network did not learn reward value well. this could potentially misguide the policy network.
+
+4) sample efficiency and convergence: in the experiments against baseline optimization methods and other rl algorithms, we found con'x(global) has the fastest convergence rate. we show two convergence traces as examples in figure 7 for mobilenet-v2. with rapid convergence, our method heads toward the objective with more sample efficiency. on the contrary, the exhaustive search needs to enumerate and search through  $l^{2n}$ ,  $12^{104} = o(10^{112})$ , data points for the search space of 52-layer mobilenet-v2 with two actions per layer and 12 level of values per action, which is near impossible to finish.
+
+# d. dataflow-hw co-automation
+
+we extend confuciux to co-automate the per-layer dataflow style decision. rather than manually picking one of the dataflow style, we let the agent make this decision. to take one step further, we let the agent do fine-grained per-layer dataflow style decision, which we termed as mix-strategy. the agent now makes three decisions per-layer: pes, buffers, and dataflow style. we found con'x-mix can not only pick the best dataflow-style for a model but also take advantage of mix-strategy to pick different dataflow-style in different layers,
+
+![](images/2bbf17f022fbc9844b1bd71634cbc9e693f9d3349e5f4298d80c0d5d9233c8b9.jpg)  
+fig. 8: dataflow-hw co-automation with confuciux for mobilenet-v2. (obj.(min.):latency,cstr:iot area).
+
+table vii: two-stage optimization of confuciux.  
+
+<table><tr><td rowspan="2">model</td><td rowspan="2">obj. (min.): latency cstr: area</td><td rowspan="2">initial valid value (cy.)</td><td colspan="2">con&#x27;x (global search)</td><td colspan="2">con&#x27;x (fine-tuning)</td></tr><tr><td>optimized results (cy.)</td><td>impr. (%)</td><td>optimized results (cy.)</td><td>impr. (%)</td></tr><tr><td>mbnetv2-dla</td><td>iot</td><td>7.3e+07</td><td>3.2e+07</td><td>56.1%</td><td>2.5e+07</td><td>22.7%</td></tr><tr><td>mnasnet-dla</td><td>iot</td><td>1.0e+08</td><td>2.8e+07</td><td>71.7%</td><td>2.3e+07</td><td>17.9%</td></tr><tr><td>resnet50-dla</td><td>cloud</td><td>1.4e+09</td><td>2.2e+08</td><td>84.1%</td><td>2.0e+08</td><td>7.0%</td></tr><tr><td>resnet50-dla</td><td>iot</td><td>7.1e+08</td><td>4.4e+08</td><td>37.9%</td><td>3.3e+08</td><td>24.0%</td></tr><tr><td>gnmt-dla</td><td>iot</td><td>4.6e+09</td><td>9.5e+06</td><td>99.8%</td><td>6.2e+06</td><td>34.6%</td></tr><tr><td>ncf-dla</td><td>iot</td><td>6.6e+07</td><td>2.6e+06</td><td>96.1%</td><td>1.8e+05</td><td>93.1%</td></tr></table>
+
+as shown in figure 8 for mobilenet-v2. in general, if there are no hw resource constraints, system will favor eye/shi at early layers (larger activations), which parallelize along activations dimensions, and favor dla at late layers (larger k/c), which parallelizes along channel dimensions (k/c) in cnn-based networks. however, when considering hw constraint, it becomes a compound decision trading-off among pe, buffers, dataflow-style, and area. from the experiment listed in table vi, we can observe that in a more relaxed constraint, dla performs better than the other two since most layers in cnn-based networks have large k/c dim. however, in a tighter constraint, the parallelization ability of dla will be restricted; eye/shi, which parallelize activations dim (whose values shrink layer-by-layer quickly in most cnns) become more efficient choices. this observation can also explain the fact that system chooses eye/dla for some of the later layers in figure 8. from the experiments listed in table vi, con'x-mix further improves the optimization results by  $4\%$  to  $69\%$  comparing to the best-performing con'x-dla/shi/eye.
+
+# e. benefit of two-stage optimization
+
+in the above comparing with baseline experiments, we did not use local fine-tuning for fairness. we now show its effectiveness. we use local ga of 20 populations and run for 2,000 generations. we use local crossover rate of 0.2, local mutation rate of 0.05, and local mutation step of 4.
+
+1) the effect of fine-tuning: we show the two stage optimization results in table vii. we show one of the trace of reached-value along epochs in figure 9, which is the first row in table vii and the third row in table iv. in this case, pure ga cannot find valid solution because of the tight constraint (iot). the first-stage global search of con'x learns to generate a valid solution first, whose value is recorded as initial valid value in table vii. then, con'x starts to optimize the value
+
+![](images/9a5a49d9e04a2e9e36e535ef3d875da0c0002b835ea7835298e64610c48d06e8.jpg)  
+fig. 9: overall latency as a function of epochs across two-stage optimization in confuciux (mobilenet-v2, obj.(min.):latency, cstr.:iot area).
+
+while conforming to constraint and reached an optimized point. the first stage improves the values from  $56\%$  to  $99\%$  compared to the initial valid values. then, local fine-tuning using ga to further optimizes the solutions, and they improves by another  $7\%$  to  $93\%$  than the output of the first stage, which are  $66\%$  to  $99\%$  improvement over the initial value.
+
+2) analysis of design-points found by confuciux: in figure 10, at the top, we show how confuciux allocates area to different components (total pe, total buffers, and per-layer) for mobilenet-v2 and resnet-50 in an experiment with total area constrained. the per-layer assignment is highly heterogeneous, which can be seen by the per-layer pe and buffer assignment shown at the bottom of figure 10. in particular, in mobilenet-v2, we observe that the dwconv layers are assigned less resources on both pes and buffers. this could be because they require less computation and we are limited by the platform area constraint, which makes the agent reduce the assigned resources. in resnet-50, we find that the agent assigns more buffers to the layers that have the larger number of input/output channel size (e.g., layers 37,43, and 47).
+
+# f. lp deployment at compile time
+
+confuciux can also be used for lp deployment at compile time. one common use-case is for fpga-based accelerator design. as is common for fpgas, we impose the maximum number of pes and buffers as constraint (which would depend on the specific fpga board). we consider both cloud and edge fpgas as constraints. the baseline is configured with uniform number of pe and buffers for each layer with nvdla-style dataflow. in table viii, we show that con'x(global)-dia
+
+![](images/9c70d159bd3f61044f11013b85861d26ed2b252a148a22af371fefc4c3553668.jpg)  
+fig. 10: the solution for (a) mobilenet-v2 and (b) resnet-50 (obj.(min.):latency, cstr:iot area).
+
+table viii: resource assignments for lp deployment at compile time of confuciux.  
+
+<table><tr><td rowspan="2" colspan="2">objective: latency</td><td rowspan="2" colspan="3">baseline-dla</td><td colspan="6">confuciux-dla</td><td colspan="6">confuciux-mix</td></tr><tr><td colspan="3">1st: global search</td><td colspan="3">2nd: local-finetuning</td><td colspan="3">1st: global search</td><td colspan="3">2nd: local-finetuning</td></tr><tr><td colspan="2"></td><td colspan="2">used cstr.</td><td rowspan="2">optimized results (cy.)</td><td colspan="2">used cstr.</td><td rowspan="2">optimized results (cy.)</td><td colspan="2">used cstr.</td><td rowspan="2">optimized results (cy.)</td><td colspan="2">used cstr.</td><td rowspan="2">optimized results</td><td colspan="2">used cstr.</td><td rowspan="2">optimized results (cy.)</td></tr><tr><td>platform constraint</td><td>model</td><td>pes</td><td>bufs</td><td>pes</td><td>bufs</td><td>pes</td><td>bufs</td><td>pes</td><td>bufs</td><td>pes</td><td>bufs</td></tr><tr><td>cloud fpga</td><td>resnet50</td><td>4081</td><td>7786</td><td>2.352e+08</td><td>4080</td><td>6338</td><td>2.346e+08</td><td>4096</td><td>7958</td><td>2.2e+08</td><td>4000</td><td>7758</td><td>8.1e+07</td><td>4092</td><td>7942</td><td>6.6e+07</td></tr><tr><td>cstr: pe: 4096, buf: 8kb</td><td>mbnetv2</td><td>4056</td><td>7716</td><td>2.5e+07</td><td>4032</td><td>3710</td><td>2.3e+07</td><td>4088</td><td>7912</td><td>2.0e+07</td><td>4064</td><td>3944</td><td>9.4e+06</td><td>4096</td><td>7898</td><td>6.0e+06</td></tr><tr><td>edge fpga</td><td>resnet50</td><td>212</td><td>3206</td><td>1.8e+09</td><td>256</td><td>2290</td><td>1.5e+09</td><td>256</td><td>3962</td><td>1.2e+09</td><td>256</td><td>3942</td><td>1.1e+09</td><td>256</td><td>3922</td><td>8.0e+08</td></tr><tr><td>cstr: pe: 256, buf: 4kb</td><td>mbnetv2</td><td>208</td><td>3356</td><td>1.13e+08</td><td>256</td><td>2468</td><td>1.08e+08</td><td>256</td><td>3838</td><td>6.9e+07</td><td>248</td><td>3442</td><td>8.7e+07</td><td>256</td><td>3920</td><td>5.7e+07</td></tr></table>
+
+table ix: different configurations of the policy network.  
+
+<table><tr><td rowspan="2">net type</td><td rowspan="2">obj. (min.): latency cstr: area</td><td colspan="2">action level: 10</td><td colspan="2">action level: 12</td><td colspan="2">action level: 14</td></tr><tr><td>optimized results(cy.)</td><td>used cstr.</td><td>optimized results(cy.)</td><td>used cstr.</td><td>optimized results(cy.)</td><td>used cstr.</td></tr><tr><td>mlp</td><td>cloud</td><td>2.3e+07</td><td>63.9%</td><td>2.2e+07</td><td>96.1%</td><td>3.0e+07</td><td>26.3%</td></tr><tr><td>rnn</td><td>cloud</td><td>2.1e+07</td><td>86.7%</td><td>2.1e+07</td><td>95.0%</td><td>2.3e+07</td><td>68.8%</td></tr><tr><td>mlp</td><td>iot</td><td>3.4e+07</td><td>97.5%</td><td>3.3e+07</td><td>97.6%</td><td>4.2e+07</td><td>95.2%</td></tr><tr><td>rnn</td><td>iot</td><td>3.3e+07</td><td>99.2%</td><td>3.2e+07</td><td>96.6%</td><td>4.2e+07</td><td>89.1%</td></tr><tr><td>mlp</td><td>iotx</td><td>8.3e+07</td><td>99.0%</td><td>9.4e+07</td><td>88.8%</td><td>4.6e+07</td><td>97.9%</td></tr><tr><td>rnn</td><td>iotx</td><td>7.1e+07</td><td>97.4%</td><td>5.6e+07</td><td>90.0%</td><td>5.4e+07</td><td>99.8%</td></tr></table>
+
+performs better than baseline-dla. then we show that local-finetuning in con'x(global)-dla can further improves the value by  $7\%$  to  $36\%$ . finally, we show the two stage results of confuciux-mix, where the final reached value is  $50\%$  to  $72\%$  better than baseline-dla.
+
+# g. policy network exploration
+
+we show our design decision process of the policy network. first is the action levels, l, where we pick  $\mathrm{l} = 12$ , in the experiments. by decreasing l, we decrease the complexity of the problem but worsen the granularity, and vice versa. as shown in table ix,  $\mathrm{l} = 12$  is the sweet spot we found. we also experimented with different type of policy networks: mlp-based and rnn-based, as table ix shows. we found rnn-based networks converging to better results, which may be owing to the fact that rnn is taking advantage of remembering the consumed constraint of previous layers.
+
+# h. summary
+
+we summarize some key results here. for global search, we observe that rls can explore an extremely large design
+
+space more effectively and efficiently compared to the baseline optimization methods. next, we find that reinforce, which does not rely on value network, can converge faster and reach similar or better results than alternate rl methods in the discrete and irregular hw performance exploration problem. next, we demonstrate that our formulation of reinforce-based (con'x(global)) can not only explore the hw configuration but also effectively explore the dataflow-style decision simultaneously and further optimize the results by  $4\%$  to  $69\%$ . finally, after a coarse-grained solution is found, we show that using a specialized ga for fine-tuning the result locally can optimize the result by another  $7\%$  to  $93\%$ .
+
+# v. related works
+
+accelerator hw design-space exploration. fine-grained hw resource assignment has been studied extensively for ls deployment on fpgas [26], [49], [97]. whole-model lp deployment has been shown to be more efficient than ls deployments with uniform resource assignments for every layer [15], [31], [33], [42], [68], [82], [93], [94]. many works have focused on allocating resources for convolution layers in a lp deployment within one fpga [68], [94], across multiple fpgas [30], [31], [33], [42], [82] or in cloud fpga platforms [15]. some works have focused on hw dse for asic accelerators [60], [64], [67] or templated systolic array structures [18], [83]. some general frameworks execute the design space exploration at the architecture level, supporting both asic and fpga [38], [89]. yang et. al., [89] further shows that the hw resource assignment dominates the performance of accelerator comparing to dataflow exploration. for design space exploration, most of these prior works employ grid/exhaustive
+
+search, while techniques for pruning the exploration spaces are manually developed. however, with myriads of dnn models being designed on a daily basis, it becomes harder to manually design and tune the policy for the newly constructed search space. in this work, we develop a ml-based method to automate the search process with high sample efficiency for both lp and ls scenario.
+
+ml-based methods for dnn compilation and mapping. ml methods have found value in mapping/compiling dnns over hardware. tensorcomprehensions [79] uses genetic algorithm, autotvm [13], [14] uses simulated annealing and boosted tree, reagen et. al., [59] uses bayesian optimization, release [7] uses rl, atlas [84] uses black box optimizations, some compiler design [12], [50] use profile-guided optimization to perform target-independent front-end compiler optimizations on dnns or linear algebra computations. some recent works use rl on hw/sw co-exploration to explore both dnn and its mapping over hardware [6], [32], [44], [88]. the problem of mapping the dnn computation graph over multiple devices (cpu/gpu/tpu [34]) has also been explored through manual heuristics [8], [72], [91] and rl [24], [46], [51]. in contrast to these works, this work looks at fine-grained design-time assignment of compute and memory within an accelerator.
+
+dataflow style optimization. architecture design of ml accelerators include resource assignment and dataflow style design. dataflow style is a scheduling and compiler optimization problem, which has been studied for decades for the generic platform such as cpu or gpu [5], [19], [36], [37], [40], [58], [71], [81], or for fpga [45], [92], while they apply grid search for reaching their objectives. for ml accelerators, some mainstream dataflow style are manually designed and proven to be efficient, becoming prominent or commercialized [3], [16], [20], [34]. in this work, we focus on the resource assignment part of the accelerator design flow, and utilize some prominent dataflow styles [3], [16], [20], [34].
+
+# vi. conclusion
+
+while efficient dnn models and dataflow style are widely studied for ml accelerators, hw resource assignment is relatively unexplored. in this paper, we propose confuciux, an autonomous strategy to find out the optimized hw resource assignment for a given dnns, a dataflow style and platform constraints. confuciux leverages rl for the global search, augmented with ga for fine-tuning. we quantitatively experiment on different models, platform constraints and dataflow styles. confuciux demonstrates the highest sample-efficiency compared to other optimization and rl methods. this works show the promise of leveraging ml within the dnn accelerator design workflow, with opportunities for future work across new ml algorithms for learning dataflow/hardware behavior, and dnn-dataflow-hardware co-design.
+
+# acknowledgement
+
+this work was supported by nsf award 1909900 and a google faculty award. we thank hyoukjun kwon for help with
+
+maestro setup and feedback on the writing. we acknowledge arun ramamurthy, siva theja maguluri and ananda samajdar for helpful technical discussions. a special thanks to cliff young for motivating us to pursue this research direction.
+
+# references
+
+[1] "stars and bars (combinatorics)," https://en.wikipedia.org/wiki/stars_and-bars_(combinatorics).  
+[2] "openai gym," https://gym.openai.com/, 2016.  
+[3] "nvdla deep learning accelerator," http://nvdla.org, 2017.  
+[4] “maestro tool,” http://maestro.ece.gatech.edu/, 2020.  
+[5] m. abadi, p. barham, j. chen, z. chen, a. davis, j. dean, m. devin, s. ghemawat, g. irving, m. isard et al., "tensorflow: a system for large-scale machine learning," in 12th {usenix} symposium on operating systems design and implementation (\{osdi\} 16), 2016, pp. 265-283.  
+[6] m. s. abdelfattah, l. dudziak, t. chau, r. lee, h. kim, and n. d. lane, "best of both worlds: automl codesign of a cnn and its hardware accelerator," arxiv preprint arxiv:2002.05022, 2020.  
+[7] b. h. ahn, p. pilligundla, and h. esmaeilzadeh, “reinforcement learning and adaptive sampling for optimized dnn compilation,” arxiv preprint arxiv:1905.12799, 2019.  
+[8] d. bahdanau, k. cho, and y. bengio, “neural machine translation by jointly learning to align and translate,” arxiv preprint arxiv:1409.0473, 2014.  
+[9] s. bang, j. wang, z. li, c. gao, y. kim, q. dong, y.-p. chen, l. fick, x. sun, r. dreslinski et al., "14.7 a  $288\mu \mathrm{w}$  programmable deep-learning processor with 270kb on-chip weight storage using non-uniform memory hierarchy for mobile intelligence," in 2017 ieee international solid-state circuits conference (isscc). ieee, 2017, pp. 250-251.  
+[10] j. bergstra and y. bengio, “random search for hyper-parameter optimization,” journal of machine learning research, vol. 13, no. feb, pp. 281–305, 2012.  
+[11] s. chakradhar, m. sankaradas, v. jakkula, and s. cadambi, "a dynamically configurable coprocessor for convolutional neural networks," in proceedings of the 37th annual international symposium on computer architecture, 2010, pp. 247-257.  
+[12] p. p. chang, s. a. mahlke, and w.-m. w. hwu, "using profile information to assist classic code optimizations," software: practice and experience, vol. 21, no. 12, pp. 1301-1321, 1991.  
+[13] t. chen, t. moreau, z. jiang, l. zheng, e. yan, h. shen, m. cowan, l. wang, y. hu, l. ceze et al., “{tvm}: an automated end-to-end optimizing compiler for deep learning,” in 13th {usenix} symposium on operating systems design and implementation (osdi) 18), 2018, pp. 578-594.  
+[14] t. chen, l. zheng, e. yan, z. jiang, t. moreau, l. ceze, c. guestrin, and a. krishnamurthy, “learning to optimize tensor programs,” in advances in neural information processing systems, 2018, pp. 3389–3400.  
+[15] y. chen, j. he, x. zhang, c. hao, and d. chen, "cloud-dnn: an open framework for mapping dnn models to cloud fpgas," in proceedings of the 2019 acm/sigda international symposium on field-programmable gate arrays, 2019, pp. 73-82.  
+[16] y.-h. chen et al., "eyeriss: an energy-efficient reconfigurable accelerator for deep convolutional neural networks," jssc, vol. 52, no. 1, pp. 127-138, 2016.  
+[17] chen, yu-hsin and krishna, tushar and emer, joel and sze, vivienne, "eyeriss: an energy-efficient reconfigurable accelerator for deep convolutional neural networks," in ieee international solid-state circuits conference, isscc 2016, digest of technical papers, 2016, pp. 262-263.  
+[18] j. cong and j. wang, “polysa: polyhedral-based systolic array autocompilation,” in 2018 ieee/acm international conference on computer-aided design (iccad). ieee, 2018, pp. 1-8.  
+[19] s. dave, y. kim, s. avancha, k. lee, and a. shrivastava, "dmazerunner: executing perfectly nested loops on dataflow accelerators," acm transactions on embedded computing systems (tecs), vol. 18, no. 5s, pp. 1-27, 2019.  
+[20] z. du, r. fasthuber, t. chen, p. ienne, l. li, t. luo, x. feng, y. chen, and o. temam, "shidiannao: shifting vision processing closer to the sensor," in international symposium on computer architecture (isca), 2015.
+
+[21] c. farabet, b. martini, p. akselrod, s. talay, y. lecun, and e. culurciello, "hardware accelerated convolutional neural networks for synthetic vision systems," in proceedings of 2010 ieee international symposium on circuits and systems. ieee, 2010, pp. 257-260.  
+[22] c. farabet, c. poulet, j. y. han, and y. lecun, "cnp: an fpga-based processor for convolutional networks," in 2009 international conference on field programmable logic and applications. ieee, 2009, pp. 32-37.  
+[23] s. fujimoto, h. van hoof, and d. meger, "addressing function approximation error in actor-critic methods," arxiv preprint arxiv:1802.09477, 2018.  
+[24] y. gao, l. chen, and b. li, "spotlight: optimizing device placement for training deep neural networks," in proceedings of the 35th international conference on machine learning, ser. proceedings of machine learning research, j. dy and a. krause, eds., vol. 80. stockholm, stockholm sweden: pmlr, 10-15 jul 2018, pp. 1676-1684. [online]. available: http://proceedings.mlr.press/v80/gao18a.html  
+[25] t. haarnoja, a. zhou, p. abbeel, and s. levine, "soft actor-critic: off-policy maximum entropy deep reinforcement learning with a stochastic actor," arxiv preprint arxiv:1801.01290, 2018.  
+[26] c. hao, x. zhang, y. li, s. huang, j. xiong, k. rupnow, w.-m. hwu, and d. chen, "fpga/dnn co-design: an efficient design methodology for 1ot intelligence on the edge," in 2019 56th acm/ieee design automation conference (dac). ieee, 2019, pp. 1-6.  
+[27] k. he, x. zhang, s. ren, and j. sun, "deep residual learning for image recognition," in proceedings of the ieee conference on computer vision and pattern recognition, 2016, pp. 770-778.  
+[28] x. he, l. liao, h. zhang, l. nie, x. hu, and t.-s. chua, “neural collaborative filtering,” in proceedings of the 26th international conference on world wide web, 2017, pp. 173–182.  
+[29] j. h. holland, "genetic algorithms," scientific american, vol. 267, no. 1, pp. 66-73, 1992.  
+[30] w. jiang, e. h.-m. sha, x. zhang, l. yang, q. zhuge, y. shi, and j. hu, "achieving super-linear speedup across multi-fpga for real-time dnn inference," acm transactions on embedded computing systems (tecs), vol. 18, no. 5s, pp. 1-23, 2019.  
+[31] w. jiang, e. h.-m. sha, q. zhuge, l. yang, x. chen, and j. hu, "heterogeneous fpga-based cost-optimal design for timing-constrained cnns," ieee transactions on computer-aided design of integrated circuits and systems, vol. 37, no. 11, pp. 2542-2554, 2018.  
+[32] w. jiang, l. yang, e. sha, q. zhuge, s. gu, y. shi, and j. hu, "hardware/software co-exploration of neural architectures," arxiv preprint arxiv:1907.04650, 2019.  
+[33] w. jiang, x. zhang, e. h.-m. sha, q. zhuge, l. yang, y. shi, and j. hu, "xfer: a novel design to achieve super-linear performance on multiple fpgas for real-time ai," in proceedings of the 2019 acm/sigda international symposium on field-programmable gate arrays, 2019, pp. 305-305.  
+[34] n. p. jouppi, c. young, n. patil, d. patterson, g. agrawal, r. bajwa, s. bates, s. bhatia, n. boden, a. borchers et al., "in-datacenter performance analysis of a tensor processing unit," in international symposium on computer architecture (isca). ieee, 2017, pp. 1-12.  
+[35] s. kirkpatrick, c. d. gelatt, and m. p. vecchi, “optimization by simulated annealing,” science, vol. 220, no. 4598, pp. 671–680, 1983.  
+[36] f. kjolstad, s. kamil, s. chou, d. lugato, and s. amarasinghe, "the tensor algebra compiler," proceedings of the acm on programming languages, vol. 1, no. oopsla, pp. 1-29, 2017.  
+[37] a. klöckner, “loo.py: transformation-based code generation for gpus and cpus,” in proceedings of acm sigplan international workshop on libraries, languages, and compilers for array programming, 2014, pp. 82–87.  
+[38] h. kwon, p. chatarasi, m. pellauer, a. parashar, v. sarkar, and t. krishna, "understanding reuse, performance, and hardware cost of dnn dataflow: a data-centric approach," in proceedings of the 52nd annual ieee/acm international symposium on microarchitecture, 2019, pp. 754-768.  
+[39] h. kwon, a. samajdar, and t. krishna, “maeri: enabling flexible dataflow mapping over dnn accelerators via reconfigurable interconnects,” acm sigplan notices, vol. 53, no. 2, pp. 461–475, 2018.  
+[40] n. d. lane, s. bhattacharya, p. georgiev, c. forlivesi, l. jiao, l. qendro, and f. kawsar, "deepx: a software accelerator for low-power deep learning inference on mobile devices," in 2016 15th acm/ieee international conference on information processing in sensor networks (ipsn). ieee, 2016, pp. 1-12.  
+[41] h. larochelle, d. erhan, a. courville, j. bergstra, and y. bengio, "an empirical evaluation of deep architectures on problems with many factors
+
+of variation," in proceedings of the 24th international conference on machine learning, 2007, pp. 473-480.  
+[42] h. li, x. fan, l. jiao, w. cao, x. zhou, and l. wang, "a high performance fpga-based accelerator for large-scale convolutional neural networks," in 2016 26th international conference on field programmable logic and applications (fpl). ieee, 2016, pp. 1-9.  
+[43] t. p. lillicrap, j. j. hunt, a. pritzel, n. heess, t. erez, y. tassa, d. silver, and d. wierstra, "continuous control with deep reinforcement learning," arxiv preprint arxiv:1509.02971, 2015.  
+[44] q. lu, w. jiang, x. xu, y. shi, and j. hu, "on neural architecture search for resource-constrained hardware platforms," arxiv preprint arxiv:1911.00105, 2019.  
+[45] y. ma, y. cao, s. vrudhula, and j.-s. seo, “optimizing loop operation and dataflow in fpga acceleration of deep convolutional neural networks,” in proceedings of the 2017 acm/sigda international symposium on field-programmable gate arrays, 2017, pp. 45–54.  
+[46] a. mirhoseini, h. pham, q. v. le, b. steiner, r. larsen, y. zhou, n. kumar, m. norouzi, s. bengio, and j. dean, "device placement optimization with reinforcement learning," in proceedings of the 34th international conference on machine learning-volume 70. jmlr.org, 2017, pp. 2430-2439.  
+[47] v. mnih, a. p. badia, m. mirza, a. graves, t. lillicrap, t. harley, d. silver, and k. kavukcuoglu, "asynchronous methods for deep reinforcement learning," in international conference on machine learning, 2016, pp. 1928-1937.  
+[48] v. mnih, k. kavukcuoglu, d. silver, a. graves, i. antonoglou, d. wierstra, and m. riedmiller, "playing atari with deep reinforcement learning," arxiv preprint arxiv:1312.5602, 2013.  
+[49] m. motamedi, p. gysel, v. akella, and s. ghiasi, "design space exploration of fpga-based deep convolutional neural networks," in 2016 21st asia and south pacific design automation conference (asp-dac). ieee, 2016, pp. 575-580.  
+[50] d. novillo, "samplepgo-the power of profile guided optimizations without the usability burden," in 2014 llvm compiler infrastructure in hpc. ieee, 2014, pp. 22-28.  
+[51] a. paliwal, f. gimeno, v. g. nair, y. li, m. lubin, p. kohli, and o. vinyals, "reinforced genetic algorithm learning for optimizing computation graphs," 2020.  
+[52] a. parashar, p. raina, y. s. shao, y.-h. chen, v. a. ying, a. mukkara, r. venkatesan, b. khailany, s. w. keckler, and j. emer, "timeloop: a systematic approach to dnn accelerator evaluation," in 2019 ieee international symposium on performance analysis of systems and software (ispass). ieee, 2019, pp. 304-315.  
+[53] m. parsa, a. ankit, a. ziabari, and k. roy, "pabo: pseudo agent-based multi-objective bayesian hyperparameter optimization for efficient neural accelerator design," arxiv preprint arxiv:1906.08167, 2019.  
+[54] m. pelikan, d. e. goldberg, e. cantú-paz et al., "boa: the bayesian optimization algorithm," in proceedings of the genetic and evolutionary computation conference gecco-99, vol. 1, 1999, pp. 525-532.  
+[55] n. pinto, d. doukhan, j. j. dicarlo, and d. d. cox, "a high-throughput screening approach to discovering good forms of biologically inspired visual representation," *plos computational biology*, vol. 5, no. 11, 2009.  
+[56] i. popov, n. heess, t. lillicrap, r. hafner, g. barth-maron, m. vecerik, t. lampe, y. tassa, t. erez, and m. riedmiller, "data-efficient deep reinforcement learning for dexterous manipulation," arxiv preprint arxiv:1704.03073, 2017.  
+[57] a. radford, j. wu, r. child, d. luan, d. amodei, and i. sutskever, "language models are unsupervised multitask learners," openai blog, vol. 1, no. 8, p. 9, 2019.  
+[58] j. ragan-kelley, c. barnes, a. adams, s. paris, f. durand, and s. amarasinghe, “halide: a language and compiler for optimizing parallelism, locality, and recomputation in image processing pipelines,” acm sigplan notices, vol. 48, no. 6, pp. 519–530, 2013.  
+[59] b. reagen, j. m. hernández-lobato, r. adolf, m. gelbart, p. whatmough, g.-y. wei, and d. brooks, "a case for efficient accelerator design space exploration via bayesian optimization," in 2017 ieee/acm international symposium on low power electronics and design (islped). ieee, 2017, pp. 1-6.  
+[60] b. reagen, p. whatmough, r. adolf, s. rama, h. lee, s. k. lee, j. m. hernandez-lobato, g.-y. wei, and d. brooks, "minerva: enabling low-power, highly-accurate deep neural network accelerators," in 2016 acm/ieee 43rd annual international symposium on computer architecture (isca). ieee, 2016, pp. 267-278.
+
+[61] t. salimans, j. ho, x. chen, s. sidor, and i. sutskever, “evolution strategies as a scalable alternative to reinforcement learning,” arxiv preprint arxiv:1703.03864, 2017.  
+[62] m. sandler, a. howard, m. zhu, a. zhmoginov, and l.-c. chen, "mobilenetv2: inverted residuals and linear bottlenecks," in proceedings of the ieee conference on computer vision and pattern recognition, 2018, pp. 4510-4520.  
+[63] m. sankaradas, v. jakkula, s. cadambi, s. chakradhar, i. durdanovic, e. cosatto, and h. p. graf, "a massively parallel coprocessor for convolutional neural networks," in 2009 20th ieee international conference on application-specific systems, architectures and processors. ieee, 2009, pp. 53-60.  
+[64] g. santoro, m. r. casu, v. peluso, a. calimera, and m. alioto, "energy-performance design exploration of a low-power microprogrammed deep-learning accelerator," in 2018 design, automation & test in europe conference & exhibition (date). ieee, 2018, pp. 1151-1154.  
+[65] e. schkufza, r. sharma, and a. aiken, "stochastic superoptimization," acm sigarch computer architecture news, vol. 41, no. 1, pp. 305-316, 2013.  
+[66] j. schulman, f. wolski, p. dhariwal, a. radford, and o. klimov, “proximal policy optimization algorithms,” arxiv preprint arxiv:1707.06347, 2017.  
+[67] y. s. shao, s. l. xi, v. srinivasan, g.-y. wei, and d. brooks, "designing accelerators and soc interfaces using gem5-aladdin," in 2016 49th annual ieee/acm international symposium on microarchitecture (micro). ieee, 2016, pp. 1-12.  
+[68] y. shen, m. ferdman, and p. milder, "maximizing cnn accelerator efficiency through resource partitioning," in 2017 acm/ieee 44th annual international symposium on computer architecture (isca). ieee, 2017, pp. 535-547.  
+[69] d. stamoulis, e. cai, d.-c. juan, and d. marculescu, “hyperpower: power-and memory-constrained hyper-parameter optimization for neural networks,” in 2018 design, automation & test in europe conference & exhibition (date). ieee, 2018, pp. 19-24.  
+[70] d. stamoulis, t.-w. chin, a. k. prakash, h. fang, s. sajja, m. bognar, and d. marculescu, "designing adaptive neural networks for energy-constrained image classification," in proceedings of the international conference on computer-aided design, 2018, pp. 1-8.  
+[71] m. steuwer, t. remmelg, and c. dubach, “lift: a functional data-parallel ir for high-performancegpu code generation,” in 2017 ieee/acm international symposium on code generation and optimization (cgo). ieee, 2017, pp. 74–85.  
+[72] i. sutskever, o. vinyals, and q. v. le, "sequence to sequence learning with neural networks," in advances in neural information processing systems, 2014, pp. 3104-3112.  
+[73] r. s. sutton, d. a. mcallester, s. p. singh, and y. mansour, "policy gradient methods for reinforcement learning with function approximation," in advances in neural information processing systems, 2000, pp. 1057-1063.  
+[74] c. szegedy, s. ioffe, v. vanhoucke, and a. a. alemi, "inception-v4, inception-resnet and the impact of residual connections on learning," in thirty-first aaai conference on artificial intelligence, 2017.  
+[75] m. tan, b. chen, r. pang, v. vasudevan, m. sandler, a. howard, and q. v. le, “mnasnet: platform-aware neural architecture search for mobile,” in proceedings of the ieee conference on computer vision and pattern recognition, 2019, pp. 2820–2828.  
+[76] m. tan, b. chen, r. pang, v. vasudevan, m. sandler, a. howard, and q. v. le, “mnasnet: platform-aware neural architecture search for mobile,” in proceedings of the ieee conference on computer vision and pattern recognition, 2019, pp. 2820–2828.  
+[77] m. tan and q. v. le, "efficientnet: rethinking model scaling for convolutional neural networks," arxiv preprint arxiv:1905.11946, 2019.  
+[78] r. r. torrado, p. bontrager, j. togelius, j. liu, and d. perez-liebana, "deep reinforcement learning for general video game ai," in 2018 ieee conference on computational intelligence and games (cig). ieee, 2018, pp. 1-8.  
+[79] n. vasilache, o. zinenko, t. theodoridis, p. goyal, z. devito, w. s. moses, s. verdoolaage, a. adams, and a. cohen, "tensor comprehensions: framework-agnostic high-performance machine learning abstractions," arxiv preprint arxiv:1802.04730, 2018.  
+[80] a. vaswani, n. shazeer, n. parmar, j. uszkoreit, l. jones, a. n. gomez, l. kaiser, and i. polosukhin, “attention is all you need,” in advances in neural information processing systems, 2017, pp. 5998–6008.
+
+[81] r. wei, l. schwartz, and v. adve, "dlvm: a modern compiler infrastructure for deep learning systems," arxiv preprint arxiv:1711.03016, 2017.  
+[82] x. wei, y. liang, x. li, c. h. yu, p. zhang, and j. cong, "tgpa: tile-grained pipeline architecture for low latency cnn inference," in proceedings of the international conference on computer-aided design, 2018, pp. 1-8.  
+[83] x. wei, c. h. yu, p. zhang, y. chen, y. wang, h. hu, y. liang, and j. cong, "automated systolic array architecture synthesis for high throughput cnn inference on fpgas," in proceedings of the 54th annual design automation conference 2017, 2017, pp. 1-6.  
+[84] r. c. whaley and j. j. dongarra, "automatically tuned linear algebra software," in sc'98: proceedings of the 1998 acm/ieee conference on supercomputing. ieee, 1998, pp. 38-38.  
+[85] y. wu, m. schuster, z. chen, q. v. le, m. norouzi, w. macherey, m. krikun, y. cao, q. gao, k. macherey et al., "google's neural machine translation system: bridging the gap between human and machine translation," arxiv preprint arxiv:1609.08144, 2016.  
+[86] y. wu, e. mansimov, r. b. grosse, s. liao, and j. ba, "scalable trust-region method for deep reinforcement learning using kronecker-factored approximation," in advances in neural information processing systems, 2017, pp. 5279-5288.  
+[87] y. wu and y. tian, “training agent for first-person shooter game with actor-critic curriculum learning,” 2016.  
+[88] l. yang, z. yan, m. li, h. kwon, l. lai, t. krishna, v. chandra, w. jiang, and y. shi, "co-exploration of neural architectures and heterogeneous asic accelerator designs targeting multiple tasks," arxiv preprint arxiv:2002.04116, 2020.  
+[89] x. yang, m. gao, j. pu, a. nayak, q. liu, s. e. bell, j. o. setter, k. cao, h. ha, c. kozyrakis et al., "dnn dataflow choice is overrated," arxiv preprint arxiv:1809.04070, 2018.  
+[90] s. yin, p. ouyang, s. zheng, d. song, x. li, l. liu, and s. wei, “a 141 uw, 2.46 pj/neuron binarized convolutional neural network based self-learning speech recognition processor in 28nm cmos,” in 2018 ieee symposium on vlsi circuits. ieee, 2018, pp. 139–140.  
+[91] w. yonghui, m. schuster, z. chen, q. le, m. norouzi, w. macherey, m. krikun, y. cao, q. gao, k. macherey et al., "bridging the gap between human and machine translation," arxiv preprint arxiv:1609.08144, 2016.  
+[92] c. zhang, p. li, g. sun, y. guan, b. xiao, and j. cong, "optimizing fpga-based accelerator design for deep convolutional neural networks," in proceedings of the 2015 acm/sigda international symposium on field-programmable gate arrays, 2015, pp. 161-170.  
+[93] c. zhang, d. wu, j. sun, g. sun, g. luo, and j. cong, "energy-efficient cnn implementation on a deeply pipelined fpga cluster," in proceedings of the 2016 international symposium on low power electronics and design, 2016, pp. 326-331.  
+[94] x. zhang, j. wang, c. zhu, y. lin, j. xiong, w.-m. hwu, and d. chen, "dnnbuilder: an automated tool for building high-performance dnn hardware accelerators for fpgas," in 2018 ieee/acm international conference on computer-aided design (iccad). ieee, 2018, pp. 1-8.  
+[95] z. zhao, h. kwon, s. kuhar, w. sheng, z. mao, and t. krishna, "mrna: enabling efficient mapping space exploration for a reconfiguration neural accelerator," in 2019 ieee international symposium on performance analysis of systems and software (ispass). ieee, 2019, pp. 282-292.  
+[96] s. zheng, p. ouyang, d. song, x. li, l. liu, s. wei, and s. yin, "an ultra-low power binarized convolutional neural network-based speech recognition processor with on-chip self-learning," ieee transactions on circuits and systems i: regular papers, vol. 66, no. 12, pp. 4648-4661, 2019.  
+[97] g. zhong, a. prakash, s. wang, y. liang, t. mitra, and s. niar, "design space exploration of fpga-based accelerators with multi-level parallelism," in design, automation & test in europe conference & exhibition (date), 2017. ieee, 2017, pp. 1141-1146.  
+[98] s. zhong, y. shen, and f. hao, "tuning compiler optimization options via simulated annealing," in 2009 second international conference on future information technology and management engineering. ieee, 2009, pp. 305-308.

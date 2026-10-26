@@ -1,0 +1,451 @@
+# pytorch distributed: experiences on accelerating data parallel training
+
+shen li† yanli zhao† rohan varma† omkar salpekar†
+
+pieter noordhuis* teng li† adam paszke‡
+
+jeff smith† brian vaughan† pritam damania† soumith chintala†
+
+{shenli, yanlizhao, rvarm1, osalpekar}@fb.com,
+
+pcnoordhuis@gmail.com, tengli@fb.com, adam.paszke@gmail.com,
+
+{jeffksmith, bvaughan, pritam.damania, soumith}@fb.com
+
+facebook ai
+
+$^{\dagger}$ university of warsaw
+
+# abstract
+
+this paper presents the design, implementation, and evaluation of the pytorch distributed data parallel module. pytorch is a widely-adopted scientific computing package used in deep learning research and applications. recent advances in deep learning argue for the value of large datasets and large models, which necessitates the ability to scale out model training to more computational resources. data parallelism has emerged as a popular solution for distributed training thanks to its straightforward principle and broad applicability. in general, the technique of distributed data parallelism replicates the model on every computational resource to generate gradients independently and then communicates those gradients at each iteration to keep model replicas consistent. despite the conceptual simplicity of the technique, the subtle dependencies between computation and communication make it non-trivial to optimize the distributed training efficiency. as of v1.5, pytorch natively provides several techniques to accelerate distributed data parallel, including bucketing gradients, overlapping computation with communication, and skipping gradient synchronization. evaluations show that, when configured appropriately, the pytorch distributed data parallel module attains near-linear scalability using 256 gpus.
+
+*this work was conducted when pieter noordhuis was an employee at facebook.
+
+# 1. introduction
+
+deep neural networks (dnn) have powered a wide spectrum of applications, ranging from image recognition [20], language translation [15], anomaly detection [16], content recommendation [38], to drug discovery [33], art generation [28], game play [18], and self-driving cars [13]. many applications pursue higher intelligence by optimizing larger models using larger datasets, craving advances in distributed training systems. among existing solutions, distributed data parallel is a dominant strategy due to its minimally intrusive nature. this paper presents the design, implementation, and evaluation of the distributed data parallel package in pytorch v1.5 [30].
+
+training a dnn model usually repeatedly conducts three steps [26], the forward pass to compute loss, the backward pass to compute gradients, and the optimizer step to update parameters. the concept of data parallelism is universally applicable to such frameworks. applications can create multiple replicas of a model, with each model replica working on a portion of training data and performing the forward and backward passes independently. after that, model replicas can synchronize either their gradients or updated parameters depending on the algorithm. it's nominally possible to build a working version of data parallel purely on the application side, as it only requires inserting appropriate communications into every iteration. however, squeezing out the last bit of performance takes an enormous amount of effort in design and tuning. providing native distributed data parallel apis on the platform side would help application developers focus on optimizing their models, while the platform developing team could continuously and transparently improve the training speed. to provide a general distributed data parallel package, the challenges are three-fold.
+
+- mathematical equivalence: the purpose of data parallel is to speed up training on large datasets. applications expect to harvest the same result model as if all training had been performed locally without model replication. this requires mathematical equivalence to local training despite its distributed nature.
+
+- non-intrusive and interceptive api: application developments usually start from local models and then scale out when necessary. to avoid the exorbitant
+
+hurdles during the transition, the api must be nonintrusive in application code. on the other hand, the api needs to allow the internal implementation to timely intercept signals to carry out communications and system optimizations.
+
+- high performance: data parallel training is subject to subtle dependencies between computations and communications. the design and implementation have to explore the solution space to efficiently convert more resources into higher training throughput.
+
+pytorch provides distributed data parallel as an nn-module class, where applications provide their model at construction time as a sub-module. to guarantee mathematical equivalence, all replicas start from the same initial values for model parameters and synchronize gradients to keep parameters consistent across training iterations. to minimize the intrusiveness, the implementation exposes the same forward [7] api as the user model, allowing applications to seamlessly replace subsequent occurrences of a user model with the distributed data parallel model object with no additional code changes. several techniques are integrated into the design to deliver high-performance training, including bucketing gradients, overlapping communication with computation, and skipping synchronization.
+
+evaluations were conducted on an exclusive 32-gpu cluster and on 256 gpus from a much larger shared entitlement. we developed benchmarks to evaluate the distributed package across different scales to present an in-depth view of the performance implications of different optimization techniques and configurations. experiments also cover the comparison between nccl and gloo communication libraries. the results show that 1) communication is the dominant training latency contributor, and its impact increases with model sizes; 2) bucket sizes considerably affect communication efficiency, which could lead to more than 2x speedup if configured properly; 3) skipping synchronizations appropriately would significantly reduce amortized communication overhead without noticeably degrading convergence speed.
+
+techniques described in this paper were first released in pytorch v1.1. during the past year, we have seen significant adoption both internally and externally. within facebook, a workload study from 05/11/20 to 06/05/20 shows that more than  $60\%$  of production gpu hours during that period were spent on the pytorch distributed data parallel package across a wide variety of applications, including speech, vision, mobile vision, translation, etc. there are three main contributions in this paper. first, this paper reveals the design and implementation of a widely adopted industrial state-of-the-art distributed training solution. second, this paper highlights real-world caveats (e.g., due to pluralized graphs) that were overlooked by prior work. third, we share performance tuning experiences collected from serving internal teams and open-source community users and summarized several directions for future improvements.
+
+the remainder of the paper is organized as follows. section 2 briefly introduces pytorch and data parallelism. section 3 elaborates the design for the pytorch distributed data parallel module. implementations and evaluations are presented in section 4 and section 5 respectively. then, section 6 discusses lessons learned and opportunities for future improvements, and section 7 surveys related work. finally, section 8 concludes the paper.
+
+# 2. background
+
+before diving into distributed training, let us briefly discuss the implementation and execution of local model training using pytorch. then, we explain and justify the idea of data parallelism and describe communication primitives.
+
+# 2.1 pytorch
+
+pytorch organizes values into tensors which are generic n-dimensional arrays with a rich set of data manipulating operations. a module defines a transform from input values to output values, and its behavior during the forward pass is specified by its forward member function. a module can contain tensors as parameters. for example, a linear module contains a weight parameter and a bias parameter, whose forward function generates the output by multiplying the input with the weight and adding the bias. an application composes its own module by stitching together native modules (e.g., linear, convolution, etc.) and functions (e.g., relu, pool, etc.) in the custom forward function. a typical training iteration contains a forward pass to generate losses using inputs and labels, a backward pass to compute gradients for parameters, and an optimizer step to update parameters using gradients. more specifically, during the forward pass, pytorch builds an autograd graph to record actions performed. then, in the backward pass, it uses the autograd graph to conduct backpropagation to generate gradients. finally, the optimizer applies the gradients to update parameters. the training process repeats these three steps until the model converges.
+
+# 2.2 data parallelism
+
+pytorch offers several tools to facilitate distributed training, including dataparallel for single-process multi-thread data parallel training using multiple gpus on the same machine, distributeddataparallel for multi-process data parallel training across gpus and machines, and rpc [6] for general distributed model parallel training (e.g., parameter server [27]). this paper focuses on distributeddataparallel. data parallelism enables distributed training by communicating gradients before the optimizer step to make sure that parameters of all model replicas are updated using exactly the same set of gradients, and hence model replicas can stay consistent across iterations.
+
+parameter averaging is another popular technique to scale out model training. similarly, it can launch multiple processes across multiple machines, but instead of synchronizing gradients, parameter averaging directly computes the average of all model parameters. this occurs after the local optimizer step, meaning that parameter averaging can be implemented completely as an auxiliary step and does not need to interact with local training steps at all, which is attractive as it can easily and cleanly decouple the code of distributed training and local iterations. there are several caveats with parameter averaging.
+
+- parameter averaging can produce vastly different results compared to local training, which, sometimes, can be detrimental to model accuracy. the root cause is that parameter averaging is not mathematically equivalent to processing all input data locally, especially when the optimizer relies on past local gradients values (e.g., momentum). as different model replicas are likely to see different gradients, the states in optimizers can gradually diverge, causing conflicting gradient
+
+descent directions. this can result in inexplicable differences in performance when switching from locally optimized models to large scale deployed models.
+
+- the structure of parameter averaging orchestrates computation (i.e., backward pass) and communication (i.e., computing average) into non-overlapping phases, using optimizer step() functions as a hard separation point. regardless of how vigorously we optimize the computation or communication, one type of resource will stay idle at any given time instance, giving up a substantial performance optimization opportunity.
+
+given the above fundamental pitfalls, we decided to implement distributed training using data parallelism to synchronize gradients instead of parameters. note that, applications can still easily build parameter averaging using pytorch. in fact, the collective communication feature described in section 3.3 is an appropriate solution for this use case. applications just need to explicitly launch a11reduce operations to calculate averaged parameters accordingly.
+
+# 2.3 allreduce
+
+allreduce is the primitive communication api used by distributeddataparallel to compute gradient summation across all processes. it is supported by multiple communication libraries, including nccl [2], gloo [1], and mpi [4]. the allreduce operation expects each participating process to provide an equally-sized tensor, collectively applies a given arithmetic operation (e.g., sum, prod, min, max) to input tensors from all processes, and returns the same result tensor to each participant. a naive implementation could simply let every process broadcast its input tensor to all peers and then apply the arithmetic operation independently. however, as allreduce has significant impact on distributed training speed, communication libraries have implemented more sophisticated and more efficient algorithms, such as ring-based allreduce [2] and tree-based allreduce [22]. as one allreduce operation cannot start until all processes join, it is considered to be a synchronized communication, as opposed to the p2p communication used in parameter servers [27].
+
+# 3. system design
+
+pytorch [30] provides a distributeddataparallel  $(\mathsf{ddp}^1)$  module to help easily parallelize training across multiple processes and machines. during distributed training, each process has its own local model replica and local optimizer. in terms of correctness, distributed data parallel training and local training must be mathematically equivalent. ddp guarantees the correctness by making sure that all model replicas start from the exact same model state, and see the same parameter gradients after every backward pass. therefore, even though optimizers from different processes are all independent, they should be able to bring their local model replicas to the same state at the end of every iteration². fig. 1 illustrates building blocks of ddp, which contains a python api frontend, c++ gradient reduction core algorithm, and
+
+![](images/04cfdef79f0bb387ea43dd27f526ec54a2e4d7ccf9948d750b3c61aea3e13afd.jpg)  
+figure 1: distributeddataparallel building blocks
+
+employs the c10d collective communication library. the following sections are presented in the top-down order of this stack graph.
+
+section 3.1 presents api design principles. section 3.2 explains gradient reduction techniques used in pytorch distributed data parallel training. finally, section 3.3 discusses the collective communication backends for ddp.
+
+# 3.1 api
+
+when designing the api, we have defined two design goals to achieve the necessary functionality.
+
+- non-intrusive: the api must be non-intrusive to applications. application developers usually start from writing local training scripts, and scale out when hitting the resource limit on a single machine. at that point, it is unacceptable to ask developers to rewrite the entire application to enable distributed data parallel training. instead, the developer should be able to reuse the local training script with minimal modifications.  
+- interceptive: the api needs to allow the implementation to intercept various signals and trigger appropriate algorithms promptly. distributed data parallel aims at accelerating training by using more computational resources. this process requires subtle optimizations in both computations and communications to achieve the best performance. hence, the api must expose as many optimization opportunities as possible to the internal implementation.
+
+given the above requirements, we implemented distributed data parallel as an nn-module, which takes the local model as a constructor argument and transparently synchronizes gradients in the backward pass. the code snippet below shows an example of using ddp module. this example uses an nn.linear layer to create a local model on line 10. then, it converts the local model into a distributed training model on line 11 and sets up the optimizer on line 12. line 14 through 23 are typical forward pass, backward pass, and optimizer step implementations. in this toy distributed training example, line 11 is the only difference that converts a local training application into a distributed one, which satisfies the non-intrusive requirement. it also fulfills the interceptive requirement. the constructor allows ddp to inspect the model structure and parameters. after construction, the local model is replaced by the distributed one, which can then
+
+![](images/c5ee0bc436ba9f314b6e798dc10c640f20c8803080068720ec24c71af85d598b.jpg)  
+(a) nccl
+
+![](images/21f84c18dc3c3c60558524def7366cc7a6bda5c6823985ad359a868d9a8b61da.jpg)  
+(b) gloo
+
+![](images/7c4cdc162f4fb27c054bfb7b2e0a0edb9aa15597b4bda71e591aeb7aba19d7e8.jpg)  
+(c) gpu  
+figure 2: communication vs computation delay
+
+![](images/6257b320b79d16847cc8dc4477ed314b42a8598f6da03a181e8009aa45cd0963.jpg)  
+(d) cpu
+
+easily intercept the forward() call to perform necessary actions accordingly. for the backward pass, ddp relies on backward hooks to trigger gradient reduction, which will be invoked by the autograd engine when executing backward() on the loss tensor.
+
+```python
+1 import torch   
+2 import torch(nn as nn   
+3 import torch(nn(parallel as par   
+4 import torch.optim as optim   
+5   
+6 # initialize torch.distributed properly   
+7 # with init_process_group   
+8   
+9 # setup model and optimizer   
+10 net  $=$  nn.linear(10,10)   
+11 net  $=$  par.distributeddataparallel(net)   
+12 opt  $=$  optim.sgd(net.params(),lr=0.01)   
+13   
+14 # run forward pass   
+15 inp  $=$  torch randn(20,10)   
+16 exp  $=$  torch randn(20,10)   
+17 out  $=$  net(inp)   
+18   
+19 # run backward pass   
+20 nn.mseloss() (out，exp).backward()   
+21   
+22 # update parameters   
+23 opt step()
+```
+
+# 3.2 gradient reduction
+
+the gradient reduction algorithm in ddp has evolved over the past releases. to introduce the structure of the current implementation, let us start from a naive solution, gradually introduce more complexities, and land in the current version as of today in pytorch v1.5.0. this will also explain how the same simple api described in section 3.1 allows us to install various performance optimization algorithms.
+
+# 3.2.1 a naive solution
+
+as mentioned in the beginning of section 3, ddp guarantees correctness by letting all training processes (1) start from the same model state and (2) consume the same gradients in every iteration. the former can be achieved by
+
+broadcasting model states from one process to all others at the construction time of ddp. to implement the latter, a naive solution can insert a gradient synchronization phase after the local backward pass and before updating local parameters. however, the api shown in section 3.1 does not provide an explicit entry point for this phase as there is nothing between backward() and step(). fortunately, the pytorch autograd engine accepts custom backward hooks. ddp can register autograd hooks to trigger computation after every backward pass. when fired, each hook scans through all local model parameters, and retrieves the gradient tensor from each parameter. then, it uses the a11reduce collective communication call to calculate the average gradients on each parameter across all processes, and writes the result back to the gradient tensor.
+
+the naive solution is sufficient for our purposes, but there are two performance concerns.
+
+- collective communication performs poorly on small tensors, which will be especially prominent on large models with massive numbers of small parameters.  
+- separating gradient computation and synchronization forfeits the opportunity to overlap computation with communication due to the hard boundary in between.
+
+the following sections elucidates solutions to address the above two concerns.
+
+# 3.2.2 gradient bucketing
+
+the idea of gradient bucketing is motivated by the observation that collective communications are more efficient on large tensors. fig. 2 (a) and (b) provide a quantitative view, which show the total execution time to a11reduce 60m torch.float32 parameters with different numbers of parameters per a11reduce. to maximize the bandwidth utilization, a11reduce operations are launched asynchronously and block waiting on all of them together, mimicking ddp's gradient reduction algorithm. the experiments are conducted on an nvlink [3] enabled server with two nvidia quadro gp100 gpus. nccl [2] a11reduce runs on cuda input tensors directly, while gloo [1] a11reduce runs on cpu input tensors to eliminate the overhead of copying between cuda memory to cpu memory when using gloo backend. the total communication time clearly decreases when using larger input tensors, for both nccl and gloo. gloo reaches a pinnacle speed at around 500k parameters per input tensor, while there is no clear saturation signal for nccl on nvlink with even 20m-parameter gpu tensors.
+
+these experiments suggest that, instead of launching a dedicated a11reduce immediately when each gradient tensor becomes available, ddp can achieve higher throughput and lower latency if it waits for a short period of time and buckets multiple gradients into one a11reduce operation. this would be especially helpful for models with many small parameters. however, ddp should not communicate all gradients in one single a11reduce, otherwise, no communication can start before the computation is over. fig. 2 (c) and (d) show the gpu and cpu backward computations time of a resnet152 [20] that contains roughly 60m parameters. the x axis is the number of ready gradients and the y axis the time elapsed since the beginning of the backward pass. the backward on gpu takes about 250ms to complete, which is in the same order of magnitude as nccl on nvlink. this conclusion also applies to gloo and cpu backward. these
+
+![](images/24c4028d0173de5292e75f8a0c136b2acd4aa098ba7d105e15b9675fd2ea9ed2.jpg)  
+figure 3: gradient synchronization failures
+
+measurements herald that, with relatively small bucket sizes, ddp can launch allreduce operations concurrently with the backward pass to overlap communication with computation, which would make a difference in per iteration latency.
+
+# 3.2.3 overlap computation with communication
+
+the a11reduce operation on gradients can start before the local backward pass finishes. with bucketing, ddp only needs to wait for all contents in the same bucket before launching communications. under such settings, triggering a11reduce at the end of the backward pass is no longer sufficient. it needs to react to more frequent signals and launches a11reduce more promptly. therefore, ddp registers one autograd hook for each gradient accumulator. the hook fires after its corresponding accumulator updating the gradients, and will inspect the bucket it pertains. if hooks of all gradients in the same buckets have fired, the last hook will trigger an asynchronous a11reduce on that bucket.
+
+two caveats require caution. first, the reducing order must be the same across all processes, otherwise, a11reduce contents might mismatch, resulting in incorrect reduction result or program crash. however, pytorch dynamically builds the autograd graph in every forward pass, and different processes might not agree on the gradient ready order. fig. 3 (a) shows one example, where the two vertical axes represent time and dotted lines indicate when a gradient is ready. in process 1, the four gradients are computed in order, but the gradient  $g_{2}$  are computed after  $g_{3}$  and  $g_{4}$  on process 2. in this case, if all processes a11reduce buckets as soon as they become ready, the a11reduce content would mismatch. therefore, all processes must use the same bucketing order, and no process can launch a11reduce on bucket i+1 before embarking bucket i. if bucket 0 is the last one that becomes ready, there is no way that communication can overlap with computation. pytorch v1.5.0 addresses this problem by using the reverse order of model.params() as the bucketing order, assuming that, layers are likely registered according to the same order as they are invoked in the forward pass. hence, the reverse order should approximately represent the gradient computation order in the backward pass. admittedly, this is not a perfect solution, but is an approximation that we can rely on with minimum engineering overhead.
+
+second, it is possible that one training iteration only involves a sub-graph in the model and the sub-graph can be different from iteration to iteration, meaning that some gradients might be skipped in some iterations. however, as gradient-to-bucket mapping is determined at the construction time, those absent gradients would leave some buckets never seeing the final autograd hook and failing to mark the bucket as ready. as a result, the backward pass could hang.
+
+fig. 3 (b) shows an example, where the parameter corresponding to gradient  $g_{3}$  is skipped in one iteration, leading to the absent of the ready signal for  $g_{3}$ . to address this problem, ddp traverses the autograd graph from the output tensors of the forward pass to find all participating parameters. the readiness of those participating tensors is a sufficient signal to conclude the completion of the backward pass. therefore, ddp can avoid waiting for the rest of the parameter gradients by proactively marking them ready at the end of the forward pass. note that, this change does not prevent us from developing non-intrusive apis, because application directly invokes the forward function on ddp and hence ddp can easily insert this step in its member function.
+
+algorithm 1: distributeddataparallel  
+input: process rank  $r$  , bucket size cap  $c$  , local model net   
+1 function constructor(net): if  $r = 0$  then broadcast net states to other processes init buckets, allocate parameters to buckets in the reverse order of net.params() for p in net.params() do acc  $\leftarrow$  p.grad accumulator acc  $\rightarrow$  add_post hook(autograd hook)   
+8 function forward (inp): out  $=$  net(inp) traverse autograd graph from out and mark unused parameters as ready return out   
+12 function autograd hook(param_index): get bucket  $b_{i}$  and bucket offset using param_index get parameter var using param_index view  $\leftarrow$  bi.narrow(offset,var.size()) view.copy_(var.grad) if all grads in  $b_{i}$  are ready then mark  $b_{i}$  as ready launch allreduce on ready buckets in order if all buckets are ready then block waiting for all allreduce ops
+
+algorithm 1 presents the pseudo-code of ddp. the constructor contains two major steps, broadcasting model states and installing autograd hooks. ddp's forward function is a simple wrapper of the local model's forward, and traverses the autograd graph to mark unused parameters at the end. the autograd hook takes the internal parameter index as input, which helps to find the parameter tensor and its belonging bucket. it writes the local gradient to the correct offset in the bucket and then launches the asynchronous a11reduce operation. there is an additional finalizing step omitted in the pseudo-code that waits for a11reduce operations and writes the value back to gradients at the end of the backward pass. fig. 4 elucidates how ddp interacts with the local model during the forward and backward passes.
+
+the above solution works for most use cases. however, as ddp always computes the average of all gradients and writes them back to parameter .grad field, an optimizer cannot distinguish whether a gradient has participated in the last backward pass or not. due to the decoupled design of ddp and the optimizer, there is no side channel for ddp to allude that information to the optimizer. without this information, the training process could suffer from regressions on
+
+![](images/f4756869d5c2494a2b9be051abe3dd3181f2277b04882bae1c04e4c27f5f68fd.jpg)  
+figure 4: distributed gradient reduction
+
+model accuracy, e.g., when the optimizer uses gradient absence information to skip updating momentum values. to tackle this problem, ddp should only touch gradients that are indeed involved in the backward pass. nevertheless, this information cannot be extracted from the local autograd graph alone, because locally absent gradients might still be involved in the forward/backward pass in a peer ddp process. therefore, ddp uses a bitmap to keep track of local parameter participants and launches one additional allreduce to collect globally unused parameters. unfortunately, ddp cannot coalesce this bitmap into other gradient allreduce operations due to the potential mismatch in element types. such additional overhead only materializes when the application explicitly tells ddp to look for unused parameters, and hence the price is only paid when necessary.
+
+# 3.2.4 gradient accumulation
+
+one common technique to speed up distributed data parallel training is to reduce gradient synchronization frequencies. instead of launching allreduce in every iteration, the application can conduct  $n$  local training iterations before synchronizing gradients globally. this is also helpful if the input batch is too large to fit into a device, where the application could split one input batch into multiple micro-batches, run local forward and backward passes on every micro-batch, and only launch gradient synchronization at the boundaries of large batches. theoretically, this should produce the same results as if all data in the large batch is processed in one shot, as gradients will simply be accumulated to the same tensor. however, this conflicts with the gradient reduction algorithm discussed in section 3.2.3 to some degree. that algorithm would mark unused parameters as ready at the end of every forward pass, while those unused parameters in one iteration still could participate in subsequent iterations. moreover, ddp cannot distinguish whether the application plans to immediately invoke optimizer step() after backward or accumulate gradients through multiple iterations. therefore, we need to introduce one additional interface (i.e., no_sync) for this use case. below is an example code snippet.
+
+```python
+1 ddp = distributeddataparallel(net)  
+2 with ddp.no_sync():  
+3 for inp, exp in zip(inputs, expected_outputs):  
+4 # no synchronization, accumulate grads  
+5 loss_fn(ipp, exp).backward()  
+6 # synchronize grads  
+7 loss_fn(ipp(another_inp), another_exp).backward()  
+8 opt-step()
+```
+
+under the hood, the implementation for no_sync is very simple. the context manager just toggles a flag on entering and exiting the context, and the flag is consumed in the forward function of ddp. in no_sync mode, all ddp hooks are disabled, and the first backward pass out of the context will synchronize the accumulated gradients altogether. the information of globally unused parameters also accumulates in the bitmap, and serves when the next communication takes place.
+
+# 3.3 collective communication
+
+distributed data parallel training uses a special communication pattern, where every participant provides an equally-sized tensor and collects the global sum across all participants. this can certainly be implemented as a gather operator followed by local reductions on every participant using point-to-point communication, but that would forfeit opportunities for performance optimizations [22]. ddp is built on top of collective communication libraries, including three options, nccl [2], gloo [1], and mpi [4].<sup>3</sup> ddp takes the apis from the three libraries and wraps them into the same processgroup api. the name heralds that processgroup expects multiple processes to work collectively as a group. all processgroup instances construct at the same time, which is implemented using a rendezvous service, where the first arrival will block waiting until the last instance joins. for nccl backend, the processgroup maintains a dedicated set of cuda streams for communication, so that it will not block the computation in the default stream. as all communications are collective operations, subsequent operations on all processgroup instances must match in size and type and follow the same order. using the same processgroup api for all libraries allows us to experiment with different communication algorithms with the same ddp implementation. for example, pytorch v1.5 provides a composite round-robin processgroup implementation, which takes a list of processgroup instances and dispatches collective communications to those processgroup instances in a round-robin manner. by using round-robin processgroups, ddp can attain higher bandwidth utilization if a single nccl, gloo, or mpi processgroup is unable to saturate the link capacity.
+
+# 4. implementation
+
+the implementation of ddp has evolved several times in the past few releases. this section focuses on the current status as of pytorch v1.5.0. ddp implementation lives both in python and c++ files, with python exposing the api and composing non-performance-critical components, and c++ serving the core gradient reduction algorithm. the python api calls into c++ core through pybind11 [5].
+
+# 4.1 python front-end
+
+the ddp nn-module is implemented in distributed.py, which contains user-facing components, including the constructor, the forward function, and the no_sync context manager. besides the general ideas highlighted in section 3, there are several implementation details in the python frontend that shape the behavior of ddp.
+
+configurable knobs are exposed in the ddp constructor api, including 1) process_group to specify a process group
+
+instance for ddp to run allreduce, which helps to avoid messing up with the default process group, 2) bucket_cap_mb to control the allreduce bucket size, where applications should tune this knob to optimize training speed, and 3) find_unused_parameters to toggle whether ddp should detect unused parameters by traversing the autograd graph. model device affinity in the local model also governs ddp's behavior, especially if the model spans multiple devices, which is common when the model is too large to fit into a single device. for large models, applications can place different layers of the model onto difference devices, and use tensor.to(device) api to move intermediate output from one device to another. ddp also works with multi-device models. as long as the device_ids argument is none or an empty list, ddp will inspect the model, perform sanity checks and apply configurations accordingly. then, it treats the multi-device model as one entirety.
+
+model buffers are necessary when layers (e.g., batchnorm) need to keep track of states like the running variance and the running mean. ddp supports model buffers by letting the process with the rank 0 to take the authority. if the model contains buffers, ddp will broadcast the buffer values from rank 0 process to all other processes before starting the forward pass on the local model. this behavior is also compatible with the no_sync mode. when no_sync mode is enabled, it sets a flag in the forward pass properly to indicate whether it expects gradient reductions in the immediate backward pass. if the communication takes place, ddp will then broadcast buffers prior to the subsequent forward pass.
+
+# 4.2 core gradient reduction
+
+major development efforts are spent in gradient reduction as it is the most performance-critical step in ddp. the implementation lives in reducer.cpp which consists of four main components, namely, building parameter-to-bucket map, installing autograd hooks, launching bucket a11reduce, and detecting globally unused parameters. this section expatiates on these four components.
+
+parameter-to-bucket mapping has considerable impact on ddp speed. in every backward pass, tensors are copied from all parameter gradients to buckets, and averaged gradients are copied back after allreduce. to accelerate copy operations, buckets are always created on the same device as the parameters. if the model spans multiple devices, ddp takes device affinity into consideration to make sure that all parameters in the same bucket are on the same device. the order of allreduce also makes a difference, as it dictates how much communication can overlap with computation. ddp launches allreduce in the reverse order of model.params().
+
+autograd hook is the entry point for ddp in the backward pass. during construction, ddp loops over all parameters in the model, finds the gradient accumulator on every parameter, and installs the same post-hook function to every gradient accumulator. the gradient accumulator will fire post hooks when the corresponding gradient is ready, and ddp will figure out when an entire bucket is ready to launch an allreduce operation. however, as there is no guarantee on the order of gradient readiness, ddp cannot selectively pick parameters to install hooks. in the current implementation, each bucket keeps a count of pending gradients. each post-hook function decrements the count, and ddp marks a bucket as ready when that count reaches zero.
+
+![](images/84ceb408b864a3c15ac893a8aaf4607a9d7fb1d6dc432d6837f1846873b43a03.jpg)  
+figure 5: gpu connection topology
+
+in the next forward pass, ddp replenishes the pending gradient count for every bucket.
+
+bucket allreduce is the main source of communication overhead in ddp. on one hand, packing more gradients into the same bucket would reduce the amortized system overhead of communication. one the other hand, using a large bucket size would result in longer lead time for reduction, as each bucket needs to wait for more gradients. hence, bucket size is the key trade-off. by default, each bucket is 25mb in size. applications should measure their impact empirically and set it to the optimal value for their use cases.
+
+globally unused parameters' gradients should stay intact during the forward and the backward passes. detecting unused parameters requires global information, as one parameter could be absent in one ddp process during one iteration, but participates training in the same iteration in another process. ddp maintains local unused parameter information in a bitmap, and launches an additional allreduce to gather a global bitmap. as the bitmap is much smaller than tensor sizes, instead of creating per-bucket bitmaps, all parameters in the model share the same bitmap. the bitmap lives on cpu to avoid launching dedicated cuda kernels for each update. however, some processgroup backends might not be able to run allreduce on cpu tensors. for example, processgroupnccl only supports cuda tensors. moreover, as ddp should work with any custom processgroup backend, it cannot make assumptions that all backends support cpu tensors. to address this problem, ddp maintains another bitmap on the same device as the first model parameter, and invokes a non-blocking copy to move the cpu bitmap to the device bitmap for collective communications.
+
+# 5. evaluation
+
+this section presents the evaluation results of pytorch ddp using an exclusive 32 gpu cluster and a shared entitlement. in the exclusive cluster, the gpus are located on 4 servers, connected using mellanox mt27700 connectx-4 100gb/s nic. all 4 servers reside in the same rack, and each server is equipped with 8 nvidia tesla v100 gpus. fig. 5 shows the interconnection of the 8 gpus within the same server. we only use the shared entitlement when a set of experiments require more than 32 gpus. in the shared entitlement, we submit jobs to run on different numbers of gpus where different jobs can run on different machines, and hence the hardware and network connectivity can vary from job to job. although the disparity in the test environment can lead to different latency measures even for the same code, we pack the same set of experiments into the
+
+![](images/0305e925966dffebaf4c17091010e7a407eb1d3e3091ffb7bbd8aba4a35eb1a0.jpg)  
+figure 6: per iteration latency breakdown
+
+same job, so that the trend shown in the same curve is still meaningful.
+
+we measure ddp per iteration latency and scalability using two popular models, resnet50 [20] and bert [15], to represent typical vision and nlp applications. most experiments use randomly generated synthetic inputs and labels, which are sufficient as the purpose is to compare per iteration latency instead of model accuracy. experiments compute losses using the crossentropyloss function and update parameters using the sgd optimizer. configurations for accuracy-related experiments will be explained in detail close to their presentations.
+
+# 5.1 latency breakdown
+
+a typical training iteration contains three steps: forward pass to compute loss, backward pass to compute gradients, and optimizer step to update parameters. with ddp, the backward pass involves local computation and a11reduce communication. to demonstrate the effectiveness of overlapping computation with communication, fig. 6 plots the latency breakdown when using nccl and gloo backends for resnet50 and bert models respectively. all experiments are conducted using 32 gpus across 4 machines. to visually compare the speedup on different model and backend combinations, we normalize the total latency to 1 for all non-overlapping cases. the results demonstrate that the backward pass is the most time-consuming step with pytorch ddp training, as a11reduce communications (i.e., gradient synchronization) are completed in this step. this observation justifies that the ddp backward pass deserves the most efforts for improvements. within the backward pass, the communication step takes more than half of the total delay and this is exacerbated with the increase of model size. between these two backends, nccl is considerably faster than gloo. the speedup is most effective when the computation and communication take roughly the same amount of time as they can overlap more. the overlapping approach helps resnet and bert on nccl attain  $38.0\%$  and  $35.2\%$  speedup. with gloo backend, the gain shrinks to  $26.8\%$  and  $21.5\%$  respectively, as gloo communication becomes the dominating delay in the backward pass.
+
+# 5.2 bucket size
+
+to avoid launching an excessive number of a11reduce operations, ddp organizes small gradients into larger buckets and synchronizes each bucket using an a11reduce operation. with this design, bucket size is an important configuration knob. ddp exposes this knob to applications through bucket_cap_mb argument. no single bucket size can best serve all applications. this value should be measured and determined empirically. the default value of bucket_cap_mb is 25mb, which is our best effort estimation based experiences. the following experiments also confirm this is a rea
+
+sonable choice for resnet50 and bert. this section compares per iteration latency across different bucket sizes using 16 gpus on two machines. zero bucket size means each gradient will be communicated on its own as soon as it is ready. this serves as a baseline on one extreme of the bucket size spectrum. the other extreme is communication all gradients in one short, which is skipped as results in fig. 7 and fig. 8 clearly show the best option for both resnet50 and bert is somewhere in the middle.
+
+fig. 7 (a) uses box-whisker to illustrate how bucket size affects per iteration latency on resnet50 with nccl backend. the x-axis is the bucket size in mbs, and y-axis per iteration latency in seconds. the outliers are the tiny delay spikes at 100 iteration boundaries caused by ddp instance re-construction and input data regeneration. other than that, delays of most iterations concentrate in a very narrow time range, which also agrees with the results shown in fig. 6 (a). the results show that the highest speed is achieved between 10mb and 25mb bucket sizes. fig. 7 (b) presents the same measurements for gloo backend. the results are different from nccl backend in two ways, 1) per iteration latency falls into a large range, 2) the 5mb bucket size attains higher speed compared to 10mb and 25mb. the first difference matches with fig. 6 (b). to understand the second difference, let us revisit fig. 2 (b) on gloo a11reduce latency across different tensor sizes. it's clear that the total a11reduce time fluctuates around the same level when the bucket size is larger than 512kb. therefore, larger bucket sizes beyond 512kb with gloo backend would only mean longer waiting time for gradients, which leads to longer per iteration latency. fig. 7 (c) and (d) show the measurements for bert model. as bert model contains 15x more parameters compared to resnet50, intuitively, it should benefit from larger buckets as larger communication overheads would dwarf the waiting time for the first bucket. the results verified the intuition with nccl backend, where 50mb bucket size leads to the best performance. however, with gloo backend, 5mb bucket size still wins with the lowest per iteration latency.
+
+fig. 8 presents the results of the same set of experiments but on 32 gpus. in this case, the outliers span a larger range, which is not surprising as synchronizations usually take longer with more participants and the impact of strangler is more prominent. fig. 8 (a) and (b) both suggest that 0mb bucket size leads to obviously longer per iteration latency on 32 gpus compared to 16 gpus, as per-gradient reductions on a larger cluster are expected to be slower. however, when bucket size is set to above 5mb, scaling from 16 gpus to 32 gpus does not lead to a noticeable speed regression. this is probably because although individual allreduce operations is expected to be slower, asynchronous execution and parallelism could help to hide the overall delay.
+
+# 5.3 scalability
+
+to understand the scalability of ddp, we measure per iteration training latency of resnet50 and bert using nccl and gloo backend on up to 256 gpus in the shared entitlement. results are presented in fig. 9. the x-axis is the number of gpus, and y-axis the latency. figure 9 (a) shows that the per iteration latency steadily increases as it scales out. using 256 gpus leads to  $100\%$  slow down in each iteration compared to local training, meaning that the real
+
+![](images/efebd5adb60d05b348ba20d5835b21d970e10553342f922d218ab6929a75953b.jpg)  
+(a) resnet50 on nccl
+
+![](images/43ebf723196529bcf5d222bafe2099b68eb4c176a582ea74af08de63d2c01dc2.jpg)  
+(b) resnet50 on gloo
+
+![](images/a0a1e671b4e670833672ad4347a4baecc72699edf89c4ad86ccac7bb76f6bb44.jpg)  
+(c) bert on nccl
+
+![](images/45077dfc72180609fff7cfdcca5b719829fe06d6e95e083abcc33316e7c357a8.jpg)  
+(d) bert on glooo
+
+![](images/80218de5a3e96dc5009330ff0d6a2cb1f24751ad3bc7a72b252a6c50ee7d5d8e.jpg)  
+(a) resnet50 on nccl
+
+![](images/c371db908c2e1561e624a660cfcfe4f0558c626f17152986301b63707f5c1fad.jpg)  
+(b) resnet50 on gloo
+
+![](images/3b3b3fdf0914aaae04e5d7c673f0b905ef3f642ceb0eb01289bfdc163323ec6f.jpg)  
+figure 7: per iteration latency vs bucket size on 16 gpus  
+(c) bert on nccl
+
+![](images/d2be772cd09ae9e251d7d6bba923750e4e287fbe8a5b86aaefcd079d814da0b8.jpg)  
+(d) bert on gloo  
+figure 8: per iteration latency vs bucket size on 32 gpus
+
+scaling factor is  $256 \times 50\% = 128$ . with the bert model, the per-iteration latency significantly increases due to the larger model size. another observation is that the 16-gpu case suffers a longer per-iteration delay compared to the 32-gpu case in figure 9 (c). we suspect this is because either the 16-gpu experiments were on a slow or congested link or there are other workflows in the shared entitlement competing for resources with our job. fig. 9 (b) and (d) show the results for gloo backend and the per-iteration slowdown is about 3x for resnet and 6x for bert when using 256 gpus. the deteriorated training speed with larger model sizes indicates that the network is the bottleneck resource when using gloo backend in this experiment.
+
+in general, scaling out to more gpus slows down individual iterations. one option to mitigate the overhead is skipping gradient synchronizations, i.e., perform gradient reduction every  $n$  iterations. this approach helps to considerably reduce the amortized latency. fig. 10 depicts the average per iteration latency for conducting gradient reduction every 1, 2, 4, and 8 iterations. to visually compare the effectiveness of this method, we consolidated different skipping configurations for the same model and backend combination into the same figure. resnet50 on nccl and gloo sees  $38\%$  and  $57\%$  speed up with 256 gpus when conducting gradient sync every 8 iterations. there is a sudden jump in delay with nccl backend when scaling from 128 to 256 and this occurs to all experiments shown in this figure. we believe this is caused by slow or congested links among some of those 256 nodes which are not included in the 128-gpu experiments. besides the per iteration latency, it's also crucial to measure the convergence speed to verify if the acceleration might be erased by convergence slowdown. the experiments use mnist [25] dataset to train the
+
+resnet. the learning rate is set to 0.02 and the batch size is 8. results are plotted in fig. 11 (a), which only contains the measurements for nccl backend as the communication layer does not change the convergence speed. x-axis is the number of iterations and y-axis the loss. please note that the goal of this experiment is not developing the best model for mnist, instead, it only aims to show the impact of skipping synchronization on the model convergence. the raw loss data oscillate severely, which are presented by the tiny dots. directly connecting them into a line would result in the last curve covering all previous drawn ones, making them less visible. therefore, we apply an order 3 low pass filter by using filtfilt from scipy [8] and plot the smoothed loss curve. the figure confirms that using no-sync in this case only leads to negligible exacerbation to the convergence speed. however, we must emphasize that the impact of no-sync could depend on the configuration. fig. 11 (b) shows similar measurements by replacing batch size to 256 and learning rate to 0.06. as highlighted by the red box in the right bottom corner, no-sync hurts the final training loss. it is because large batch size and no-sync cause more gradients to be accumulated between consecutive communications and optimizer steps, which implicitly requires using a smaller learning rate. in summary, when skipping synchronizations properly, ddp attains near linear scalability with negligible accuracy penalty.
+
+# 5.4 round-robin process group
+
+another technique to speed up training is to use multiple process groups to work around subtle intrinsic concurrency limitations in process group backend implementations. the concurrency limitations could come from nccl streams or gloo threads, depending on the type of the backend, which
+
+![](images/35b41554299a637088b5d1020b57cecafa75658535005210f9c31db8ca75036b.jpg)  
+(a) resnet50 on nccl
+
+![](images/28fd870b206fb673f9e0cf7f5b7a2d0c5a681214a856fe84cd7f517caf092592.jpg)  
+(b) resnet50 on gloo
+
+![](images/3b46f77d8e40b8cca342afaceb67f24d76e7f809587b6d0a0a61f771b94ab712.jpg)  
+(c) bert on nccl
+
+![](images/8699a2477024dba3e758c0046286e56cbecd4d63c5fd7e9617068aa06d9c79fe.jpg)  
+(d) bert on glooo
+
+![](images/6c8717649b445004614c71137fc503ee54c510a346612c2c70b1325f93918020.jpg)  
+(a) resnet50 on nccl
+
+![](images/2fd3e667374a5b3934caf33a54f16a55a3e00e6f541d7b09c922c91d888ac4ea.jpg)  
+figure 9: scalability  
+(b) resnet50 on gloo
+
+![](images/9ac8744214f95fdbc9527df36463494320fa4a633d7a1dbeeefba9ed8ce8a31c.jpg)  
+(a) batch size  $= 8$
+
+![](images/78f456e683ccbee38c81adcb6f6a467a9521d16a4694c00f01257222c38ad3e4.jpg)  
+(b) batch size  $= 256$
+
+![](images/2cb3c7592a4d1ea2f0722ff99ee6af74b6100620ab6e162ccbcb68eeb8812b2e.jpg)  
+figure 10: skip gradient synchronization  
+(a) resnet50 on nccl
+
+![](images/798c5d598de413642db9b7837c13cd918fbb839624c1f9e7f6ff7bbf3f6f9018.jpg)  
+(b) resnet50 on gloo  
+figure 12: round-robin process group
+
+![](images/3ce751ce7b0630f27cbc04f9e7443f2e5882e021f95db5417015ddd540dd8b3b.jpg)  
+(c) bert on nccl
+
+![](images/8f43a403a56ae495489278be0467ba9c3246a22259ac41be62722ac51cd1dfdd.jpg)  
+figure 11: accuracy with skipping synchronization  
+(d) bert on glooo
+
+might prevent one process group instance to fully utilize all link bandwidth. the pytorch distributed package supports composing a round-robin process group with multiple nccl or gloo process groups, which dispatches collective communications to different process group instances in robin-robin order. fig. 12 plots the per iteration latency of round-robin process group using 1, 3, and 5 nccl or gloo process groups, where rrx stands for round-robin with x process group instances. resnet50 on nccl backend sees negligible differences with different amounts of process groups, meaning that for relatively small models like resnet50, bandwidth is not the bottleneck resource. noticeable difference can be observed in resnet50 on gloo, where rr3 consistently outperforms rr1. the most prominent acceleration occurs in bert model with nccl backend, where rr3 achieves  $33\%$  speedup compared to rr1 on 16 gpus, revealing that one nccl group is incompetent to saturate the link capacity.
+
+# 6. discussion
+
+this section discusses lessons learned from our experiments and past experiences. we then present several ideas for future improvements.
+
+# 6.1 lessons learned
+
+distributed data parallel training is a conceptually simple or practically subtle framework. there are various techniques to improve its speed, creating a complex configuration space. based on our observations, there is no single configuration that would work for all use cases, as it would highly depend on the model size, model structure, network link bandwidth, etc. however, on individual configuration dimensions, we summarized intuitions to help application developers to quickly navigate to a small range which likely contains the optimal solution for a given use case. the specific value of the configuration would require empirical measurements for every different deployment.
+
+- communication backend: nccl is considerably faster than gloo in most use cases. when available, applications should seek to use nccl as the primary collective communication backend.  
+- bucket size: both excessively small or large bucket sizes are detrimental to communication performance. the optimal value lives in between and depends on the type of communication backend employed. the optimal bucket sizes are likely to increase with the size of the model in a sub-linear manner.  
+- resource allocation: there is a significant slowdown with nccl backend when scaling models across machine boundaries, if the bandwidth across machines is considerably lower than that between same-machine gpus. in such cases, it is recommended to keep the ddp group within the same machine. if the training requires larger scale, developers can explore enabling no_sync mode if it attains acceptable convergence speed.
+
+# 6.2 future improvements
+
+while we implement and maintain the ddp package, several ideas for improvements popped up. this section discusses the basic ideas behind those improvements.
+
+# 6.2.1 gradient order prediction
+
+although ddp cannot deterministically detect the backward computation order on all parameters at construction time, the order usually does not change that often in practice. one viable solution is to trace the backward order using autograd hooks and update parameter to bucket mapping accordingly. as bucket re-allocation will introduce noticeable overhead, it should be conducted infrequently. given the existing complexities in ddp, tracing overhead should be negligible. nevertheless, if there are disparities among tracing results from different iterations, additional complexities will be necessary to reach a consensus.
+
+# 6.2.2 layer dropping
+
+one technique to accelerate training and avoid overfitting is to randomly drop layers during the forward pass [17]. this works well with local training. as every forward pass would build a new autograd graph, those skipped layers will not participate in the backward pass either. this idea also works with ddp, because parameters in skipped layers can be marked as ready in the forward pass and ddp will not wait for their autograd hooks during the backward pass. although ddp would produce the correct result, this technique alone is inadequate to accelerate distributed data parallel training the same way as local training due to the fixed parameter-to-bucket mapping. as a11reduce uses a bucket as the minimum granularity, it cannot judiciously react to vacancies in buckets (i.e., skipped layers or parameters). consequently, regardless of how the forward pass skips layers, there is always the same amount of data to be communicated across the wire during the backward pass. besides, ddp cannot afford the luxury to adjust all buckets to cooperate with randomly skipped layers, as that would result in unacceptable memory allocation overhead. to tackle this problem, one solution is to keep bucket buffers intact but modify parameter-to-bucket mappings accordingly. another option is to perform layer skips at the bucket level, i.e., ddp can map layers
+
+instead of parameters to buckets and all processes skip the same bucket in the same iteration. both options require extra coordination across all ddp processes, which can be implemented by using the same random seed or having an authority process to broadcast the plan.
+
+# 6.2.3 gradient compression
+
+another potential improvement for ddp is to reduce the volume of data for communication by compressing gradients. the absolute value of gradients are usually small, which might not require float32 or float64 types. current ddp implementation always uses the parameter type as the gradient type that can become an overkill especially when the model is approaching convergence. in this case, ddp would benefit from adaptive compression levels by only communicating gradients with the necessary precision. some recent research work [34] even proposes more aggressive compression schemes, where by trading a tiny amount of model accuracy, applications can significantly accelerate distributed training by communicating just 1 bit for each gradient.
+
+# 7. related work
+
+distributed training algorithms can be categorized into different types from different perspectives. below are three popular categorizations.
+
+- synchronous update vs asynchronous update: with the former, all model replicas can use allreduce to collectively communicate gradients or parameters, while the asynchronous scheme employs p2p communication to update gradients or parameters independently.  
+- cross-iteration vs intra-iteration: cross-iteration parallelism (e.g., pipeline parallelism) allows the lifetime of multiple iterations to overlap with each other, while intra-iteration scheme focuses on parallelizing training within one iteration.  
+- data parallel vs model parallel: data parallel training distributes input data to multiple model replicas, while model parallelism divides the model into smaller pieces, which is especially helpful when the model is too large to fit in one device or machine.
+
+table 1 summarizes some recent distributed training solutions by marking which scheme they can support. besides advances in training schemes, prior work has also explored different communication algorithms, including tree-based a11reduce [22], heterogeneity-aware interconnection structure [39], and a11reduce decomposition [14]. as this paper focuses on ddp, the remainder of this section only elaborates and compares closely related techniques, i.e., synchronous, intra-iteration, and data parallel training schemes.
+
+the techniques presented in this paper were first implemented and released in pytorch v1.1. similar computation-communication overlap techniques are also introduced in tensorflow v2.2 as the multi worker mirrored strategy [10]. this technique is researched in academia as well. gradientflow [37] combines bucketing a11reduce with skipping parameter synchronizations. compared to pytorch ddp, instead of skipping the entire synchronization step in one iteration, gradientflow selectively communicates a subset of gradients. although this strategy helps to reduce communication overhead for gradients, it requires an additional
+
+communication phase to attain consensus on which gradients to synchronize. as a result, the overhead incurred to acquire consensus might overshadow the speedup achieved in gradient synchronizations, especially for small models or large network round-trip delays.
+
+another approach to speeding up distributed training is preempting and prioritizing communications based on the order of downstream computations. jayarajan et al. [24] proposed to prioritize gradient synchronizations and parameter updates based on the forward order instead of the backward order, meaning that gradient buckets containing the initial layers should receive higher priorities than those in the final layers. communications should still start from final layer gradients, as they will become ready earlier, but higher priority gradients (i.e., in initial layers) can preempt lower priority ones. this design allows the forward pass in the next iteration to start sooner, even before finishing gradients communications in the previous iteration, creating more opportunities to overlap computations and communications. bytescheduler [31] explored scheduling communications for distributed data parallel training as well. however, instead of binding with a single framework, bytescheduler works for multiple frameworks by inserting a common core scheduler between framework apis and framework engines and uses per-engine plugins to intercept communication invocations. to integrate with pytorch, bytescheduler builds on top of horovod [35] which launches communication in the optimizer. one downside of this approach is that, there is a hard barrier between the backward pass and the optimizer step. as a result, communication can only overlap with the next forward pass instead of the current backward pass. with dynamic graphs, the next iteration might touch a different set of parameters, which would invalidate the schedule derived from the previous iteration. pace [12] computes the optimal communication schedule and implements preemption by segmenting primitive a11reduce operations into smaller pieces. although segmenting can indeed mimic preemption, it will on the other hand hurt the total communication time as we have seen in fig. 2. a more efficient approach would be to natively support prioritization in the communication libraries (e.g., nccl and gloo).
+
+the mixture of different parallelism scheme fosters even more powerful training paradigms. mesh-tensorflow [36] combines data parallelism with model parallelism. it vertically divides some layers by dimensions and replicating other layers where the given dimension is absent. zero [32] also combines data parallelism with model parallelism, but with minimum model replication to support fast training on super large models. the authors observed that main memory consumption contributors are input data, model parameters, gradients, optimizer states, and activations. splitting input data is trivial. however, model parameters and activations are compulsory ingredients for backward passes. zero addressed this problem by partitioning parameters, gradients, and optimizer states on each ddp instance. parameters are broadcast from the owner ddp instance to all others when necessary. activations are recomputed during the backward pass. compared to pytorch ddp, zero can scale to much larger models as each process only needs to maintain a small partition of the model. the high scalability is achieved by sacrificing the training speed, as the additional re-computation, broadcast, and gather would intro
+
+<table><tr><td>scheme</td><td>s</td><td>a</td><td>c</td><td>i</td><td>d</td><td>m</td></tr><tr><td>pt ddp [9]</td><td>✓</td><td></td><td></td><td>✓</td><td>✓</td><td></td></tr><tr><td>pt rpc [6]</td><td></td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr><tr><td>tf multiworkermirrored [10]</td><td>✓</td><td></td><td></td><td>✓</td><td>✓</td><td></td></tr><tr><td>tf parameterserver [11, 27]</td><td></td><td>✓</td><td></td><td>✓</td><td>✓</td><td>✓</td></tr><tr><td>mesh tensorflow [36]</td><td>✓</td><td></td><td></td><td>✓</td><td>✓</td><td>✓</td></tr><tr><td>gpipe [21]</td><td>✓</td><td></td><td>✓</td><td></td><td></td><td>✓</td></tr><tr><td>horovod [35]</td><td>✓</td><td></td><td></td><td>✓</td><td>✓</td><td></td></tr><tr><td>gradientflow [37]</td><td>✓</td><td></td><td></td><td>✓</td><td>✓</td><td></td></tr><tr><td>slowmo [40]</td><td></td><td>✓</td><td></td><td>✓</td><td>✓</td><td></td></tr><tr><td>pipedream [29]</td><td>✓</td><td></td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr><tr><td>zero [32]</td><td>✓</td><td></td><td></td><td>✓</td><td>✓</td><td>✓</td></tr><tr><td>parallax [23]</td><td>✓</td><td>✓</td><td></td><td>✓</td><td>✓</td><td>✓</td></tr><tr><td>bytescheduler [31]</td><td>✓</td><td></td><td>✓</td><td>✓</td><td>✓</td><td></td></tr><tr><td>tictac [19]</td><td></td><td>✓</td><td></td><td>✓</td><td>✓</td><td>✓</td></tr><tr><td>pace [12]</td><td>✓</td><td></td><td></td><td>✓</td><td>✓</td><td></td></tr></table>
+
+table 1: distributed training solutions: six schemes are synchronous-update vs asynchronous-update, cross-iteration vs intra-iteration, data-parallel vs model-parallel
+
+duce considerable overhead. hence, applications can choose which techniques to use based on the size of the given model and available resources. pipedream [29] employs a different approach where the model stack is decomposed into multiple stages, where data parallelism is applied within one stage and pipeline with model parallelisms govern the workload across stages. one subtle detail is that to attain high training speed, pipedream slightly sacrifices accuracy by using the latest gradients from multiple concurrent passes. although the gradient might not be derived from the current parameter states, the authors show that this mismatch is tolerable in practice. parallax [23] explored a hybrid structure that combines parameter-server [27] and collective communications. models are partitioned based on sparsity, where dense parameters are communicated using a11reduce and sparse tensors are placed to parameter servers. this design avoids densifying sparse tensors and communicating empty values, which is especially helpful for nlp models.
+
+# 8. conclusion
+
+this paper explained the design and implementation of the distributed data parallel module in pytorch v1.5, and conducted performance evaluations on nccl and gloo backend using resnet50 and bert models. ddp accelerates training by aggregating gradients into buckets for communication, overlapping communication with computation, and skipping synchronizations. we also highlighted real-world caveats in gradient synchronization which are important for broad adoption. results showed that ddp with nccl backend can achieve near-linear scalability on 256 gpus when configured properly. the measurements also revealed that the backward pass in ddp is the most expensive step in training and requires efforts from both framework developers to enable optimization algorithms and application developers to empirically configure the knobs. based on our observations, we shared lessons learned from serving a variety of application, discussed potential future improvements for distributed data parallel training, and enthusiastically encourage open source community to experiment with more novel ideas.
+
+# 9. references
+
+[1] gloo: a collective communications library. https://github.com/facebookincubator/gloo, 2019.  
+[2] nvidia collective communications library (nccl). https://developer.nvidia.com/ncc1, 2019.  
+[3] nvlink and nvswitch: the building blocks of advanced multi-gpu communication. https://www.nvidia.com/en-us/data-center/nvlink/, 2019.  
+[4] open mpi: a high performance message passing library. https://www.open-mpi.org/, 2019.  
+[5] pybind11: seamless operability between c++11 and python. https://pybind11.readthedocs.io/, 2019.  
+[6] pytorch distributed rpc framework. https://pytorch.org/docs/master/rpc.html, 2019.  
+[7] pytorch module forward function. https://pytorch.org/docs/stable/nn.html#torch. nnmodule.forward, 2019.  
+[8] scipy: open-source software for mathematics, science, and engineering. https://docs.scipy.org/, 2019.  
+[9] pytorch distributeddataparallel. https://pytorch.org/docs/stable/nn.html#torch. nn(parallel.distributeddataparallel,2020.  
+[10] tensorflow distributed training multiworkermirroredstrategy. https://www.tensorflow.org/guide/distributed_training#multiworkermirroredstrategy, 2020.  
+[11] tensorflow distributed training  
+parameterserverstrategy.  
+https://www.tensorflow.org/guide/distributed_training#parameterserverstrategy, 2020.  
+[12] y. bao, y. peng, y. chen, and c. wu. preemptive all-reduce scheduling for expediting distributed dnn training. in ieee infocom, 2020.  
+[13] m. bojarski, d. del testa, d. dworakowski, b. firner, b. flepp, p. goyal, l. d. jackel, m. monfort, u. muller, j. zhang, et al. end to end learning for self-driving cars. arxiv preprint arxiv:1604.07316, 2016.  
+[14] m. cho, u. finkler, m. serrano, d. kung, and h. hunter. blueconnect: decomposing all-reduce for deep learning on heterogeneous network hierarchy. ibm journal of research and development, 63(6):1-1, 2019.  
+[15] j. devlin, m.-w. chang, k. lee, and k. toutanova. bert: pre-training of deep bidirectional transformers for language understanding. arxiv preprint arxiv:1810.04805, 2018.  
+[16] m. du, f. li, g. zheng, and v. srikumar. deeplog: anomaly detection and diagnosis from system logs through deep learning. in proceedings of the 2017 acm sigsac conference on computer and communications security, pages 1285-1298, 2017.  
+[17] a. fan, e. grave, and a. joulin. reducing transformer depth on demand with structured dropout. arxiv preprint arxiv:1909.11556, 2019.  
+[18] x. guo, s. singh, h. lee, r. l. lewis, and x. wang. deep learning for real-time atari game play using offline monte-carlo tree search planning. in advances in neural information processing systems, pages 3338-3346, 2014.
+
+[19] s. h. hashemi, s. a. jyothi, and r. h. campbell. tictac: accelerating distributed deep learning with communication scheduling. arxiv preprint arxiv:1803.03288, 2018.  
+[20] k. he, x. zhang, s. ren, and j. sun. deep residual learning for image recognition. in proceedings of the ieee conference on computer vision and pattern recognition, pages 770-778, 2016.  
+[21] y. huang, y. cheng, a. bapna, o. first, d. chen, m. chen, h. lee, j. ngiam, q. v. le, y. wu, et al. gpipe: efficient training of giant neural networks using pipeline parallelism. in advances in neural information processing systems, pages 103-112, 2019.  
+[22] s. jeaugey. massively scale your deep learning training with nccl 2.4. https://devblogs.nvidia.com/ massively-scale-deep-learning-training-nccl-2-4/, february 2019.  
+[23] s. kim, g.-i. yu, h. park, s. cho, e. jeong, h. ha, s. lee, j. s. jeong, and b.-g. chun. parallax: sparsity-aware data parallel training of deep neural networks. in proceedings of the fourteenth eurosys conference 2019, pages 1-15, 2019.  
+[24] j. kosaian, k. v. rashmi, and s. venkataraman. parity models: erasure-coded resilience for prediction serving systems. in proceedings of the 27th acm symposium on operating systems principles, sosp 19, page 3046, new york, ny, usa, 2019. association for computing machinery.  
+[25] y. lecun, c. cortes, and c. burges. the mnist database. http://yann.lecun.com/exdb/mnist/, 1999.  
+[26] y. lecun, d. touresky, g. hinton, and t. sejnowski. a theoretical framework for back-propagation. in proceedings of the 1988 connectionist models summer school, volume 1, pages 21-28. cmu, pittsburgh, pa: morgan kaufmann, 1988.  
+[27] m. li, d. g. andersen, j. w. park, a. j. smola, a. ahmed, v. josifovski, j. long, e. j. shekita, and b.-y. su. scaling distributed machine learning with the parameter server. in 11th {usenix} symposium on operating systems design and implementation (osdi) 14), pages 583-598, 2014.  
+[28] h. mao, m. cheung, and j. she. deepart: learning joint representations of visual arts. in proceedings of the 25th acm international conference on multimedia, pages 1183-1191, 2017.  
+[29] d. narayanan, a. harlap, a. phanishayee, v. seshadri, n. r. devanur, g. r. ganger, p. b. gibbons, and m. zaharia. pipedream: generalized pipeline parallelism for dnn training. in proceedings of the 27th acm symposium on operating systems principles, pages 1-15, 2019.  
+[30] a. paszke, s. gross, f. massa, a. lerer, j. bradbury, g. chanan, t. killeen, z. lin, n. gimelshein, l. antiga, a. desmaison, a. kopf, e. yang, z. devito, m. raison, a. tejani, s. chilamkurthy, b. steiner, l. fang, j. bai, and s. chintala. pytorch: an imperative style, high-performance deep learning library. in advances in neural information processing systems 32, pages 8024-8035. curran associates, inc., 2019.
+
+[31] y. peng, y. zhu, y. chen, y. bao, b. yi, c. lan, c. wu, and c. guo. a generic communication scheduler for distributed dnn training acceleration. in proceedings of the 27th acm symposium on operating systems principles, pages 16-29, 2019.  
+[32] s. rajbhandari, j. rasley, o. ruwase, and y. he. zero: memory optimization towards training a trillion parameter models. arxiv preprint arxiv:1910.02054, 2019.  
+[33] b. ramsundar, p. eastman, p. walters, and v. pande. deep learning for the life sciences: applying deep learning to genomics, microscopy, drug discovery, and more." o'reilly media, inc.", 2019.  
+[34] f. seide, h. fu, j. droppo, g. li, and d. yu. 1-bit stochastic gradient descent and its application to data-parallel distributed training of speech dnns. in fifteenth annual conference of the international speech communication association, 2014.  
+[35] a. sergeev and m. d. balso. horovod: fast and easy distributed deep learning in tensorflow. arxiv preprint arxiv:1802.05799, 2018.  
+[36] n. shazeer, y. cheng, n. parmar, d. tran,
+
+a. vaswani, p. koanantakool, p. hawkins, h. lee, m. hong, c. young, et al. mesh-tensorflow: deep learning for supercomputers. in advances in neural information processing systems, pages 10414-10423, 2018.  
+[37] p. sun, y. wen, r. han, w. feng, and s. yan. gradientflow: optimizing network performance for large-scale distributed dnn training. ieee transactions on big data, 2019.  
+[38] a. van den oord, s. dieleman, and b. schrauwen. deep content-based music recommendation. in advances in neural information processing systems, pages 2643-2651, 2013.  
+[39] g. wang, s. venkataraman, a. phanishayee, j. thelin, n. devanur, and i. stoica. blink: fast and generic collectives for distributed ml. arxiv preprint arxiv:1910.04940, 2019.  
+[40] j. wang, v. tantia, n. ballas, and m. rabbat. slowmo: improving communication-efficient distributed sgd with slow momentum. arxiv preprint arxiv:1910.00643, 2019.

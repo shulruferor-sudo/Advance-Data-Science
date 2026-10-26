@@ -1,0 +1,301 @@
+# instead of rewriting foreign code for machine learning, automatically synthesize fast gradients
+
+william s. moses
+
+mit csail
+
+wmoses@mit.edu
+
+valentin churavy
+
+mit csail
+
+vchuravy@mit.edu
+
+# abstract
+
+applying differentiable programming techniques and machine learning algorithms to foreign programs requires developers to either rewrite their code in a machine learning framework, or otherwise provide derivatives of the foreign code. this paper presents enzyme<sup>1</sup>, a high-performance automatic differentiation (ad) compiler plugin for the llvm compiler framework capable of synthesizing gradients of statically analyzable programs expressed in the llvm intermediate representation (ir). enzyme synthesizes gradients for programs written in any language whose compiler targets llvm ir including c, c++, fortran, julia, rust, swift, mlir, etc., thereby providing native ad capabilities in these languages. unlike traditional source-to-source and operator-overloading tools, enzyme performs ad on optimized ir. on a machine-learning focused benchmark suite including microsoft's adbench, ad on optimized ir achieves a geometric mean speedup of  $4.5\mathrm{x}$  over ad on ir before optimization allowing enzyme to achieve state-of-the-art performance. packaging enzyme for pytorch and tensorflow provides convenient access to gradients of foreign code with state-of-the-art performance, enabling foreign code to be directly incorporated into existing machine learning workflows.
+
+# 1 introduction
+
+machine learning (ml) frameworks such as pytorch [48] and tensorflow [1] have become widespread as the primary workhorses of the modern ml community. computing gradients necessary for algorithms such as backpropagation [32], bayesian inference, uncertainty quantification [60], and probabilistic programming [16] requires all of the code differentiated to be written in these frameworks. this is problematic for applying ml to new domains as existing tools like physics simulators [23, 10, 17, 18, 35], game engines, and climate models [58] are not written in the domain specific languages (dsl's) of ml frameworks. the rewriting required has been identified as the quintessential challenge of applying ml to scientific computing [4]. as stated by rackauckas [50] "this is [the key challenge of scientific ml] because, if there is just one part of your loss function that isn't ad-compatible, then the whole network won't train."
+
+to remedy this issue, the trend has been to either create new dsl's [35, 17, 43] that make the rewriting process easier or to add differentiation as a first-class construct in programming languages [44, 9, 61, 37]. this results in efficient gradients, but still requires rewriting in either the dsl or the differentiable programming language. developers may want to use code foreign to a ml framework to either re-use existing tools or write loss functions in a language with an easier abstraction for their use case. while there exist reverse-mode automatic differentiation (ad) frameworks for various languages, using them automatically on foreign code for an ml framework is difficult as they still require rewriting and have limited support for cross-language ad and libraries[61, 33, 30, 36]. the two primary approaches to computing gradients are as follows.
+
+```c
+float mag(const float\* x);//compute magnitude in o(n)   
+void norm(float\* out, float\* in) { //float res  $=$  mag(in); code motion optimization can move outside the loop for(int  $\mathrm{i} = 0$  ; i<n; i++) { out[i]  $=$  in[i]/mag(in); }   
+//licm,then ad,o(n) //ad,then licm o(n^2) void  $\nabla$  norm(float\*out, float\*d_out, float\*in, float\*d_in){ float res  $=$  mag(in); for (int  $\mathrm{i} = 0$  ;i<n; i++) { out[i]  $=$  in[i]/res; } float d_res  $=$  0; for (int  $\mathrm{i} = 0$  ;i<n; i++) { float d_res  $=$  -in[i]*in[i]/res\*d_out[i]; d_in[i]  $+ =$  d_out[i]/res; }  $\nabla$  mag(in,d_in,d_res); }
+```
+
+figure 1: top: an  $o(n^2)$  function norm which normalizes a vector. running loop-invariant-codemotion (licm) [45, sec. 13.2] moves the  $o(n)$  call to mag outside the loop, reducing norm's runtime to  $o(n)$ . left: an  $o(n) \nabla$  norm resulting from running licm before ad. both mag and its adjoint  $\nabla$  mag are outside the loop. right: an  $o(n^2) \nabla$  norm resulting from running licm after ad.  $\nabla$  mag remains inside the loop as it uses a value computed inside the loop, making licm illegal.
+
+operator-overloading computes derivatives by providing differentiable versions of existing language constructs. examples include adept [33]/adol-c [27], c++ libraries providing differentiable types; and jax [9]/autograd [44], python libraries providing derivatives of numpy-style functions. these approaches, however, require rewriting programs to use differentiable operators in place of standard language utilities. this prevents differentiation of many libraries and code in other languages.
+
+source-rewriting [26] analyzes the source code of programs and emits source code defining the gradient. examples of tools include tapenade [30, 47] for c and fortran; adic [46] for c and  $\mathrm{c + + }$  and zygote [36, 38, 37] for julia. users must provide all code being differentiated to the tool aheadof-time and must write programs in a specific subset of the language. this makes source-rewriting hard to use with header-only libraries and impossible to use with precompiled libraries.
+
+both operator-overloading and source-rewriting ad systems differentiate programs before optimization. performing ad on unoptimized programs, however, may result in complicated gradients that cannot be simplified by future optimization. as an example, the gradient of norm in figure 1 runs in  $o(n)$  if optimization is run before ad and  $o(n^2)$  if optimization is run after ad.
+
+traditional ad systems have not operated on optimized intermediate representation (ir) as doing so requires either re-implementing all of the optimizations or working at a low-level after which optimization has already been performed. conventional wisdom says that producing efficient gradients for low-level ir is difficult as it lacks high-level information many tools rely upon: "ad is more effective in high-level compiled languages (e.g. julia, swift, rust, nim) than traditional ones such as c/c++, fortran and llvm ir [...]" – innes [36]. this paper challenges that wisdom by creating an efficient ad tool for llvm [41], a low-level ir and set of optimizations used by many compilers.
+
+this paper presents enzyme, an efficient cross-platform compiler plugin for automatic differentiation that operates on llvm ir [41] and makes the following contributions:
+
+- enzyme, a compiler plugin for llvm that can synthesize fast gradients of statically analyzable llvm ir, including ir generated by compiler frontends for c, c++, fortran, rust, swift, etc.  
+- pytorch-enzyme/tensorflow-enzyme, a foreign-function interface that allows machine learning researchers to use foreign code written in llvm-compiled languages in pytorch and tensorflow.  
+- enzyme.jl, a julia package that uses enzyme to synthesize gradients of code written in a dynamic high-level language using only low-level information.  
+- multisource ad and static library support by leveraging link-time optimization (lto) [41, 39].  
+- a study demonstrating that running ad after optimization results in significant performance gains on a standard machine learning benchmark suite [57] and achieves state-of-the-art performance.
+
+```c
+void f(void* dst, void* src) { memcpydst, src, 8); } // gradient memcpy for double inputs void grad_f(double\* dst, double\* ddst, double\* src, double\* dsrc) { // forward pass memcpydst, src, 8); // reverse pass dsrc[0] += ddst[0]; ddst[0] = 0; }
+```
+
+figure 2: top: call to memcpy for an unknown 8-byte object. left: gradient for a memcpy of 8 bytes of double data. right: gradient for a memcpy of 8 bytes of float data.
+
+related work clad is a plugin to the clang compiler that implements forward mode automatic differentiation on a subset of  $\mathrm{c} / \mathrm{c}++$  with reverse mode in development [59]. chen et al. [11] present an end-to-end differentiable model for protein structure prediction. difftaichi [35] implements a differentiable dsl for physics and robotics simulation. de avila belbute-peres et al. [17] also provide a differentiable physics framework. halide is a differentiable dsl for image processing [43]. swift implements first class automatic differentiation [61]. elliott [21] present a compiler plugin to provide differentiable programming in haskell. enzyme differs from the related work by running on generic low-level ir and post-optimization. this gives enzyme several performance and compatibility benefits that don't exist in current systems.
+
+# 2 design
+
+enzyme is composed of three stages: type analysis determines the underlying types of values, activity analysis determines what instructions and values can impact the gradient calculation, and synthesis creates the necessary functions to compute the gradient. a core design goal of enzyme is to operate upon optimized ir. as seen in figure 1 this can result in significant benefits such as simpler and more optimized gradients, though it requires working on a low-level representation. gradients synthesized by enzyme contain two parts: a forward pass that mirrors the original code and a reverse pass that computes the gradient by inverting the instructions in the forward pass. inverted instructions in the reverse pass are known as adjoints. for all differentiable instructions in llvm, enzyme defines an adjoint to describe how gradients propagate through each instruction.
+
+type analysis one challenge of performing ad on llvm ir (and even  $\mathrm{c / c + + }$ ) is that llvm types do not necessarily represent the type of the underlying data. for example, the memcpy function copies data between generic pointers without types (void*). creating a correct gradient for memcpy, however, requires knowing the type of the memory being copied. as shown in figure 2, copying 8 bytes of double data requires performing one double (8-byte) addition in the reverse pass, whereas copying 8 bytes of float data requires two float (4-byte) additions. these operations are incompatible, resulting in an incorrect gradient if the wrong one is used.
+
+enzyme determines the type of the data being copied by creating a new interprocedural type analysis. every value in a function is given a type tree that describes the known type at any given byte offset in the value. if the type at a particular offset is a pointer type, we have a new type tree that represents the types inside that offset. as an example the type tree {[]:pointer, [0]:double, [8]:integer} represents a pointer to a struct that contains first a double at byte 0, then an integer at byte 8.
+
+type analysis initializes the type trees of all values to empty and uses type based alias analysis (tbaa) metadata to initialize the type trees of loads, stores, and memcpy operations. tbaa allows us to make assumptions about the underlying type because of strict aliasing [19, 12]. for every kind of instruction, enzyme implements a type propagation rule that specifies how types flow through the instruction. as an example, if the result of a load is known to be type t, then the pointer loaded must be a pointer to t at offset 0. type analysis then runs all of the type propagation rules until a fixed point is reached. this is an application of abstract interpretation [15].
+
+```lisp
+double g(double* x) { return *x * *x; }  
+void f(double* x) { *x = g(x); }  
+{/*return val*/double, /*cache*/double}  
+augmented_g(double* x) {  
+    return {x[0]*x[0], x[0]};  
+}  
+void grad_g(double* x, double* d_x) {  
+    double* read_cache = malloc(10*8);  
+    for(int i=0; i<10; i++)  
+        readcache[i] = read();  
+    // reverse  
+    for(int i=10-1; i>=0; i--)  
+        d_x[i] += read_cache[i];  
+}  
+void grad_f(double* x, double* d_x) {  
+    {call, cache} = augmented_g(x);  
+    *x = call;  
+    double d_ret = *d_x;  
+    *d_x = 0;  
+    grad_g(x, d_x, d_ret, cache);  
+}
+```
+
+figure 3: left: caching the result of read for the reverse pass. right: creating an augmented forward pass for a function to ensure requisite values are cached for the reverse.
+
+activity analysis activity analysis determines what instructions could impact the gradient computation and is common in automatic differentiation systems to avoid performing unnecessary adjoints [56, 8]. enzyme also uses activity analysis to avoid taking gradients of "undifferentiable" instructions such as the cpuid instruction. an instruction is active iff it can propagate a differential value to its return or another memory location. for example, a function that counts the length of an active input array would not be active. in our implementation of activity analysis, we leverage llvm's alias analysis [3, ch. 12] and type analysis to help prove that instructions are inactive. as an example, any read-only function that returns an integer must be inactive since it cannot propagate adjoints through the return or any memory location. this is true because the adjoint of any integer value must be zero and while the instruction can read active memory it cannot propagate it anywhere.
+
+**shadow memory gradients of values are stored in shadow allocations.** consider the gradient of sum in the left of figure 3. the gradient function grad_sum takes in both  $x$  as an argument as well as the shadow d_x, where it will store the result. for every active value in the forward pass, enzyme creates and zeros a shadow version of that value. similarly, any data structures (including function arguments) need to be duplicated. for any data structures computed inside the function being differentiated enzyme will create a shadow data structure automatically. this involves duplicating any memory instructions such as malloc/new and stores of pointers, with equivalent shadow memory operations. finally, enzyme delays all dealocations until the memory is not needed by the gradient calculation. shadow memory is used to compute the adjoint of instructions like load in the reverse pass, which propagates the gradient of the load to the shadow of the pointer operand. given shadow versions of all arguments and active globals, the shadow version of any value can be computed by duplicating the instruction that created the original value, replacing operands with their shadow. for calls to functions, we return the shadow pointer along with the original pointer.
+
+synthesis given the results of type and activity analysis, enzyme can now perform synthesis, the creation of the gradient function. enzyme initializes all the shadow values as described above. for every basic block bb in the original program, enzyme creates a corresponding reverse block reverse_bb. enzyme then emits the adjoint of all instructions from bb into reverse_bb in reverse order. enzyme then branches to the reverse of bb's predecessor, returning if bb was the entry block. finally, enzyme replaces any return instruction in the forward pass with a branch to its reverse block. an example of this procedure is shown in figure 4.
+
+cache computing adjoints of certain instructions requires values computed in the forward pass. by default, enzyme will attempt to recompute these in the reverse pass. however, it may be impossible or less efficient to recompute certain instructions. the question of whether and how to cache is known as the well-studied "checkpointing" problem in the literature [25, 40]. checkpointing in enzyme
+
+```txt
+define double @relu3(double  $\% x$  ） reverse_if.end:   
+entry: ； adjoint of return store  $\% d\_ res = 1.0$  ； adjoint of  $\%$  res phi node  $\% d\_ call += if \% x > 0$  ，(load  $\% d\_ res$  )，else 0   
+;alloca  $\% d\_ call = 0.0$  store  $\% d\_ res = 0.0$    
+;alloca  $\% d\_ result = 0.0$  br %cmp,  $\%$  reverse_if:true,  $\%$  reverse_entry   
+br  $(\% x > 0)$  ,if:true,if.end reverse_if:true: if true: ； adjoint of  $\%$  call  $\% df = 3 * @pow(\% x, 2)$    
+br cond.end store  $\% d\_ call = 0.0$    
+if.end:  $\%$  res  $=$  phi[%call,if(true],  $\rightarrow [0,$  entry]   
+ret %res reverse_entry:  $\% \theta =$  load  $\% d\_ x$  ret  $\% \theta$
+```
+
+figure 4: example gradient synthesis for relu  $(\mathsf{pow}(\mathsf{x},3))$ . the left hand side shows the llvm ir for the original computation. in the comments on the left we show the shadow allocations of active variables that would be added to the forward pass. the right hand side shows the reverse pass that enzyme would generate. the full synthesized gradient function would combine these (with shadow allocations added), replacing the return in if .end with a branch to reverse_if .end.
+
+adds additional complexity with the inclusion of potentially-aliasing memory, a cost model for llvm instructions (many of which are cost-free), and the impact of checkpointing on future optimization.
+
+consider the calls to read on the left of figure 3, which cannot be recomputed. enzyme provides a cache (often referred to as a tape in other ad systems) that provides forward-pass values to the reverse pass. in this example, enzyme allocates memory (in this case an array of 10 doubles) to store the values needed by the reverse pass. if enzyme can statically bound the number of values needing to be cached (e.g. a loop of fixed size), it will perform a single allocation to cache that instruction. if not, enzyme will dynamically reallocate memory. for function calls, enzyme may need to augment a call in the forward pass as shown in the right of figure 3 to save values needed to compute the adjoint of the call.
+
+to maximize performance, it is often desirable to reduce the number of values cached and enzyme contains optimizations to reduce the number of values that need caching. enzyme greatly benefits from llvm's alias analysis and function attributes by proving that it is legal to recompute certain instructions. enzyme also runs a differential-use analysis to determine which values are not necessary for computing the gradient and avoids caching them. this analysis is sometimes referred to as "to be recorded analysis" in other systems [31]. additionally, if enzyme already cached an equivalent value (e.g. a load to the same location which couldn't have since been written to), enzyme simply reuses the existing cache for that value. finally, if a cached value  $a$  is only used to recompute a single value  $b$  in the reverse pass, enzyme will choose to cache the value  $b$  instead of the value  $a$ , minimizing the amount of work in the reverse pass.
+
+function calls it is desirable to compute both the forward and reverse pass in the same function. this allows for optimization between the forward and reverse pass, and can reduce memory usage. enzyme detects whether it is legal to move the forward pass instructions of a function into the adjoint computation. if so, the forward pass call is erased and the combined function is used as the adjoint.
+
+an indirect function call is a call to an anonymous function pointer which is not known at compile time. like all other active pointers in a function, there exists a shadow version of the function pointer being called. whenever a function pointer is used outside of a static call, we create a new global variable containing a pair of functions, namely the augmented forward and reverse pass. this global is then used as the shadow pointer for the original function. thus, whenever enzyme needs to perform an adjoint of an active indirect function call, it extracts the augmented forward and gradient functions from the shadow of the indirect callee, then uses those functions in the adjoint. like the rest of shadow memory, this is handled automatically by enzyme for all objects created inside functions being differentiated. if you want enzyme to differentiate a function with a virtual  $\mathrm{c}++$  class as an argument, however, you need to pass in a modified virtual method table in the shadow that conforms with enzyme's calling convention.
+
+```c
+__attribute__( enzyme("augment", augment_f), enzyme("gradient", gradient_f)   
+double f(double in);   
+double func(double\* x, double\* y){ return  $\mathsf{f}(*\mathsf{x}) + \mathsf{f}(*\mathsf{y})$  1   
+1
+```
+
+```cpp
+double dfunc(double\*x,double \*d_x, double\*y){ _enzyme_autodiff(func, //the variable  $x$  is active diffe_dup,x,d_x, //the variable  $y$  is constant diffe_const,y);   
+}
+```
+
+figure 5: left: specifying a custom forward and reverse pass for f. right: creating a gradient for func with  $x$  as an active variable and  $y$  as a constant.
+
+```txt
+function f(x)  
+sum = zero(x)  
+for i = 1:10^7  
+sum += x^i / i  
+end  
+return sum  
+end
+```
+
+figure 6: left: a simple scalar function computing a taylor expansion. center: the runtime of the gradient as computed by enzyme.jl and two common julia ad frameworks. right: how enzyme can be embedded in existing ad frameworks to use enzyme's efficient implementation of scalars.
+
+limitations enzyme needs access to the ir for any function being differentiated to create adjoints. this prevents enzyme from differentiating functions loaded or created at runtime like a shared library or self-modifying code. enzyme also must be able to deduce the types of active memory operations and phi nodes. practically, this means enabling tbaa for your language and limiting yourself to programs with statically-analyzable types (no unions of differing types nor copies of undefined memory). enzyme presently does not implement adjoints of exception-handling instructions so exceptions should be turned off (e.g. with -fno-exceptions for a c++ compiler).
+
+# 3 usage
+
+enzyme is designed to simplify both importing foreign code into machine-learning workflows and providing native ad for llvm-based languages. enzyme is implemented as an llvm compiler plug-in, allowing it to be easily used in existing tools without need to build and maintain custom forks of llvm, pytorch, or tensorflow.
+
+static languages using gradients inside llvm-based languages simply requires calling an external `enzyme_autodiff` function as shown on the right in figure 5. for added control, users may whether a variable is active by including either an enzyme-specific variable or metadata as part of the function call. enzyme requires the ir for all functions it may need to differentiate to be available when the pass is run. for single-source codes all the ir is simply available. codebases with multiple source files or those using external libraries require an additional step. enzyme makes use of link-time optimization (lto) [39, 41], a compiler technique for whole-program optimization that preserves ir from all source files until link time where a final set of interprocedural optimizations may run. to use enzyme on multi-source codebases, enable lto and run enzyme on the merged ir for all the sources. static libraries can be handled by compiling them with the - fembed-bitcode command that ensures that bytecode is included in the library as well. this allows one to perform ad on a program linking against a static library, by extracting the bytecode in the static library, and then running enzyme on the original program with the ir of the static library.
+
+programmers can use custom forward and backward passes in enzyme by specifying them as metadata on the function to be differentiated, even if the definition of that function is not available during ad. in a separate clang c/c++ frontend extension, we allow users to specify this directly with function attributes as on the left in figure 5. internally, one can also specify the type propagation, activity analysis, and adjoint rules for custom foreign functions. to minimize the amount of work for users, we provide these rules for common functions in the c/c++ standard and math libraries.
+
+dynamic languages dynamic languages such as julia require more consideration. julia uses llvm to perform native code generation for functions as a just-in-time compiler. the ir for all
+
+```cpp
+void f(float* inp, size_t n, float* out); // input tensor + size, and output tensor  
+void diffe(float* inp, float* d_inp, size_t n, float* d_out) { // diffe_dupnoneed specifies not recomputing the output  
+    __enzyme_autodiff(f, diffe_dup, inp, d_inp, n, diffe_dupnoneed, (float*)0, d_out);  
+}
+```
+
+```python
+import torch   
+from torch_enzyme import enzyme   
+# create some initial tensor   
+inp  $= \ldots$    
+# apply foreign function to tensor   
+out  $=$  enzyme("test.c","f").apply(inp)   
+# derive gradient   
+out/backward()   
+print(inp_grad)
+```
+
+```python
+import tensorflow as tf  
+from tf_enzyme import enzyme  
+inp = tf.variable(...)  
+# use external c code as a regular tf op  
+out = enzyme(inp, filename="test.c", function="f")  
+# results is a tf tensor  
+out = tf.sigmoid(out)
+```
+
+![](images/fbe66b8837c30bb8ce298e9933153dfdea4cdb6a3c887f857c7833089fb1ca27.jpg)  
+figure 7: top: sample glue code for how to use enzyme to produce a custom operator for an ml framework. left+right: sample code of using enzyme to provide gradients of foreign code in pytorch and tensorflow, respectively.  
+figure 8: the pipelines enzyme and ref, which run optimizations before and after ad, respectively.
+
+code needed by enzyme is not immediately available since julia's execution engine uses caching aggressively. we use the infrastructure developed for julia's gpu code generator [5, 6] to collect all the function definitions reachable by the function to be differentiated. julia implements its own version of common math functions like sin with custom implementations that are not amenable to type analysis, or resolves them to indirect function calls through opaque pointers into libm. enzyme.jl uses cassette.jl [53] to replace these functions calls llvm intrinsics. the enzyme plugin is loaded and the enzyme pass directly executed over the collected ir.
+
+zygote [36, 38, 37] is a popular automatic-differentiation framework for julia used in probabilistic programming [24] and scientific machine learning [51]. zygote performs source-to-source ad on high-level julia code with optimizations for matrix programs. as shown in figure 6, however, it can perform poorly on scalar programs. by embedding enzyme inside zygote as shown in the right of figure 6, julia is able to perform ad with both high-level knowledge and low-level optimizations. by utilizing embedded bytecode, enzyme.jl provides the ability to take derivatives of foreign functions.
+
+ml frameworks having demonstrated the ability to synthesize gradients of functions in a variety of languages compiled by llvm, we will demonstrate how to leverage this ability to embed foreign code into a machine learning framework. after specifying the desired gradient by calling __enzyme_autodiff as shown in figure 7, users can follow the tutorials for creating a custom operator in pytorch [14] or tensorflow [13] and compiling the custom operator with enzyme as described above. to simplify this workflow for machine learning researchers, we also created a simple package for pytorch and tensorflow in figure 7 that exposes this functionality in python without needing to compile a custom operator.
+
+# 4 evaluation
+
+we evaluate the enzyme approach by measuring the runtime of seven benchmarks: the three reverse-mode automatic differentiation benchmarks from microsoft's machine-learning focused adbench suite [57], and four additional tests that are technically interesting or represent potential uses of enzyme in practice. the adbench suite includes bundle analysis (ba), a long short term memory model (lstm), and a gaussian mixture model (gmm). we also differentiate two integrators (euler, rk4) from the odeint header-only ode solver library [2]; a simple fast fourier transform (fft); and a finite difference discretized simulation of the 2-dimensional brusselator system (bruss) [22, 62].
+
+the two integrators test indirect function calls, complicated  $\mathrm{c}++$  headers, and foreign ode solvers. the fft test demonstrates ad of recursive functions. the brusselator test demonstrates the utility
+
+![](images/eb631627b54c3376f62c760474d2a51d0fb260f164737ec014c1f3ad59f5c40e.jpg)  
+figure 9: left: relative speedup of ad systems on the benchmark suite, higher is better. a red x denotes programs that an ad system does not produce a correct gradient (after accounting for the tapenade corrections present in adbench). for each benchmark, we take the geometric mean of the runtime for all test cases, normalizing to the victor. a value of 1.0 denotes the fastest ad system tested for that benchmark, whereas a value of 0.5 denotes that an ad system produced a gradient which took twice as long. right: table with geometric mean runtime in seconds. n/a indicates a benchmark did not work with that system, perhaps producing incorrect results.
+
+in adjoint sensitivity analysis for ordinary differential equations, a widely applicable method with applications to pde-constrained optimization [7, 42], control theory [49], and scientific machine learning like neural ode's [51, 11].
+
+we ran our experiments on a "quiesced" aws c4.8xlarge instance with hyperthreading and turbo boost disabled. for all benchmarks, we took the geometric mean across all inputs. we ran all 92 inputs from adbench, removing the 21 inputs where adept exhausted system memory or a tool ran in under 0.01 seconds. for the integrator and fft tests we ran a total of 36 different inputs, with the number iterations or the input size increasing exponentially. for bruss, we ran a total of 10 trials.
+
+to evaluate the effectiveness of ad on optimized ir, we construct two pipelines shown in figure 8. the enzyme pipeline consists of running optimizations before enzyme ad, followed by a second round of optimizations. the reference (ref) pipeline is identical to the enzyme pipeline, except that ad is performed before the first round of optimization. this allows us to effectively evaluate the importance of optimization on ad without considering additional confounding factors (such as differing tape implementations) between enzyme and existing source ad systems. taking the geometric mean across all benchmarks and inputs, enzyme outperforms ref by a factor of 4.5.
+
+we also compare against the two fastest  $\mathrm{c / c + + }$  ad tools evaluated in adbench. these results are presented in figure 9. enzyme demonstrates state-of-the-art performance in all benchmarks. enzyme's advantage in the ba, lstm, euler, and rk4 tests appears to stem from running optimizations before ad. enzyme uses a different tape structure than tapenade (using a recursive set of allocations rather than a stack), which explains their differences on the gmm and bruss benchmarks. enzyme doesn't need to store as much on its tape as adept (such as not needing to store what statements were executed), explaining enzyme's superior performance on fft and bruss.
+
+# 5 conclusion
+
+enzyme demonstrates the feasibility of performing efficient ad on low-level programs, opening up the door for language-independent ad and ad after optimization. this transforms the existing workflow machine learning researchers use to bring ml to foreign code. instead of rewriting foreign code for machine learning, they can automatically synthesize fast gradients! this allows researchers to apply ml to a vast array of new use cases without the substantial effort of a rewrite or new dsl.
+
+building enzyme as part of the llvm compiler creates many avenues for future research. exploring new ad-specific optimizations in llvm may yield additional performance benefits. one could use llvm's existing gpu or parallel code generators on programs generated by enzyme [28, 29]. enzyme could be extended to differentiate gpu and cpu-parallel programs by using existing representations for these programs in llvm [54, 34, 55, 20]. enzyme could also be extended to support forward-mode ad, mixed-mode ad [52], and checkpointing problem beyond a simple heuristic. enzyme opens up opportunities for cross-language ad. there are also opportunities to use enzyme to port various physics engines and other codebases to ml frameworks.
+
+# acknowledgments and disclosure of funding
+
+special thanks to tim kaler of mit for introducing the topic of ad to the authors. tim's work on ad inspired enzyme and tim was a master bugfinder for an early prototype of enzyme, contributing many test cases and patches. thanks to charles leiserson of mit for working with us to find a good title and suggesting edits. thanks to laurent hascoet of inria for caching discussions and helping run tapenade on various codes. thanks to yingbo ma and chris rackauckas of mit for their help in understanding scientific ml and its relationship to ad. finally, the authors thank james bradbury (google), paul hovland (anl), hal finkel (anl), tb schardl (mit), yo shavit (harvard), dhash shrivathsa (radix labs), nalini singh (mit), and alex zinenko (google) for their invaluable feedback and advice.
+
+william s. moses was supported in part by a doe computational sciences graduate fellowship de-sc0019323. valentin churavy was supported in part by the darpa program pappa under contract number hr00112090016, and in part by nsf grant oac-1835443. this research was supported in part by los alamos national laboratories grant 531711. research was sponsored in part by the united states air force research laboratory and was accomplished under cooperative agreement number fa8750-19-2-1000. the views and conclusions contained in this document are those of the authors and should not be interpreted as representing the official policies, either expressed or implied, of the united states air force or the u.s. government. the u.s. government is authorized to reproduce and distribute reprints for government purposes notwithstanding any copyright notation herein.
+
+# broader impact
+
+enzyme reduces the amount of work necessary to apply ml to new domains. this has a generally positive impact as it reduces the workload necessary by researchers to use ml. it could be negative, however for those whose job it is to manually rewrite existing code for ml frameworks. similarly, this added accessibility advances various scientific problem domains with all the positives and negatives that come with it. it is also generally positive as enzyme can help bridge the gap between the ml and scientific computing communities by allowing them to share tools and more easily inter-operate. as an example, enzyme may allow for improved policy design for climate change via projected-gradient-descent on a climate simulator.
+
+# references
+
+[1] martin abadi, paul barham, jianmin chen, zhifeng chen, andy davis, jeffrey dean, matthieu devin, sanjay ghemawat, geoffrey irving, michael isard, et al. tensorflow: a system for large-scale machine learning. in 12th usenix symposium on operating systems design and implementation (osdi 16), pages 265-283, 2016.  
+[2] karsten ahnert and mario mulansky. odeint - solving ordinary differential equations in  $\mathbf{c} + +$ . aip conference proceedings, 1389(1):1586-1589, 2011. doi: 10.1063/1.3637934. url https://aip.scitation.org/doi/abs/10.1063/1.3637934.  
+[3] alfred v. aho, monica s. lam, ravi sethi, and jeffrey d. ullman. compilers: principles, techniques, and tools. addison-wesley, second edition, 2006.  
+[4] nathan baker, frank alexander, timo bremer, aric hagberg, yannis kevrekidis, habib najm, manish parashar, abani patra, james sethian, stefan wild, karen willcox, and steven lee. workshop report on basic research needs for scientific machine learning: core technologies for artificial intelligence. usdoe office of science (sc), 2 2019. doi: 10.2172/1478744.  
+[5] t besard, c foket, and b de sutter. effective extensible programming: unleashing julia on gpus. ieee transactions on parallel and distributed systems, 30(4):827-841, april 2019. issn 1045-9219. doi: 10.1109/tpds.2018.2872064.  
+[6] tim besard, valentin churavy, alan edelman, and bjorn de sutter. rapid software prototyping for heterogeneous and distributed platforms. advances in engineering software, 132:29-46, june 2019. issn 0965-9978. doi: 10.1016/j.advengsoft.2019.02.002.
+
+[7] lorenz t biegler, omar ghattas, matthias heinkenschloss, and bart van bloemen waanders. large-scale pde-constrained optimization: an introduction. in large-scale pde-constrained optimization, pages 3-13. springer, 2003.  
+[8] christian bischof, alan carle, george corliss, andreas griewank, and paul hovland. adifogenerating derivative codes from fortran programs. scientific programming, 1(1):11-29, 1992.  
+[9] james bradbury, roy frostig, peter hawkins, matthew james johnson, chris leary, dougal maclaurin, and skye wanderman-milne. jax: composable transformations of python+numpy programs, 2018. url http://github.com/google/jax.  
+[10] michael broughton, guillaume verdon, trevor mccourt, antonio j martinez, jae hyeon yoo, sergei v isakov, philip massey, murphy yuezhen niu, ramin halavati, evan peters, et al. tensorflow quantum: a software framework for quantum machine learning. arxiv preprint arxiv:2003.02989, 2020.  
+[11] tian qi chen, yulia rubanova, jesse bettencourt, and david k duvenaud. neural ordinary differential equations. in advances in neural information processing systems, pages 6571-6583, 2018.  
+[12] llvm contributors. llvm language reference manual, 2020. url https://llvm.org/docs/langref.html.  
+[13] tensorflow contributors. create an op: tensorflow core, 2020. url https://www.tensorflow.org/guide/create_op.  
+[14] torch contributors. extending torchscript with custom c operators, 2020. url https://pytorch.org/tutorials/advanced/torch.scriptcustomops.html.  
+[15] patrick cousot and radhia cousot. abstract interpretation: a unified lattice model for static analysis of programs by construction or approximation of fixpoints. in proceedings of the 4th acm sigact-sigplan symposium on principles of programming languages, pages 238-252, 1977.  
+[16] marco f cusumano-towner, feras a saad, alexander k lew, and vikash k mansinghka. gen: a general-purpose probabilistic programming system with programmable inference. in proceedings of the 40th acm sigplan conference on programming language design and implementation, pages 221-236, 2019.  
+[17] filipe de avila belbute-peres, kevin smith, kelsey allen, josh tenenbaum, and j. zico kolter. end-to-end differentiable physics for learning and control. in s. bengio, h. wallach, h. larochelle, k. grauman, n. cesa-bianchi, and r. garnett, editors, advances in neural information processing systems 31, pages 7178-7189. curran associates, inc., 2018. url http://papers.nips.cc/paper/7948-end-to-end-differentiable-physics-for-learning-and-control.pdf.  
+[18] jonas degrave, michiel hermans, joni dambre, and francis wyffels. a differentiable physics engine for deep learning in robotics. frontiers in neurorobotics, 13:6, 2019.  
+[19] amer diwan, kathryn s. mckinley, and j. eliot b. moss. type-based alias analysis. in proceedings of the acm sigplan 1998 conference on programming language design and implementation, pldi '98, page 106-117, new york, ny, usa, 1998. association for computing machinery. isbn 0897919874. doi: 10.1145/277650.277670. url https://doi.org/10.1145/277650.277670.  
+[20] johannes doerfert and hal finkel. compiler optimizations for openmp. in international workshop on openmp, pages 113-127. springer, 2018.  
+[21] conal elliott. the simple essence of automatic differentiation. proc. acm program. lang., 2 (icfp):1-29, july 2018. doi: 10.1145/3236765.  
+[22] martin feinberg. chemical reaction network structure and the stability of complex isothermal reactors-i. the deficiency zero and deficiency one theorems. chemical engineering science, 42 (10):2229-2268, 1987.
+
+[23] yu feng, man-yat chu, uroš seljak, and patrick mcdonald. fastpm: a new scheme for fast simulations of dark matter and haloes. monthly notices of the royal astronomical society, 463 (3):2273-2286, 2016.  
+[24] hong ge, kai xu, and zoubin ghahramani. turing: a language for flexible probabilistic inference. in international conference on artificial intelligence and statistics, aistats 2018, 9-11 april 2018, playa blanca, lanzarote, canary islands, spain, pages 1682-1690, 2018. url http://proceedings.mlr.press/v84/ge18b.html.  
+[25] andreas griewank and andrea walther. algorithm 799: revolve: an implementation of checkpointing for the reverse or adjoint mode of computational differentiation. acm trans. math. softw., 26(1):19-45, march 2000. issn 0098-3500. doi: 10.1145/347837.347846. url https://doi.org/10.1145/347837.347846.  
+[26] andreas griewank and andrea walther. evaluating derivatives: principles and techniques of algorithmic differentiation. society for industrial and applied mathematics, usa, second edition, 2008. isbn 0898716594.  
+[27] andreas griewank, david juedes, and jean utke. algorithm 755: adol-c: a package for the automatic differentiation of algorithms written in c/c++. acm transactions on mathematical software (toms), 22(2):131-167, 1996.  
+[28] tobias grosser, hongbin zheng, raghesh aloor, andreas simbürger, armin größinger, and louis-noël pouchet. polly-polyhedral optimization in llvm. in proceedings of the first international workshop on polyhedral compilation techniques (impact), volume 2011, page 1, 2011.  
+[29] tobias gysi, christoph müller, oleksandr zinenko, stephan herhut, eddie davis, tobias wicky, oliver fuhrer, torsten hoefler, and tobias grosser. domain-specific multi-level ir rewriting for gpu. arxiv preprint arxiv:2005.13014, 2020.  
+[30] l. hascoet and v. pascual. the tapenade automatic differentiation tool: principles, model, and specification. acm transactions on mathematical software, 39(3), 2013. url http://dx.doi.org/10.1145/2450153.2450158.  
+[31] laurent hascoët, uwe naumann, and valérie pascual. “to be recorded” analysis in reverse-mode automatic differentiation. future generation computer systems, 21(8):1401-1417, 2005.  
+[32] robert hecht-nielsen. theory of the backpropagation neural network. in neural networks for perception, pages 65-93. elsevier, 1992.  
+[33] robin j hogan. fast reverse-mode automatic differentiation using expression templates in c++. acm transactions on mathematical software (toms), 40(4):1-16, 2014.  
+[34] justin holewinski. ptx back-end: gpu programming with llvm. in *the ohio state university*. llvm developer's meeting. november, volume 18, 2011.  
+[35] yuanming hu, luke anderson, tzu-mao li, qi sun, nathan carr, jonathan ragan-kelley, and frédo durand. difftaichi: differentiable programming for physical simulation. arxiv preprint arxiv:1910.00935, 2019.  
+[36] michael innes. don't unroll adjoint: differentiating ssa-form programs. arxiv preprint arxiv:1810.07951, 2018.  
+[37] mike innes. sense & sensitivities: the path to general-purpose algorithmic differentiation. in proceedings of machine learning and systems 2020, pages 58-69. acm, 2020.  
+[38] mike innes, alan edelman, keno fischer, chris rackauckas, elliot saba, viral b shah, and will tebbutt. a differentiable programming system to bridge machine learning and scientific computing, 2019.  
+[39] teresa johnson, mehdi amini, and xinliang david li. thinlto: scalable and incremental lto. in proceedings of the 2017 international symposium on code generation and optimization, cgo '17, pages 111-121. ieee press, february 2017. isbn 9781509049318.
+
+[40] navjot kukreja, jan hückelheim, michael lange, mathias louboutin, andrea walther, simon w funke, and gerard gorman. high-level python abstractions for optimal checkpointing in inversion problems. arxiv preprint arxiv:1802.02474, 2018.  
+[41] chris lattner and vikram adve. llvm: a compilation framework for lifelong program analysis & transformation. in international symposium on code generation and optimization, 2004. cgo 2004., pages 75-86. ieee, 2004.  
+[42] shengtai li and linda petzold. adjoint sensitivity analysis for time-dependent partial differential equations with adaptive mesh refinement. journal of computational physics, 198(1):310-325, 2004.  
+[43] tzu-mao li, michael gharbi, andrew adams, frédo durand, and jonathan ragan-kelley. differentiable programming for image processing and deep learning in halide. acm trans. graph. (proc. siggraph), 37(4):139:1-139:13, 2018.  
+[44] dougal maclaurin, david duvenaud, and ryan p adams. autograd: effortless gradients in numpy. in icml 2015 automl workshop, volume 238, 2015.  
+[45] steven s. muchnick. advanced compiler design and implementation. morgan kaufmann, 1997.  
+[46] sri hari krishna narayanan, boyana norris, and beata winnicka. adic2: development of a component source transformation system for differentiating c and  $\mathrm{c + + }$  .procedia computer science,1(1):1845-1853,2010.  
+[47] valérie pascual and laurent hascoët. mixed-language automatic differentiation. optimization methods and software, 33(4-6):1192-1206, 2018. doi: 10.1080/10556788.2018.1435650. url https://doi.org/10.1080/10556788.2018.1435650.  
+[48] adam paszke, sam gross, soumith chintala, gregory chanan, edward yang, zachary devito, zeming lin, alban desmaison, luca antiga, and adam lerer. automatic differentiation in pytorch. in nips 2017 workshop autodiff, 2017.  
+[49] michael piasecki and nikolaos d katopodes. control of contaminant releases in rivers. i: adjoint sensitivity analysis. journal of hydraulic engineering, 123(6):486-492, 1997.  
+[50] christopher rackauckas. the essential tools of scientific machine learning (scientific ml). the winnower, 08 2019. doi: 10.15200/winn.156631.13064. url https://dx.doi.org/10.15200/winn.156631.13064.  
+[51] christopher rackauckas, yingbo ma, julius martensen, collin warner, kirill zubov, rohit supekar, dominic skinner, and ali ramadhan. universal differential equations for scientific machine learning. arxiv preprint arxiv:2001.04385, 2020.  
+[52] jarrett revels, tim besard, valentin churavy, bjorn de sutter, and juan pablo vielma. dynamic automatic differentiation of gpu broadcast kernels, 2018.  
+[53] jarrett revels, valentin churavy, tim besard, lyndon white, twan koolen, mike j innes, nathan daly, rogerluo, robin deits, morten piibeleht, moritz schauer, kristoffer carlsson, keno fischer, and chris de graaf. jreveis/cassette.jl: v0.3.3, april 2020. url https://doi.org/10.5281/zenodo.3758805.  
+[54] helge rhodin. a ptx code generator for llvm. oct, 29:1-63, 2010.  
+[55] tao b. schardl, william s. moses, and charles e. leiserson. tapir: embedding fork-join parallelism into llvm's intermediate representation. in proceedings of the 22nd acm sigplan symposium on principles and practice of parallel programming, ppopp '17, pages 249–265, new york, ny, usa, january 2017. acm. isbn 978-1-4503-4493-7. doi: 10.1145/3018743.3018758.  
+[56] jaewook shin and paul d hovland. comparison of two activity analyses for automatic differentiation: context-sensitive flow-insensitive vs. context-insensitive flow-sensitive. in proceedings of the 2007 acm symposium on applied computing, pages 1323-1329, 2007.
+
+[57] filip srajer, zuzana kukelova, and andrew fitzgibbon. a benchmark of selected algorithmic differentiation tools on some problems in computer vision and machine learning. optimization methods and software, 33(4-6):889-906, 2018. url https://arxiv.org/abs/1807.10129.  
+[58] rick stevens, valerie taylor, jeff nichols, arthur barney maccabe, katherine yelick, and david brown. ai for science. technical report, argonne national lab.(anl), argonne, il (united states), 2020.  
+[59] v vassilev, m vassilev, a penev, l moneta, and v ilieva. clad — automatic differentiation using clang and llvm. journal of physics: conference series, 608:012055, may 2015. doi: 10.1088/1742-6596/608/1/012055. url https://doi.org/10.1088%2f1742-6596%2f608%2f1%2f012055.  
+[60] mu wang, guang lin, and alex pothen. using automatic differentiation for compressive sensing in uncertainty quantification. optimization methods & software, 33(4-6):799-812, november 2018. issn 1055-6788. doi: 10.1080/10556788.2017.1359267.  
+[61] richard wei, marc rasi dan zheng, and bart chrzaszcz. differentiable programming mega-proposal. https://github.com/apple/swift/blob/master/docs/differentiableprogramming.md, 2019. accessed: 2019-09-25.  
+[62] polly y yu and gheorghe craciun. mathematical analysis of chemical reaction systems. israel journal of chemistry, 58(6-7):733-741, 2018.

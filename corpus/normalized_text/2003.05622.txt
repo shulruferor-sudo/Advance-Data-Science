@@ -1,0 +1,468 @@
+# distributed hierarchical gpu parameter server for massive scale deep learning ads systems
+
+weijie zhao<sup>1</sup>, deping xie<sup>2</sup>, ronglai jia<sup>2</sup>, yulei qian<sup>2</sup>, ruiquan ding<sup>3</sup>, mingming sun<sup>1</sup>, ping li<sup>1</sup>
+
+$^{1}$  cognitive computing lab, baidu research
+
+2 baidu search ads (phoenix nest), baidu inc.
+
+$^{3}$  sys. & basic infra., baidu inc.
+
+{weijiezhao, xiedeping01, jiaronglai, qianyulei, dingruiquan, sunmingming01, liping11} @baidu.com
+
+# abstract
+
+neural networks of ads systems usually take input from multiple resources, e.g., query-ad relevance, ad features and user portraits. these inputs are encoded into one-hot or multi-hot binary features, with typically only a tiny fraction of nonzero feature values per example. deep learning models in online advertising industries can have terabyte-scale parameters that do not fit in the gpu memory nor the cpu main memory on a computing node. for example, a sponsored online advertising system can contain more than  $10^{11}$  sparse features, making the neural network a massive model with around 10 tb parameters. in this paper, we introduce a distributed gpu hierarchical parameter server for massive scale deep learning ads systems. we propose a hierarchical workflow that utilizes gpu high-bandwidth memory, cpu main memory and ssd as 3-layer hierarchical storage. all the neural network training computations are contained in gpus. extensive experiments on real-world data confirm the effectiveness and the scalability of the proposed system. a 4-node hierarchical gpu parameter server can train a model more than 2x faster than a 150-node in-memory distributed parameter server in an mpi cluster. in addition, the price-performance ratio of our proposed system is 4-9 times better than an mpi-cluster solution.
+
+# 1 introduction
+
+baidu search ads (a.k.a. "phoenix nest") has been successfully using ultra-high dimensional input data and ultra-large-scale deep neural networks for training ctr (click-through rate) models since 2013 (fan et al., 2019). sponsored online advertising produces many billions of dollar revenues for online ad publishers such as baidu, bing, and google. the task of ctr prediction (broder, 2002; fain & pedersen, 2006; fan et al., 2019; zhao et al., 2019) plays a key role to determine the best ad spaces allocation because it directly influences user experience and ads profitability. ctr prediction takes input from multiple resources—e.g., query-ad relevance, ad features, and user portraits—then estimates the probability that a user clicks on a given ad. these inputs are typically one-hot/multi-hot binary features with only a tiny fraction of nonzero feature values per example. the high-dimensional sparse input data first go through an embedding layer to get a low-dimensional embedding; then the embedded results are connected by fully-connected layers. a real-world sponsored online advertising system can contain more than  $10^{11}$  sparse features, making the neural network a massive model with around 10 tb parameters. figure 1 provides an illustration of ctr prediction network.
+
+![](images/db9e2afa8c7f319446e4c918091be72359bbcf9a528b86f5d3c28ec2208fd53f.jpg)  
+figure 1. a visual illustration of ctr prediction network. the input data are sparse—only a tiny proportion of features are non-zero. the parameters of hatched neurons are referenced by the input.
+
+# 1.1 ctr prediction based on mpi-cluster solution
+
+since 2013, the standard practice in baidu search ads has been using an mpi-based solution for training massive-scale deep learning ctr prediction. before that, baidu had adopted a distributed logistic regression (lr) ctr model and distributed parameter server around 2010. the mpi solution partitions the model parameters across computing nodes (e.g., 150 nodes). each node obtains a batch of training data streamed from a distributed file system. the node pulls the required parameters from other nodes and
+
+computes the gradients. the gradients are pushed to the nodes that maintain the corresponding parameters through mpi communications. baidu's mpi solution and distributed parameter server was also summarized in (li et al., 2014) (while the first author in that paper was with baidu inc.).
+
+we should mention that this paper focuses on the ctr models in the final stage of baidu's ads system. in the earlier stage of the pipeline, baidu has been extensively using recent advancements on approximate near neighbor search (anns) and maximum inner product search (mips) (fan et al., 2019; zhou et al., 2019; zhao et al., 2020; tan et al., 2020) to improve the quality of ads recalls, which is a separate important task in the full pipeline of the ads system.
+
+# 1.2 drawbacks of mpi-cluster solution
+
+ctr model researchers and practitioners train the massive-scale model rapidly to test and verify their new ideas. however, it is impractical to reserve a large-scale computing cluster for everyone—the hardware maintenance and the energy cost of a large-scale computing cluster is costly. besides, further scaling up the training speed is challenging—in this large-scale distributed setting, communication and synchronization cost between computing nodes limits the training performance. we seek to explore other directions to optimize the training system for massive-scale ads models.
+
+# 1.3 gpu parameter server for ctr prediction
+
+recently, gpus attract broad attention as a cost-efficient machine learning accelerator. however, it is not straightforward to directly employ gpus on the ctr prediction problem due to the limited gpu memory and excessive cpu-gpu data communications. this amount of parameters exceeds the amount of overall volume of gpu high-bandwidth memory (hbm) of any single computing node, and any practical computing cluster. gpus are considered inefficient to train the model that does not fit in the gpu memory (chilimbi et al., 2014). prior efforts (cui et al., 2016; zhao et al., 2019) cache the parameters in the cpu main memory and still require time-consuming data transferring between cpu and gpu to update parameters.
+
+we notice that in the massive-scale ads system, although the entire model is huge, the number of non-zero features per example is small. for example, in figure 1, the referenced parameters for the given input are hatched. the sparse input has 2 non-zeros: the  $1^{st}$  and the  $6^{th}$  features. for the parameters in the embedding layer, only a subset of them is used and will be updated for this sparse input (we call them "sparse parameters" for convenience). following that, the dense parameters in the fully-connected layers are all referenced. the ctr prediction neural network usually has at most a few million dense parameters—the memory footprint of dense parameters is small (around a few hundred
+
+megabytes). the working parameters—the parameters that are referenced in the current batch input—can fit in the gpu memory. it allows us to distribute the working parameters in the gpu memory and accelerate the training with gpus.
+
+in this paper, we propose a hierarchical parameter server that builds a distributed hash table across multiple gpus and performs direct inter-gpu communications to eliminate the cpu-gpu data transferring overhead. moreover, the hierarchical design on top of ssds with an in-memory cache also enables us to train a large-scale out-of-main-memory deep neural network on distributed gpu environments.
+
+challenges & approaches. there are three major challenges in the design of the hierarchical parameter server. 1) the first challenge is to construct an efficient distributed gpu hash table to store the working parameters in multiple gpus in multiple computing nodes. we design intra-node gpu communications and collective communication strategies among multiple nodes to synchronize the parameters across all gpus. remote direct memory access protocols are employed to enable direct peer-to-peer gpu communications without involving cpus. 2) the second challenge is to devise a data transferring and caching mechanism to keep working parameters in memory. data transferring and ssd i/os bandwidth are relatively slow compared with the deep neural network training on gpus. without a carefully designed architecture, excessive network and disk i/os can be a dominant performance slowdown. we propose a 4-stage pipeline that overlaps inter-node network communications, ssd i/os, cpu/gpu data transferring and gpu computations. all stages are optimized to match the inevitable gpu computations—the pipeline hides the i/o latency. 3) the third challenge is to effectively organize the materialized parameters on ssds. the i/o granularity of ssds is a block, while the training parameters we load is in key-value granularity. this mismatch incurs i/o amplification (lu et al., 2017)—unnecessary data are read from ssds to load required parameters. in contrast, reading and writing contiguous addresses on ssds are faster than random accesses—larger block size yields better disk i/o bandwidth. we present a file-level parameter management strategy to write updates in batches as new files. a file compaction thread runs in the background to regularly merge files that contain a large proportion of stale parameters into new files.
+
+contributions. the technical contributions we make in this paper can be summarized as follows:
+
+- we present a hashing method (op+osrp) to reduce ctr models. we observe that combining op+osrp with dnn-based models can replace the original lr-based models. however, for dnn-based ctr models, the hashing method will hurt the prediction accuracy to the extent that the revenue would be noticeably affected (section 2).  
+we introduce the architecture of a distributed hierarchi
+
+cal gpu parameter server (section 3). the hierarchical design employs the main memory and ssds to store the out-of-gpu-memory and out-of-main-memory parameters when training massive-scale neural networks. as far as we know, it is the first distributed gpu parameter server for the terabyte-scale sparse input deep learning.
+
+- we propose a novel hbm parameter server that keeps the working parameters in distributed gpu hbms. the hbm parameter server enables gpu worker threads to efficiently fetch/update neural network parameters and to directly synchronize parameters across multiple gpu cards from multiple computing nodes (section 4).  
+- we show a cpu main memory parameter server that prefetches and buffers the parameters of the future training batches. the memory parameter server hides the data loading and parameter transfer latency (section 5).  
+- we present an ssd parameter server that materializes the out-of-main-memory parameters in files. parameter updates are written in batches onto ssds as new files to fully utilize the i/o bandwidth. regular compaction operations are performed to bound the disk usage (section 6).  
+- we perform an extensive set of experiments on 5 real ctr prediction models/datasets and compare the results with an mpi cluster training framework in the production environment (section 7). the 4-node distributed hierarchical gpu parameter server is 1.8-4.8x faster than the mpi solution. the price-performance ratio of our proposed system is 4-9 times better than the mpi solution.
+
+# 2 prior effort: hashing methods for reducing ctr models
+
+it is natural to ask why one could not simply use a good hashing method to reduce the model size. in this section, we report a brief summary of our prior efforts back in 2015 for developing hashing algorithms to reduce the size of ctr models, with the hope that hashing would not hurt accuracy.
+
+hashing algorithms are popular these days (weinberger et al., 2009; li et al., 2011). we had spent serious efforts to develop effective hashing methods suitable for ctr models. the results are both encouraging and discouraging. here we would like to make a comment that there is a difference between academia research and industrial practice. in academia research, we often take it as a good result if, for example, we are able to achieve a 10-fold model reduction by losing only  $1\%$  of accuracy. for commercial search, however, we often cannot afford to lose an accuracy of  $0.1\%$  since that would result in a noticeable decrease in revenue.
+
+one permutation + one sign random projection. in the course of this research, we had tried many versions of hashing. we eventually recommend the method called "one permutation + one sign random projection (op+osrp)". as the name suggests, our idea was inspired by several well-
+
+known hashing methods, e.g., (goemans & williamson, 1995; charikar, 2002; charikar et al., 2004; cormode & muthukrishnan, 2005; weinberger et al., 2009; li et al., 2011; 2012; shrivastava & li, 2014; li et al., 2019).
+
+we assume the dimensionality of the binary training data is  $p$ . op+osrp consists of the following key steps:
+
+1. permute the  $p$  columns (only once). this can be very efficiently done via standard 2u or 4u hashing.  
+2. break the permuted  $p$  columns uniformly into  $k$  bins.  
+3. apply independent random projection in each bin, for example, in the first bin, we let  $z = \sum_{i=1}^{p/k} x_i r_i$ , where we sample  $r_i \in \{-1, +1\}$  w.p.  $1/2$ .  
+4. store the sign of  $z$  and expand it into a vector of length 2: [0 1] if  $z > 0$ , [1 0] if  $z < 0$ , [0 0] if  $z = 0$ . the hashed data will be binary in  $2k$  dimensions. this step is different from prior research. this way, we still obtain binary features so that we do not need to modify the training algorithm (which is coded efficiently for binary data).
+
+$\mathrm{op + osrp}$  is very efficient (essentially by touching each nonzero entry once) and can naturally handle sparse data (i.e., many bins will be empty since  $k$  cannot be small).
+
+experimental results. this set of experiments was conducted in 2015 using 3 months of sponsored ads click data from web search and 3 months of data from image search. as one would expect, web search brings in majority of the revenue. image search is fun and important but its revenue is only a tiny fraction of the revenue from web search. understandably, lots of computing/storage resources have been allocated for building ctr models for web search.
+
+table 1. op+osrp for image search sponsored ads data  
+
+<table><tr><td></td><td># nonzero weights</td><td>test auc</td></tr><tr><td>baseline lr</td><td>31,949,213,205</td><td>0.7112</td></tr><tr><td>baseline dnn</td><td></td><td>0.7470</td></tr><tr><td>hash+dnn (k = 234)</td><td>6,439,972,994</td><td>0.7407</td></tr><tr><td>hash+dnn (k = 223)</td><td>3,903,844,565</td><td>0.7388</td></tr><tr><td>hash+dnn (k = 222)</td><td>2,275,442,496</td><td>0.7370</td></tr><tr><td>hash+dnn (k = 231)</td><td>1,284,025,453</td><td>0.7339</td></tr><tr><td>hash+dnn (k = 230)</td><td>707,983,366</td><td>0.7310</td></tr><tr><td>hash+dnn (k = 229)</td><td>383,499,175</td><td>0.7278</td></tr><tr><td>hash+dnn (k = 228)</td><td>203,864,439</td><td>0.7245</td></tr><tr><td>hash+dnn (k = 227)</td><td>106,824,123</td><td>0.7208</td></tr><tr><td>hash+dnn (k = 226)</td><td>55,363,771</td><td>0.7175</td></tr><tr><td>hash+dnn (k = 225)</td><td>28,479,330</td><td>0.7132</td></tr><tr><td>hash+dnn (k = 224)</td><td>14,617,324</td><td>0.7113</td></tr></table>
+
+table 1 summarizes the experimental result for applying op+osrp on image search ads data. there are several important observations from the results:
+
+- compared to the baseline lr model, the dnn model very substantially improves the auc. this is basically the
+
+justification of adopting dnn models for ctr prediction.
+
+- hashing reduces the accuracy. even with  $k = 2^{34}$ , the test auc is dropped by  $0.7\%$ .  
+- hash+dnn is a good combination for replacing lr. compared to the original baseline lr model, we can reduce the number of nonzero weights from 31b to merely 14.6m without affecting the accuracy.
+
+table 2 summarizes the experiments on web search ads data. the trend is essentially similar to table 1. the main difference is that we cannot really propose to use hash+dnn for web search ads ctr models, because that would reduce the accuracy of current dnn-based models and consequently would affect the revenue for the company.  
+table 2. op+osrp for web search sponsored ads data  
+
+<table><tr><td></td><td># nonzero weights</td><td>test auc</td></tr><tr><td>baseline lr</td><td>199,359,034,971</td><td>0.7458</td></tr><tr><td>baseline dnn</td><td></td><td>0.7670</td></tr><tr><td>hash+dnn (k = 232)</td><td>3,005,012,154</td><td>0.7556</td></tr><tr><td>hash+dnn (k = 231)</td><td>1,599,247,184</td><td>0.7547</td></tr><tr><td>hash+dnn (k = 230)</td><td>838,120,432</td><td>0.7538</td></tr><tr><td>hash+dnn (k = 229)</td><td>433,267,303</td><td>0.7528</td></tr><tr><td>hash+dnn (k = 228)</td><td>222,780,993</td><td>0.7515</td></tr><tr><td>hash+dnn (k = 227)</td><td>114,222,607</td><td>0.7501</td></tr><tr><td>hash+dnn (k = 226)</td><td>58,517,936</td><td>0.7487</td></tr><tr><td>hash+dnn (k = 224)</td><td>15,410,799</td><td>0.7453</td></tr><tr><td>hash+dnn (k = 222)</td><td>4,125,016</td><td>0.7408</td></tr></table>
+
+summary. this section summarizes our effort on developing effective hashing methods for ads ctr models. the work was done in 2015 and we had never attempted to publish the paper. the proposed algorithm, op+osrp, actually still has some novelty to date, although it obviously combines several previously known ideas. the experiments are exciting in a way because it shows that one can use a single machine to store the dnn model and can still achieve a noticeable increase in auc compared to the original (large) lr model. however, for the main ads ctr model used in web search which brings in the majority of the revenue, we observe that the test accuracy is always dropped as soon as we try to hash the input data. this is not acceptable in the current business model because even a  $0.1\%$  decrease in auc would result in a noticeable decrease in revenue.
+
+therefore, this report helps explain why we introduce the distributed hierarchical gpu parameter server in this paper to train the massive scale ctr models, in a lossless fashion.
+
+# 3 distributed hierarchical parameter server overview
+
+in this section, we present the distributed hierarchical parameter server overview and describe its main modules from a high-level view. figure 2 illustrates the proposed hierarchical parameter server architecture. it contains three major components: hbm-ps, mem-ps and ssd-ps.
+
+![](images/f2130e2a37d27d97a939ac50ae11ec030d2ebe26ac95ec34ad23bcc234fabf29.jpg)  
+figure 2. hierarchical parameter server architecture.
+
+workflow. algorithm 1 depicts the distributed hierarchical parameter server training workflow. the training data batches are streamed into the main memory through a network file system, e.g., hdfs (line 2). our distributed training framework falls in the data-parallel paradigm (li et al., 2014; cui et al., 2014; 2016; luo et al., 2018). each node is responsible to process its own training batches—different nodes receive different training data from hdfs. then, each node identifies the union of the referenced parameters in the current received batch and pulls these parameters from the local mem-ps/ssd-ps (line 3) and the remote mem-ps (line 4). the local mem-ps loads the local parameters stored on local ssd-ps into the memory and requests other nodes for the remote parameters through the network. after all the referenced parameters are loaded in the memory, these parameters are partitioned and transferred to the hbm-ps in gpus. in order to effectively utilize the limited gpu memory, the parameters are partitioned in a non-overlapped fashion—one parameter is stored only in one gpu. when a worker thread in a gpu requires the parameter on another gpu, it directly fetches the parameter from the remote gpu and pushes the updates back to the remote gpu through high-speed inter-gpu hardware connection nvlink (foley & danskin, 2017). in addition, the data batch is sharded into multiple mini-batches and sent to each gpu worker thread (line 5-10). many recent machine learning system studies (ho et al., 2013; chilimbi et al., 2014; cui et al., 2016; alistarh et al., 2018) suggest that the parameter staleness shared among workers in data-parallel systems leads to slower convergence. in our proposed system, a mini-batch contains thousands of examples. one gpu worker thread is responsible to process a few thousand mini-batches. an
+
+algorithm 1 distributed hierarchical parameter server training workflow.  
+1. while not converged do  
+2. batch  $\leftarrow$  get_batch_from_hdfs()  
+3. working  $\leftarrow$  pull_local_mem-ps_and_ssd-ps(batch)  
+4. working  $\leftarrow$  working  $\cup$  pull_remote_mem-ps(batch)  
+5. minibatches  $\leftarrow$  shard_batch(batch, #gpu, #minibatch)  
+6. partitions  $\leftarrow$  map_parameters_to_gpus(working, #gpu)  
+7. for  $i \gets 1$  to #gpu do  
+8. transfer_to_gpu(i, minibatches_i)  
+9. insertinto_hashtable(i, partitions_i)  
+10. end for  
+11. for  $j \gets 1$  to #minibatch do  
+12. pull_hbm-ps_kernel(minibatch_j)  
+13.  $\delta_j \gets$  train-mini-batch_kernel(j)  
+14. push_parameters updates_back_kernel( $\delta_j$ )  
+15. end for  
+16.  $\delta \gets$  pull updates_hbm-ps()  
+17. parameters_to_dump  $\leftarrow$  update_local_cache()  
+18. push_local_ssd-ps(parametes_to_dump)  
+19. end while
+
+inter-gpu parameter synchronization is performed after each mini-batch is processed to eliminate the parameter staleness. each training worker pulls the required parameters of its corresponding mini-batch from the hbm-ps (line 12), performs forward and backward propagation to update the parameters (line 13), and interacts with the hbm-ps to update the referenced parameters on other gpus (line 14). the mem-ps collects the updates from the hbm-ps (line 16) and dumps infrequently used parameters to the ssd-ps when the mem-ps does not have sufficient memory (line 17-18). an example for algorithm 1 is shown in appendix a. hbm-ps, mem-ps, and ssd-ps communicate in a hierarchical storage fashion. the upper-level module acts as a high-speed cache of the lower-level module.
+
+hbm-ps. hbm-ps is distributed in the high-bandwidth memory (hbm) across multiple gpus. comparing with the conventional distributed parameter servers, workers in gpus can directly request and update parameters in the hbm without transferring data between gpu memory and cpu memory. thus the training throughput is significantly increased. however, the hbm capacity is limited and price. in order to fit all the terabyte-scale parameters into hbms, we have to maintain a distributed computing cluster with hundreds of gpus—it is not only expensive but also inefficient, because excessive inter-gpu and inter-node communications are required to request and update the parameters. therefore, our proposed hierarchical architecture leverages memory and ssd to store the massive model parameters.
+
+mem-ps. the mem-ps pulls the referenced parame
+
+ters from remote nodes to prepare the data for the training in gpus. after the gpu workers complete the forward/backward propagation, the mem-ps retrieves the updates from the gpus, applies the changes, and materializes the updated parameters in the ssds. the mem-ps also caches the frequently used parameters to reduce ssd i/os.
+
+ssd-ps. we build the ssd-ps to store the materialized parameters and provide efficient parameter loading and updating. contiguous addresses readings and writings on ssds have better i/o bandwidth than random disk accesses. thus, the ssd-ps organizes the parameters in files. the updated parameters in the memory are written to ssds in batches as new files. a file compaction thread runs in the background to regularly merge files that contain a large proportion of stale parameters into new files.
+
+4-stage pipeline. the training workflow majorly involves 4 time-consuming tasks: data transferring, parameter partitioning, materialized data loading/dumping and neural network training. the 4 tasks correspond to independent hardware resources: network, cpu, ssd and gpu, respectively. we build a 4-stage pipeline to hide the latency of those tasks by maintaining a prefetch queue for each stage. a worker thread is created for each stage—it extracts jobs from the prefetch queue and feeds the corresponding hardware resource. after that, the worker thread pushes the processed results into the prefetch queue of the next stage. especially, the worker thread stalls when the prefetch queue of the next stage is full—the next stage has already obtained too many unprocessed jobs. the capacity of the prefetch queue is preset according to the execution time of each stage. a detailed explanation is shown in appendix b.
+
+# 4 hbm-ps
+
+the hbm-ps stores the working parameters in gpus and provides efficient accesses. in this section, we introduce the multi-gpu distributed hash table and gpu communications. additional details of hbm-ps are described in appendix c.
+
+# 4.1 multi-gpu distributed hash table
+
+multi-gpu distributed hash table manages the gpu hbms on the same node and provides a unified interface to the gpu worker threads. all referenced parameters of the current training batch are partitioned and inserted into the local hash table of each gpu. operations such as insert, get and accumulate are provided to interact with the hash table.
+
+local gpu hash table. each gpu maintains its own local hash table in the hbm. in this paper, we adopts the concurrent_unordered_map of cudf library (https://github.com/rapidsf/cudf) as the hash table. the hash table implementation uses the open-addressing method to resolve hash collision. in order
+
+to avoid the inefficient dynamic memory allocation in gpus, we fix the hash table capacity when we construct the hash table—we know the number of parameters (key-value pairs) to be stored on each gpu. for parallel hash table updates, the data integrity is guaranteed by gpu atomic operations.
+
+algorithm 2 distributed gpu hash table accumulate.  
+input: a collections of key-value pairs: (keys, vals).  
+1. switch_to_gpu(get_resource owner keys, vals)  
+2. partitioned  $\leftarrow$  parallel_partition_keys, vals)  
+3. for  $i\gets 1$  to #gpu do  
+4. if partitioned  $\mathbf{\dot{q}}_{i}\neq \emptyset$  then  
+5. async_send(i, partitioned  $\mathbf{\dot{q}}_i$  )  
+6. end if  
+7. end for  
+8. wait_send(destination()  
+9. for  $i\gets 1$  to #gpu do  
+10. switch_to_gpu(i)  
+11. hash_tables.asyncaccumulate(partitioned  $\mathbf{\dot{q}}_i$  )  
+12. end for
+
+operations. the multi-gpu distributed hash table provides operations such as insert, get and accumulate. here we introduce the accumulate operation that updates the parameters during neural network training in detail. the insert and get operations implement the pull and push interfaces to interact with the hbm-ps. their workflows are similar to the accumulate—their implementation details are omitted due to the page limit.
+
+the accumulate operation takes a collection of key-value pairs as input and accumulates the values onto the parameters referenced by the corresponding keys. after each back propagation is finished in the neural network training, accumulate operations are called to update the parameters.
+
+algorithm 2 illustrates the accumulate operation workflow. the key-value pairs are passed in a zero-copy fashion—these pairs are represented as the addresses of two arrays—keys and vals—in the gpu hbm. we first switch to the gpu that owns the memory of the input key-value pairs (line 1). then we parallelly partition them according to the partition policy. the partitioned results for each gpu are stored at partitioned (line 2). after that, we send the partitioned key-value pairs to their corresponding gpus (line 3-7). the send operation is executed asynchronously through nvlink—we can send data to other gpus simultaneously. finally, we iterate over all gpus and apply the actual accumulation on the local hash table of each gpu asynchronously (line 9-12).
+
+# 4.2 gpu communication
+
+since each node processes its own input training batch, these batches may share some working parameters—the shared parameters are referenced and updated by multiple nodes.
+
+the multi-gpu distributed hash table stores the working parameters across all gpus in the same node. we have to synchronize the parameters on different nodes to guarantee the model convergence (ho et al., 2013; chilimbi et al., 2014; cui et al., 2016; alistarh et al., 2018).
+
+physically, gpu communication is performed through remote direct memory access (rdma) (potluri et al., 2013) hardware. rdma enables zero-copy network communication—it allows the network card to transfer data from a device memory directly to another device memory without copying data between the device memory and the data buffers in the operating system. our rdma hardware design eliminates the involvement of the cpu and memory.
+
+logically, the inter-node gpu parameter synchronization requires an all-reduce communication—each gpu needs to receive all parameter updates from other gpus and then performs a reduction to accumulate these updates. appendix c.3 illustrates the implementation details.
+
+# 5 mem-ps
+
+the mem-ps identifies the referenced parameters from the input and communicates with the local ssd-ps and remote mem-ps to gather the required parameters. meanwhile, a parameter cache is maintained to reduce ssd i/os. more implementation details are in appendix d.
+
+prepare parameters. as mentioned in the distributed architecture design (figure 2), each node only maintains a shard of parameters—parameters are partitioned according to a pre-defined parameter-to-node mapping. we leverage the modulo hashing as the partition scheme in a similar manner to the gpu parameter partition policy discussed in section 4.1. the mem-ps partitions the referenced parameters according to their keys. for the remote parameters that belong to a remote node, the mem-ps pulls them from other mem-ps through the network. for the local parameters, the mem-ps reads the ssds to fetch the parameters. in order to avoid excessive ssd i/os, an in-memory cache is maintained to store the recently/frequently used parameters and to buffer the working parameters.
+
+update parameters. the mem-ps pulls the updated parameters from the hbm-ps after its gpus complete the current batch and applies these changes in the memory (we pin the working parameters in the memory). note that we do not need to push the changes of the remote parameters to other mem-ps, because the remote parameters are synchronized across gpus in hbm-ps—the remote node mem-ps can pull the updates from its own gpus.
+
+# 6 ssd-ps
+
+the ssd-ps aims to maintain the materialized out-of-main-memory parameters efficiently on ssds.
+
+parameter files. we organize the model parameters in the file-level granularity—each file contains a collection of parameters. a parameter-to-file mapping is maintained in the main memory. a file descriptor occupies much less memory than the parameter value—a file descriptor can be represented as couples of bytes while a parameter value consists of multiple numeric attributes. in addition, a node only contains a shard of the parameters. thus, we can assume the mapping can fit in the memory of a single node.
+
+parameter i/o. we consider a parameter file as an ssd i/o unit. the ssd-ps gathers requested parameter keys and reads an entire parameter file when it contains requested parameters. on the other hand, parameters evicted from the hbm-ps cache are dumped onto ssds. it is impractical to locate these parameters and perform in-place updates inside the original file because it randomly writes the disk. instead, our ssd-ps chunks these updated parameters into files and writes them as new files on ssds—data are sequentially written onto the disk. after the files are written, we update the parameter-to-file mapping of these parameters. the older versions of the parameters stored in the previous files become stale—these older values will not be used since the mapping is updated. the ssd usage hikes as we keep creating files on ssds. a file compaction operation is performed regularly to reduce the disk usage—many old files containing a large proportion of stale values can be merged into new files. appendix e presents the implementation of parameter loading/dumping and file compaction operations.
+
+# 7 experimental evaluation
+
+the objective of the experimental evaluation is to investigate the overall performance—as well as the impact of optimizations of the proposed system. specifically, the experiments are targeted to answer the following questions:
+
+- how does the proposed hierarchical gpu parameter server compare with the mpi cluster solution?  
+- how is the execution time of each training stage?  
+- how does the time distribute in each component?  
+- how does the proposed system scale?
+
+system. we execute the distributed hierarchical gpu parameter server experiments on 4 gpu computing nodes. each node has 8 cutting-edge 32 gb hbm gpus, server-grade cpus with 48 cores (96 threads),  $\sim 1$  tb of memory,  $\sim 20$  tb raid-0 nvme ssds and a  $100\mathrm{gb}$  rdma network adaptor. the nodes in the mpi cluster for the baseline comparison are maintained in the same data center. cpus in the mpi cluster have similar performance specifications as the ones in the gpu computing nodes. all nodes are inter-connected through a high-speed ethernet switch. the hardware and maintenance cost of 1 gpu node roughly equals to the cost of 10 cpu-only mpi nodes.
+
+table 3. model specifications.  
+
+<table><tr><td></td><td>#non-zeros</td><td>#sparse</td><td>#dense</td><td>size (gb)</td><td>mpi</td></tr><tr><td>a</td><td>100</td><td>8 × 109</td><td>7 × 105</td><td>300</td><td>100</td></tr><tr><td>b</td><td>100</td><td>2 × 1010</td><td>2 × 104</td><td>600</td><td>80</td></tr><tr><td>c</td><td>500</td><td>6 × 1010</td><td>2 × 106</td><td>2,000</td><td>75</td></tr><tr><td>d</td><td>500</td><td>1 × 1011</td><td>4 × 106</td><td>6,000</td><td>150</td></tr><tr><td>e</td><td>500</td><td>2 × 1011</td><td>7 × 106</td><td>10,000</td><td>128</td></tr></table>
+
+models. we use 5 ctr prediction models in real-world online sponsor advertising applications to investigate the effectiveness of our proposed system. table 3 illustrates the specification of these models. the number of sparse parameters of each model varies from  $8 \times 10^{9}$  (model a) to  $10^{11}$  (model e). the number of dense parameters is  $4 - 5$  orders of magnitude less than the number of sparse parameters for all models. the size of the smallest model is  $300\mathrm{gb}$ , while the largest model has  $10\mathrm{tb}$  parameters. the mpi column shows the number of cpu-only nodes we used to train each model in the mpi cluster for real-world ads products. due to different training speed requirements for these products, the number of mpi cluster nodes varies from 75 to 150.
+
+data. we collect user click history logs from our search engine as the training dataset. the datasets are chunked into batches—each batch contains  $\sim 4 \times 10^{6}$  examples. the trained ctr models are evaluated over the production environment of our search engine in an a/b testing manner.
+
+# 7.1 comparison with mpi solution
+
+we evaluate the performance of the proposed system on the training execution time and the prediction accuracy. our proposed system runs on 4 gpu computing nodes. we take an mpi cluster training framework in the production environment as the baseline. the baseline solution employs a distributed parameter server that shards and keeps the massive parameters in the memory across all the nodes.
+
+training time. figure 3(a) depicts the total training execution time of the 4-node hierarchical parameter server (hps-4) and the mpi training solution (mpi-cluster). hps-4 outperforms mpi-cluster in all 5 models. the first row of table 4 shows the speedup over the mpi solution. the hps-4 is 1.8-4.8x faster than the mpi solution. note that the hardware and maintenance cost of 1 gpu node is roughly equivalent to 10 cpu-only nodes in the mpi cluster. the 4-gpu-node setting is much cheaper than the 75-150 nodes in the mpi cluster. the second row of the table illustrates the cost-normalized speedup of our proposed system. the cost-normalized speedup is computed as: speedup/4/10 × #mpi. the price-performance ratio of
+
+table 4. training speedup over the mpi-cluster solution.  
+
+<table><tr><td></td><td>a</td><td>b</td><td>c</td><td>d</td><td>e</td></tr><tr><td>speedup over mpi-cluster</td><td>1.8</td><td>2.7</td><td>4.8</td><td>2.2</td><td>2.6</td></tr><tr><td>cost-normalized speedup</td><td>4.4</td><td>5.4</td><td>9.0</td><td>8.4</td><td>8.3</td></tr></table>
+
+![](images/f425b3fb4e3f38986194c77e6c7caf0bbf6e3b19df318cc5d717d35c227c5091.jpg)  
+(a) total execution time
+
+![](images/3a3e0dba61506aad712f799f945b9ca35898763dee84417bf94293d2bbd99d13.jpg)  
+(b) auc accuracy  
+figure 3. the performance (execution time and accuracy of 4-node hierarchical parameter server (hps-4).
+
+![](images/06c9f41b8ed0e70eac26da506ad9f856ff1d1655bad513ed92d07430f32e6fa7.jpg)  
+(c) execution time distribution
+
+our proposed system is 4.4-9.0x better than the mpi cluster.
+
+accuracy. we take area under the curve (huang & ling, 2005) (auc) as the quality measure of our trained models. figure 3(b) shows the relative auc of hps-4 (relative to the mpi-cluster method). the auc of the mpi-cluster solution is  $100\%$ . the aucs of both trained models are tested online for 1 day in real online ads products. since the ctr prediction accuracy is crucial to the revenue, we have to ensure all our optimizations are loss-less. for model c, the relative auc loss of hps-4 is less than  $0.01\%$ . for other 4 models, hps-4 has even slightly better accuracy than the mpi-128. our hierarchical parameter server runs on fewer nodes—fewer stale parameters are used than the case on the mpi cluster. therefore, it is possible to have a better auc than the mpi solution. overall, the relative differences of all 5 models are within  $0.1\%$ . we can conclude that our hierarchical parameter server training is loss-less.
+
+# 7.2 time distribution
+
+the time distribution of each abstract execution stage is presented in figure 3(c). as illustrated in the training workflow (algorithm 1), read examples corresponds to the operation that reads and extracts the data from hdfs; pull/push is the execution time of gathering and updating the working parameters in the mem-ps and ssd-ps; and train dnn is the execution time of the inter-gpu communication and the deep neural network training in the hbm-ps. since these stages are paralleled in the pipeline, the overall execution time for each batch is dominated by the slowest stage. for the two small models (model a and b), the read examples stage that relies on the hdfs throughput becomes the bottleneck. because the models are small and fit in the memory, the sparse parameter pulling and pushing operations are faster than the hdfs i/os. when the number of sparse parameters grows, the pull/push operations catch up with the example reading (model c) and become the dominant stage in model d and e.
+
+# 7.3 hbm-ps
+
+the execution time distribution of hbm-ps operations is shown in figure 4(a). the pull/push operations of hbm
+
+ps depend on the number of non-zero values of training inputs. while the training operation (forward/backward propagation) correlates to the number of dense parameters of the deep model. the execution time of these operations shows the same trend in the model specification (table 3). model a and model b have around 100 non-zero input features per example, the pull/push hbm-ps operations are faster than the ones of model c, d and e. model e has the largest number of dense parameters. thus its training operation costs most of the execution time in hbm-ps.
+
+# 7.4 mem-ps
+
+local/remote parameters. figure 4(b) illustrates the execution time of pulling local/remote parameters in the memps for model e over 1, 2 and 4 gpu nodes. the results of other models show a similar trend. the remote parameter pulling operation is not applicable when we only have 1 gpu node—all the parameters are stored in the same node. when we deploy the proposed system in distributed environments with 2 and 4 nodes, the local and remote pulling operations are paralleled. the overall execution time is determined by the slower operation. we can observe that the overall time of pulling mem-ps parameters does not hike much when inter-node communications are involved.
+
+cache performance. the cache hit rate for model e is illustrated in figure 4(c). in the beginning of the training, the cache hit rate is low because we start from a cold cache—no data are cached. we can observe that the cache hit rate increases steeply during the training of the first 10 batches. after 40 training batches, the cache hit rate goes to  $46\%$  and becomes stable in the following training—the frequently visited parameters are captured by our cache policy.
+
+# 7.5 ssd-ps
+
+figure 5(a) presents the ssd i/o time for model e. the ssd disk usage threshold is reached and the parameter file compaction operation is involved from the  $54^{th}$  batch—the ssd i/o time hikes. the regular file merging in the compaction operation causes the i/o performance fluctuation.
+
+![](images/df82a5f80da7fdda2d7f9c889086e4805ef63aff16d47d33ed35f09f1e0b214b.jpg)  
+(a) time distribution in hbm-ps
+
+![](images/13dad98af5185ff36b4c191214023e22c46759a3fbca4d3b84601802c77bb396.jpg)  
+(b) time distribution in mem-ps  
+figure 4. the time distribution in hbm-ps/mem-ps and the cache hit rate on model e.
+
+![](images/62036978abfcf9457d49b35a945a693a0ca4107ecdc0c25f06f364bec06e6cd1.jpg)  
+(c) cache hit rate
+
+![](images/80a7850a23187f9b4f70b19be8f73b08d86421b343427edeb5ea1695fec2f559.jpg)  
+(a) ssd-ps i/o time  
+figure 5. the ssd-ps i/o time and speedup on model e.
+
+![](images/d39b9297238244ed27a27dfd24533622ba9c9801f8756fcb40ee44ed851166a9.jpg)  
+(b) speedup
+
+# 7.6 scalability
+
+the training throughput (number of examples trained per second) speedup is depicted in figure 5(b) over 1, 2, and 4 nodes. the dashed line represents the ideal linear speedup. the reason for the (slightly) sub-linear speedup is that more network communications are incurred when we use more nodes. a speedup of 3.57 out of 4 is obtained for 4 nodes.
+
+# 7.7 discussion
+
+based on the results shown above, we can answer the questions driving the experimental evaluation. the 4-node distributed hierarchical gpu parameter server is 1.8-4.8x faster than the mpi solution in the production environment. the cost of 4 gpu nodes is much less than the cost of maintaining 75-150 cpu nodes in the mpi cluster. after normalizing the execution time by the hardware and maintenance cost, the price-performance ratio of our proposed system is 4.4-9.0x better than the mpi solution. besides the training speed, the relative accuracy difference to the mpi solution is within  $0.1\%$  —the training in our proposed system is lossless. the proposed pipeline parallels all training stages. the overall execution time for each batch is dominated by the hdfs when the model is small. when the number of sparse parameters grows to 6 and 10 tb, the sparse parameter pulling and pushing operations become the dominant factor. the execution time in the hbm-ps depends on the model specifications. a larger number of non-zero values of training inputs yields longer execution time for pulling and pushing parameters in the hbm-ps. the training for
+
+ward and backward propagation time depend on the size of fully-connected layers in the deep model. the execution time of pulling working parameters in the mem-ps is almost independent of the number of nodes. although the local data required to load from ssds are reduced when we have multiple nodes, more parameter requests from remote nodes have to be processed. in expectation, the average number of parameters to load from ssds stays the same in multi-node cases. the ssd-ps performance has slight fluctuations when the parameter file compaction operation involves in. our proposed system scales well in distributed environments—a training throughput speedup of 3.57 out of 4 (the ideal speedup) is obtained for 4 nodes.
+
+# 8 related work
+
+in this section, we discuss relevant work from ctr prediction models and parameter servers. additional related work about in-memory cache management systems and key-value stores on ssds are discussed in appendix f.
+
+ctr prediction models. the large scale logistic regression model with careful feature engineering used to dominate the ctr prediction strategies (edelman et al., 2007; graepel et al., 2010). recently, deep neural networks with embedding layers are applied in the ctr prediction problem and obtain significant improvements. generally, the sparse input features are converted into dense vectors through embedding layers, and then feed into neural components to expose the correlation/interaction among them. the differences among these models lie in the neural components above the embedding layer. for example, deep crossing (shan et al., 2016), wide&deep learning (cheng et al., 2016), youtube recommendation ctr model (covington et al., 2016) and deep interest network (din) (zhou et al., 2018) design special fully-connected layers for corresponding tasks to capture the latent interactions among features; product-based neural network (pnn) (qu et al., 2016) employs a product layer to capture high-order feature interactions; deepfm (guo et al., 2017) and xdeepfm (lian et al., 2018) use factorization machines (fm) to model both low-order and high-order
+
+feature correlations. through this approach, the correlations between sparse features are automatically exploited.
+
+the successes of these systems have proven that deep learning with sparse input is an effective approach for real-world commercial advertisement and recommendation systems. however, when the scale of the problem becomes extremely huge, for example, with  $10^{11}$  dimensional sparse data and trillions of samples, the architecture of these models must be carefully designed to cope with the challenges mentioned in above sections. this paper is our attempts to solving these challenges using an ssd based, three-layer distributed gpu training architecture. we believe our solution greatly enhances the feasibility of the methodology of deep learning with sparse input in much larger scale problems.
+
+parameter servers. one important research direction is the parallel mechanism among the computational nodes and server nodes. one such topic is the synchronization pattern of local updates of parameters, where three typical types of synchronization patterns are proposed: 1) bulk synchronous parallel (bsp) (valiant, 1990), which strictly synchronizes all local updates from all computing nodes in each iteration, and thus the learning procedure acts as the same logic as that of learning in a single machine. 2) stale synchronous parallel (ssp) (ho et al., 2013), which allows the fastest computing node to run a certain number of iterations ahead of other nodes. 3) asynchronous parallel (asp), which does not need any synchronization among the updates of computing nodes. instead of using the same parallel strategy throughout the training procedure, flexps (huang et al., 2018) proposed a flexible parallelism control for multi-stage learning algorithms such as svrg.
+
+another direction is to design efficient parameter server architecture for different hardware/network situations. communication is a major bottleneck in parallel training. poseidon (zhang et al., 2017) develops two strategies wait-free back-propagation and hybrid communication to exploit the independency between parameters of layered model structures in deep neural networks and conquer communication bottleneck; while gaia (hsieh et al., 2017) even considered the problem of running learning program on geo-distributed clusters that communicate over wans. another challenge is the big model size for gpu platforms. when the model becomes bigger, the limited gpu memory cannot hold the entire model. geeps (cui et al., 2016) builds a two-layer architecture to cope with the problems in this situation, including data movement overheads, gpu stalls, and limited gpu memory, where the memory layer holds the entire model in memory, and the gpu layer fetch the required part of the model from the memory layer, do the computation and rewrite the updates to the memory layer. our proposed system constructs a distributed hash table across gpu hbms that enables direct gpu peer-to-peer communi
+
+cations. it reduces the excessive cpu-gpu data movement and synchronization overhead in geeps.
+
+however, when the model size becomes even larger, the parameters cannot even be stored in the cpu main memory of the cluster. our solution to the challenge is a three-layer architecture that consists of ssd-ps, mem-ps layer, and hbm-ps. the new architecture results in new challenges such as gpu i/o problems and we develop strategies to optimize the performance. our architecture can efficiently train a 10 tb model, which greatly enhances the capability of gpu clusters to cope with massive scale models.
+
+# 9 conclusions
+
+since 2013, baidu search ads (a.k.a. "phoenix nest") has been successfully using ultra-high dimensional input data and ultra-large-scale deep neural networks for training ctr prediction models. in this paper, we introduce the architecture of a distributed hierarchical gpu parameter server for massive scale deep learning ads systems. as discussed in section 2, model hashing techniques such as "one-permutation + one sign random projection" are not fully applicable to the accuracy-crucial ads industry applications. the deep learning model parameter size can become huge and cannot fit in the cpu/gpu memory. the proposed hierarchical design employs the main memory and ssds to, respectively, store the out-of-gpu-memory and out-of-main-memory parameters of massive scale neural networks
+
+we perform an extensive set of experiments on 5 ctr prediction models in real-world online sponsor advertising applications. the results confirm the effectiveness and the scalability of the proposed system. the 4-node distributed hierarchical gpu parameter server is 1.8-4.8x faster than the mpi solution in the production environment. for example, a 4-node hierarchical gpu parameter server can train a model more than 2x faster than a 150-node in-memory distributed parameter server in an mpi cluster on model d. the cost of 4 gpu nodes is much less than the cost of maintaining an mpi cluster of 75-150 cpu nodes. after normalizing the execution time by the hardware cost and maintenance expenditure, the price-performance ratio of this proposed system is 4.4-9.0x better than the previous mpi solution.
+
+the system described in this paper is being integrated with the paddlepaddle deep learning platform (https://www.paddlepaddle.org.cn) to become the "paddlebox".
+
+# acknowledgement
+
+the system described in this paper represents the substantial effort in the past years involving several major product teams at baidu inc. we could not include all the names we should acknowledge but only a few: xuewu jiao, quanxiang jia, lian zhao, lin liu, jiajun zhang, yue wang, anlong qi.
+
+# references
+
+marc abrams, charles r. standridge, ghaleb abdulla, stephen m. williams, and edward a. fox. caching proxies: limitations and potentials. world wide web journal, 1(1), 1996.  
+dan alistarh, christopher de sa, and nikola konstantinov. the convergence of stochastic gradient descent in asynchronous shared memory. in proceedings of the 2018 acm symposium on principles of distributed computing (podc), pp. 169-178, new york, ny, 2018.  
+ashok anand, chitra muthukrishnan, steven kappes, aditya akella, and suman nath. cheap and large cams for high performance data-intensive networked systems. in proceedings of the 7th usenix symposium on networked systems design and implementation (nsdi), pp. 433-448, san jose, ca, 2010.  
+david g. andersen, jason franklin, michael kaminsky, amar phanishayee, lawrence tan, and vijay vasudevan. fawn: a fast array of wimpy nodes. in proceedings of the 22nd acm symposium on operating systems principles (sosp), pp. 1-14, big sky, mt, 2009.  
+andrei broder. a taxonomy of web search. sigir forum, 36(2):3-10, 2002.  
+pei cao and sandy irani. cost-aware www proxy caching algorithms. in 1st usenix symposium on internet technologies and systems (usits), monterey, ca, 1997.  
+moses charikar, kevin chen, and martin farach-colton. finding frequent items in data streams. theor. comput. sci., 312(1):3-15, 2004.  
+moses s. charikar. similarity estimation techniques from rounding algorithms. in proceedings on 34th annual acm symposium on theory of computing (stoc), pp. 380-388, montreal, canada, 2002.  
+heng-tze cheng, levent koc, jeremiah harmsen, tal shaked, tushar chandra, hrishi aradhye, glen anderson, greg corrado, wei chai, mustafa ispir, rohan anil, zakaria haque, lichan hong, vihan jain, xiaobing liu, and hemal shah. wide & deep learning for recommender systems. in proceedings of the 1st workshop on deep learning for recommender systems, (dlrs@recsys), pp. 7-10, boston, ma, 2016.  
+trishul m. chilimbi, yutaka suzue, johnson apacible, and karthik kalyanaraman. project adam: building an efficient and scalable deep learning training system. in 11th usenix symposium on operating systems design and implementation (osdi), pp. 571-582, broomfield, co, 2014.
+
+hong-tai chou and david j dewitt. an evaluation of buffer management strategies for relational database systems. algorithmica, 1(1-4):311-336, 1986.  
+graham cormode and s. muthukrishnan. an improved data stream summary: the count-min sketch and its applications. journal of algorithm, 55(1):58-75, 2005.  
+paul covington, jay adams, and emre sargin. deep neural networks for youtube recommendations. in proceedings of the 10th acm conference on recommender systems (recsys), pp. 191-198, boston, ma, 2016.  
+henggang cui, james cipar, qirong ho, jin kyu kim, seunghak lee, abhimanu kumar, jinliang wei, wei dai, gregory r. ganger, phillip b. gibbons, garth a. gibson, and eric p. xing. exploiting bounded staleness to speed up big data analytics. in 2014 usenix annual technical conference (usenix atc), pp. 37-48, philadelphia, pa, 2014.  
+henggang cui, hao zhang, gregory r. ganger, phillip b. gibbons, and eric p. xing. geeps: scalable deep learning on distributed gpus with a gpu-specialized parameter server. in proceedings of the eleventh european conference on computer systems (eurosys), pp. 4:1-4:16, london, uk, 2016.  
+shaul dar, michael j. franklin, björn pór jónsson, divesh srivastava, and michael tan. semantic data caching and replacement. in proceedings of 22th international conference on very large data bases (vldb), pp. 330-341, mumbai (bombay), india, 1996.  
+biplob k. debnath, sudipta sengupta, and jin li. flashstore: high throughput persistent key-value store. pvldb, 3(2):1414-1425, 2010.  
+biplob k. debnath, sudipta sengupta, and jin li. skimpystash: ram space skimpy key-value store on flash-based storage. in proceedings of the acm sigmod international conference on management of data (sigmod), pp. 25-36, athens, greece, 2011.  
+benjamin edelman, michael ostrovsky, and michael schwarz. internet advertising and the generalized second-price auction: selling billions of dollars worth of keywords. american economic review, 97(1):242-259, 2007.  
+assaf eisenman, maxim naumov, darryl gardner, misha smelyanskiy, sergey pupyrev, kim hazelwood, asaf cidon, and sachin katti. bandana: using non-volatile memory for storing deep learning models. arxiv preprint arxiv:1811.05922, 2018.  
+daniel c. fain and jan o. pedersen. sponsored search: a brief history. bulletin of the american society for information science and technology, 32(2):12-13, 2006.
+
+miao fan, jiacheng guo, shuai zhu, shuo miao, mingming sun, and ping li. mobius: towards the next generation of query-ad matching in baidu's sponsored search. in proceedings of the 25th acm sigkdd international conference on knowledge discovery & data mining, (kdd), pp. 2509-2517, anchorage, ak, 2019.  
+denis foley and john danskin. ultra-performance pascal gpu and nvlink interconnect. ieee micro, 37(2):7-17, 2017.  
+michel x. goemans and david p. williamson. improved approximation algorithms for maximum cut and satisfiability problems using semidefinite programming. journal of acm, 42(6):1115-1145, 1995.  
+thore graepel, joaquin quinonero candela, thomas borchert, and ralf herbrich. web-scale bayesian click-through rate prediction for sponsored search advertising in microsoft's bing search engine. in proceedings of the 27th international conference on machine learning (icml), pp. 13-20, haifa, israel, 2010.  
+huifeng guo, ruiming tang, yunming ye, zhenguo li, and xiuqiang he. deepfm: a factorization-machine based neural network for ctr prediction. in proceedings of the twenty-sixth international joint conference on artificial intelligence (ijcai), pp. 1725-1731, melbourne, australia, 2017.  
+qirong ho, james cipar, henggang cui, seunghak lee, jin kyu kim, phillip b. gibbons, garth a. gibson, gregory r. ganger, and eric p. xing. more effective distributed ml via a stale synchronous parallel parameter server. in advances in neural information processing systems (nips), pp. 1223-1231, lake tahoe, nv, 2013.  
+kevin hsieh, aaron harlap, nandita vijaykumar, dimitris konomis, gregory r. ganger, phillip b. gibbons, and onur mutlu. gaia: geo-distributed machine learning approaching lan speeds. in 14th usenix symposium on networked systems design and implementation (nsdi), pp. 629-647, boston, ma, 2017.  
+jin huang and charles x ling. using auc and accuracy in evaluating learning algorithms. ieee transactions on knowledge and data engineering (tkde), 17(3):299-310, 2005.  
+yuzhen huang, tatiana jin, yidi wu, zhenkun cai, xiao yan, fan yang, jinfeng li, yuying guo, and james cheng. flexps: flexible parallelism control in parameter server architecture. pvldb, 11(5):566-579, 2018.  
+tim kraska, alex beutel, ed h. chi, jeffrey dean, and neoklis polyzotis. the case for learned index structures. in proceedings of the 2018 international conference on
+
+management of data (sigmod), pp. 489-504, houston, tx, 2018.  
+donghee lee, jongmoo choi, jong-hun kim, sam h noh, sang lyul min, yookun cho, and chong sang kim. lrfu: a spectrum of policies that subsumes the least recently used and least frequently used policies. ieee transactions on computers, 50(12):1352-1361, 2001.  
+mu li, david g. andersen, jun woo park, alexander j. smola, amr ahmed, vanja josifovski, james long, eugene j. shekita, and bor-yiing su. scaling distributed machine learning with the parameter server. in 11th usenix symposium on operating systems design and implementation (osdi), pp. 583-598, broomfield, co, 2014.  
+ping li, anshumali shrivastava, joshua moore, and arnd christian könig. hashing algorithms for large-scale learning. in advances in neural information processing systems (nips), pp. 2672-2680, granada, spain, 2011.  
+ping li, art b owen, and cun-hui zhang. one permutation hashing. in advances in neural information processing systems (nips), pp. 3122-3130, lake tahoe, nv, 2012.  
+ping li, xiaoyun li, and cun-hui zhang. re-randomized densification for one permutation hashing and bin-wise consistent weighted sampling. in advances in neural information processing systems (neurips), vancouver, canada, 2019.  
+jianxun lian, xiaohuan zhou, fuzheng zhang, zhongxia chen, xing xie, and guangzhong sun. xdeepfm: combining explicit and implicit feature interactions for recommender systems. in proceedings of the 24th acm sigkdd international conference on knowledge discovery & data mining (kdd), pp. 1754-1763, london, uk, 2018.  
+hyeontaek lim, bin fan, david g. andersen, and michael kaminsky. silt: a memory-efficient, high-performance key-value store. in proceedings of the 23rd acm symposium on operating systems principles (sosp), pp. 1-13, cascais, portugal, 2011.  
+lanyue lu, thanumalayan sankaranarayana pillai, hariharan gopalakrishnan, andrea c arpaci-dusseau, and remzi h arpaci-dusseau. wiskey: separating keys from values in ssd-conscious storage. acm transactions on storage (tos), 13(1):5, 2017.  
+liang luo, jacob nelson, luis ceze, amar phanishayee, and arvind krishnamurthy. parameter hub: a rack-scale parameter server for distributed deep neural network training. in proceedings of the acm symposium on cloud computing (socc), pp. 41-54, carlsbad, ca, 2018.
+
+shamkant navathe et al. vertical partitioning algorithms for database design. acm transactions on database systems (tods), 9(4):680-710, 1984.  
+elizabeth j. o'neil, patrick e. o'neil, and gerhard weikum. the lru-k page replacement algorithm for database disk buffering. in proceedings of the 1993 acm sigmod international conference on management of data (sigmod), pp. 297-306, washington, dc, 1993.  
+sreeram potluri, khaled hamidouche, akshay venkatesh, devendar bureddy, and dhabaleswar k. panda. efficient inter-node mpi communication using gpudirect rdma for infiniband clusters with nvidia gpus. in 42nd international conference on parallel processing (icpp), pp. 80-89, lyon, france, 2013.  
+yanru qu, han cai, kan ren, weinan zhang, yong yu, ying wen, and jun wang. product-based neural networks for user response prediction. in ieee 16th international conference on data mining (icdm), pp. 1149-1154, barcelona, spain, 2016.  
+ying shan, t. ryan hoens, jian jiao, haijing wang, dong yu, and j. c. mao. deep crossing: web-scale modeling without manually crafted combinatorial features. in proceedings of the 22nd acm sigkdd international conference on knowledge discovery and data mining (kdd), pp. 255-262, san francisco, ca, 2016.  
+anshumali shrivastava and ping li. improved densification of one permutation hashing. in proceedings of the thirtieth conference on uncertainty in artificial intelligence (uai), pp. 732-741, quebec city, canada, 2014.  
+leonid b. sokolinsky. lfu-k: an effective buffer management replacement algorithm. in 9th international conference on database systems for advances applications (dasfaa), pp. 670-681, jeju island, korea, 2004.  
+shulong tan, zhixin zhou, zhaozhuo xu, and ping li. fast item ranking under neural network based measures. in proceedings of the 13th acm international conference on web search and data mining (wsdm), huston, tx, 2020.  
+leslie g. valiant. a bridging model for parallel computation. commun. acm, 33(8):103-111, 1990.
+
+kilian weinberger, anirban dasgupta, john langford, alex smola, and josh attenberg. feature hashing for large scale multitask learning. in proceedings of the 26th annual international conference on machine learning (icml), pp. 1113-1120, montreal, canada, 2009.  
+roland p. wooster and marc abrams. proxy caching that estimates page load delays. computer networks, 29(8-13):977-986, 1997.  
+hao zhang, zeyu zheng, shizhen xu, wei dai, qirong ho, xiaodan liang, zhiting hu, jinliang wei, pengtao xie, and eric p. xing. poseidon: an efficient communication architecture for distributed deep learning on gpu clusters. in 2017 usenix annual technical conference (usenix atc), pp. 181-193, santa clara, ca, 2017.  
+weijie zhao, yu cheng, and florin rusu. vertical partitioning for query processing over raw data. in proceedings of the 27th international conference on scientific and statistical database management, (ssdbm), pp. 15:1-15:12, la jolla, ca, 2015.  
+weijie zhao, jingyuan zhang, deping xie, yulei qian, ronglai jia, and ping li. abox: ctr prediction model training on a single node. in proceedings of the 28th acm international conference on information and knowledge management (cikm), pp. 319-328, beijing, china, 2019.  
+weijie zhao, shulong tan, and ping li. song: approximate nearest neighbor search ongpu. in 35th ieee international conference on data engineering (icde), dallas, tx, 2020.  
+guorui zhou, xiaogiang zhu, chengru song, ying fan, han zhu, xiao ma, yanghui yan, junqi jin, han li, and kun gai. deep interest network for click-through rate prediction. in proceedings of the 24th acm sigkdd international conference on knowledge discovery & data mining (kdd), pp. 1059-1068, london, uk, 2018.  
+zhixin zhou, shulong tan, zhaozhuo xu, and ping li. möbius transformation for fast inner product search on graph. in advances in neural information processing systems (neurips), pp. 8216-8227, vancouver, canada, 2019.
+
+![](images/c166db6b21fb135b4d0f4f08220ed90658d090199ab528d49b23e0c8304bf01d.jpg)  
+working: 4, 5, 11, 50, 53, 56, 61, 87, 98
+
+![](images/582fe3f9c99b0bcc5ab9c647cde074ef55b729b0d121bbe6537b2f9291ea648c.jpg)  
+figure 6. an example for algorithm 1.
+
+# a hierarchical parameter server workflow example
+
+example. figure 6 depicts an example for the training workflow (algorithm 1). consider now we are at  $node_1$ . an input batch is streamed from hdfs and is divided into 4 minibatches. the working parameters of the current batch are: 4, 5, 11, 50, 53, 56, 61, 87, 98. parameters are sharded and stored on the ssds of each node. we have 2 nodes and shard the parameters in a round-robin method in this example— $node_1$  stores the parameters with odd keys while  $node_2$  stores the ones with even keys. here we have 100 total parameters in this example—there are  $10^{11}$  parameters in real-world large-scale deep learning models. 5, 11, 53, 61, 87 are stored on the local node— $node_1$ . we pull these parameters from the local mem-ps (for the cached parameters) and the local ssd-ps. for the parameters that stored on other nodes—4, 50, 56, 98, we pull these parameters from the mem-ps on  $node_2$  through the network. the mem-ps on  $node_2$  interacts with its memory cache and its local ssd-ps to load the requested parameters. now all the working parameters are retrieved and are stored in the memory of  $node_1$ . here we have 2 gpus on  $node_1$ . the working parameters are partitioned and transferred to gpu hbms. in this example,  $gpu_1$  obtains the parameters whose keys are less than or equal to 50—4, 5, 11, 50, and  $gpu_2$  takes 53, 56, 61, 87, 98. the partition strategy can be any hashing function that maps a parameter key to a gpu id. consider the worker_1 of  $gpu_1$  is responsible to process mini-batch_1. worker_1 is required to load 11, 87 and 98. among them,
+
+11 is stored in the hbm of the local gpu— $gpu_1$ . 87 and 98 are pulled from  $gpu_2$ . since the gpus are connected with high-speed interconnections—nvlink, the inter-gpu data transfer has low-latency and high-bandwidth. after the parameters are ready in the working memory of  $worker_1$ , we can perform the neural network forward and backward propagation operations to update the parameters. all the updated parameters are synchronized among all gpus on all nodes after each mini-batch is finished. when all the minibatches are finished, the mem-ps on each node pulls back the updated parameters and materializes them onto ssds.
+
+# b 4-stage pipeline example
+
+![](images/cb23c754e52e35c77627ac2877c401e3ef1993561f993a57d537c194105117dd.jpg)  
+figure 7. the 4-stage pipeline.
+
+figure 7 is an illustration of the 4-stage pipeline. for example, when the gpus are busy training the model, our 4-stage pipeline enables the proposed system to prepare the referenced parameters of the next training batch at the same time: the hbm-ps pulls remote parameters from other nodes and the ssd-ps loads local parameters for the next batch simultaneously. after the training of the current batch is finished, all the required parameters of the next batch are ready to use in the gpu hbm—gpus are able to train the next batch immediately.
+
+# c hbm-ps implementation
+
+# c.1 multi-gpu distributed hash table
+
+partition policy. a partition policy that maps a parameter key to a gpu id is required to partition the parameters. a simple modulo hash function yields a balanced partitioning in general cases, because the features of the input training data are usually distributed randomly. the modulo hash function can be computed efficiently with constant memory space. as a trade-off of the memory footprint, the disadvantage of the simple hash partition policy is that we need to pull parameters from other gpus if the parameters referenced in a mini-batch are not stored in the local parameter partition. one possible improvement is to group parameters with high co-occurrence together (eisenman et al., 2018), for example, pre-train a learned hash
+
+![](images/f7e42a466377ed583a7e122df7720022bdaf097ee3aac8302be79c7ac0491578.jpg)  
+figure 8. inter-node rdma communication.
+
+function (kraska et al., 2018) to maximize the parameter co-occurrence. it is another research axis—vertical partitioning (navathe et al., 1984; zhao et al., 2015) that is beyond the scope of this paper. generally, no perfect balanced partition solution exists for random inputs. although the number of pulled parameters is reduced, we still have to pull parameters from almost all other gpus even with an optimized partition policy. besides, transferring a large batch of data can better utilize the nvlink bandwidth—the disadvantage of the simple hash function partition policy is reduced.
+
+# c.2 gpu rdma communication
+
+gpu communication mechanism. the inter-node gpu communication mechanism is depicted in figure 8. two nodes are shown in the figure—the left node is the sender and the right one is the receiver. for each node, the cpu, gpu and network card are connected with a pcie bus.
+
+we first examine the baseline method before we introduce our rdma solution. in the figure, the data flow of the baseline method is represented as the dashed line starting from the sender hbm to the receiver hbm. the cpu calls the gpu driver to copy the data from gpu hbm into the cpu memory. then, the cpu reads the data in the memory and transmits the data through the network. the transmitted data are stored in the memory of the receiver node. finally, the receiver cpu transfers the in-memory data to the gpu hbm. in this baseline method, the cpu memory is utilized as a buffer to store the communication data—it incurs unnecessary data copies and cpu consumptions.
+
+our rdma hardware design eliminates the involvement of the cpu and memory. its data flow is represented as a solid line in the figure. remote direct memory access (rdma) (potluri et al., 2013) enables zero-copy network communication—it allows the network card to transfer data from a device memory directly to another device memory without copying data between the device memory and the data buffers in the operating system. the rdma data transfer demands no cpu consumption or context switches. the network protocol-rdma over converged ethernet (roce)-
+
+is employed to allow rdma over the ethernet network. the sender gpu driver<sup>1</sup> directly streams the data in hbm to the network, while the receiver network card directly stores the collected data into the gpu hbm.
+
+![](images/f3fb125462084f5a3958b13820a44f4059c779be10e485ce2a90353e539dd7dd.jpg)  
+figure 9. all-reduce communication.
+
+# c.3 inter-node gpu communication
+
+all-reduce communication. the parameter synchronization requires an all-reduce communication—each gpu needs to receive all parameter updates from other gpus and then performs a reduction to accumulate these updates. figure 9 presents an example communication workflow. 4 nodes are shown in this example. each node contains 8 gpus. initially, the gpus on  $node_1$  exchange their parameter updates with their corresponding gpus on  $node_2$  (step ①)—i.e., the  $i^{th}$  gpu on  $node_1$  communicates with the  $i^{th}$  gpu on  $node_2$ . meanwhile, the gpus with the same id on  $node_3$  and  $node_4$  share their data with each other. then, the gpus on  $node_1$  perform the communication with the ones on  $node_3$  (step ②). likewise, the gpus on  $node_2$  and  $node_4$  perform the same pattern communication in parallel. after these two steps, each gpu on each node has collected all the parameter updates of its corresponding
+
+gpus on other nodes. an intra-node gpu tree all-reduce communication $^2$  is executed to share the data across all 8 gpus on the same node (step  $③$ ). most of the communications are paralleled— $\log_2 \# \text{nodes}$  non-parallel inter-node and  $\log_2 \# \text{gpus}$  intra-node all-reduce communications are required to synchronize the parameters across all nodes.
+
+# c.4 dense parameters
+
+as we discussed in the ctr prediction neural network example (figure 1), besides the large-scale sparse parameters, there are a small number of dense parameters for the fully-connected layers. for any sparse input, all the dense parameters are referenced and updated. therefore, we can pin these dense parameters in the hbm of all gpus at the beginning of the training for better training performance. in extreme cases—we have insufficient hbm memory to replicate the dense parameters, we can shard the dense parameters as the sparse parameters and distribute them across all gpu hbms. the dense parameters are also synchronized as the sparse ones in the hbm-ps after each mini-batch is processed.
+
+# d mem-ps implementation
+
+cache policy. we target to cache the most recently and the most frequently used parameters in the memory to reduce ssd i/os. in this paper, we leverage a cache eviction policy that combines two cache methods—least recently used (lru) (o'neil et al., 1993) and least frequently used (lfu) (sokolinsky, 2004). whenever we visit a parameter, we add it into an lru cache. for the evicted parameters from the lru cache, we insert them into an lfu cache. the evicted parameters from the lfu cache are collected—we have to flush them into ssds before releasing their memory. to guarantee the data integrity of our pipeline, we pin the working parameters of the current batch and the pre-fetched parameters of next iterations in the lru cache—they cannot be evicted from the memory until their batch is completed.
+
+# e ssd-ps implementation
+
+load parameters. the ssd-ps gathers requested parameter keys from the mem-ps and looks up the parameter-to-file mapping to locate the parameter files to read. we have to read an entire parameter file when it contains requested parameters—a larger file causes more unnecessary parameter readings. this is a trade-off between the ssd i/o bandwidth and the unnecessary parameter reading—a small-size file cannot fully utilize the ssd i/o bandwidth. we tune the file size to obtain the optimal performance. figure 10(a) depicts an example of parameter files on ssds. in
+
+the example, each parameter file can store 3 parameters.
+
+dump parameters. parameters evicted from the hbm-ps cache are required to be dumped onto ssds. it is impractical to locate these parameters and perform in-place updates inside the original file—it poorly utilizes the ssd i/o bandwidth because it requires us to randomly write the disk. instead, our ssd-ps chunks these updated parameters into files and writes them as new files on ssds—data are sequentially written onto the disk. after the files are written, we update the parameter-to-file mapping of these parameters. the older versions of the parameters stored in the previous files become stale—these older values will not be used since the mapping is updated. in figure 10(b), we present an example for dumping parameters—1, 2, 4, 6, 8, 9 are updated and dumped to ssd-ps. we chunked them into two files and write these two files onto the ssd— $\text{file}_4$  and  $\text{file}_5$ . the underlined values—the values of the updated parameters in the old files—are stale.
+
+file compaction. the ssd usage hikes as we keep creating new files on ssds. a file compaction operation is performed regularly to reduce the disk usage—many old files containing a large proportion of stale values can be merged into new files. we adopt the leveled compaction algorithm of leveldb<sup>3</sup> to create a lightweight file merging strategy. a worker thread runs in the background to check the disk usage. when the usage reaches a pre-set threshold, the ssd-ps scans the old parameter files, collects the non-stale parameters, merges them into new files, and erases the old files. the parameter-to-file mapping of the merged parameters is also updated in the file compaction operation. figure 10(c) illustrates the file compaction effects. before the compaction (figure 10(b)), the stale values in  $\text{file}_1$ ,  $\text{file}_2$  and  $\text{file}_3$  occupy more than a half of the file capacity. we scan these files, merge the non-stale values into a new file  $\text{(file}_6$  ), and erase these files  $\text{(file}_1$  and  $\text{file}_2$ . the compaction operation may merge a large number of files on ssds. in order to reduce the excessive merging, we set a threshold to limit the number of merged files—we only merge files that contain more than  $50\%$  stale parameters. by employing this threshold, we can limit the total ssd space usage—the size of all parameter files will not exceed 2 times  $(1/50\%)$  of the original non-stale parameter size. note that we do not need to read the entire file to obtain the proportion of stale parameters—a counter that counts the number of stale parameters is maintained as an auxiliary attribute for each file. when we update the parameter-to-file mapping, we accumulate the counter of the old file it previously maps to.
+
+# f additional related work
+
+in-memory cache management. many caching policies have been developed for storage systems, such as the lru-
+
+![](images/3a544c8677e1eec7ab77f5e20dfaed24601c2d761e10c9a78a81adf9e4a7ef12.jpg)  
+figure 10. ssd-ps examples: (a) parameter-to-file mapping and parameter files; (b) 1, 2, 4, 8, 9 are updated; (c) a compaction operation.
+
+k (o'neil et al., 1993), dbmin (chou & dewitt, 1986), lrfu(lee et al., 2001), and semantic caching (dar et al., 1996). these algorithms evict cache according to a combined weight of recently used time-stamp and frequency. in the web context, there is extensive work developed for variable-size objects. some of the most well-known algorithms in this space are lowest-latency-first(wooster & abrams, 1997), lru-threshold (abrams et al., 1996), and greedy-dual-size(cao & irani, 1997). unlike our caching problem, the parameter we tackle with has a fixed size and a clear access pattern in our ctr prediction model training—some parameters are frequently referenced. it is effective to keep those "hot parameters" in the cache by applying an lfu eviction policy. while our additional lru linked list maintains the parameters referenced in the current pass to accelerate the hash table probing.
+
+key-value store for ssds. there is a significant amount of work on key-value stores for ssd devices. the major
+
+designs (andersen et al., 2009; lim et al., 2011) follow the paradigm that maintains an in-memory hash table and constructs an append-only lsm-tree-like data structure on the ssd for updates. flashstore (debnath et al., 2010) optimize the hash function for the in-memory index to compact key memory footprints. skimpystash (debnath et al., 2011) moves the key-value pointers in the hash table onto the ssd. bufferhash (anand et al., 2010) builds multiple hash tables with bloom filters for hash table selection. wisckey (lu et al., 2017) separates keys and values to minimize read/write amplifications. our ssd-ps design follows the mainstream paradigm, while it is specialized for our training problem. we do not need to confront the challenges to store general keys and values. the keys are the index of parameters that distributes uniformly. it is unnecessary to employ any sophisticated hashing functions. also, the values have a known fixed length, the serialized bucket on ssd exactly fits in an ssd block—i/o amplification is minimized.

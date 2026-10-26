@@ -1,0 +1,304 @@
+# reformer: the efficient transformer
+
+nikita kitaev*
+
+u.c. berkeley & google research
+
+kitaev@cs.berkeley.edu
+
+łukasz kaiser*
+
+google research
+
+{lukaszkaiser,levskaya}@google.com
+
+anselm levskaya
+
+google research
+
+# abstract
+
+large transformer models routinely achieve state-of-the-art results on a number of tasks but training these models can be prohibitively costly, especially on long sequences. we introduce two techniques to improve the efficiency of transformers. for one, we replace dot-product attention by one that uses locality-sensitive hashing, changing its complexity from  $\mathrm{o}(l^2)$  to  $\mathrm{o}(l\log l)$ , where  $l$  is the length of the sequence. furthermore, we use reversible residual layers instead of the standard residuals, which allows storing activations only once in the training process instead of  $n$  times, where  $n$  is the number of layers. the resulting model, the reformer, performs on par with transformer models while being much more memory-efficient and much faster on long sequences.
+
+# 1 introduction
+
+the transformer architecture (vaswani et al., 2017) is widely used in natural language processing and yields state-of-the-art results on a number of tasks. to obtain these results, researchers have resorted to training ever larger transformer models. the number of parameters exceeds 0.5b per layer in the largest configuration reported in (shazeer et al., 2018) while the number of layers goes up to 64 in (al-rfou et al., 2018). transformer models are also used on increasingly long sequences. up to 11 thousand tokens of text in a single example were processed in (liu et al., 2018) and when processing other modalities, like music (huang et al., 2018) and images (parmar et al., 2018), even longer sequences are commonplace. these large-scale long-sequence models yield great results but strain resources to the point where some argue that this trend is breaking nlp research<sup>1</sup>. many large transformer models can only realistically be trained in large industrial research laboratories and such models trained with model parallelism cannot even be fine-tuned on a single gpu as their memory requirements demand a multi-accelerator hardware setup even for a single training step.
+
+do large transformer models fundamentally require such huge resources or are they simply inefficient? consider the following calculation: the 0.5b parameters used in the largest reported transformer layer account for 2gb of memory. activations for 64k tokens with embedding size 1024 and batch size 8 account for  $64\mathrm{k} \times 1\mathrm{k} \times 8 = 0.5\mathrm{b}$  floats, requiring another 2gb of memory. if our memory use was only per-layer, then we should fairly easily fit a large transformer even on sequences of length 64k on a single accelerator. further, the whole corpus used to train bert only requires 17gb to store. why is it then that we cannot even fine-tune these models on single machines?
+
+the above estimate includes only per-layer memory and input activations cost and does not take into account the following major sources of memory use in the transformer.
+
+- memory in a model with  $n$  layers is  $n$ -times larger than in a single-layer model due to the fact that activations need to be stored for back-propagation.  
+- since the depth  $d_{ff}$  of intermediate feed-forward layers is often much larger than the depth  $d_{model}$  of attention activations, it accounts for a large fraction of memory use.  
+- attention on sequences of length  $l$  is  $\mathrm{o}(l^2)$  in both computational and memory complexity, so even for a single sequence of 64k tokens can exhaust accelerator memory.
+
+we introduce the reformer model which solves these problems using the following techniques:
+
+- reversible layers, first introduced in gomez et al. (2017), enable storing only a single copy of activations in the whole model, so the  $n$  factor disappears.  
+- splitting activations inside feed-forward layers and processing them in chunks removes the  $d_{ff}$  factor and saves memory inside feed-forward layers.  
+- approximate attention computation based on locality-sensitive hashing replaces the  $\mathrm{o}(l^2)$  factor in attention layers with  $\mathrm{o}(l\log l)$  and so allows operating on long sequences.
+
+we study these techniques and show that they have negligible impact on the training process compared to the standard transformer. splitting activations in fact only affects the implementation; it is numerically identical to the layers used in the transformer. applying reversible residuals instead of the standard ones does change the model but has a negligible effect on training in all configurations we experimented with. finally, locality-sensitive hashing in attention is a more major change that can influence the training dynamics, depending on the number of concurrent hashes used. we study this parameter and find a value which is both efficient to use and yields results very close to full attention.
+
+we experiment on a synthetic task, a text task (enwik8) with sequences of length 64k and an image generation task (imagenet-64 generation) with sequences of length 12k. in both cases we show that reformer matches the results obtained with full transformer but runs much faster, especially on the text task, and with orders of magnitude better memory efficiency.
+
+# 2 locality-sensitive hashing attention
+
+dot-product attention. the standard attention used in the transformer is the scaled dot-product attention (vaswani et al., 2017). the input consists of queries and keys of dimension  $d_{k}$ , and values of dimension  $d_{v}$ . the dot products of the query with all keys are computed, scaled by  $\sqrt{d_k}$ , and a softmax function is applied to obtain the weights on the values. in practice, the attention function on a set of queries is computed simultaneously, packed together into a matrix  $q$ . assuming the keys and values are also packed together into matrices  $k$  and  $v$ , the matrix of outputs is defined as:
+
+$$
+\operatorname {a t t e n t i o n} (q, k, v) = \operatorname {s o f t m a x} \left(\frac {q k ^ {t}}{\sqrt {d _ {k}}}\right) v \tag {1}
+$$
+
+multi-head attention. in the transformer, instead of performing a single attention function with  $d_{model}$ -dimensional keys, values and queries, one linearly projects the queries, keys and values  $h$  times with different, learned linear projections to  $d_k$ ,  $d_k$  and  $d_v$  dimensions, respectively. attention is applied to each of these projected versions of queries, keys and values in parallel, yielding  $d_v$ -dimensional output values. these are concatenated and once again projected, resulting in the final values. this mechanism is known as multi-head attention.
+
+memory-efficient attention. to calculate the memory use of the attention mechanism, let us focus on the attention computation from equation 1. let us assume that q, k and v all have the shape [batch_size, length,  $d_{model}$ ]. the main issue is the term  $qk^t$ , which has the shape [batch_size, length, length]. in the experimental section we train a model on sequences of length  $64k$  – in this case, even at batch-size of 1, this is a  $64k \times 64k$  matrix, which in 32-bit floats would take 16gb of memory. this is impractical and has hindered the use of the transformer for long sequences. but it is important to note that the  $qk^t$  matrix does not need to be fully materialized in memory. the attention can indeed be computed for each query  $q_i$  separately, only calculating  $\mathrm{softmax}(\frac{q_i k^t}{\sqrt{d_k}}) v$  once in memory, and then re-computing it on the backward pass when needed for gradients. this way of computing attention may be less efficient but it only uses memory proportional to length. we use this memory-efficient implementation of attention to run the full-attention baselines presented in the experimental section.
+
+where do q, k, v come from? the multi-head attention described above operates on keys, queries and values, but usually we are only given a single tensor of activations a of the shape [batch_size, length,  $d_{model}$ ] - e.g., coming from embedding the tokens in a sentence into vectors.
+
+![](images/1531e5b8ff848be21dd68aeb5485fc87f981bbc4e3d06ed95d6a5cf3e1ea192e.jpg)  
+figure 1: an angular locality sensitive hash uses random rotations of spherically projected points to establish buckets by an argmax over signed axes projections. in this highly simplified 2d depiction, two points  $x$  and  $y$  are unlikely to share the same hash buckets (above) for the three different angular hashes unless their spherical projections are close to one another (below).
+
+to build q, k and v from a, the transformer uses 3 different linear layers projecting a into q, k and v with different parameters. for models with lsh attention, we want queries and keys (q and k) to be identical. this is easily achieved by using the same linear layer to go from a to q and k, and a separate one for v. we call a model that behaves like this a shared-qk transformer. it turns out that sharing qk does not affect the performance of transformer, even if we additionally normalize the length of the keys k, as we show in the experimental section 5.
+
+hashing attention. for the lsh attention, we start with two tensors,  $\mathrm{q} = \mathrm{k}$  and  $\mathrm{v}$  of the shape [batch_size, length,  $d_{\text{model}}$ ]. we keep the multi-head mechanism intact and focus on the attention computation from equation 1. as already mentioned, the main issue is the term  $qk^t$ , which has the shape [batch_size, length, length]. but note that we are actually only interested in  $\text{softmax}(qk^t)$ . since softmax is dominated by the largest elements, for each query  $q_i$  we only need to focus on the keys in  $\mathbf{k}$  that are closest to  $q_i$ . for example, if  $\mathbf{k}$  is of length 64k, for each  $q_i$  we could only consider a small subset of, say, the 32 or 64 closest keys. that is much more efficient, but how can we find the nearest neighbors among the keys?
+
+locality sensitive hashing. the problem of finding nearest neighbors quickly in high-dimensional spaces can be solved by locality-sensitive hashing (lsh). a hashing scheme that assigns each vector  $x$  to a hash  $h(x)$  is called locality-sensitive if nearby vectors get the same hash with high probability and distant ones do not. in our case, we actually only require that nearby vectors get the same hash with high probability and that hash-backets are of similar size with high probability.
+
+we achieve this by employing random projections as follows (see figure 1). to get  $b$  hashes, we first fix a random matrix  $r$  of size  $[d_k, b/2]$ . we then define  $h(x) = \arg \max([xr; -xr])$  where  $[u; v]$  denotes the concatenation of two vectors. this method is a known lsh scheme (andoni et al., 2015) and is easy to implement and apply to batches of vectors.
+
+lsh attention. knowing our lsh scheme and the general idea of hashing attention, we will now formalize the lsh attention we use in this paper. we first rewrite the equation for normal attention, (1), for a single query position  $i$  at a time:
+
+$$
+o _ {i} = \sum_ {j \in \mathcal {p} _ {i}} \exp \left(q _ {i} \cdot k _ {j} - z (i, \mathcal {p} _ {i})\right) v _ {j} \quad \text {w h e r e} \mathcal {p} _ {i} = \{j: i \geq j \} \tag {2}
+$$
+
+we introduce the notation  $\mathcal{p}_i$  to represent the set that the query at position  $i$  attends to, and  $z$  to denote the partition function (i.e. the normalizing term in the softmax). for clarity, we also omit scaling by  $\sqrt{d_k}$ .
+
+for batching purposes we typically perform attention over a larger set  $\widetilde{\mathcal{p}}_i = \{0,1,\dots ,l\} \supseteq \mathcal{p}_i$  while masking out elements not in  $\mathcal{p}_i$ :
+
+$$
+o _ {i} = \sum_ {j \in \widetilde {\mathcal {p}} _ {i}} \exp \left(q _ {i} \cdot k _ {j} - m (j, \mathcal {p} _ {i}) - z (i, \mathcal {p} _ {i})\right) v _ {j} \quad \text {w h e r e} m (j, \mathcal {p} _ {i}) = \left\{ \begin{array}{l l} \infty & \text {i f} j \notin \mathcal {p} _ {i} \\ 0 & \text {o t h e r w i s e} \end{array} \right. \tag {3}
+$$
+
+![](images/d8db596c5b76d29a4745034b08c46f37c5f2307dbff244b9ccd5319789866f90.jpg)  
+figure 2: simplified depiction of lsh attention showing the hash-bucketing, sorting, and chunking steps and the resulting causal attentions. (a-d) attention matrices for these varieties of attention.
+
+![](images/334b577d58a8f8e298abe37f865f7c0ed0e1c52e4b4e145fe33c6fc338566ac4.jpg)
+
+![](images/55ce100abc20441e6dee08e5039b45b283e6432b98d0d4f3baecb9c80d36946b.jpg)
+
+![](images/2dc50e33f723c9306551b7cfca2aac9d442529a708b8e4ba6de09e3935b47af4.jpg)
+
+![](images/c9b373504597ecbc12d82e8aeaa62da731e35928d100e09d8e95762dbf60c576.jpg)
+
+now we turn to lsh attention, which we can think of in terms of restricting the set  $\mathcal{p}_i$  of target items a query position  $i$  can attend to, by only allowing attention within a single hash bucket.
+
+$$
+\mathcal {p} _ {i} = \{j: h \left(q _ {i}\right) = h \left(k _ {j}\right) \} \tag {4}
+$$
+
+figure 2(a-b) shows a schematic comparison of full-attention with a hashed variant. part (a) depicts that the attention matrix for full attention is typically sparse, but the computation does not take advantage of this sparsity. in (b), the queries and keys have been sorted according to their hash bucket. since similar items fall in the same bucket with high probability, the full attention pattern can be approximated by only allowing attention within each bucket.
+
+hash buckets in this formulation tend to be uneven in size, which makes it difficult to batch across buckets. moreover, the number of queries and the number of keys within a bucket may be unequal – in fact, it is possible for a bucket to contain many queries but no keys. to alleviate these issues, we first ensure that  $h(k_{j}) = h(q_{j})$  by setting  $k_{j} = \frac{q_{j}}{\|q_{j}\|}$ . next, we sort the queries by bucket number and, within each bucket, by sequence position; this defines a permutation where  $i \mapsto s_i$  after sorting. in the sorted attention matrix, pairs from the same bucket will cluster near the diagonal (as depicted in figure 2c). we can follow a batching approach where chunks of  $m$  consecutive queries (after sorting) attend to each other, and one chunk back (figure 2d). following our earlier notation, this corresponds to setting:
+
+$$
+\widetilde {\mathcal {p}} _ {i} = \left\{j: \left\lfloor \frac {s _ {i}}{m} \right\rfloor - 1 \leq \left\lfloor \frac {s _ {j}}{m} \right\rfloor \leq \left\lfloor \frac {s _ {i}}{m} \right\rfloor \right\} \tag {5}
+$$
+
+if  $\max_i |\mathcal{p}_i| < m$ , then  $\mathcal{p}_i \subseteq \widetilde{\mathcal{p}}_i$ . in practice we set  $m = \frac{2l}{n_{\text{buckets}}}$  (where  $l$  is the sequence length). the average bucket size is  $\frac{l}{n_{\text{buckets}}}$ , and we assume that the probability of a bucket growing to twice that size is sufficiently low. the overall process of lsh attention is summarized in figure 2.
+
+multi-round lsh attention. with hashing, there is always a small probability that similar items nevertheless fall in different buckets. this probability can be reduced by doing multiple rounds of hashing with  $n_{rounds}$  distinct hash functions  $\{h^{(1)}, h^{(2)}, \ldots\}$ , such that:
+
+$$
+\mathcal {p} _ {i} = \bigcup_ {r = 1} ^ {n _ {\text {r o u n d s}}} \mathcal {p} _ {i} ^ {(r)} \quad \text {w h e r e} \mathcal {p} _ {i} ^ {(r)} = \left\{j: h ^ {(r)} \left(q _ {i}\right) = h ^ {(r)} \left(q _ {j}\right) \right\} \tag {6}
+$$
+
+the multi-round case essentially involves performing lsh attention  $n_{rounds}$  times in parallel; the details of the procedure are described in in appendix a.
+
+causal masking for shared-qk attention. in a transformer decoder, masking (denoted by  $m(j,\mathcal{p}_i)$  in equation 3) is used to prevent positions from attending into the future. to implement masking in lsh attention, we associate every query/key vector with a position index, re-order the position indices using the same permutations used to sort the query/key vectors, and then use a comparison operation to compute the mask.
+
+table 1: memory and time complexity of attention variants. we write  $l$  for length,  $b$  for batch size,  ${n}_{h}$  for the number of heads,  ${n}_{c}$  for the number of lsh chunks,  ${n}_{r}$  for the number of hash repetitions.  
+
+<table><tr><td>attention type</td><td>memory complexity</td><td>time complexity</td></tr><tr><td>scaled dot-product</td><td>max(bnhldk, bnhl2)</td><td>max(bnhldk, bnhl2)</td></tr><tr><td>memory-efficient</td><td>max(bnhldk, bnhl2)</td><td>max(bnhldk, bnhl2)</td></tr><tr><td>lsh attention</td><td>max(bnhldk, bnhlnrl(4l/nc)2)</td><td>max(bnhldk, bnhnrl(4l/nc)2)</td></tr></table>
+
+table 2: accuracies on the duplication task of a 1-layer transformer model with full attention and with locality-sensitive hashing attention using different number of parallel hashes.  
+
+<table><tr><td>eval train</td><td>full attention</td><td>lsh-8</td><td>lsh-4</td><td>lsh-2</td><td>lsh-1</td></tr><tr><td>full attention</td><td>100%</td><td>94.8%</td><td>92.5%</td><td>76.9%</td><td>52.5%</td></tr><tr><td>lsh-4</td><td>0.8%</td><td>100%</td><td>99.9%</td><td>99.4%</td><td>91.9%</td></tr><tr><td>lsh-2</td><td>0.8%</td><td>100%</td><td>99.9%</td><td>98.1%</td><td>86.8%</td></tr><tr><td>lsh-1</td><td>0.8%</td><td>99.9%</td><td>99.6%</td><td>94.8%</td><td>77.9%</td></tr></table>
+
+while attention to the future is not allowed, typical implementations of the transformer do allow a position to attend to itself. such behavior is undesirable in a shared-qk formulation because the dot-product of a query vector with itself will almost always be greater than the dot product of a query vector with a vector at another position. we therefore modify the masking to forbid a token from attending to itself, except in situations where a token has no other valid attention targets (e.g. the first token in a sequence).
+
+# 2.1 analysis on a synthetic task
+
+to verify the performance of lsh attention and study its behavior, we start with the following synthetic task: duplicate a sequence of symbols. in this task, each training and testing example has the form  $0w0w$  where  $w \in \{1, \dots, n\}^*$  is a sequence of symbols ranging from 1 to  $n$  (we use  $n = 127$  in our experiments). an example with the word  $w$  of length 3 is given below.
+
+<table><tr><td>example:</td><td>0</td><td>19</td><td>113</td><td>72</td><td>0</td><td>19</td><td>113</td><td>72</td></tr></table>
+
+to study lsh attention, we train a language model on examples of the above form where each  $w$  is of length 511 (so the whole input  $0w0w$  is of length 1024). as this is a language modeling task, we always predict the next symbol given all the previous ones, but we mask the loss and accuracy to only consider positions in the second half of the input, i.e., those that can actually be predicted.
+
+the above task can be solved perfectly (to accuracy  $100\%$  and loss 0) by a 1-layer transformer model. note though, that it requires non-local attention lookups, so it cannot be solved by any model relying on sparse attention with a limited span. to make it easy and fast to train but similar to models used in nlp, we use a 1-layer transformer with  $d_{model} = d_{ff} = 256$  and 4 heads. we train it for 150k steps in 4 different settings: with full attention, lsh attention with  $n_{rounds} = 1$ ,  $n_{rounds} = 2$  and  $n_{rounds} = 4$ .
+
+from the results summarized in table 2 we see that a model trained with full attention can be immediately used with lsh attention, but at some loss of accuracy. when trained from scratch with lsh attention, the model trained with 4 hashes achieves almost perfect accuracy as well. interestingly, the accuracy becomes perfect when evaluated with 8 hashes. it goes down when evaluated with 2 or 1 hashes. models trained with less hashes show worse results but even the model trained with just 1 hash performs almost perfectly when evaluated with 8 hashes.
+
+# 3 reversible transformer
+
+as the above section shows, the complexity of attention can be reduced from square in length to linear, provided an approximation is acceptable. but it is clear from table 1 that each field starts with a  $b \cdot n_h \cdot l$  term: the  $b \cdot n_h \cdot l \cdot d_k$ , or alternatively  $b \cdot l \cdot d_{model}$  cost cannot be avoided. indeed, the activations before each layer are already of the size  $b \cdot l \cdot d_{model}$ , so the memory use of the whole model with  $n_l$  layers is at least  $b \cdot l \cdot d_{model} \cdot n_l$ . even worse: inside the feed-forward layers of transformer this goes up to  $b \cdot l \cdot d_{ff} \cdot n_l$ . in a big transformer it is usual to set  $d_{ff} = 4k$  and  $n_l = 16$  so with  $l = 64k$  this again would use an impractical 16gb of memory
+
+in this section, we show how to reduce this cost by first dealing with the  $n_l$  part of the term using reversible layers and then showing how chunking can allow us to handle the  $d_{ff}$  problem. the effects of each of these approaches on memory and time complexity are summarized in table 3.
+
+revnets. reversible residual networks were introduced by gomez et al. (2017) where it was shown that they can replace resnets for image classification. the main idea is to allow the activations at any given layer to be recovered from the activations at the following layer, using only the model parameters. rather than having to checkpoint intermediate values for use in the backward pass, layers can be reversed one-by-one as back-propagation proceeds from the output of the network to its input. whereas a normal residual layer performs a function  $x \mapsto y$  that operates on a single input and produces a single output and has the form  $y = x + f(x)$ , a reversible layer works on pairs of inputs/outputs:  $(x_1, x_2) \mapsto (y_1, y_2)$ , and follows the equations:
+
+$$
+y _ {1} = x _ {1} + f \left(x _ {2}\right) \quad y _ {2} = x _ {2} + g \left(y _ {1}\right) \tag {7}
+$$
+
+a layer can be reversed by subtracting (rather than adding) the residuals:
+
+$$
+x _ {2} = y _ {2} - g \left(y _ {1}\right) \quad x _ {1} = y _ {1} - f \left(x _ {2}\right) \tag {8}
+$$
+
+reversible transformer. we apply the revnet idea to the transformer by combining the attention and feed-forward layers inside the revnet block. in the notation above, f becomes an attention layer while g becomes the feed-forward layer. note that layer normalization (ba et al., 2016) is moved inside the residual blocks.
+
+$$
+y _ {1} = x _ {1} + \operatorname {a t t e n t i o n} \left(x _ {2}\right) \quad y _ {2} = x _ {2} + \operatorname {f e e d f o r w a r d} \left(y _ {1}\right) \tag {9}
+$$
+
+the reversible transformer does not need to store activations in each layer and so gets rid of the  $n_l$  term. in section 5 we show that it performs the same as the normal transformer when using the same number of parameters; we achieve this by having both  $x_1$  and  $x_2$  have size  $d_{model}$ .
+
+chunking. while reversibility covers the  $n_l$  term, the thicker layers can still use a lot of memory. the feed-forward layer in particular can use intermediate vectors of dimensionality  $d_{ff} = 4k$  or higher. however, computations in feed-forward layers are completely independent across positions in a sequence, so the computation can be split into  $c$  chunks:
+
+$$
+y _ {2} = \left[ y _ {2} ^ {(1)}; \dots ; y _ {2} ^ {(c)} \right] = \left[ x _ {2} ^ {(1)} + \operatorname {f e e d f o r w a r d} \left(y _ {1} ^ {(1)}\right); \dots ; x _ {2} ^ {(c)} + \operatorname {f e e d f o r w a r d} \left(y _ {1} ^ {(c)}\right) \right] \tag {10}
+$$
+
+this layer is typically batched by performing operations for all positions in parallel, but operating on one chunk at a time can reduce memory. the reverse computation in (8) and the backward pass are also chunked. in addition to the feed-forward layers, for models with large vocabulary (more than  $d_{model}$  word types) we also chunk the log-probabilities at the output and calculate the loss for sections of the sequence at a time.
+
+chunking, large batches and parameter reuse. with chunking and reversible layers the memory we use for activations in the whole network is independent of the number of layers. the same is not true for parameters though as their number grows with the number of layers. this problem is remedied though because we can swap layer parameters to and from cpu memory when this layer is not computing. in a standard transformer this would be inefficient because memory transfer to cpu is slow. the batch size multiplied by length in reformer is much larger though and therefore the amount of compute done with the parameters amortizes the cost of their transfer.
+
+table 3: memory and time complexity of transformer variants. we write  $d_{model}$  and  $d_{ff}$  for model depth and assume  $d_{ff} \geq d_{model}$ ;  $b$  stands for batch size,  $l$  for length,  $n_l$  for the number of layers. we assume  $n_c = l / 32$  so  $4l / n_c = 128$  and we write  $c = 128^2$ .  
+
+<table><tr><td>model type</td><td>memory complexity</td><td>time complexity</td></tr><tr><td>transformer</td><td>max(bldff, bnhl2)nl</td><td>(bldff + bnhl2)nl</td></tr><tr><td>reversible transformer</td><td>max(bldff, bnhl2)</td><td>(bnhlldff + bnhl2)nl</td></tr><tr><td>chunked reversible transformer</td><td>max(bldmodel, bnhl2)</td><td>(bnhlldff + bnhl2)nl</td></tr><tr><td>lsh transformer</td><td>max(bldff, bnhlnc)nl</td><td>(bldff + bnhnrlc)nl</td></tr><tr><td>reformer</td><td>max(bldmodel, bnhlnc)</td><td>(bldff + bnhnrlc)nl</td></tr></table>
+
+# 4 related work
+
+the transformer model introduced in (vaswani et al., 2017) has been used widely in natural language tasks and further extended to model diverse data such as music scores (huang et al., 2018), and images (parmar et al., 2018; ramachandran et al., 2019). most notably, this model class has been applied successfully in the self-supervised training of extremely large language models (devlin et al., 2018; radford et al., 2019).
+
+given the enormous computational requirements of state of the art sequence models, there has been increasing interest in finding methods to reduce the memory footprint and computational requirements of transformer models. in addition to standard methods such as precision reduction and gradient checkpointing (sohoni et al., 2019), more efficient versions of the transformer model's self-attention mechanism (sukhbaatar et al., 2019a;b) have also recently been explored.
+
+in particular, leveraging sparsity in the attention layers has proved fruitful. openai introduced the sparse transformer (child et al., 2019) which exploits a factorized sparse representation of attention. using product-key attention to increase the key space has also been used to reduce memory requirements in the feed-forward layers with no loss in performance (lample et al., 2019).
+
+locality-sensitive hashing (lsh) has, to our knowledge, not been directly applied to transformer attention layers before. but previous work using external memory with neural networks has dealt with memories of large sizes. the original implementation of memory networks (weston et al., 2014) and later work on scaling it (bordes et al., 2015; chandar et al., 2016) used memory with size in the millions. the cost of doing so is that the memory must be fixed prior to training. moreover, since during the beginning of training the model is unlikely to query the memory correctly, strong supervision is used to encourage the model to query memory locations that are useful. these hints are either given as additional supervising information by the task or determined heuristically as in hill et al. (2015). the requirement that the memory be fixed before has been removed in santoro et al. (2016) at the cost of memory size and later alleviated by rae et al. (2016). the last paper considered memory lookups with approximate nearest neighbors including both lsh and random kd-trees, but only for lookups in external memory.
+
+# 5 experiments
+
+in this section we present experimental results demonstrating the techniques described above. we analyze the techniques one-by-one to make clear which combinations have impact on performance. we start by showing that reversible layers and shared query-key spaces do not impact performance, then proceed to analyze hashing attention and finally the full reformer model.
+
+we ran our experiments on the imagenet64 and enwik8-64k tasks, where the latter is a variant of enwik8 that is chunked into subsequences of  $2^{16} = 64k$  tokens. we use 3-layer models for our ablations so as to make it tractable to compare with the regular transformer, which has high memory usage and performs full  $o(l^2)$  attention. all experiments have  $d_{model} = 1024$ ,  $d_{ff} = 4096$ ,  $n_{heads} = 8$ , and a total batch size of 8 sequences. we used the adafactor optimizer (shazeer & stern, 2018) for training these models. we also evaluate on the wmt 2014 english-to-german translation task, following the hyperparameters of vaswani et al. (2017). training for all experiments
+
+![](images/bfc838aee1a07fbaa15c4b4de1cf6b512b340dc5f38dbf507f8f0ecaecf78d95.jpg)
+
+![](images/161fedab9403d29f442d6ab9a0f9f36cd1c3d0c9eb4d66653f9d19a8c22be2a8.jpg)
+
+![](images/a965b926bae0cbc2ef8592ac6900cc002f196323e730b73bb6ac5adeeff86aea.jpg)  
+figure 3: effect of shared query-key space (left) and reversibility (right) on performance on enwik8 and imagenet64 training. the curves show bits per dim on held-out data.
+
+![](images/f4c40749dee1f9e78cf3c15298af8c2db310a82d7938cec66a52d6725d6c2b54.jpg)
+
+table 4: bleu scores on newestest2014 for wmt english-german (ende). we additionally report detokenized bleu scores as computed by sacrebleu (post, 2018).  
+
+<table><tr><td rowspan="2">model</td><td rowspan="2">bleu</td><td colspan="2">sacrebleu</td></tr><tr><td>uncased3</td><td>cased4</td></tr><tr><td>vaswani et al. (2017), base model</td><td>27.3</td><td></td><td></td></tr><tr><td>vaswani et al. (2017), big</td><td>28.4</td><td></td><td></td></tr><tr><td>ott et al. (2018), big</td><td>29.3</td><td></td><td></td></tr><tr><td>reversible transformer (base, 100k steps)</td><td>27.6</td><td>27.4</td><td>26.9</td></tr><tr><td>reversible transformer (base, 500k steps, no weight sharing)</td><td>28.0</td><td>27.9</td><td>27.4</td></tr><tr><td>reversible transformer (big, 300k steps, no weight sharing)</td><td>29.1</td><td>28.9</td><td>28.4</td></tr></table>
+
+was parallelized across 8 devices (8 gpus or 8 tpu v3 cores). code for training our models is made publicly available.2
+
+effect of sharing qk. we first consider the effect of shared-qk attention on a regular transformer model. shared-qk attention sets  $k_{j} = \frac{q_{j}}{\|q_{j}\|}$  and prevents tokens from attending to themselves (except when no other context is available). in the left part of figure 3, we plot perplexity curves for both regular and shared-qk attention. a shared query-key space does not perform worse than regular attention; in fact, for enwik8 it appears to train slightly faster. in other words, we are not sacrificing accuracy by switching to shared-qk attention.
+
+effect of reversible layers. in the two plots on the right in figure 3, we compare a regular transformer per vaswani et al. (2017) with the reversible one describe in section 3. the two models have identical parameter counts, and the learning curves likewise appear to be nearly the same. these results show that the memory savings in the reversible transformer do not come at the expense of accuracy.
+
+reversible layers in machine translation. we also evaluate reversible layers in the context of an encoder-decoder transformer model for machine translation from english to german. we start by making both the encoder and the decoder fully reversible in the transformer-base architecture, and
+
+![](images/7736ac8e603c99db39552882b707a3f02dd55d59f77c9168ee92ae1a323ea538.jpg)  
+figure 4: lsh attention performance as a function of hashing rounds onimagenet64.
+
+![](images/56f3c5ae38754b95c6af92c9623d1c9e6e33992ad16a495a1e16f0df7aa9b535.jpg)  
+figure 5: left: lsh attention performance as a function of number of layers on enwik8. right: speed of attention evaluation as a function of input length for full- and lsh- attention.
+
+![](images/53d3418baf095a3b08f7480057121b89f8f63176de4601b2b2594b5609abbab7.jpg)
+
+see that the resulting model performs comparably to vaswani et al. (2017) when trained for 100k steps. we also evaluate training for a greater number of steps and with a larger model. reformer models are very memory-efficient, so for the latter two experiments we do not need to save memory by sharing embedding and output projection weight matrices throughout the model. results are shown in table 4. we do not apply lsh attention in this setting because examples are single sentences, and sentences tend to be relatively short. our typical lsh attention configuration uses chunks of 128 tokens after hashing and sorting, whereas the examples in the wmt14 test set are all shorter than 128 tokens.
+
+lsh attention in transformer. lsh attention is an approximation for full attention that, as evidenced in figure 4, becomes more accurate as the number of hashes increases. at  $n_{rounds} = 8$ , it already almost matches full attention. the computational cost of a model grows with the number of hashes, so this hyperparameter can be adjusted depending on the available compute budget. additionally, as in table 2, the number of hashes can be increased at evaluation time to produce more accurate results. on the right half of figure 5, we plot the speed of different attention types vs. the sequence length, while holding the total number of tokens fixed. we see that while regular attention becomes slower at longer sequence length, lsh attention speed remains flat.
+
+large reformer models. to verify that the reformer can indeed fit large models on a single core and train fast on long sequences, we train up to 20-layer big reformers on enwik8 and imagenet64. as can be seen in figure 5, these models fit into memory and train. we were not able to train transformer baselines in this case as they are too slow and memory-hungry, but we see clear improvement with the number of layers. a 12-layer model on enwik8 trained for 20k steps with a dropout rate of 0.1 achieves 1.19 bits/dim on the test set. we also trained a 12-layer reformer model for longer with further tuning and improvements and we reached 1.05 bits/dim on the enwiki8 test set.
+
+# 6 conclusion
+
+reformer combines the modeling capacity of a transformer with an architecture that can be executed efficiently on long sequences and with small memory use even for models with a large number of layers. we believe that this will help large, richly-parameterized transformer models become more widespread and accessible. also, the ability to handle long sequences opens the way for the use of the reformer on many generative tasks. in addition to generating very long coherent text, the reformer can bring the power of transformer models to other domains like time-series forecasting, music, image and video generation.
+
+# references
+
+rami al-rfou, dokook choe, noah constant, mandy guo, and llion jones. character-level language modeling with deeper self-attention. corr, abs/1808.04444, 2018. url http://arxiv.org/abs/1808.04444.  
+alexandr andoni, piotr indyk, thijs laarhoven, ilya p. razenshteyn, and ludwig schmidt. practical and optimal lsh for angular distance. corr, abs/1509.02897, 2015. url http://arxiv.org/abs/1509.02897.  
+jimmy lei ba, jamie ryan kiros, and geoffrey e hinton. layer normalization. arxiv preprint arxiv:1607.06450, 2016. url http://arxiv.org/abs/1607.06450.  
+antoine bordes, nicolas usunier, sumit chopra, and jason weston. large-scale simple question answering with memory networks. corr, abs/1506.02075, 2015. url http://arxiv.org/abs/1506.02075.  
+sarath chandar, sungjin ahn, hugo larochelle, pascal vincent, gerald tesauro, and yoshua bengio. hierarchical memory networks. arxiv preprint arxiv:1605.07427, 2016.  
+rewon child, scott gray, alec radford, and ilya sutskever. generating long sequences with sparse transformers. url https://openai.com/blog/sparse-transformers, 2019.  
+jacob devlin, ming-wei chang, kenton lee, and kristina toutanova. bert: pre-training of deep bidirectional transformers for language understanding. corr, abs/1810.04805, 2018. url http://arxiv.org/abs/1810.04805.  
+aidan n gomez, mengye ren, raquel urtasun, and roger b grosse. the reversible residual network: backpropagation without storing activations. in advances in neural information processing systems, pp. 2214-2224, 2017.  
+felix hill, antoine bordes, sumit chopra, and jason weston. the goldilocks principle: reading children's books with explicit memory representations. corr, abs/1511.02301, 2015. url http://arxiv.org/abs/1511.02301.  
+cheng-zhi anna huang, ashish vaswani, jakob uszkoreit, noam shazeer, curtis hawthorne, andrew m dai, matthew d hoffman, and douglas eck. music transformer: generating music with long-term structure. arxiv preprint arxiv:1809.04281, 2018.  
+guillaume lample, alexandre sablayrolles, marc'aurelio ranzato, ludovic denoyer, and hervé jégou. large memory layers with product keys. corr, abs/1907.05242, 2019. url http://arxiv.org/abs/1907.05242.  
+peter j. liu, mohammad saleh, etienne pot, ben goodrich, ryan sepassi, lukasz kaiser, and noam shazeer. generating wikipedia by summarizing long sequences. corr, abs/1801.10198, 2018. url http://arxiv.org/abs/1801.10198.  
+myle ott, sergey edunov, david grangier, and michael auli. scaling neural machine translation. in proceedings of the third conference on machine translation: research papers, pp. 1-9, brussels, belgium, october 2018. association for computational linguistics. doi: 10.18653/v1/w18-6301. url https://www.aclweb.org/anthology/w18-6301.
+
+niki parmar, ashish vaswani, jakob uszkoreit, lukasz kaiser, noam shazeer, and alexander ku. image transformer. corr, abs/1802.05751, 2018. url http://arxiv.org/abs/1802.05751.  
+matt post. a call for clarity in reporting bleu scores. in proceedings of the third conference on machine translation: research papers, pp. 186-191, belgium, brussels, october 2018. association for computational linguistics. url https://www.aclweb.org/anthology/w18-6319.  
+alec radford, jeff wu, rewon child, david luan, dario amodei, and ilya sutskever. language models are unsupervised multitask learners. 2019.  
+jack w rae, jonathan j hunt, tim harley, ivo danihelka, andrew senior, greg wayne, alex graves, and timothy p lillicrap. scaling memory-augmented neural networks with sparse reads and writes. in advances in neural information processing systems, (nips), 2016.  
+prajit ramachandran, niki parmar, ashish vaswani, irwan bello, anselm levskaya, and jonathon shlens. stand-alone self-attention in vision models. corr, abs/1906.05909, 2019. url http://arxiv.org/abs/1906.05909.  
+adam santoro, sergey bartunov, matthew botvinick, daan wierstra, and timothy p. lillicrap. one-shot learning with memory-augmented neural networks. corr, abs/1605.06065, 2016. url http://arxiv.org/abs/1605.06065.  
+noam shazeer and mitchell stern. adafactor: adaptive learning rates with sublinear memory cost. corr, abs/1804.04235, 2018. url http://arxiv.org/abs/1804.04235.  
+noam shazeer, youlong cheng, niki parmar, dustin tran, ashish vaswani, penporn koanantakool, peter hawkins, hyoukjoong lee, mingsheng hong, cliff young, ryan sepassi, and blake hechtman. mesh-tensorflow: deep learning for supercomputers. corr, abs/1811.02084, 2018. url http://arxiv.org/abs/1811.02084.  
+nimit sharad sohoni, christopher richard aberger, megan leszczynski, jian zhang, and christopher ré. low-memory neural network training: a technical report. corr, abs/1904.10631, 2019. url http://arxiv.org/abs/1904.10631.  
+sainbayar sukhbaatar, edouard grave, piotr bojanowski, and armand joulin. adaptive attention span in transformers. corr, abs/1905.07799, 2019a. url http://arxiv.org/abs/1905.07799.  
+sainbayar sukhbaatar, edouard grave, guillaume lample, hervé jégou, and armand joulin. aug-mentation self-attention with persistent memory. corr, abs/1907.01470, 2019b. url http://arxiv.org/abs/1907.01470.  
+ashish vaswani, noam shazeer, niki parmar, jakob uszkoreit, llion jones, aidan n. gomez, lukasz kaiser, and illia polosukhin. attention is all you need. corr, 2017. url http://arxiv.org/abs/1706.03762.  
+jason weston, sumit chopra, and antoine bordes. memory networks. corr, abs/1410.3916, 2014. url http://arxiv.org/abs/1410.3916.
+
+# a multi-round lsh attention
+
+in this section we describe in more detail the multi hash version of our lsh attention mechanism. we first repeat equation (3) from the main text, which describes a general formulation of attention with sparsity:
+
+$$
+o _ {i} = \sum_ {j \in \widetilde {\mathcal {p}} _ {i}} \exp \left(q _ {i} \cdot k _ {j} - m (j, \mathcal {p} _ {i}) - z (i, \mathcal {p} _ {i})\right) v _ {j} \quad \text {w h e r e} m (j, \mathcal {p} _ {i}) = \left\{ \begin{array}{l l} \infty & \text {i f} j \notin \mathcal {p} _ {i} \\ 0 & \text {o t h e r w i s e} \end{array} \right. \tag {3}
+$$
+
+in the multi-round case, a query position  $i$  can attend to key positions  $\mathcal{p}_i$  as defined in (6), which we also repeat here:
+
+$$
+\mathcal {p} _ {i} = \bigcup_ {r = 1} ^ {n _ {\text {r o u n d s}}} \mathcal {p} _ {i} ^ {(r)} \quad \text {w h e r e} \mathcal {p} _ {i} ^ {(r)} = \left\{j: h ^ {(r)} \left(q _ {i}\right) = h ^ {(r)} \left(q _ {j}\right) \right\} \tag {6}
+$$
+
+for batching purposes, attention is performed on chunks of sorted queries/keys:
+
+$$
+\widetilde {\mathcal {p}} _ {i} ^ {(r)} = \left\{j: \left\lfloor \frac {s _ {i} ^ {(r)}}{m} \right\rfloor - 1 \leq \left\lfloor \frac {s _ {j} ^ {(r)}}{m} \right\rfloor \leq \left\lfloor \frac {s _ {i} ^ {(r)}}{m} \right\rfloor \right\} \tag {11}
+$$
+
+combining (3) and (6) gives:
+
+$$
+\begin{array}{l} o _ {i} = \sum_ {j \in \tilde {\mathcal {p}} _ {i}} \exp \left(q _ {i} \cdot k _ {j} - m (j, \mathcal {p} _ {i}) - z (i, \mathcal {p} _ {i})\right) v _ {j} (12) \\ = \sum_ {r = 1} ^ {n _ {\text {r o u n d s}}} \exp \left(z (i, \mathcal {p} _ {i} ^ {(r)}) - z (i, \mathcal {p} _ {i})\right) \sum_ {j \in \widetilde {\mathcal {p}} _ {i} ^ {(r)}} \frac {1}{n _ {i , j}} \exp \left(q _ {i} \cdot k _ {j} - m (j, \mathcal {p} _ {i} ^ {(r)}) - z (i, \mathcal {p} _ {i} ^ {(r)})\right) v _ {j} (13) \\ = \sum_ {r = 1} ^ {n _ {\text {r o u n d s}}} \exp \left(z (i, \mathcal {p} _ {i} ^ {(r)}) - z (i, \mathcal {p} _ {i})\right) o _ {i} ^ {(r)} (14) \\ \end{array}
+$$
+
+$$
+o _ {i} ^ {(r)} = \sum_ {j \in \overline {{\mathcal {p}}} _ {i} ^ {(r)}} \exp \left(q _ {i} \cdot k _ {j} - m _ {i, j} ^ {(r)} - z (i, \mathcal {p} _ {i} ^ {(r)})\right) v _ {j} \tag {15}
+$$
+
+$$
+\text {w h e r e} n _ {i, j} = \left| \left\{r ^ {\prime}: j \in \mathcal {p} _ {i} ^ {(r ^ {\prime})} \right\} \right| \text {a n d} m _ {i, j} ^ {(r)} = \left\{ \begin{array}{l l} \infty & \text {i f} j \notin \mathcal {p} _ {i} ^ {(r)} \\ 1 0 ^ {5} & \text {i f} i = j \\ \log n _ {i, j} & \text {o t h e r w i s e} \end{array} \right. \tag {16}
+$$
+
+each round of lsh attention produces a vector  $o_{i}^{(r)}$  that can be computed independently from other rounds, except for the inclusion of a term  $n_{i,j}$  to avoid double-counting elements when constructing the union of  $\mathcal{p}_i^{(r)}$  sets. in our implementation we fold the  $n_{i,j}$  factor into the masking term  $m_{i,j}^{(r)}$ .
+
+we also modify  $m_{i,j}^{(r)}$  to introduce a special case for  $i = j$ . this case is added because causal masking in a standard transformer allows position  $i$  to attend to itself, which is not desirable in a shared-qk formulation. we set the mask to a large but finite value to disallow attention-in-place, except in the situation where a token has no other valid attention targets. for example, the first token in a sequence attends only to itself, because no prior context is available.

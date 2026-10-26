@@ -1,0 +1,529 @@
+# end-to-end adversarial text-to-speech
+
+jeff donahue* sander dieleman* mikołaj bńkowski, erich elsen, karen simonyan* deepmind
+
+{jeffdonahue, sedielem, binek, eriche, simonyan}@google.com
+
+# abstract
+
+modern text-to-speech synthesis pipelines typically involve multiple processing stages, each of which is designed or learnt independently from the rest. in this work, we take on the challenging task of learning to synthesise speech from normalised text or phonemes in an end-to-end manner, resulting in models which operate directly on character or phoneme input sequences and produce raw speech audio outputs. our proposed generator is feed-forward and thus efficient for both training and inference, using a differentiable alignment scheme based on token length prediction. it learns to produce high fidelity audio through a combination of adversarial feedback and prediction losses constraining the generated audio to roughly match the ground truth in terms of its total duration and mel-spectrogram. to allow the model to capture temporal variation in the generated audio, we employ soft dynamic time warping in the spectrogram-based prediction loss. the resulting model achieves a mean opinion score exceeding 4 on a 5 point scale, which is comparable to the state-of-the-art models relying on multi-stage training and additional supervision. $^{1}$
+
+# 1 introduction
+
+a text-to-speech (tts) system processes natural language text inputs to produce synthetic human-like speech outputs. typical tts pipelines consist of a number of stages trained or designed independently - e.g. text normalisation, aligned linguistic featurisation, mel-spectrogram synthesis, and raw audio waveform synthesis (taylor, 2009). although these pipelines have proven capable of realistic and high-fidelity speech synthesis and enjoy wide real-world use today, these modular approaches come with a number of drawbacks. they often require supervision at each stage, in some cases necessitating expensive "ground truth" annotations to guide the outputs of each stage, and sequential training of the stages. further, they are unable to reap the full potential rewards of data-driven "end-to-end" learning widely observed in a number of prediction and synthesis task domains across machine learning.
+
+in this work, we aim to simplify the tts pipeline and take on the challenging task of synthesising speech from text or phonemes in an end-to-end manner. we propose eats – end-to-end adversarial text-to-speech – generative models for tts trained adversarially (goodfellow et al., 2014) that operate on either pure text or raw (temporally unaligned) phoneme input sequences, and produce raw speech waveforms as output. these models eliminate the typical intermediate bottlenecks present in most state-of-the-art tts engines by maintaining learnt intermediate feature representations throughout the network.
+
+our speech synthesis models are composed of two high-level submodules, detailed in section 2. an aligner processes the raw input sequence and produces relatively low-frequency (200 hz) aligned features in its own learnt, abstract feature space. the features output by the aligner may be thought of as taking the place of the earlier stages of typical tts pipelines – e.g., temporally aligned mel-spectrograms or linguistic features. these features are then input to the decoder which upsamples the features from the aligner by 1d convolutions to produce 24 khz audio waveforms.
+
+by carefully designing the aligner and guiding training by a combination of adversarial feedback and domain-specific loss functions, we demonstrate that a tts system can be learnt nearly end-to-end,
+
+resulting in high-fidelity natural-sounding speech approaching the state-of-the-art tts systems. our main contributions include:
+
+- a fully differentiable and efficient feed-forward aligner architecture that predicts the duration of each input token and produces an audio-aligned representation.  
+- the use of flexible dynamic time warping-based prediction losses to enforce alignment with input conditioning while allowing the model to capture the variability of timing in human speech.  
+- an overall system achieving a mean opinion score of 4.083, approaching the state of the art from models trained using richer supervisory signals.
+
+# 2 method
+
+our goal is to learn a neural network (the generator) which maps an input sequence of characters or phonemes to raw audio at  $24\mathrm{khz}$ . beyond the vastly different lengths of the input and output signals, this task is also challenging because the input and output are not aligned, i.e. it is not known beforehand which output tokens each input token will correspond to. to address these challenges, we divide the generator into two blocks: (i) the aligner, which maps the unaligned input sequence to a representation which is aligned with the output, but has a lower sample rate of  $200\mathrm{hz}$ ; and (ii) the decoder, which upsamples the aligner's output to the full audio frequency. the entire generator architecture is differentiable, and is trained end to end. importantly, it is also a feed-forward convolutional network, which makes it well-suited for applications where fast batched inference is important: our eats implementation generates speech at a speed of  $200\times$  realtime on a single nvidia v100 gpu (see appendix a and table 3 for details). it is illustrated in figure 1.
+
+the generator is inspired by gan-tts (binkowski et al., 2020), a text-to-speech generative adversarial network operating on aligned linguistic features. we employ the gan-tts generator as the decoder in our model, but instead of upsampling pre-computed linguistic features, its input comes from the aligner block. we make it speaker-conditional by feeding in a speaker embedding s alongside the latent vector  $\mathbf{z}$ , to enable training on a larger dataset with recordings from multiple speakers. we also adopt the multiple random window discriminators (rwds) from gan-tts, which have been proven effective for adversarial raw waveform modelling, and we preprocess real audio input by applying a simple  $\mu$ -law transform. hence, the generator is trained to produce audio in the  $\mu$ -law domain and we apply the inverse transformation to its outputs when sampling.
+
+the loss function we use to train the generator is as follows:
+
+$$
+\mathcal {l} _ {g} = \mathcal {l} _ {g, \text {a d v}} + \lambda_ {\text {p r e d}} \cdot \mathcal {l} _ {\text {p r e d}} ^ {\prime \prime} + \lambda_ {\text {l e n g t h}} \cdot \mathcal {l} _ {\text {l e n g t h}}, \tag {1}
+$$
+
+where  $\mathcal{l}_{g,\mathrm{adv}}$  is the adversarial loss, linear in the discriminators' outputs, paired with the hinge loss (lim & ye, 2017; tran et al., 2017) used as the discriminators' objective, as used in gan-tts (binkowski et al., 2020). the use of an adversarial (goodfellow et al., 2014) loss is an advantage of our approach, as this setup allows for efficient feed-forward training and inference, and such losses tend to be mode-seeking in practice, a useful behaviour in a strongly conditioned setting where realism is an important design goal, as in the case of text-to-speech. in the remainder of this section, we describe the aligner network and the auxiliary prediction  $(\mathcal{l}_{\mathrm{pred}}^{\prime \prime})$  and length  $(\mathcal{l}_{\mathrm{length}})$  losses in detail, and recap the components which were adopted from gan-tts.
+
+# 2.1 alignner
+
+given a token sequence  $\mathbf{x} = (x_{1},\ldots ,x_{n})$  of length  $n$ , we first compute token representations  $\mathbf{h} = f(\mathbf{x},\mathbf{z},\mathbf{s})$ , where  $f$  is a stack of dilated convolutions (van den oord et al., 2016) interspersed with batch normalisation (ioffe & szegedy, 2015) and relu activations. the latents  $\mathbf{z}$  and speaker embedding  $\mathbf{s}$  modulate the scale and shift parameters of the batch normalisation layers (dumoulin et al., 2017; de vries et al., 2017). we then predict the length for each input token individually:  $l_{n} = g(h_{n},\mathbf{z},\mathbf{s})$ , where  $g$  is an mlp. we use a relu nonlinearity at the output to ensure that the predicted lengths are non-negative. we can then find the predicted token end positions as a cumulative sum of the token lengths:  $e_n = \sum_{m = 1}^n l_m$ , and the token centre positions as  $c_{n} = e_{n} - \frac{1}{2} l_{n}$ . based on these predicted positions, we can interpolate the token representations into an audio-aligned representation at  $200\mathrm{hz}$ ,  $\mathbf{a} = (a_1,\dots,a_s)$ , where  $s = \lceil e_n\rceil$  is the total number of output time steps. to compute  $a_{t}$ , we obtain interpolation weights for the token representations  $h_n$  using a softmax over
+
+the squared distance between  $t$  and  $c_{n}$ , scaled by a temperature parameter  $\sigma^2$ , which we set to 10.0 (i.e. a gaussian kernel):
+
+$$
+w _ {t} ^ {n} = \frac {\exp \left(- \sigma^ {- 2} \left(t - c _ {n}\right) ^ {2}\right)}{\sum_ {m = 1} ^ {n} \exp \left(- \sigma^ {- 2} \left(t - c _ {m}\right) ^ {2}\right)}. \tag {2}
+$$
+
+using these weights, we can then compute  $a_{t} = \sum_{n=1}^{n} w_{t}^{n} h_{n}$ , which amounts to non-uniform interpolation. by predicting token lengths and obtaining positions using cumulative summation, instead of predicting positions directly, we implicitly enforce monotonicity of the alignment. note that tokens which have a non-monotonic effect on prosody, such as punctuation, can still affect the entire utterance thanks to the stack of dilated convolutions  $f$ , whose receptive field is large enough to allow for propagation of information across the entire token sequence. the convolutions also ensure generalisation across different sequence lengths. appendix b includes pseudocode for the aligner.
+
+# 2.2 windowed generator training
+
+training examples vary widely in length, from about 1 to 20 seconds. we cannot pad all sequences to a maximal length during training, as this would be wasteful and prohibitively expensive: 20 seconds of audio at  $24\mathrm{khz}$  correspond to 480,000 timesteps, which results in high memory requirements. instead, we randomly extract a 2 second window from each example, which we will refer to as a training window, by uniformly sampling a random offset  $\eta$ . the aligner produces a  $200\mathrm{hz}$  audio-aligned representation for this window, which is then fed to the decoder (see figure 1). note that we only need to compute  $a_{t}$  for time steps  $t$  that fall within the sampled window, but we do have to compute the predicted token lengths  $l_{n}$  for the entire input sequence. during evaluation, we simply produce the audio-aligned representation for the full utterance and run the decoder on it, which is possible because it is fully convolutional.
+
+# 2.3 adversarial discriminators
+
+random window discriminators. we use an ensemble of random window discriminators (rwds) adopted from gan-tts. each rwd operates on audio fragments of different lengths, randomly sampled from the training window. we use five rwds with window sizes 240, 480, 960, 1920 and 3600. this enables each rwd to operate at a different resolution. note that 3600 samples at  $24\mathrm{khz}$  corresponds to  $150~\mathrm{ms}$  of audio, so all rwds operate on short timescales. all rwds in our model are unconditional with respect to text: they cannot access the text sequence or the aligner output. (gan-tts uses 10 rwds, including 5 conditioned on linguistic features which we omit.) they are, however,
+
+conditioned on the speaker, via projection embedding (miyato & koyama, 2018).
+
+![](images/8e03b65e38531aaaec2cc8d6f7a086fedf3c4e0025138009472e4f5412b2c653.jpg)  
+figure 1: a diagram of the generator, including the monotonic interpolation-based aligner.  $z$  and  $ch$  denote the latent gaussian vector and the number of output channels, respectively. during training, audio windows have a fixed length of 2 seconds and are generated from the conditioning text using random offsets  $\eta$  and predicted phoneme lengths; the shaded areas in the logits grid and waveform are not synthesised. for inference (sampling), we set  $\eta = 0$ . in the no phonemes ablation, the phonemizer is skipped and the character sequence is fed directly into the aligner.
+
+spectrogram discriminator. we use an additional discriminator which operates on the full training window in the spectrogram domain. we extract log-scaled mel-spectrograms from the audio signals and use the biggan-deep architecture (brock et al., 2018), essentially treating the spectrograms as
+
+images. the spectrogram discriminator also uses speaker identity through projection embedding. details on the spectrogram discriminator architecture are included in appendix c.
+
+# 2.4 spectrogram prediction loss
+
+in preliminary experiments, we discovered that adversarial feedback is insufficient to learn alignment. at the start of training, the aligner does not produce an accurate alignment, so the information in the input tokens is incorrectly temporally distributed. this encourages the decoder to ignore the aligner output. the unconditional discriminators provide no useful learning signal to correct this. if we want to use conditional discriminators instead, we face a different problem: we do not have aligned ground truth. conditional discriminators also need an aligner module, which cannot function correctly at the start of training, effectively turning them into unconditional discriminators. although it should be possible in theory to train the discriminators' aligner modules adversarially, we find that this does not work in practice, and training gets stuck.
+
+instead, we propose to guide learning by using an explicit prediction loss in the spectrogram domain: we minimise the  $l_{1}$  loss between the log-scaled mel-spectrograms of the generator output, and the corresponding ground truth training window. this helps training to take off, and renders conditional discriminators unnecessary, simplifying the model. let  $s_{\mathrm{gen}}$  be the spectrogram of the generated audio,  $s_{\mathrm{gt}}$  the spectrogram of the corresponding ground truth, and  $s[t,f]$  the log-scaled magnitude at time step  $t$  and mel-frequency bin  $f$ . then the prediction loss is:
+
+$$
+\mathcal {l} _ {\text {p r e d}} = \frac {1}{f} \sum_ {t = 1} ^ {t} \sum_ {f = 1} ^ {f} | s _ {\text {g e n}} [ t, f ] - s _ {\text {g t}} [ t, f ] |. \tag {3}
+$$
+
+$t$  and  $f$  are the total number of time steps and mel-frequency bins respectively. computing the prediction loss in the spectrogram domain, rather than the time domain, has the advantage of increased invariance to phase differences between the generated and ground truth signals, which are not perceptually salient. seeing as the spectrogram extraction operation has several hyperparameters and its implementation is not standardised, we provide the code we used for this in appendix d. we applied a small amount of jitter (by up to  $\pm 60$  samples at  $24\mathrm{khz}$ ) to the ground truth waveform before computing  $s_{\mathrm{gt}}$ , which helped to reduce artifacts in the generated audio.
+
+the inability to learn alignment from adversarial feedback alone is worth expanding on: likelihood-based autoregressive models have no issues learning alignment, because they are able to benefit from teacher forcing (williams & zipser, 1989) during training: the model is trained to perform next step prediction on each sequence step, given the preceding ground truth, and it is expected to infer alignment only one step at a time. this is not compatible with feed-forward adversarial models however, so the prediction loss is necessary to bootstrap alignment learning for our model.
+
+note that although we make use of mel-spectrograms for training in  $\mathcal{l}_{\mathrm{pred}}$  (and to compute the inputs for the spectrogram discriminator, section 2.3), the generator itself does not produce spectrograms as part of the generation process. rather, its outputs are raw waveforms, and we convert these waveforms to spectrograms only for training (backpropagating gradients through the waveform to mel-spectrogram conversion operation).
+
+# 2.5 dynamic time warping
+
+the spectrogram prediction loss incorrectly assumes that token lengths are deterministic. we can relax the requirement that the generated and ground truth spectrograms are exactly aligned, by incorporating dynamic time warping (dtw) (sakoe, 1971; sakoe & chiba, 1978). we calculate the prediction loss by iteratively finding a minimal-cost alignment path  $p$  between the generated and target spectrograms,  $s_{\mathrm{gen}}$  and  $s_{\mathrm{gt}}$ . we start at the first time step in both spectrograms:  $p_{\mathrm{gen},1} = p_{\mathrm{gt},1} = 1$ . at each iteration  $k$ , we take one of three possible actions:
+
+1. go to the next time step in both  $s_{\mathrm{gen}}$ ,  $s_{\mathrm{gt}}$ :  $p_{\mathrm{gen},k + 1} = p_{\mathrm{gen},k} + 1$ ,  $p_{\mathrm{gt},k + 1} = p_{\mathrm{gt},k} + 1$ ;  
+2. go to the next time step in  $s_{\mathrm{gt}}$  only:  $p_{\mathrm{gen},k + 1} = p_{\mathrm{gen},k}$ ,  $p_{\mathrm{gt},k + 1} = p_{\mathrm{gt},k} + 1$ ;  
+3. go to the next time step in  $s_{\mathrm{gen}}$  only:  $p_{\mathrm{gen},k + 1} = p_{\mathrm{gen},k} + 1$ ,  $p_{\mathrm{gt},k + 1} = p_{\mathrm{gt},k}$ .
+
+the resulting path is  $p = \langle (p_{\mathrm{gen},1},p_{\mathrm{gt},1}),\ldots ,(p_{\mathrm{gen},k_p},p_{\mathrm{gt},k_p})\rangle$ , where  $k_{p}$  is the length. each action is assigned a cost based on the  $l_{1}$  distance between  $s_{\mathrm{gen}}[p_{\mathrm{gen},k}]$  and  $s_{\mathrm{gt}}[p_{\mathrm{gt},k}]$ , and a warp penalty  $w$  which is incurred if we choose not to advance both spectrograms in lockstep (i.e. we are
+
+warping the spectrogram by taking action 2 or 3; we use  $w = 1.0$ ). the warp penalty thus encourages alignment paths that do not deviate too far from the identity alignment. let  $\delta_{k}$  be an indicator which is 1 for iterations where warping occurs, and 0 otherwise. then the total path cost  $c_{p}$  is:
+
+$$
+c _ {p} = \sum_ {k = 1} ^ {k _ {p}} \left(w \cdot \delta_ {k} + \frac {1}{f} \sum_ {f = 1} ^ {f} \left| s _ {\text {g e n}} [ p _ {\text {g e n}, k}, f ] - s _ {\text {g t}} [ p _ {\text {g t}, k}, f ] \right|\right). \tag {4}
+$$
+
+$k_{p}$  depends on the degree of warping  $(t\leq k_p\leq 2t - 1)$ . the dtw prediction loss is then:
+
+$$
+\mathcal {l} _ {\text {p r e d}} ^ {\prime} = \min  _ {p \in \mathcal {p}} c _ {p}, \tag {5}
+$$
+
+where  $\mathcal{p}$  is the set of all valid paths.  $p\in \mathcal{p}$  only when  $p_{\mathrm{gen},1} = p_{\mathrm{gt},1} = 1$  and  $p_{\mathrm{gen},k_p} = p_{\mathrm{gt},k_p} = t$ , i.e. the first and last timesteps of the spectrograms are aligned. to find the minimum, we use dynamic programming. figure 2 shows a diagram of an optimal alignment path between two sequences.
+
+dtw is differentiable, but the minimum across all paths makes optimisation difficult, because the gradient is propagated only through the minimal path. we use a soft version of dtw instead (cuturi & blondel, 2017), which replaces the minimum with the soft minimum:
+
+$$
+\mathcal {l} _ {\text {p r e d}} ^ {\prime \prime} = - \tau \cdot \log \sum_ {p \in \mathcal {p}} \exp \left(- \frac {c _ {p}}{\tau}\right), \tag {6}
+$$
+
+where  $\tau = 0.01$  is a temperature parameter and the loss scale factor  $\lambda_{\mathrm{pred}} = 1.0$ . note that the minimum operation is recovered by letting  $\tau \to 0$ . the resulting loss is a weighted aggregated cost across all paths, enabling gradient propagation through all feasible paths. this creates a trade-off: a higher  $\tau$  makes optimisation easier, but the resulting loss less accurately reflects the minimal path cost. pseudocode for the soft dtw procedure is provided in appendix e.
+
+by relaxing alignment in the prediction loss, the generator can produce waveforms that are not exactly aligned, without being heavily penalised for it. this creates a synergy with the adversarial loss: instead of working against each other because of the rigidity of the prediction loss, the losses now cooperate to reward realistic audio generation with stochastic alignment. note that the prediction loss
+
+is computed on a training window, and not on full length utterances, so we still assume that the start and end points of the windows are exactly aligned. while this might be incorrect, it does not seem to be much of a problem in practice.
+
+![](images/0522039ff813ebc8a4510b992416a8275d45c702308d889b9f004280e4601842.jpg)  
+figure 2: dynamic time warping between two sequences finds a minimal-cost alignment path. positions where warping occurs are marked with a border.
+
+# 2.6 alignner length loss
+
+to ensure that the model produces realistic token length predictions, we add a loss which encourages the predicted utterance length to be close to the ground truth length. this length is found by summing all token length predictions. let  $l$  be the number of time steps in the training utterance at  $200\mathrm{hz}$ ,  $l_{n}$  the predicted length of the  $n$ th token, and  $n$  the number of tokens, then the length loss is:
+
+$$
+\mathcal {l} _ {\text {l e n g t h}} = \frac {1}{2} \left(l - \sum_ {n = 1} ^ {n} l _ {n}\right) ^ {2}. \tag {7}
+$$
+
+we use a scale factor  $\lambda_{\mathrm{length}} = 0.1$ . note that we cannot match the predicted lengths  $l_{n}$  to the ground truth lengths individually, because the latter are not available.
+
+# 2.7 text pre-processing
+
+although our model works well with character input, we find that sample quality improves significantly using phoneme input instead. this is not too surprising, given the heterogeneous way in which spellings map to phonemes, particularly in the english language. many character sequences also have special pronunciations, such as numbers, dates, units of measurement and website domains, and a very large training dataset would be required for the model to learn to pronounce these correctly. text normalisation (zhang et al., 2019) can be applied beforehand to spell out these sequences as they are typically pronounced (e.g., 1976 could become nineteen seventy six), potentially followed by conversion to phonemes. we use an open source tool, phonemizer (bernard, 2020), which performs partial normalisation and phonemisation (see appendix f). finally, whether we train on text or phoneme input sequences, we pre- and post-pad the sequence with a special silence token (for training and inference), to allow the aligner to account for silence at the beginning and end of each utterance.
+
+# 3 related work
+
+speech generation saw significant quality improvements once treating it as a generative modelling problem became the norm (zen et al., 2009; van den oord et al., 2016). likelihood-based approaches dominate, but generative adversarial networks (gans) (goodfellow et al., 2014) have been making significant inroads recently. a common thread through most of the literature is a separation of the speech generation process into multiple stages: coarse-grained temporally aligned intermediate representations, such as mel-spectrograms, are used to divide the task into more manageable subproblems. many works focus exclusively on either spectrogram generation or vocoding (generating a waveform from a spectrogram). our work is different in this respect, and we will point out which stages of the generation process are addressed by each model. in appendix j, table 6 we compare these methods in terms of the inputs and outputs to each stage of their pipelines.
+
+initially, most likelihood-based models for tts were autoregressive (van den oord et al., 2016; mehri et al., 2017; arik et al., 2017), which means that there is a sequential dependency between subsequent time steps of the produced output signal. that makes these models impractical for real-time use, although this can be addressed with careful engineering (kalchbrenner et al., 2018; valin & skoglund, 2019). more recently, flow-based models (papamakarios et al., 2019) have been explored as a feed-forward alternative that enables fast inference (without sequential dependencies). these can either be trained directly using maximum likelihood (prenger et al., 2019; kim et al., 2019; ping et al., 2019b), or through distillation from an autoregressive model (van den oord et al., 2018; ping et al., 2019a). all of these models produce waveforms conditioned on an intermediate representation: either spectrograms or "linguistic features", which contain temporally-aligned high-level information about the speech signal. spectrogram-conditioned waveform models are often referred to as vocoders.
+
+a growing body of work has applied gan (goodfellow et al., 2014) variants to speech synthesis (donahue et al., 2019). an important advantage of adversarial losses for tts is a focus on realism over diversity; the latter is less important in this setting. this enables a more efficient use of capacity compared to models trained with maximum likelihood. melgan (kumar et al., 2019) and parallel wavegan (yamamoto et al., 2020) are adversarial vocoders, producing raw waveforms from mel-spectrograms. neekhara et al. (2019) predict magnitude spectrograms from mel-spectrograms. most directly related to our work is gan-tts (binkowski et al., 2020), which produces waveforms conditioned on aligned linguistic features, and we build upon that work.
+
+another important line of work covers spectrogram generation from text. such models rely on a vocoder to convert the spectrograms into waveforms (for which one of the previously mentioned models could be used, or a traditional spectrogram inversion technique (griffin & lim, 1984)). tacotron 1 & 2 (wang et al., 2017; shen et al., 2018), deep voice 2 & 3 (gibiansky et al., 2017; ping et al., 2018), transformertts (li et al., 2019), flowtron (valle et al., 2020), and voiceloop (taigman et al., 2017) are autoregressive models that generate spectrograms or vocoder features frame by frame. guo et al. (2019) suggest using an adversarial loss to reduce exposure bias (bengio et al., 2015; ranzato et al., 2016) in such models. melnet (vasquez & lewis, 2019) is autoregressive over both time and frequency. paranet (peng et al., 2019) and fastspeech (ren et al., 2019) are non-autoregressive, but they require distillation (hinton et al., 2015) from an autoregressive model. recent flow-based approaches flow-tts (miao et al., 2020) and glow-tts (kim et al., 2020) are feedforward without requiring distillation. most spectrogram generation models require training of a custom vocoder model on generated spectrograms, because their predictions are imperfect and the vocoder needs to be able to compensate for this $^{2}$ . note that some of these works also propose new vocoder architectures in tandem with spectrogram generation models.
+
+unlike all of the aforementioned methods, as highlighted in appendix j, table 6, our model is a single feed-forward neural network, trained end-to-end in a single stage, which produces waveforms given character or phoneme sequences, and learns to align without additional supervision from auxiliary sources (e.g. temporally aligned linguistic features from an external model) or teacher forcing. this simplifies the training process considerably. char2wav (sotelo et al., 2017) is finetuned end-to-end in the same fashion, but requires a pre-training stage with vocoder features used for intermediate supervision.
+
+spectrogram prediction losses have been used extensively for feed-forward audio prediction models (yamamoto et al., 2019; 2020; yang et al., 2020; ark et al., 2018; engel et al., 2020; wang et al.,
+
+2019; défossez et al., 2018). we note that the  $l_{1}$  loss we use (along with (défossez et al., 2018)), is comparatively simple, as spectrogram losses in the literature tend to have separate terms penalising magnitudes, log-magnitudes and phase components, each with their own scaling factors, and often across multiple resolutions. dynamic time warping on spectrograms is a component of many speech recognition systems (sakoe, 1971; sakoe & chiba, 1978), and has also been used for evaluation of tts systems (sailor & patil, 2014; chevelu et al., 2015). cuturi & blondel (2017) proposed the soft version of dtw we use in this work as a differentiable loss function for time series models. kim et al. (2020) propose monotonic alignment search (mas), which relates to dtw in that both use dynamic programming to implicitly align sequences for tts. however, they have different goals: mas finds the optimal alignment between the text and a latent representation, whereas we use dtw to relax the constraints imposed by our spectrogram prediction loss term. several mechanisms have been proposed to exploit monotonicity in tasks that require sequence alignment, including attention mechanisms (graves, 2013; zhang et al., 2018; vasquez & lewis, 2019; he et al., 2019; raffel et al., 2017; chiu & raffel, 2018), loss functions (graves et al., 2006; graves, 2012) and search-based approaches (kim et al., 2020). for tts, incorporating this constraint has been found to help generalisation to long sequences (battenberg et al., 2020). we incorporate monotonicity by using an interpolation mechanism, which is cheap to compute because it is not recurrent (unlike many monotonic attention mechanisms).
+
+# 4 evaluation
+
+in this section we discuss the setup and results of our empirical evaluation, describing the hyperparameter settings used for training and validating the architectural decisions and loss function components detailed in section 2. our primary metric used to evaluate speech quality is the mean opinion score (mos) given by human raters, computed by taking the mean of 1-5 naturalness ratings given across 1000 held-out conditioning sequences. in appendix i we also report the fréchet deepspeech distance (fdsd), proposed by binkowski et al. (2020) as a speech synthesis quality metric. appendix a reports training and evaluation hyperparameters we used for all experiments.
+
+# 4.1 multi-speaker dataset
+
+we train all models on a private dataset that consists of high-quality recordings of human speech performed by professional voice actors, and corresponding text. the voice pool consists of 69 female and male voices of north american english speakers, while the audio clips contain full sentences of lengths varying from less than 1 to 20 seconds at  $24\mathrm{khz}$  frequency. individual voices are unevenly distributed, accounting for from 15 minutes to over 51 hours of recorded speech, totalling 260.49 hours. at training time, we sample 2 second windows from the individual clips, post-padding those shorter than 2 seconds with silence. for evaluation, we focus on the single most prolific speaker in our dataset, with all our main mos results reported with the model conditioned on that speaker id, but also report mos results for each of the top four speakers using our main multi-speaker model.
+
+# 4.2 results
+
+in table 1 we present quantitative results for our eats model described in section 2, as well as several ablations of the different model and learning signal components. the architecture and training setup of each ablation is identical to our base eats model except in terms of the differences described by the columns in table 1. each ablation is "subtractive", representing the full eats system minus one particular feature. our main result achieved by the base multi-speaker model is a mean opinion score (mos) of 4.083. although it is difficult to compare directly with prior results from the literature due to dataset differences, we nonetheless include mos results from prior works (binkowski et al., 2020; van den oord et al., 2016; 2018), with mos in the 4.2 to  $4.4+$  range. compared to these prior models, which rely on aligned linguistic features, eats uses substantially less supervision.
+
+the no rwds, no melspecd, and no discriminators ablations all achieved substantially worse mos results than our proposed model, demonstrating the importance of adversarial feedback. in particular, the no rwds ablation, with an mos of 2.526, demonstrates the importance of the raw audio feedback, and removing rwds significantly degrades the high frequency components. no melspecd causes intermittent artifacts and distortion, and removing all discriminators results in audio that sounds robotic and distorted throughout. the no  $\mathcal{l}_{\mathrm{length}}$  and no  $\mathcal{l}_{\mathrm{pred}}$  ablations result in a model that does not train at all. comparing our model with no dtw (mos 3.559), the temporal
+
+<table><tr><td>model</td><td>data</td><td>inputs</td><td>rwd</td><td>msd</td><td>llength</td><td>lpred</td><td>align</td><td>mos</td></tr><tr><td>natural speech</td><td></td><td></td><td></td><td>-</td><td></td><td></td><td></td><td>4.55 ± 0.075</td></tr><tr><td>gan-tts (bińkowski et al., 2020)</td><td></td><td></td><td></td><td>-</td><td></td><td></td><td></td><td>4.213 ± 0.046</td></tr><tr><td>wavenet (van den oord et al., 2016)</td><td></td><td></td><td></td><td>-</td><td></td><td></td><td></td><td>4.41 ± 0.069</td></tr><tr><td>par. wavenet (van den oord et al., 2018)</td><td></td><td></td><td></td><td>-</td><td></td><td></td><td></td><td>4.41 ± 0.078</td></tr><tr><td>tacotron 2 (shen et al., 2018)</td><td></td><td></td><td></td><td>-</td><td></td><td></td><td></td><td>4.526 ± 0.066</td></tr><tr><td>no llength</td><td>ms</td><td>ph</td><td>✓</td><td>✓</td><td>×</td><td>l&#x27;&#x27;pred</td><td>mi</td><td>[does not train]</td></tr><tr><td>no lpred</td><td>ms</td><td>ph</td><td>✓</td><td>✓</td><td>✓</td><td>×</td><td>mi</td><td>[does not train]</td></tr><tr><td>no discriminators</td><td>ms</td><td>ph</td><td>×</td><td>×</td><td>✓</td><td>l&#x27;&#x27;pred</td><td>mi</td><td>1.407 ± 0.040</td></tr><tr><td>no rwds</td><td>ms</td><td>ph</td><td>×</td><td>✓</td><td>✓</td><td>l&#x27;&#x27;pred</td><td>mi</td><td>2.526 ± 0.060</td></tr><tr><td>no phonemes</td><td>ms</td><td>ch</td><td>✓</td><td>✓</td><td>✓</td><td>l&#x27;&#x27;pred</td><td>mi</td><td>3.423 ± 0.073</td></tr><tr><td>no melspecd</td><td>ms</td><td>ph</td><td>✓</td><td>×</td><td>✓</td><td>l&#x27;&#x27;pred</td><td>mi</td><td>3.525 ± 0.057</td></tr><tr><td>no mon. int.</td><td>ms</td><td>ph</td><td>✓</td><td>✓</td><td>✓</td><td>l&#x27;&#x27;pred</td><td>attn</td><td>3.551 ± 0.073</td></tr><tr><td>no dtw</td><td>ms</td><td>ph</td><td>✓</td><td>✓</td><td>✓</td><td>lpred</td><td>mi</td><td>3.559 ± 0.065</td></tr><tr><td>single speaker</td><td>ss</td><td>ph</td><td>✓</td><td>✓</td><td>✓</td><td>l&#x27;&#x27;pred</td><td>mi</td><td>3.829 ± 0.055</td></tr><tr><td>eats (ours)</td><td>ms</td><td>ph</td><td>✓</td><td>✓</td><td>✓</td><td>l&#x27;&#x27;pred</td><td>mi</td><td>4.083 ± 0.049</td></tr></table>
+
+table 1: mean opinion scores (mos) for our final eats model and the ablations described in section 4, sorted by mos. the middle columns indicate which components of our final model are enabled or ablated. data describes the training set as multispeaker (ms) or single speaker (ss). inputs describes the inputs as raw characters (ch) or phonemes (ph) produced by phonemizer. rwd (random window discriminators), msd (mel-spectrogram discriminator), and  $\mathcal{l}_{\mathrm{length}}$  (length prediction loss) indicate the presence  $(\checkmark)$  or absence  $(\times)$  of each of these training components described in section 2.  $\mathcal{l}_{\mathrm{pred}}$  indicates which spectrogram prediction loss was used: with dtw  $(\mathcal{l}_{\mathrm{pred}}^{\prime \prime}$ , eq. 6), without dtw  $(\mathcal{l}_{\mathrm{pred}}$ , eq. 3), or absent  $(\times)$ . align describes the architecture of the aligner as monotonic interpolation (mi) or attention-based (attn). we also compare against recent state-of-the-art approaches from the literature which are trained on aligned linguistic features (unlike our models). our mos evaluation set matches that of gan-tts (bińkowski et al., 2020) (and our "single speaker" training subset matches the gan-tts training set); the other approaches are not directly comparable due to dataset differences.  
+
+<table><tr><td>speaker</td><td>#1</td><td>#2</td><td>#3</td><td>#4</td></tr><tr><td>speaking time (hours)</td><td>51.68</td><td>31.21</td><td>20.68</td><td>10.32</td></tr><tr><td>mos</td><td>4.083 ± 0.049</td><td>3.828 ± 0.051</td><td>4.149 ± 0.045</td><td>3.761 ± 0.052</td></tr></table>
+
+table 2: mean opinion scores (mos) for the top four speakers with the most data in our training set. all evaluations are done using our single multi-speaker eats model.
+
+flexibility provided by dynamic time warping significantly improves fidelity: removing it causes warbling and unnatural phoneme lengths. no phonemes is trained with raw character inputs and attains mos 3.423, due to occasional mispronunciations and unusual stress patterns. no mon. int. uses an aligner with a transformer-based attention mechanism (described in appendix g) in place of our monotonic interpolation architecture, which turns out to generalise poorly to long utterances (yielding mos 3.551). finally, comparing against training with only a single speaker (mos 3.829) shows that our eats model benefits from a much larger multi-speaker dataset, even though mos is evaluated only on this same single speaker on which the ablation was solely trained. samples from each ablation are available at https://deepmind.com/research/publications/end-to-end-adversarial-text-to-speech.
+
+we demonstrate that the aligner learns to use the latent vector  $\mathbf{z}$  to vary the predicted token lengths in appendix h. in table 2 we present additional mos results from our main multi-speaker eats model for the four most prolific speakers in our training data<sup>3</sup>. mos generally improves with more training data, although the correlation is imperfect (e.g., speaker #3 achieves the highest mos with only the third most training data).
+
+# 5 discussion
+
+we have presented an adversarial approach to text-to-speech synthesis which can learn from a relatively weak supervisory signal – normalised text or phonemes paired with corresponding speech audio. the speech generated by our proposed model matches the given conditioning texts and generalises to unobserved texts, with naturalness judged by human raters approaching state-of-the-art systems with multi-stage training pipelines or additional supervision. the proposed system described in section 2 is efficient in both training and inference. in particular, it does not rely on autoregressive sampling or teacher forcing, avoiding issues like exposure bias (bengio et al., 2015; ranzato et al., 2016) and reduced parallelism at inference time, or the complexities introduced by distillation to a more efficient feed-forward model after the fact (van den oord et al., 2018; ping et al., 2019a).
+
+while there remains a gap between the fidelity of the speech produced by our method and the state-of-the-art systems, we nonetheless believe that the end-to-end problem setup is a promising avenue for future advancements and research in text-to-speech. end-to-end learning enables the system as a whole to benefit from large amounts of training data, freeing models to optimise their intermediate representations for the task at hand, rather than constraining them to work with the typical bottlenecks (e.g., mel-spectrograms, aligned linguistic features) imposed by most tts pipelines today. we see some evidence of this occurring in the comparison between our main result, trained using data from 69 speakers, against the single speaker ablation: the former is trained using roughly four times the data and synthesises more natural speech in the single voice on which the latter is trained.
+
+notably, our current approach does not attempt to address the text normalisation and phonemisation problems, relying on a separate, fixed system for these aspects, while a fully end-to-end tts system could operate on unnormalised raw text. we believe that a fully data-driven approach could ultimately prevail even in this setup given sufficient training data and model capacity.
+
+# acknowledgments
+
+the authors would like to thank norman casagrande, yutian chen, aidan clark, kazuya kawakami, pauline luc, and many other colleagues at deepmind for valuable discussions and input.
+
+# references
+
+martín abadi, ashish agarwal, paul barham, eugene brevdo, zhifeng chen, craig citro, greg s. corrado, andy davis, jeffrey dean, matthieu devin, sanjay ghemawat, ian goodfellow, andrew harp, geoffrey irving, michael isard, yangqing jia, rafal jozefowicz, lukasz kaiser, manjunath kudlur, josh levenberg, dandelion mane, rajat monga, sherry moore, derek murray, chris olah, mike schuster, jonathon shlens, benoit steiner, ilya sutskever, kunal talwar, paul tucker, vincent vanhoucke, vijay vasudevan, fernanda viégas, oriol vinyals, pete warden, martin wattenberg, martin wicke, yuan yu, and xiaoqiang zheng. tensorflow: large-scale machine learning on heterogeneous systems. arxiv:1603.04467, 2015.  
+sercan ö arik, mike chrzanowski, adam coates, gregory diamos, andrew gibiansky, yongguo kang, xian li, john miller, andrew ng, jonathan raiman, shubho sengupta, and mohammad shoeybi. deep voice: real-time neural text-to-speech. in icml, 2017.  
+sercan ö arik, heewoo jun, and gregory diamos. fast spectrogram inversion using multi-head convolutional neural networks. ieee signal processing letters, 2018.  
+jimmy lei ba, jamie ryan kiros, and geoffrey e. hinton. layer normalization. arxiv:1607.06450, 2016.  
+eric battenberg, rj skerry-ryan, soroosh mariooryad, daisy stanton, david kao, matt shannon, and tom bagby. location-relative attention mechanisms for robust long-form speech synthesis. in icassp, 2020.  
+samy bengio, oriol vinyals, navdeep jaitly, and noam shazeer. scheduled sampling for sequence prediction with recurrent neural networks. in neurips, 2015.  
+mathieu bernard. phonemizer. https://github.com/bootphon/phonemizer, 2020.  
+mikołaj binkowski, jeff donahue, sander dieleman, aidan clark, erich elsen, norman casagrande, luis c. cobo, and karen simonyan. high fidelity speech synthesis with adversarial networks. in iclr, 2020.  
+andrew brock, jeff donahue, and karen simonyan. large scale gan training for high fidelity natural image synthesis. in iclr, 2018.  
+peter buchlovsky, david budden, dominik grewe, chris jones, john aslanides, frederic besse, andy brock, aidan clark, sergio gomez colmenarejo, aedan pope, fabio viola, and dan belov. tf-replicator: distributed machine learning for researchers. arxiv preprint arxiv:1902.00465, 2019.  
+jonathan chevelu, damien lolive, sébastien le maguer, and david guennec. how to compare tts systems: a new subjective evaluation methodology focused on differences. in international speech communication association, 2015.  
+chung-cheng chiu and colin raffel. monotonic chunkwise attention. in iclr, 2018.  
+marco cuturi and mathieu blondel. soft-dtw: a differentiable loss function for time-series. in icml, 2017.  
+harm de vries, florian strub, jérémie mary, hugo larochelle, olivier pietquin, and aaron c. courville. modulating early visual processing by language. in neurips, 2017.  
+alexandre defossez, neil zeghidour, nicolas usunier, leon bottou, and francis bach. sing: symbol-to-instrument neural generator. in neurips, 2018.  
+chris donahue, julian mcauley, and miller puckette. adversarial audio synthesis. in iclr, 2019.  
+vincent dumoulin, jonathon shlens, and manjunath kudlur. a learned representation for artistic style. in iclr, 2017.  
+jesse engel, lamtharn (hanoi) hantrakul, chenjie gu, and adam roberts. ddsp: differentiable digital signal processing. in iclr, 2020.
+
+andrew gibiansky, sercan arik, gregory diamos, john miller, kainan peng, wei ping, jonathan raiman, and yanqi zhou. deep voice 2: multi-speaker neural text-to-speech. in neurips, 2017.  
+ian goodfellow, jean pouget-abadie, mehdi mirza, bing xu, david warde-farley, sherjil ozair, aaron courville, and yoshua bengio. generative adversarial nets. in neurips, 2014.  
+alex graves. sequence transduction with recurrent neural networks. arxiv:1211.3711, 2012.  
+alex graves. generating sequences with recurrent neural networks. arxiv:1308.0850, 2013.  
+alex graves, santiago fernández, faustino gomez, and jürgen schmidhuber. connectionist temporal classification: labelling unsegmented sequence data with recurrent neural networks. in icml, 2006.  
+daniel griffin and jae lim. signal estimation from modified short-time fourier transform. ieee transactions on acoustics, speech, and signal processing, 1984.  
+haohan guo, frank k soong, lei he, and lei xie. a new gan-based end-to-end tts training algorithm. in interspeech, 2019.  
+mutian he, yan deng, and lei he. robust sequence-to-sequence acoustic modeling with stepwise monotonic attention for neural tts. in *interspeech*, 2019.  
+martin heusel, hubert ramsauer, thomas unterthiner, bernhard nessler, and sepp hochreiter. gans trained by a two time-scale update rule converge to a local nash equilibrium. in neurips, 2017.  
+geoffrey hinton, oriol vinyals, and jeffrey dean. distilling the knowledge in a neural network. in neurips deep learning and representation learning workshop, 2015.  
+sergey ioffe and christian szegedy. batch normalization: accelerating deep network training by reducing internal covariate shift. in icml, 2015.  
+fumitada itakura. minimum prediction residual principle applied to speech recognition. ieee transactions on acoustics, speech, and signal processing, 1975.  
+nal kalchbrenner, erich elsen, karen simonyan, seb noury, norman casagrande, edward lockhart, florian stimberg, aaron van den oord, sander dieleman, and koray kavukcuoglu. efficient neural audio synthesis. in icml, 2018.  
+jaehyeon kim, sungwon kim, jungil kong, and sungroh yoon. glow-tts: a generative flow for text-to-speech via monotonic alignment search. arxiv:2005.11129, 2020.  
+sungwon kim, sang-gil lee, jongyoon song, jaehyeon kim, and sungroh yoon. flowavenet: a generative flow for raw audio. in icml, 2019.  
+diederik p kingma and jimmy ba. adam: a method for stochastic optimization. in iclr, 2015.  
+kundan kumar, rithesh kumar, thibault de boissiere, lucas gestin, wei zhen teoh, jose sotelo, alexandre de brebisson, yoshua bengio, and aaron courville. melgan: generative adversarial networks for conditional waveform synthesis. in neurips, 2019.  
+karol kurach, mario lucic, xiaohua zhai, marcin michalski, and sylvain gelly. a large-scale study on regularization and normalization in gans. in icml, 2019.  
+naihan li, shujie liu, yanqing liu, sheng zhao, and ming liu. neural speech synthesis with transformer network. in aaai, 2019.  
+jae hyun lim and jong chul ye. geometric gan. arxiv:1705.02894, 2017.  
+ilya loshchilov and frank hutter. sgdr: stochastic gradient descent with warm restarts. in *iclr*, 2017.  
+soroush mehri, kundan kumar, ishaan gulrajani, rithesh kumar, shubham jain, jose sotelo, aaron courville, and yoshua bengio. samplernn: an unconditional end-to-end neural audio generation model. in *iclr*, 2017.
+
+chenfeng miao, shuang liang, minchuan chen, jun ma, shaojun wang, and jing xiao. flow-tts: a non-autoregressive network for text to speech based on flow. in icassp, 2020.  
+takeru miyato and masanori koyama. cgans with projection discriminator. in iclr, 2018.  
+takeru miyato, toshiki kataoka, masanori koyama, and yuichi yoshida. spectral normalization for generative adversarial networks. in iclr, 2018.  
+masanori morise, fumiya yokomori, and kenji ozawa. world: a vocoder-based high-quality speech synthesis system for real-time applications. ieice transactions on information and systems, 2016.  
+paarth neekhara, chris donahue, miller puckette, shlomo dubnov, and julian mcauley. expediting tts synthesis with adversarial vocoding. in *interspeech*, 2019.  
+george papamakarios, eric nalisnick, danilo jimenez rezende, shakir mohamed, and balaji lakshminarayanan. normalizing flows for probabilistic modeling and inference. arxiv:1912.02762, 2019.  
+kainan peng, wei ping, zhao song, and kexin zhao. parallel neural text-to-speech. arxiv:1905.08459, 2019.  
+wei ping, kainan peng, andrew gibiansky, sercan o. arik, ajay kannan, sharan narang, jonathan raiman, and john miller. deep voice 3: 2000-speaker neural text-to-speech. in *iclr*, 2018.  
+wei ping, kainan peng, and jitong chen. clarinet: parallel wave generation in end-to-end text-to-speech. in iclr, 2019a.  
+wei ping, kainan peng, kexin zhao, and zhao song. waveflow: a compact flow-based model for raw audio. arxiv:1912.01219, 2019b.  
+ryan prenger, rafael valle, and bryan catanzaro. waveglow: a flow-based generative network for speech synthesis. in icassp, 2019.  
+colin raffel, minh-thang luong, peter j liu, ron j weiss, and douglas eck. online and linear-time attention by enforcing monotonic alignments. in icml, 2017.  
+marc'aurelio ranzato, sumit chopra, michael auli, and wojciech zaremba. sequence level training with recurrent neural networks. in iclr, 2016.  
+yi ren, yangjun ruan, xu tan, tao qin, sheng zhao, zhou zhao, and tie-yan liu. fastspeech: fast, robust and controllable text to speech. in neurips, 2019.  
+malcolm reynolds, gabriel barth-maron, frederic besse, diego de las casas, andreas fidjeland, tim green, adrià puigdomènech, sébastien racanière, jack rae, and fabio viola. open sourcing sonnet - a new library for constructing neural networks. https://deepmind.com/blog/open-sourcing-sonnet/, 2017.  
+hardik b sailor and hemant a patil. fusion of magnitude and phase-based features for objective evaluation of tts voice. in international symposium on chinese spoken language processing, 2014.  
+hiroaki sakoe. dynamic-programming approach to continuous speech recognition. in international congress of acoustics, 1971.  
+hiroaki sakoe and seibi chiba. dynamic programming algorithm optimization for spoken word recognition. ieee transactions on acoustics, speech, and signal processing, 1978.  
+jonathan shen, ruoming pang, ron j weiss, mike schuster, navdeep jaitly, zongheng yang, zhifeng chen, yu zhang, yuxuan wang, rj skerrv-ryan, rif a. saurous, yannis agiomyrgiannakis, and yonghui wu. natural tts synthesis by conditioning wavenet on mel spectrogram predictions. in icassp, 2018.  
+jose sotelo, soroush mehri, kundan kumar, joao felipe santos, kyle kastner, aaron courville, and yoshua bengio. char2wav: end-to-end speech synthesis. in iclr, 2017.
+
+yaniv taigman, lior wolf, adam polyak, and eliya nachmani. voiceloop: voice fitting and synthesis via a phonological loop. arxiv:1705.03122, 2017.  
+paul taylor. text-to-speech synthesis. cambridge university press, 2009.  
+dustin tran, rajesh ranganath, and david m. blei. hierarchical implicit models and likelihood-free variational inference. in neurips, 2017.  
+jean-marc valin and jan skoglund. lpcnet: improving neural speech synthesis through linear prediction. in icassp, 2019.  
+rafael valle, kevin shih, ryan prenger, and bryan catanzaro. flowtron: an autoregressive flow-based generative network for text-to-speech synthesis. arxiv:2005.05957, 2020.  
+aäron van den oord, sander dieleman, heiga zen, karen simonyan, oriol vinyals, alex graves, nal kalchbrenner, andrew w. senior, and koray kavukcuoglu. wavenet: a generative model for raw audio. arxiv:1609.03499, 2016.  
+aaron van den oord, yazhe li, igor babuschkin, karen simonyan, oriol vinyals, koray kavukcuoglu, george driessche, edward lockhart, luis cobo, florian stimberg, norman casagrande, dominik grewe, seb noury, sander dieleman, erich elsen, nal kalchbrenner, heiga zen, alex graves, helen king, tom walters, dan belov, and demis hassabis. parallel wavenet: fast high-fidelity speech synthesis. in icml, 2018.  
+sean vasquez and mike lewis. melnet: a generative model for audio in the frequency domain. arxiv:1906.01083, 2019.  
+ashish vaswani, noam shazeer, niki parmar, jakob uszkoreit, llion jones, aidan n. gomez, lukasz kaiser, and illia polosukhin. attention is all you need. in neurips, 2017.  
+xin wang, shinji takaki, and junichi yamagishi. neural source-filter-based waveform model for statistical parametric speech synthesis. in icassp, 2019.  
+yuxuan wang, rj skerry-ryan, daisy stanton, yonghui wu, ron j weiss, navdeep jaitly, zongheng yang, ying xiao, zhifeng chen, samy bengio, quoc le, yannis agiomyrgiannakis, rob clark, and rif a. saurous. tacotron: towards end-to-end speech synthesis. in interspeech, 2017.  
+ronald j. williams and david zipser. a learning algorithm for continually running fully recurrent neural networks. neural computation, 1989.  
+ryuichi yamamoto, eunwoo song, and jae-min kim. probability density distillation with generative adversarial networks for high-quality parallel waveform generation. in interspeech, 2019.  
+ryuichi yamamoto, eunwoo song, and jae-min kim. parallel wavegan: a fast waveform generation model based on generative adversarial networks with multi-resolution spectrogram. in icassp, 2020.  
+geng yang, shan yang, kai liu, peng fang, wei chen, and lei xie. multi-band melgan: faster waveform generation for high-quality text-to-speech. arxiv:2005.05106, 2020.  
+heiga zen, keiichi tokuda, and alan w black. statistical parametric speech synthesis. speech communication, 2009.  
+hao zhang, richard sproat, axel h ng, felix stahlberg, xiaochang peng, kyle gorman, and brian roark. neural models of text normalization for speech applications. computational linguistics, 2019.  
+jing-xuan zhang, zhen-hua ling, and li-rong dai. forward attention in sequence-to-sequence acoustic modeling for speech synthesis. in icassp, 2018.
+
+<table><tr><td>hardware</td><td># utt. / batch</td><td># batch / run</td><td># utt. / run</td><td>length / utt. (s)</td><td>length / run (s)</td><td>med. run time (s)</td><td>realtime factor</td></tr><tr><td>tpu v3 (1 chip)</td><td>16</td><td>10</td><td>160</td><td>30</td><td>4800</td><td>30.53</td><td>157.2×</td></tr><tr><td>v100 gpu (1)</td><td>8</td><td>10</td><td>80</td><td>30</td><td>2400</td><td>11.60</td><td>206.8×</td></tr><tr><td>xeon cpu (6 cores)</td><td>2</td><td>10</td><td>20</td><td>30</td><td>600</td><td>70.42</td><td>8.520×</td></tr></table>
+
+table 3: eats batched inference benchmarks, timing inference (speech generation) on a google cloud tpu v3 (1 chip with 2 cores), a single nvidia v100 gpu, or an intel xeon e5-1650 v4 cpu at  $3.60\mathrm{ghz}$  (6 physical cores). we use a batch size of 2, 8, or 16 utterances (utt.), each 30 seconds long (input length of 600 phoneme tokens, padded if necessary). one "run" consists of 10 consecutive forward passes at the given batch size. we perform 101 such runs and report the median run time (med. run time (s)) and the resulting realtime factor, the ratio of the total duration of the generated speech (length / run (s)) to the run time. (note: gpu benchmarking is done using single precision (ieee fp32) floating point; switching to half precision (ieee fp16) could yield further speedups.)
+
+# a hyperparameters and other details
+
+our models are trained for  $5 \cdot 10^{5}$  steps, where a single step consists of one discriminator update followed by one generator update, each using a minibatch size of 1024, with batches sampled independently in each of these two updates. both updates are computed using the adam optimizer (kingma & ba, 2015) with  $\beta_{1} = 0$  and  $\beta_{2} = 0.999$ , and a learning rate of  $10^{-3}$  with a cosine decay (loshchilov & hutter, 2017) schedule used such that the learning rate is 0 at step 500k. we apply spectral normalisation (miyato et al., 2018) to the weights of the generator's decoder module and to the discriminators (but not to the generator's aligner module). parameters are initialised orthogonally and off-diagonal orthogonal regularisation with weight  $10^{-4}$  is applied to the generator, following biggan (brock et al., 2018). minibatches are split over 64 or 128 cores (32 or 64 chips) of google cloud tpu v3 pods, which allows training of a single model within up to 58 hours. we use cross-replica batchnorm (ioffe & szegedy, 2015) to compute batch statistics aggregated across all devices. like in gan-tts (binkowski et al., 2020), our trained generator requires computation of standing statistics before sampling; i.e., accumulating batch norm statistics from 200 forward passes. as in gan-tts (binkowski et al., 2020) and biggan (brock et al., 2018), we use an exponential moving average of the generator weights for inference, with a decay of 0.9999. although gans are known to exhibit stability issues sometimes, we found that eats model training consistently converges.
+
+models were implemented using tensorflow (abadi et al., 2015) v1 framework and the sonnet (reynolds et al., 2017) neural network library. we used the tf-replicator (buchlovsky et al., 2019) library for data parallel training over tpus.
+
+inference speed. in table 3 we report benchmarks for eats batched inference on two modern hardware platforms (google cloud tpu v3, nvidia v100 gpu, intel xeon e5-1650 cpu). we find that eats can generate speech two orders of magnitude faster than realtime on a gpu or tpu, demonstrating the efficiency of our feed-forward model. on the gpu, generating 2400 seconds (40 minutes) of speech (80 utterances of 30 seconds each) takes 11.60 seconds on average (median), for a realtime factor of  $206.8 \times$ . on tpu we observe a realtime factor of  $157.2 \times$  per chip (2 cores), or  $78.6 \times$  per core. on a cpu, inference runs at  $8.52 \times$  realtime.
+
+# b alignner pseudocode
+
+in figure 3 we present pseudocode for the eats aligner described in section 2.1.
+
+# c spectrogram discriminator architecture
+
+in this appendix we present details of the architecture of the spectrogram discriminator (section 2.3). the discriminator's inputs are  $47 \times 80 \times 1$  images, produced by adding a channel dimension to the  $47 \times 80$  output of the mel-spectrogram computation (appendix d) from the length 48000 input waveforms (2 seconds of audio at  $24\mathrm{khz}$ ).
+
+then, the architecture is like that of the biggan-deep (brock et al., 2018) discriminator for  $128 \times 128$  images (listed in biggan (brock et al., 2018) appendix b, table 7 (b)), but removing the first two "resblocks" and the "non-local block" (self-attention) - rows 2-4 in the architecture table (keeping row 1, the input convolution, and rows  $5+$  afterwards, as is). this removes one  $2 \times 2$  downsampling step as the resolution of the spectrogram inputs is smaller than the  $128 \times 128$  images for which the biggan-deep architecture was designed. we set the channel width multiplier referenced in the table to  $ch = 64$ .
+
+```python
+def eatsaigner(token_sequences, token_vocab_size, lengths, speaker_ids, num speakers, noise, out_offset, out_sequence_length=6000, sigma2=10.):
+    ""returns audio-aligned features and lengths for the given input sequences.
+```
+
+```txt
+"n" denotes the batch size throughout the comments.
+```
+
+args:  
+```txt
+token_sequences: batch of token sequences indicating the id of each token, padded to a fixed maximum sequence length (400 for training, 600 for sampling). tokens may either correspond to raw characters or phonemes (as output by phonemizer). each sequence should begin and end with a special silence token (assumed to have already been added to the inputs). (dtype=int, shape=[n, in_sequence_length=600])  
+token_vocab_size: scalar int indicating the number of tokens. (all values in token_sequences should be in [0, token_vocab_size].)  
+lengths: indicates the true length <= in_sequence_length=600 of each sequence in token_sequences before padding was added. (dtype=int, shape=[n])  
+speaker_ids: ints indicating the speaker id. (dtype=int, shape=[n])  
+num-speakers: scalar int indicating the number of speakers. (all values in speaker_ids should be in [0, num-speakers].)  
+noise: 128d noise sampled from a standard isotropic gaussian  $(n(0,1))$ . (dtype=float, shape=[n, 128])  
+out_offset: first timestep to output. randomly sampled for training, 0 for sampling. (dtype=int, shape=[n])  
+out_sequence_length: scalar int length of the output sequence at 200 hz. 400 for training (2 seconds), 6000 for sampling (30 seconds).
+```
+
+```txt
+sigma2: scalar float temperature (sigma**2) for the softmax.
+```
+
+returns:  
+1 1  
+```python
+aligned_features: audio-aligned features to be fed into the decoder.  
+(dtype=float, shape=[n, out_sequence_length, 256])  
+aligned_lengths: the predicted audio-aligned lengths.  
+(dtype=float, shape=[n])
+```
+
+```txt
+learnembeddings of the input tokens and speaker ids.  
+embedded_tokens = embed(input voc_size=token voc_size, output_dim=256) (token_sequences)  
+embedded-speaker_ids = embed(input voc_size=num-speakers, output_dim=128) (speaker_ids)
+```
+
+```ruby
+make the "class-conditioning" inputs for class-conditional batch norm (ccbn) # using the embedded speaker ids and the noise.  
+ccbn_condition = concat([embedded-speaker_ids, noise], axis=1) # -> [n, 256]  
+# add a dummy sequence axis to ccbn_condition for broadcasting.  
+ccbn_condition = ccbn_condition[:, none, :] # -> [n, 1, 256]
+```
+
+```python
+# use 'lengths' to make a mask indicating valid entries of token_sequences. sequence_length = token_sequences.shape[1] # = 600 mask = range(sequence_length)[none, :] < lengths[:, none] # -> [n, 600]
+```
+
+dilated 1d convolution stack.  
+```txt
+10 blocks \* 6 cons vs per block  $= 60$  convolutions total.  $\mathbf{x} =$  embedded_tokens
+```
+
+```txt
+conv_mask = mask[:, :, none] # -> [n, 600, 1]; dummy axis for broadcast.  
+for in range(10):  
+    for a, b in [(1, 2), (4, 8), (16, 32)]:
+```
+
+```txt
+block_entries  $\equiv$  x   
+ $\mathbf{x} =$  relu(classconditionalbatchnorm(x, ccbn_condition))   
+x  $=$  maskedconv1d(output_channels=256,kernel_size=3,dilation=a)(x，conv_mask)   
+ $\mathbf{x} =$  relu(classconditionalbatchnorm(x,ccbn_condition))   
+ $\mathbf{x} =$  maskedconv1d(output_channels=256,kernel_size=3,dilation=b)(x，conv_mask)
+```
+
+```latex
+$\mathbf{x} + =$  blockinputs #->[n,600,256] # save dilated conv stack outputs as unaligned_features. unaligned_features  $= \mathbf{x}$  # [n,600,256]
+```
+
+```txt
+map to predicted token lengths.  
+x = relu(classconditionalbatchnorm(x, ccbn_condition))  
+x = convld(output_channels=256, kernel_size=1)(x)  
+x = relu(classconditionalbatchnorm(x, ccbn_condition))  
+x = convld(output_channels=1, kernel_size=1)(x) # -> [n, 600, 1]  
+token_lengths = relu(x[:, :, 0]) # -> [n, 600]  
+token ends = cumsum(token_lengths, axis=1) # -> [n, 600]  
+token_centres = token ends - (token_lengths / 2.) # -> [n, 600]  
+# compute predicted length as the last valid entry of token ends. -> [n]  
+aligned_lengths = [endlength-1] for end, length in zip(token ends, lengths)]
+```
+
+```txt
+# compute output grid -> [n, out_sequence_length=6000]  
+out_pos = range(out_sequence_length) [none, :, ] + out_offset[:, none]  
+out_pos = cast(out_pos[:, :, none], float) # -> [n, 6000, 1]  
+diff = token_centres[:, none, :, -out_pos # -> [n, 6000, 600]  
+logits = -(diff**2 / sigma2) # -> [n, 6000, 600]  
+# mask out invalid input locations (flip 0/1 to 1/0); add dummy output axis.  
+logits_inv_mask = 1. - cast(mask[:, none, :, float) # -> [n, 1, 600]  
+masked_logits = logits - 1e9 * logits_inv_mask # -> [n, 6000, 600]  
+weights = softmax(masked_logits, axis=2) # -> [n, 6000, 600]  
+# do a batch matmul (written as an einsum) to compute the aligned features.  
+# aligned_features -> [n, 6000, 256]  
+aligned_features = einsum('noi,nid->nod', weights, unaligned_features)
+```
+
+```txt
+return aligned_features, aligned_lengths
+```
+
+figure 3: pseudocode for our proposed eats aligner.
+
+```python
+import tensorflow compat.v1 as tf   
+def get_mel_spectrogram(waveforms, invert_mu_law  $\equiv$  true, mu  $= 255$  jitter  $\equiv$  false,max_jitter_steps  $= 60$  ..   
+""computes mel-spectrograms for the given waveforms.   
+args: waveforms: a tf.tensor corresponding to a batch of waveforms sampled at  $24\mathrm{khz}$  (dtype  $\equiv$  tf.float32, shape  $\equiv$  [n, sequence_length]) invert_mu_law: whether to apply mu-law inversion to the input waveforms. in eats both the real data and generator outputs are mu-law'ed, so this is always set to true. mu: the mu value used if invert_mu_law  $\equiv$  true (ignored otherwise). jitter: whether to apply random jitter to the input waveforms before computing spectrograms. set to true only for gt spectrograms input to the prediction loss. max_jitter_steps: maximum number of steps by which the input waveforms are randomly jittered if jitter  $\equiv$  true (ignored otherwise). returns: a 3d tensor with spectrograms for the corresponding input waveforms. (dtype  $\equiv$  tf.float32, shape  $\equiv$  [n, num_frames  $\equiv$  ceil(sequence_length/1024), num_bins  $\equiv$  80])   
+waveforms.shape.assert_has_rank(2)   
+t = waveforms   
+if jitter: assert max_jitter_steps  $\geqslant 0$  crop_shape  $=$  [t.shape[1]] t = tf.train(t, [[0, 0], [max_jitter_steps, max_jitter_steps]]) # jitter independently for each batch item. t = tf.map_fn( lambda ti: tf(image.randomcrop(ti, crop_shape), t)   
+if invert_mu_law: t = tf.sign(t) / mu \* ((1 + mu) \*\*tf.abs(t) - 1) t = tf.signal.stft(t, frame_length  $= 2048$  ,frame_step  $= 1024$  ,pad_end  $\equiv$  true) t = tf.abs(t) mel_weight_matrix  $=$  tf(signal.linear_to_mel_weight_matrix( num_mel_bins  $= 80$  , num_spectrogram_bins  $=$  t.shape[-1], sample_rate  $= 24000$  ., lower_edge_hertz  $= 80$  ., upper_edge_hertz  $= 7600$  .) t = tf.tensordot(t, mel_weight_matrix, axes  $= 1$  ) t = tf.log(1. + 10000.*t)   
+return t   
+gen_spectrograms_for_pred_loss  $=$  get_mel_spectrogram(genwaveforms, jitter  $\equiv$  false) real_spectrograms_for_pred_loss  $=$  get_mel_spectrogram(realwaveforms, jitter  $\equiv$  true)
+```
+
+figure 4: tensorflow code for mel-spectrogram computation.
+
+# d mel-spectrogram computation
+
+in figure 4 we include the tensorflow (abadi et al., 2015) code used to compute the mel-spectrograms fed into the spectrogram discriminator (section 2.3) and the spectrogram prediction loss (section 2.4). note that for use in the prediction losses  $\mathcal{l}_{\mathrm{pred}}$  or  $\mathcal{l}_{\mathrm{pred}}^{\prime \prime}$ , we call this function with jitter=true for real spectrograms and jitter=false for generated spectrograms. when used for the spectrogram discriminator inputs, we do not apply jitter to either real or generated spectrograms, setting jitter=false in both cases.
+
+```python
+def soft_minimum(values, temperature):
+    """"compute the soft minimum with the given temperature."
+    return -temperature * log(sum(exp(-values / temperature)))  
+def skew_matrix(x):
+    """"skew a matrix so that the diagonals become the rows."
+    height, width = x.shape
+    y = zeros(width + width - 1, width)
+    for i in range(width + width - 1):
+        for j in range(width): # shift each column j down by j steps.
+            y[i, j] = x[clip(i - j, 0, height - 1), j]
+    return y  
+def spectrogram_dtw_error(spec_a, spec_b, warp_penalty=1.0, temperature=0.01):
+    """"compute dtw error given a pair of spectrograms."
+    # compute cost matrix.
+    diffs = abs(spec_a[none, :, :] - spec_b[(:, none, :])
+    costs = mean(diffs, axis=-1) # pairwise l1 cost, square the diffs for l2.
+    size = cost.shape[-1]
+    # initialise path costs.
+    path_cost = infinity * ones(size + 1)
+    path_cost prev = infinity * ones(size + 1)
+    path_cost prev[0] = 0.0
+    # aggregate path costs from cost[0, 0] to cost[-1, -1].
+    cost = skew_matrix(cost) # shape is now (2 * size - 1, size).
+    for i in range(2 * size - 1):
+        directions = [path_cost prev[:-1],
+                    path_cost[1:] + warp_penalty,
+                    path_cost[:-1] + warp_penalty]
+        path_cost_next = cost[i] + soft minimumdirections, temperature)
+        # replace soft minimum with regular minimum for regular dtw.
+        path_cost_next = concatenate([[infinity], path_cost_next])
+        path_cost, path_cost prev = path_cost_next, path_cost
+    return path_cost[-1]
+```
+
+figure 5: pseudocode for dynamic time warping.
+
+# e dynamic time warping pseudocode
+
+in figure 5 we present pseudocode for the soft dynamic time warping (dtw) procedure we use in the spectrogram prediction loss  $\mathcal{l}_{\mathrm{pred}}^{\prime \prime}$ .
+
+note that the complexity of this implementation is quadratic. it could be made more efficient using itakura or sakoe-chiba bands (itakura, 1975; sakoe & chiba, 1978), but we found that enabling or disabling dtw for the prediction loss did not meaningfully affect training time, so this optimisation is not necessary in practice.
+
+<table><tr><td>output symbol</td><td>x</td><td>ç</td><td>‡</td><td>j</td><td>;</td><td>—</td><td>i</td><td>r</td><td>~</td><td>&quot;</td></tr><tr><td>substitute symbol</td><td>k</td><td>k</td><td>l</td><td>j</td><td>.</td><td>.</td><td></td><td></td><td></td><td></td></tr></table>
+
+table 4: the symbols in this table are replaced or removed when they appear in phonemizer's output.
+
+# f text preprocessing
+
+we use phonemizer (bernard, 2020) (version 2.2) to perform partial normalisation and phonemisation of the input text (for all our results except for the no phonemes ablation, where we use character sequences as input directly). we used the espeak backend (with espeak-ng version 1.50), which produces phoneme sequences using the international phonetic alphabet (ipa). we enabled the following options that phonemizer provides:
+
+- with_stress, which includes primary and secondary stress marks in the output;  
+- strip, which removes spurious whitespace;  
+- preserve_punctuation, which ensures that punctuation is left unchanged. this is important because punctuation can meaningfully affect prosody.
+
+the phoneme sequences produced by phonemizer contain some rare symbols (usually in non-english words), which we replace with more frequent symbols. the substitutions we perform are listed in table 4. this results in a set of 51 distinct symbols. the character sequence
+
+modern text-to-speech synthesis pipelines typically involve multiple processing stages.
+
+becomes
+
+m'α:dən t'eksttəsp'i:tʃ s'mθəs,ɪs p'airplainz t'ipikli mv'a:lv m'ʌltipəl pr'ɑːsɛsɪŋ st'ɛdʒɪz.
+
+# g transformer-based attention alignner baseline
+
+in this appendix we describe our transformer-based attention aligner baseline, used in section 4 to compare against our monotonic interpolation-based aligner described in section 2.1. we use transformer attention (vaswani et al., 2017) with output positional features as the queries, and a sum of input positional features and encoder output as the keys. the encoder outputs are from the same dilated convolution stack as used in our eats model, normalised using layer normalization (ba et al., 2016) before input into the transformer. we omit the fully-connected output layer following the attention mechanism. both sets of positional features use the sinusoidal encodings from vaswani et al. (2017). we use 4 heads with key and value dimensions of 64 per head. its outputs are taken as the audio-aligned feature representations, after which we apply batch normalisation and relu non-linearity before upsampling via the decoder.
+
+![](images/2457e9209e0db65b6c44038faf188be675e661ebe25b4191c14ff4efb3ce0560.jpg)  
+figure 6: positions of the tokens over time for 128 utterances generated from the same text, with different latent vectors  $\mathbf{z}$ . close-ups of the start and end of the sequence show the variability of the predicted lengths.
+
+![](images/b3a5fc1ad6b5277220386535870a5305e87c4e84e109fcd6a45236eb0b35eea4.jpg)
+
+![](images/a0be682fd18559b2c35213b10715b71b979c367d443abb73e412c62b30ca9609.jpg)
+
+![](images/6c282fb2ed69a1856b3e589275776b84766777c51e05dc9902f8feb84f386957.jpg)  
+figure 7: histogram of lengths for 128 utterances generated from the same text, with different latent vectors  $\mathbf{z}$ .
+
+# h variation in alignment
+
+to demonstrate that the aligner module makes use of the latent vector  $\mathbf{z}$  to account for variations in token lengths, we generated 128 different renditions of the second sentence from the abstract: "in this work, we take on the challenging task of learning to synthesise speech from normalised text or phonemes in an end-to-end manner, resulting in models which operate directly on character or phoneme input sequences and produce raw speech audio outputs". figure 6 shows the positions of the tokens over time, with close-ups of the start and end of the sequence, to make the subtle variations in length more visible. figure 7 shows a histogram of the lengths of the generated utterances. the variation is subtle (less than  $2\%$  for this utterance), but noticeable. given that the training data consists of high-quality recordings of human speech performed by professional voice actors, only a modest degree of variation is to be expected.
+
+<table><tr><td>model</td><td>mos</td><td>fdsd</td></tr><tr><td>natural speech</td><td>4.55 ± 0.075</td><td>0.682</td></tr><tr><td>no discriminators</td><td>1.407 ± 0.040</td><td>1.594</td></tr><tr><td>no rwds</td><td>2.526 ± 0.060</td><td>0.757</td></tr><tr><td>no phonemes</td><td>3.423 ± 0.073</td><td>0.688</td></tr><tr><td>no melspecd</td><td>3.525 ± 0.057</td><td>0.849</td></tr><tr><td>no mon. int.</td><td>3.551 ± 0.073</td><td>0.724</td></tr><tr><td>no dtw</td><td>3.559 ± 0.065</td><td>0.694</td></tr><tr><td>eats</td><td>4.083 ± 0.049</td><td>0.702</td></tr></table>
+
+table 5: mean opinion scores (mos) and fréchet deepspeech distances (fdsd) for our final eats model and the ablations described in section 4, sorted by mos. fdsd scores presented here were computed on held-out validation multi-speaker set and therefore could not be obtained for the single speaker ablation. due to dataset differences, these are also not comparable with the fdsd values reported for gan-tts by binkowski et al. (2020).
+
+# i evaluation with frechet deepspeech distance
+
+we found fréchet deepspeech distances (binkowski et al., 2020), both conditional and unconditional, unreliable in our setting. although they provided useful guidance at the early stages of model iteration – i.e., were able to clearly distinguish the models that do and do not train – fdsd scores of the models of reasonable quality were not in line with their mean opinion scores, as shown for our ablations in table 5.
+
+a possible reason for fdsd working less well in our setting is the fact that our models rely on features extracted from spectrograms similar to those computed at the deepspeech preprocessing stage. as our models combine losses computed on raw audio and mel-spectrograms, it might be the case that the speech generated by some model is of lower quality, yet has convincing spectrograms. comparison of two of our ablations seems to affirm this hypothesis: the no melspecd model achieves much higher mos ( $\approx 3.5$ ) than the no rwds ablation ( $\approx 2.5$ ) which is optimised only against spectrogram-based losses. their fdsds, however, suggest the opposite ranking of these models.
+
+another potential cause for the discrepancy between mos and fdsd is the difference in samples for which these scores were established. while fdsd was computed on samples randomly held out from the training set, the mos was computed on more challenging, often longer utterances. as we did not have ground truth audio for the latter, we could not compute fdsd for these samples. the sample sizes commonly used for the metrics based on fréchet distance, e.g. (heusel et al., 2017; kurach et al., 2019; binkowski et al., 2020), are also usually larger than the ones used for mos testing (van den oord et al., 2016; binkowski et al., 2020); we used 5,120 samples for fdsd and 1,000 for mos.
+
+we also note that conditional fdsd is not immediately applicable in our setting, as it requires fixed length (two second) samples with aligned conditionings, while in our case there is no fixed alignment between the ground truth characters and audio.
+
+we hope that future research will revisit the challenge of automatic quantitative evaluation of text-to-speech models and produce a reliable quality metric for models operating in our current regime.
+
+<table><tr><td></td><td>stages</td><td>1 stage</td><td>notes</td></tr><tr><td>wavenet (van den oord et al., 2016)</td><td>ling ar au</td><td>×</td><td></td></tr><tr><td>samplernn (mehri et al., 2017)</td><td>∅ ar au</td><td>×</td><td>not a tts model</td></tr><tr><td>deep voice (arik et al., 2017)</td><td>ch ar ph ff ling ar au</td><td>×</td><td>uses segmentation model</td></tr><tr><td>wavernn (kalchbrenner et al., 2018)</td><td>ling ar au</td><td>×</td><td></td></tr><tr><td>lpcnet (valin &amp; skoglund, 2019)</td><td>cep ar au</td><td>×</td><td></td></tr><tr><td>waveglow (prenger et al., 2019)</td><td>mels ff au</td><td>×</td><td></td></tr><tr><td>flowavenet (kim et al., 2019)</td><td>mels ff au</td><td>×</td><td></td></tr><tr><td>waveflow (ping et al., 2019b)</td><td>mels ar au</td><td>×</td><td>partially autoregressive</td></tr><tr><td>par. wavenet (van den oord et al., 2018)</td><td>ling ff* au</td><td>×</td><td>distillation</td></tr><tr><td>clarinet (ping et al., 2019a), teacher</td><td>ch/ph ar au</td><td>√</td><td></td></tr><tr><td>clarinet (ping et al., 2019a), student</td><td>ch/ph ff* au</td><td>×</td><td>distillation</td></tr><tr><td>wavegan (donahue et al., 2019)</td><td>∅ ff au</td><td>×</td><td>not a tts model</td></tr><tr><td>melgan (kumar et al., 2019)</td><td>mels ff au</td><td>×</td><td></td></tr><tr><td>par. wavegan (yamamoto et al., 2020)</td><td>ph ar mels ff au</td><td>×</td><td></td></tr><tr><td>advoc (neekhara et al., 2019)</td><td>mels ff mags</td><td>×</td><td></td></tr><tr><td>gan-tts (bińkowski et al., 2020)</td><td>ling ff au</td><td>×</td><td></td></tr><tr><td>tacotron (wang et al., 2017)</td><td>ch ar mels ff mags → au</td><td>×</td><td>uses griffin &amp; lim (1984)</td></tr><tr><td>tacotron 2 (shen et al., 2018)</td><td>ch ar mels ar au</td><td>×</td><td></td></tr><tr><td>deep voice 2 (gibiansky et al., 2017)</td><td>ch → ph ff ling ar au</td><td>×</td><td>uses segmentation model</td></tr><tr><td>dv2 tacotron (gibiansky et al., 2017)</td><td>ch ar mags ar au</td><td>×</td><td></td></tr><tr><td>deep voice 3 (ping et al., 2018)</td><td>ch ar mels ar au</td><td>×</td><td>several alternative vocoders</td></tr><tr><td>transformertts (li et al., 2019)</td><td>ch → ph ar mels ar au</td><td>×</td><td></td></tr><tr><td>flowtron (valle et al., 2020)</td><td>ch ar mels ff au</td><td>×</td><td></td></tr><tr><td>voiceloop (taigman et al., 2017)</td><td>ph ar ling → au</td><td>×</td><td></td></tr><tr><td>gan exposure (guo et al., 2019)</td><td>ph ar mels ar au</td><td>×</td><td></td></tr><tr><td>melnet (vasquez &amp; lewis, 2019)</td><td>ch ar mels → au</td><td>×</td><td></td></tr><tr><td>paranet (peng et al., 2019)</td><td>ch/ph ff* mels ff au</td><td>×</td><td>distillation</td></tr><tr><td>fastspeech (ren et al., 2019)</td><td>ph ff* mels ff au</td><td>×</td><td>distillation</td></tr><tr><td>flow-tts (miao et al., 2020)</td><td>ch ff mels ff au</td><td>×</td><td></td></tr><tr><td>glow-tts (kim et al., 2020)</td><td>ph ff mels ff au</td><td>×</td><td></td></tr><tr><td>char2wav (sotelo et al., 2017)</td><td>ch ar ling ar au</td><td>×</td><td>end-to-end finetuning</td></tr><tr><td>eats (ours)</td><td>ch/ph ff au</td><td>√</td><td></td></tr></table>
+
+table 6: a comparison of tts methods. the model stages described in each paper are shown by linking together the inputs, outputs and intermediate representations that are used: characters (ch), phonemes (ph), mel-spectrograms (mels), magnitude spectrograms (mags), cepstral features (cep), linguistic features (ling, such as phoneme durations and fundamental frequencies, or world (morise et al., 2016) features for char2wav (sotelo et al., 2017) and voiceloop (taigman et al., 2017)), and audio (au). arrows with various superscripts describe model components: autoregressive (ar), feed-forward (ff), or feed-forward requiring distillation  $(\mathbf{f}\mathbf{f}^{*})$ . arrows without a superscript indicate components that do not require learning. 1 stage means the model is trained in a single stage to map from unaligned text/phonemes to audio (without, e.g., distillation or separate vocoder training). eats is the only feed-forward model that fulfills this requirement.
+
+# j comparison of tts methods
+
+in table 6 we compare recent tts approaches in terms of the inputs and outputs to each stage of the pipeline, and whether they are learnt in a single stage or multiple stages. differentiating eats from each prior approach is the fact that it learns a feed-forward mapping from text/phonemes to audio end-to-end in a single stage, without requiring distillation or separate vocoder training. the clarinet teacher model (ping et al., 2019a) is also trained in a single stage, but it uses teacher forcing to achieve this, requiring the model to be autoregressive. a separate distillation stage is necessary to obtain a feed-forward model in this case.

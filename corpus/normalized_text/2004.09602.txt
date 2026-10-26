@@ -1,0 +1,459 @@
+# integer quantization for deep learning inference: principles and empirical evaluation
+
+hao  $\mathbf{w}\mathbf{u}^{1}$
+
+patrick judd<sup>1</sup>
+
+xiaojie zhang
+
+mikhail isaev\*
+
+paulius micikevicius<sup>1</sup>
+
+$^{1}$ nvidia
+
+{skyw, pjudd, viczhang, paulium}@nvidia.com
+
+2georgia institute of technology
+
+michael.v.isaev@gatech.edu
+
+# abstract
+
+quantization techniques can reduce the size of deep neural networks and improve inference latency and throughput by taking advantage of high throughput integer instructions. in this paper we review the mathematical aspects of quantization parameters and evaluate their choices on a wide range of neural network models for different application domains, including vision, speech, and language. we focus on quantization techniques that are amenable to acceleration by processors with high-throughput integer math pipelines. we also present a workflow for 8-bit quantization that is able to maintain accuracy within  $1\%$  of the floating-point baseline on all networks studied, including models that are more difficult to quantize, such as mobilenets and bert-large.
+
+# 1 introduction
+
+while 32-bit single-precision floating-point was the dominant numerical format for deep learning (dl) applications, more recently a variety of alternative formats have been proposed to increase the computational performance of deep learning applications. it is becoming commonplace to train neural networks in 16-bit floating-point formats, either ieee fp16 [35] or bffloat16 [57], supported by most dl accelerators. once trained, neural networks can be deployed for inference using even lower-precision formats, including floating-point, fixed-point, and integer. low-precision formats offer several performance benefits. first, many processors provide higher throughput math pipelines the low-bit formats, which can speed up math-intensive operations, such as convolutions and matrix multiplications. second, smaller word sizes reduce memory bandwidth pressure, improving performance for bandwidth-limited computations. third, smaller word sizes lead to lower memory size requirements, which can improve cache utilization as well as other aspects of memory-system operation.
+
+in this paper we focus on integer quantization for neural network inference, where trained networks are modified to use integer weights and activations so that integer math pipelines can be used for many operations. table 1 lists the relative tensor operation throughputs of various data types on the nvidia turing graphics processing unit (gpu) architecture [40]. math-intensive tensor operations executed on 8-bit integer types can see up to a 16x speed-up compared to the same operations in fp32. memory-limited operations could see up to a 4x speed-up compared to the fp32 version, due to the smaller word size. other processors, such as tpuv1 [23], intel cpus with vnni
+
+<table><tr><td>input data type</td><td>accumulation data type</td><td>math throughput</td><td>bandwidth reduction</td></tr><tr><td>fp32</td><td>fp32</td><td>1x</td><td>1x</td></tr><tr><td>fp16</td><td>fp16</td><td>8x</td><td>2x</td></tr><tr><td>int8</td><td>int32</td><td>16x</td><td>4x</td></tr><tr><td>int4</td><td>int32</td><td>32x</td><td>8x</td></tr><tr><td>int1</td><td>int32</td><td>128x</td><td>32x</td></tr></table>
+
+table 1: benefits of lower precision data types for tensor operations on the nvidia turing gpu architecture
+
+instructions [28], and a number of emerging accelerator designs also provide significant acceleration for int8 operations. the process of neural network quantization can be automated by software tools [36, 61] or controlled manually. in either case, care must be taken to minimize any impact quantization has on the model accuracy.
+
+in this paper we review the mathematical fundamentals underlying various integer quantization choices (section 3) as well as techniques for recovering accuracy lost due to quantization (section 5). section 6 combines this information into a recommended workflow. in section 4 and the appendices we present empirical evaluation of various quantization choices on a wide range of network models from different application domains - image processing, language modeling, language translation, and speech recognition. these models include the major network topologies - convolutional networks, recurrent networks, as well as attention-based networks. with the presented workflow for int8 quantization we are able to maintain model accuracy within  $1\%$  of each baseline floating-point network, even for the networks that are known to be challenging to quantize, such as mobilenets and bert-large.
+
+# 2 related work
+
+vanhoucke et al. [52] showed that earlier neural networks could be quantized after training to use int8 instructions on intel cpus while maintaining the accuracy of the floating-point model. more recently it has been shown that some modern networks require training to maintain accuracy when quantized for int8. jacob et al. [20] described models optimized for inference where all inference operations were performed with integer data types. here batch normalization layers were folded into the preceding convolution layer before quantization, reducing the number of layers that needed to be executed during inference. krishnamoorthi [26] evaluated various quantization methods and bit-widths on a variety of convolutional neural networks (cnns). he showed that even with per-channel quantization, networks like mobilenet do not reach baseline accuracy with int8 post training quantization (ptq) and require quantization aware training (qat). mckinstry et al. [33] demonstrated that many imagenet cnns can be finetuned for just one epoch after quantizing to int8 and reach baseline accuracy. they emphasized the importance of using an annealing learning rate schedule and a very small final learning rate. they also set the quantization range based on a percentile of activations sampled from the training set. instead of using fixed ranges, choi et al. [6] proposed pact which learns the activation ranges during training.
+
+much of the earlier research in this area focused on very low bit quantization [7, 13, 59], all the way down to ternary (2-bit) [60, 34] and binary weights [8] and activations [45, 18]. these works showed that for lower bit-widths, training with quantization was required to achieve high accuracy, though accuracy was still lower than the floating-point network on harder tasks such as imagenet image classification [47]. they also demonstrated the importance of techniques such as using higher precision for weight updates and the straight-through estimator (ste) for gradient backpropagation [3]. also, in many cases the first and last layer were not quantized, or quantized with a higher bit-width as they are more sensitive to quantization [59, 45, 18]. multi-bit quantization schemes use either uniform [7, 59], or non-uniform quantization [13, 60, 34, 2]. uniform quantization enables the use of integer or fixed-point math pipelines, allowing computation to be performed in the quantized domain. non-uniform quantization requires dequantization, e.g. a codebook lookup, before doing computation in higher precision, limiting its benefits to model compression and bandwidth reduction. this paper focuses on leveraging quantization to accelerate computation, so we will restrict our focus to uniform quantization schemes.
+
+while much of the aforementioned work has focused on cnns for image classification, there are also many examples of applying quantization to other types of network architectures. wu et al. [55] described how google's neural machine translation (gnmt), which employs a long short term memory (lstm) recurrent neural network (rnn), was trained with hard range constraints on multiple tensors to be more amenable to ptq. a similar strategy was taken on mobilenet v2 [48], which restricts activations to be in the range [0, 6] (relu6). bhandare et al. [4] quantized the smaller base transformer [53] model targeting the int8 vnni instructions on intel cpus. they use kl-divergence [36] to calibrate the quantization ranges and apply ptq. zafrir et al. [58] quantized bert [10] to int8 using both ptq and qat. in this paper, we present an evaluation of int8 quantization on all of the major network architectures with both ptq and qat.
+
+more complex methods have also been proposed for training quantized models. distillation has been used to train a quantized "student" model with a high precision, and often larger, "teacher" model. it has been applied to training quantized cnns [37, 43], lstms [43] and transformers [24]. leng et al. [31] used the alternating direction method of multipliers (admm) as an alternative to ste when training quantized model. these methods generally target lower bit-width quantization, as qat has been shown to be sufficient for int8 quantization. we have also found qat to be sufficient for int8 quantization on the models we evaluated, and as such we chose not to include these methods in our evaluation of int8 quantization.
+
+![](images/d07e6e233a305a01941d9a208832e68285a656d4759bf717fb649cc110d93ac2.jpg)  
+(a) affine quantization  
+figure 1: quantization mapping of real values to int8
+
+![](images/2a77a293671743b674d96fa91e7afba6672d82d63b30182d2c6157c83627b183.jpg)  
+(b) scale quantization
+
+# 3 quantization fundamentals
+
+we focus on uniform integer quantization as it enables computing matrix multiplications and convolutions in the integer domain, allowing the use of high throughput integer math pipelines. uniform quantization can be divided in to two steps. first, choose the range of the real numbers to be quantized, clamping the values outside this range. second, map the real values to integers representable by the bit-width of the quantized representation (round each mapped real value to the closest integer value).
+
+in this section we will consider higher precision floating-point formats like fp16 and fp32 to be real numbers for the purpose of discussion. enabling integer operations in a pre-trained floating-point neural network requires two fundamental operations:
+
+quantize: convert a real number to a quantized integer representation (e.g. from fp32 to int8).
+
+dequantize: convert a number from quantized integer representation to a real number (e.g. from int32 to fp16).
+
+we will first define the quantize and dequantize operations in section 3.1 and discuss their implications in neural network quantization in sections 3.2 and 3.3. then we will discuss how the real ranges are chosen in section 3.4.
+
+# 3.1 range mapping
+
+let  $[\beta, \alpha]$  be the range of representable real values chosen for quantization and  $b$  be the bit-width of the signed integer representation. uniform quantization transforms the input value  $x \in [\beta, \alpha]$  to lie within  $[-2^{b-1}, 2^{b-1} - 1]$ , where inputs outside the range are clipped to the nearest bound. since we are considering only uniform transformations, there are only two choices for the transformation function:  $f(x) = s \cdot x + z$  and its special case  $f(x) = s \cdot x$ , where  $x, s, z \in \mathbb{r}$ . in this paper we refer to these two choices as affine and scale, respectively.
+
+# 3.1.1 affine quantization
+
+affine quantization maps a real value  $x \in \mathbb{r}$  to a  $b$ -bit signed integer  $x_{q} \in \{-2^{b - 1}, -2^{b - 1} + 1, \dots, 2^{b - 1} - 1\}$ . equations 1 and 2 define affine transformation function,  $f(x) = s \cdot x + z$ :
+
+$$
+s = \frac {2 ^ {b} - 1}{\alpha - \beta} \tag {1}
+$$
+
+$$
+z = - \operatorname {r o u n d} (\beta \cdot s) - 2 ^ {b - 1} \tag {2}
+$$
+
+where  $s$  is the scale factor and  $z$  is the zero-point - the integer value to which the real value zero is mapped. in the 8-bit case,  $s = \frac{255}{\alpha - \beta}$  and  $z = -\text{round}(\beta \cdot s) - 128$ . note that  $z$  is rounded to an integer value so that the real value of zero is exactly representable. this will result in a slight adjustment to the real representable range  $[\beta, \alpha]$  [20].
+
+the quantize operation is defined by equation 3 and 4:
+
+$$
+\operatorname {c l i p} (x, l, u) \left\{ \begin{array}{l} l, x <   l \\ x, l \leq x \leq u \\ u, x > u \end{array} \right. \tag {3}
+$$
+
+$$
+x _ {q} = \operatorname {q u a n t i z e} (x, b, s, z) = \operatorname {c l i p} (\operatorname {r o u n d} (s \cdot x + z), - 2 ^ {b - 1}, 2 ^ {b - 1} - 1) \tag {4}
+$$
+
+where round() rounds to the nearest integer. figure 1a shows the mapping of real values to int8 representation with affine quantization. note that  $s$  is the ratio of the integer-representable and chosen real ranges.
+
+equation 5 shows the corresponding dequantize function, which computes an approximation of the original real valued input,  $\hat{x} \approx x$ .
+
+$$
+\hat {x} = \operatorname {d e q u a n t i z e} \left(x _ {q}, s, z\right) = \frac {1}{s} \left(x _ {q} - z\right) \tag {5}
+$$
+
+# 3.1.2 scale quantization
+
+scale quantization performs range mapping with only a scale transformation. for simplicity we describe the symmetric variant of scale quantization (often called symmetric quantization [26]), where the input range and integer range are symmetric around zero. this means that for int8 we use the integer range  $[-127, 127]$ , opting not to use the value -128 in favor of symmetry. for 8-bit quantization, losing one out of 256 representable values is insignificant, but for lower bit quantization the trade-off between representable values and symmetry should be re-evaluated.
+
+figure 1b illustrates the mapping of real values to int8 with scale quantization. equation 6 and 7 define scale quantization of a real value  $x$ , with a chosen representable range  $[-\alpha, \alpha]$ , producing a  $b$ -bit integer value,  $x_{q}$ .
+
+$$
+s = \frac {2 ^ {b - 1} - 1}{\alpha} \tag {6}
+$$
+
+$$
+x _ {q} = \operatorname {q u a n t i z e} (x, b, s) = \operatorname {c l i p} (\operatorname {r o u n d} (s \cdot x), - 2 ^ {b - 1} + 1, 2 ^ {b - 1} - 1) \tag {7}
+$$
+
+equation 8 shows the corresponding dequantize operation for scale quantization.
+
+$$
+\hat {x} = \operatorname {d e q u a n t i z e} \left(x _ {q}, s\right) = \frac {1}{s} x _ {q} \tag {8}
+$$
+
+# 3.2 tensor quantization granularity
+
+there are several choices for sharing quantization parameters among tensor elements. we refer to this choice as quantization granularity. at the coarsest, per-tensor granularity, the same quantization parameters are shared by all elements in the tensor. the finest granularity would have individual quantization parameters per element. intermediate granularities reuse parameters over various dimensions of the tensor - per row or per column for 2d matrices, per channel for 3d (image-like) tensors, etc.
+
+we will consider two factors when choosing granularity: impact on model accuracy and computational cost. to understand the computational cost, we will examine matrix multiplication (note that this results in no loss of generality for math-intensive operations since convolutions can be expressed as matrix multiplications [5, 54]).
+
+consider a linear (fully-connected) layer that performs a matrix multiplication  $y = xw$ , where  $x = (x_{ik}) \in \mathbb{r}^{m \times p}$  is the input activation tensor,  $w = (w_{kj}) \in \mathbb{r}^{p \times n}$  is the weight tensor, and  $y = (y_{ij}) \in \mathbb{r}^{m \times n}$  is the output tensor. the result of the real-valued matrix multiplication  $y = xw$  can be approximated with quantized tensors  $x_{q} = (x_{q,ik}) \in \mathbb{z}^{m \times p}$  and  $w_{q} = (w_{q,kj}) \in \mathbb{z}^{p \times n}$ , by first dequantizing them, and then performing the matrix multiplication. first, consider tensors quantized at the finest granularity, per-element, with scale quantization:
+
+$$
+y _ {i j} = \sum_ {k = 1} ^ {p} x _ {i k} \cdot w _ {k j} \approx \sum_ {k = 1} ^ {p} \operatorname {d e q u a n t i z e} \left(x _ {q, i k}, s _ {q, i k}\right) \cdot \operatorname {d e q u a n t i z e} \left(w _ {q, k j}, s _ {w, k j}\right) = \sum_ {k = 1} ^ {p} \frac {1}{s _ {x , i k}} x _ {q, i k} \cdot \frac {1}{s _ {w , k j}} w _ {q, k j} \tag {9}
+$$
+
+in order to use integer matrix multiplication the scales must be factored out of the summation on the right-hand side of equation 9, for which the scales must be independent of  $k$ :
+
+$$
+\frac {1}{s _ {x , i} \cdot s _ {w , j}} \sum_ {k = 1} ^ {p} x _ {q, i k} \cdot w _ {q, k j} \tag {10}
+$$
+
+thus, integer matrix multiplication is possible as long as the quantization granularity is per-row or per-tensor for activations and per-column or per-tensor for weights. for activations, only per-tensor quantization is practical for performance reasons. in the above formulation different rows belong to either different batch instances or items in a sequence and thus row count can vary at inference time. this prevents the per-row scaling factor from being computation offline (which would not be meaningful for different instances in a mini-batch), whereas determining them online imposes a compute overhead and in some cases results in poor accuracy (dynamic quantization discussion in [58]).
+
+for maximum performance, activations should use per-tensor quantization granularity. weights should be quantized at either per-tensor or per-column granularity for linear layers of the form  $y = xw$  (per-row for linear layers of the form  $y = xw^t$ ). the corresponding granularity to per-column in convolutions is per-kernel, or equivalently per-output-channel since each kernel produces a separate output channel [27, 29]. this is commonly referred to as "per-channel" weight quantization in literature and we follow that convention [21, 25, 26, 38, 46]. we examine the granularity impact on accuracy in section 4.1.
+
+# 3.3 computational cost of affine quantization
+
+while both affine and scale quantization enable the use of integer arithmetic, affine quantization leads to more computationally expensive inference. as shown in equation 10, scale quantization results in an integer matrix multiply, followed by a point-wise floating-point multiplication. given that a typical dot-product in a dnn comprises 100s to 1000s of multiply-add operations, a single floating-point operation at the end is a negligible cost. furthermore, if per-tensor quantization is used for both arguments, a single floating-point multiplier is needed and is part of the gemm api (often referred to as alpha) in blas libraries [11].
+
+affine quantization yields a more complex expression:
+
+(1) (2) (3)
+
+$$
+\begin{array}{l} y _ {i j} \approx \sum_ {k = 1} ^ {p} \frac {1}{s _ {x}} (x _ {q, i k} - z _ {x}) \frac {1}{s _ {w , j}} (w _ {q, k j} - z _ {w, j}) \\ = \frac {1}{s _ {x} s _ {w , j}} \left(\sum_ {k = 1} ^ {p} x _ {q, i k} w _ {q, k j} - \sum_ {k = 1} ^ {p} \left(w _ {q, k j} z _ {x} + z _ {x} z _ {w, j}\right) - \sum_ {k = 1} ^ {p} x _ {q, i k} z _ {w, j}\right) \tag {11} \\ \end{array}
+$$
+
+computation can be broken down into three terms, as annotated in equation 11. the first term is the integer dot product, just as in scale quantization (equation 10). the second term consists of only integer weights and zero-points. as a result, this term can be computed offline, only adding an element-wise addition at inference time. if the layer has a bias then this term can be folded in without increasing inference cost. the third term, however, involves the quantized input matrix  $x_{q}$ , and thus cannot be computed offline. this extra computation, depending on implementation, can introduce considerable overhead, reducing or even eliminating the throughput advantage that integer math pipelines have over reduced precision floating-point. note that this extra computation is incurred only if affine quantization is used for the weight matrix. thus, to maximize inference performance we recommend using scale quantization for weights. while affine quantization could be used for activations without a performance penalty, we show in later sections that scale quantization is sufficient for int8 quantization of all the networks we studied.
+
+![](images/b9474492cdd919b40d23c2b51c7db9dbc53f568a4e0d2cbc2832a33f17eb6b6b.jpg)  
+figure 2: histogram of input activations to layer 3 in resnet50 and calibrated ranges
+
+# 3.4 calibration
+
+calibration is the process of choosing  $\alpha$  and  $\beta$  for model weights and activations. for simplicity we describe calibration of a symmetric range, as needed for scale quantization. in this paper we consider three calibration methods:
+
+max: use the maximum absolute value seen during calibration [52].
+
+entropy: use kl divergence to minimize information loss between the original floating-point values and values that could be represented by the quantized format. this is the default method used by tensorrt [36].
+
+percentile: set the range to a percentile of the distribution of absolute values seen during calibration [33]. for example,  $99\%$  calibration would clip  $1\%$  of the largest magnitude values.
+
+figure 2 shows a log scaled histogram of activations feeding into layer1.0.conv2 of resnet50. ranges derived from max, entropy, and  $99.99\%$  percentile calibration are shown with dashed lines. note that the activations are strictly non-negative because this layer directly follows a relu activation function [39]. max calibration represents the largest value in the distribution, maintaining the full range while having low precision. clipping the distribution trades off a large clipping error on a few outlier values for smaller rounding errors on a majority of the values. both entropy and percentile calibration clip some outlier values in order to increase the resolution of inlier values.
+
+# 4 post training quantization
+
+in this section we evaluate various post training quantization (ptq) parameter choices, as described in section 3. quantization parameters are calibrated offline by processing the trained model weights and activations generated by running inference on a sample dataset, no further training is involved. these quantization parameters are evaluated on a variety of neural network tasks and models, summarized in table 2. more details on these networks can be found in appendix a. the selected models comprise multiple types of network architectures: convolutional feed forward networks, recurrent networks, and attention-based networks. we report accuracy metrics computed on the evaluation set of the corresponding dataset. metrics for all tasks are reported as percentages, where higher is better and  $100\%$  is a perfect score. for metric consistency, we report word accuracy (wacc) for speech recognition instead of the more commonly used word error rate (wer), where wacc = 100% - wer. note that accuracy metrics for different tasks are computed in very different ways, thus it is not meaningful to compare absolute changes in accuracy when quantizing different models. therefore, when discussing accuracy impact we will refer to the relative accuracy change, computed by  $(\mathrm{acc}_{int8} - \mathrm{acc}_{fp32}) / \mathrm{acc}_{fp32}$ .
+
+our experiments are conducted using pytorch [42], with custom quantization operations. we focus on quantizing the computationally intensive operations, including convolutions, linear (fully-connected) layers, lstm cells, projection layers and other matrix multiplications. most of the other layers, such as softmax and batch normalization, are not quantized unless stated otherwise. an operation is quantized by quantizing all of its inputs (e.g. weights and activations). the output of a quantized operation is not quantized to int8 because the operation that follows it may require higher precision, e.g. nonlinear operations. furthermore, consecutive operations can be executed with a fused implementation, avoiding memory reads and writes for the intermediate values. therefore we leave quantization of the output activations to the input of the next operation. appendix c discusses how batch normalization can be eliminated by folding it into the preceding layer for inference.
+
+<table><tr><td>task</td><td>model</td><td>accuracy</td><td>metric</td><td>dataset (evaluation set)</td></tr><tr><td rowspan="10">classification</td><td>mobilenet v1</td><td>71.88</td><td></td><td></td></tr><tr><td>mobilenet v2</td><td>71.88</td><td></td><td></td></tr><tr><td>resnet50 v1.5</td><td>76.16</td><td></td><td></td></tr><tr><td>resnet152 v1.5</td><td>78.32</td><td></td><td></td></tr><tr><td>inception v3</td><td>77.34</td><td rowspan="2">top1</td><td rowspan="2">imagenet 2012 (val)</td></tr><tr><td>inception v4</td><td>79.71</td></tr><tr><td>resnext50</td><td>77.61</td><td></td><td></td></tr><tr><td>resnext101</td><td>79.30</td><td></td><td></td></tr><tr><td>efficientnet b0</td><td>76.85</td><td></td><td></td></tr><tr><td>efficientnet b3</td><td>81.61</td><td></td><td></td></tr><tr><td rowspan="3">detection</td><td>faster r-cnn</td><td>36.95</td><td></td><td></td></tr><tr><td>mask r-cnn</td><td>37.89</td><td>map</td><td>coco 2017 (val)</td></tr><tr><td>retinanet</td><td>39.30</td><td></td><td></td></tr><tr><td rowspan="2">segmentation</td><td>fcn</td><td>63.70</td><td></td><td></td></tr><tr><td>deeplabv3</td><td>67.40</td><td>miou</td><td>coco 2017 (val)</td></tr><tr><td rowspan="2">translation</td><td>gnmt</td><td>24.27</td><td></td><td></td></tr><tr><td>transformer</td><td>28.27</td><td>bleu</td><td>wmt16 en-de (newtest2014)</td></tr><tr><td>speech recognition</td><td>jasper</td><td>96.09 (3.91)</td><td>wacc (wer)</td><td>librispeech (test-clean)</td></tr><tr><td>language model</td><td>bert large</td><td>91.01</td><td>f1</td><td>squad v1.1 (dev)</td></tr></table>
+
+table 2: summary of networks and pre-trained model accuracy  
+
+<table><tr><td>model</td><td>fp32</td><td>per-channel</td><td>per-channel fold bn</td><td>per-tensor</td><td>per-tensor fold bn</td></tr><tr><td>mobilenet v1</td><td>71.88</td><td>71.59</td><td>71.59</td><td>69.58</td><td>66.88</td></tr><tr><td>mobilenet v2</td><td>71.88</td><td>71.61</td><td>71.61</td><td>71.12</td><td>70.21</td></tr><tr><td>resnet50 v1.5</td><td>76.16</td><td>76.14</td><td>76.14</td><td>75.83</td><td>75.84</td></tr><tr><td>resnext50</td><td>77.61</td><td>77.62</td><td>77.62</td><td>77.48</td><td>77.45</td></tr><tr><td>efficientnet b0</td><td>76.85</td><td>76.72</td><td>76.72</td><td>76.68</td><td>12.93</td></tr></table>
+
+table 3: accuracy with int8 quantization of weights only: per-tensor vs per-channel granularity. fold bn indicates batch norms were folded into the preceding convolution before quantization
+
+# 4.1 weight quantization
+
+we first evaluate weight quantization in isolation, since their values do not depend on network inputs, and demonstrate that max calibration is sufficient to maintain accuracy for int8 weights. table 3 compares the accuracy impact of the per-tensor and per-channel quantization granularities, which in section 3.2 were shown to require minimal compute overheads. while per-tensor quantization results in substantial accuracy losses for some networks, accuracy loss is more pronounced and even catastrophic for efficientnet once batch-normalization (bn) parameters are folded into convolution layers. bn folding (appendix c) is a common technique to speed up inference as it completely eliminates this memory-limited operation without changing the underlying mathematics. however, as bn parameters are learned per channel, their folding can result in significantly different weight value distributions across channels. fortunately, as table 3 shows, per-channel quantization granularity maintains model accuracy even with bn folding. table 4 reports per-channel (per-column for linear layers) granularity and indicates that max calibration is sufficient to maintain accuracy when quantizing weights to int8. the rest of the experiments in this paper use per-channel max calibration for weights.
+
+# 4.2 activation quantization
+
+table 5 shows activation quantization results for different calibration methods: max, entropy and percentiles from  $99.9\%$  to  $99.9999\%$ . details on activation calibration can be found in appendix a. in all cases, weights were quantized per-channel with max calibration as described in section 4.1.
+
+<table><tr><td>model</td><td>fp32</td><td>accuracy</td><td>relative</td><td>model</td><td>fp32</td><td>accuracy</td><td>relative</td></tr><tr><td>mobilenet v1</td><td>71.88</td><td>71.59</td><td>-0.40%</td><td>faster r-cnn</td><td>36.95</td><td>36.86</td><td>-0.24%</td></tr><tr><td>mobilenet v2</td><td>71.88</td><td>71.61</td><td>-0.38%</td><td>mask r-cnn</td><td>37.89</td><td>37.84</td><td>-0.13%</td></tr><tr><td>resnet50 v1.5</td><td>76.16</td><td>76.14</td><td>-0.03%</td><td>retinanet</td><td>39.30</td><td>39.20</td><td>-0.25%</td></tr><tr><td>resnet152 v1.5</td><td>78.32</td><td>78.28</td><td>-0.05%</td><td>fcn</td><td>63.70</td><td>63.70</td><td>0.00%</td></tr><tr><td>inception v3</td><td>77.34</td><td>77.44</td><td>0.13%</td><td>deeplabv3</td><td>67.40</td><td>67.40</td><td>0.00%</td></tr><tr><td>inception v4</td><td>79.71</td><td>79.64</td><td>-0.09%</td><td>gnmt</td><td>24.27</td><td>24.41</td><td>0.58%</td></tr><tr><td>resnext50</td><td>77.61</td><td>77.62</td><td>0.01%</td><td>transformer</td><td>28.27</td><td>28.58</td><td>1.10%</td></tr><tr><td>resnext101</td><td>79.30</td><td>79.29</td><td>-0.01%</td><td>jasper</td><td>96.09</td><td>96.10</td><td>0.01%</td></tr><tr><td>efficientnet b0</td><td>76.85</td><td>76.72</td><td>-0.17%</td><td>bert large</td><td>91.01</td><td>90.94</td><td>-0.08%</td></tr><tr><td>efficientnet b3</td><td>81.61</td><td>81.55</td><td>-0.07%</td><td></td><td></td><td></td><td></td></tr></table>
+
+table 4: accuracy with int8 quantization of weights only: per-channel granularity, max calibration  
+
+<table><tr><td>models</td><td>fp32</td><td>max</td><td>entropy</td><td>99.9%</td><td>99.99%</td><td>99.999%</td><td>99.9999%</td></tr><tr><td>mobilenet v1</td><td>71.88</td><td>69.51</td><td>70.19</td><td>70.39</td><td>70.29</td><td>69.97</td><td>69.57</td></tr><tr><td>mobilenet v2</td><td>71.88</td><td>69.41</td><td>70.28</td><td>70.68</td><td>71.14</td><td>70.72</td><td>70.23</td></tr><tr><td>resnet50 v1.5</td><td>76.16</td><td>75.82</td><td>76.05</td><td>75.68</td><td>75.98</td><td>75.97</td><td>76.00</td></tr><tr><td>resnet152 v1.5</td><td>78.32</td><td>77.93</td><td>78.21</td><td>77.62</td><td>78.17</td><td>78.17</td><td>78.19</td></tr><tr><td>inception v3</td><td>77.34</td><td>72.53</td><td>77.54</td><td>76.21</td><td>77.52</td><td>77.43</td><td>77.37</td></tr><tr><td>inception v4</td><td>79.71</td><td>0.12</td><td>79.60</td><td>78.16</td><td>79.63</td><td>79.12</td><td>71.19</td></tr><tr><td>resnext50</td><td>77.61</td><td>77.31</td><td>77.46</td><td>77.04</td><td>77.39</td><td>77.45</td><td>77.39</td></tr><tr><td>resnext101</td><td>79.30</td><td>78.74</td><td>79.09</td><td>78.77</td><td>79.15</td><td>79.17</td><td>79.05</td></tr><tr><td>efficientnet b0</td><td>76.85</td><td>22.3</td><td>72.06</td><td>70.87</td><td>68.33</td><td>51.88</td><td>42.49</td></tr><tr><td>efficientnet b3</td><td>81.61</td><td>54.27</td><td>76.96</td><td>77.80</td><td>80.28</td><td>80.06</td><td>77.13</td></tr><tr><td>faster r-cnn</td><td>36.95</td><td>36.38</td><td>36.82</td><td>35.22</td><td>36.69</td><td>36.76</td><td>36.78</td></tr><tr><td>mask r-cnn</td><td>37.89</td><td>37.51</td><td>37.75</td><td>36.17</td><td>37.55</td><td>37.72</td><td>37.80</td></tr><tr><td>retinanet</td><td>39.30</td><td>38.90</td><td>38.97</td><td>35.34</td><td>38.55</td><td>39.19</td><td>39.19</td></tr><tr><td>fcn</td><td>63.70</td><td>63.40</td><td>64.00</td><td>62.20</td><td>64.00</td><td>63.90</td><td>63.60</td></tr><tr><td>deeplabv3</td><td>67.40</td><td>67.20</td><td>67.40</td><td>66.40</td><td>67.40</td><td>67.50</td><td>67.40</td></tr><tr><td>gnmt</td><td>24.27</td><td>24.31</td><td>24.53</td><td>24.34</td><td>24.36</td><td>24.38</td><td>24.33</td></tr><tr><td>transformer</td><td>28.27</td><td>21.23</td><td>21.88</td><td>24.49</td><td>27.71</td><td>20.22</td><td>20.44</td></tr><tr><td>jasper</td><td>96.09</td><td>95.99</td><td>96.11</td><td>95.77</td><td>96.09</td><td>96.09</td><td>96.03</td></tr><tr><td>bert large</td><td>91.01</td><td>85.92</td><td>37.40</td><td>26.18</td><td>89.59</td><td>90.20</td><td>90.10</td></tr></table>
+
+table 5: post training quantization accuracy. weights use per-channel or per-column max calibration. activations use the calibration listed. best quantized accuracy per network is in bold.
+
+for most of the networks, there is at least one activation calibration method that achieves acceptable accuracy, except for mobilenets, efficientnets, transformer and bert where the accuracy drop is larger than  $1\%$ . max calibration leads to inconsistent quality across various networks, leading to particularly large accuracy drops for inception v4, efficientnets and transformer, presumably due to their outlier values.  $99.9\%$  percentile calibration clips the large magnitude values too aggressive and leads to significant accuracy drops on most networks. the best post training quantization results are achieved with entropy,  $99.99\%$ , or  $99.999\%$  percentile calibrations, though no single calibration is best for all networks.
+
+# 5 techniques to recover accuracy
+
+while many networks maintain accuracy after post training quantization, there are cases where accuracy loss is substantial. a number of techniques are available to recover accuracy. the simplest one is partial quantization, described in section 5.1, which leaves the most sensitive layers unquantized. one also has an option to train networks with quantization, as described in section 5.2. finally, there are also approaches that jointly learn the model weights and quantization parameters.
+
+![](images/cb993c203614dde00538e8f82a42d4221af8c330dc3f31db4fce5123cfa9f8ca.jpg)  
+figure 3: partial quantization of efficientnet b0, showing the 10 most sensitive layers in order of increasing accuracy. sensitivity shows the accuracy from the sensitivity analysis when only the corresponding layer inputs are quantized. partial quantization shows the accuracy when the corresponding layer, and all layers to the left, are not quantized.
+
+<table><tr><td>model</td><td>fp32accuracy</td><td>calibration</td><td>full int8total quantized layers</td><td>accuracy</td><td>partial int8skipped layers</td><td>accuracy</td></tr><tr><td>mobilenet v1</td><td>71.88</td><td>max</td><td>28</td><td>69.51</td><td>2</td><td>71.50</td></tr><tr><td>efficientnet b0</td><td>76.85</td><td>entropy</td><td>82</td><td>72.06</td><td>10</td><td>76.35</td></tr><tr><td>efficientnet b3</td><td>81.61</td><td>99.99%</td><td>131</td><td>76.96</td><td>3</td><td>81.27</td></tr><tr><td>transformer</td><td>28.27</td><td>max</td><td>121</td><td>21.23</td><td>5</td><td>28.20</td></tr><tr><td>bert large</td><td>91.01</td><td>max</td><td>244</td><td>85.92</td><td>141</td><td>90.41</td></tr></table>
+
+table 6: partial post training quantization
+
+# 5.1 partial quantization
+
+often just a few quantized layers contribute to most of the accuracy loss of a quantized model. we can trade off some performance to increase accuracy by leaving these sensitive layers unquantized (i.e. leaving their inputs and computation in floating-point). since quantization of one layer affects the inputs of others, finding the optimal set of layers to quantize can require evaluating an exponential number of configurations. instead, we propose using a one-at-a-time sensitivity analysis as a more tractable approach to infer which layers contribute most to the accuracy drop.
+
+during sensitivity analysis a single layer is quantized at a time, and model accuracy is evaluated. we refer to layers that result in lower accuracy when quantized as being more "sensitive" to quantization. we sort the layers in descending order of sensitivity, and skip quantization of the most sensitive layers until the desired accuracy is achieved.
+
+figure 3 shows an example of sensitivity analysis and partial quantization of efficientnet b0. starting from entropy calibration, we quantize one layer at a time and evaluate accuracy. for clarity we are only showing the 10 most sensitive layers. in this example, skipping the 10 most sensitive layers reduces the relative top-1 accuracy drop to  $0.65\%$ . since there are 82 convolution layers, keeping 10 in floating-point while quantizing the remaining 72 maintains most of the performance benefit.
+
+as reported in table 5, mobilenet v1, efficientnets, transformer, and bert all incurred a substantial loss in accuracy when quantized with various calibrations. we list the results of partial quantization for these networks in table 6. with the exception of bert, these networks need to skip quantization of only a few of the most-sensitive layers to recover accuracy to within  $1\%$  of the fp32 accuracy. for bert, sensitivity analysis does not reveal any particular layer that contributes more to the accuracy drop. as a result we cannot identify a small subset of layers to leave in floating-point. to address this we need to consider different approaches. section 5.2, incorporates quantization with training to recover accuracy. additionally, appendix d examines the gelu activation function in bert and presents a simple augmentation to significantly improve post training quantization accuracy.
+
+![](images/a2ab93c1c7a60c024a402be40d5668c7f92ea6c0d547e66068a3e5b2ac17336d.jpg)  
+figure 4: 3-bit fake quantization forward and backward pass with ste derivative approximation.
+
+# 5.2 quantization-aware training
+
+quantization aware training (qat) describes the technique of inserting quantization operations in to the neural network before training or fine-tuning, to allow the network to adapt to the quantized weights and activations. appendix b illustrates how this can lead to a better result. we apply qat to fine-tuning as it has been shown that starting from a pre-trained network and fine-tuning leads to better accuracy [37, 26] and requires significantly fewer iterations [33]. this also allows us to leverage the calibrated pre-trained models from section 4. note that we keep the quantization ranges fixed throughout fine-tuning. another approach is to learn the ranges, which we evaluate in section 5.3.
+
+a common approach to implementing qat is to insert fake quantization, also called simulated quantization [26], operations into a floating-point network. equation 12 defines fake quantization as a quantize and dequantize operation that produces an approximate version of the input,  $\hat{x} \approx x$ , where  $x$  and  $\hat{x}$  are both floating-point values.
+
+$$
+\hat {x} = \operatorname {d e q u a n t i z e} (\operatorname {q u a n t i z e} (x, b, s), b, s) \tag {12}
+$$
+
+we add fake quantization operations at the inputs of the operation we wish to quantize to simulate the effects of quantization. recall the matrix multiplication example in section 3.2. equation 9 is effectively a fake quantized matrix multiplication. after training, we transform the network to enable a quantized integer matrix multiply as shown in equation 10.
+
+one challenge to training in floating-point with quantization is that the quantization operation's derivative is undefined at the step boundaries and zero everywhere else. the derivative is required to compute loss gradients on the backward pass of each training iteration. qat addresses this by using the straight-through estimator (ste) [3] as shown in figure 4. as defined in equation 13, ste approximates the derivative of the fake quantization function to be 1 for inputs in the representable range  $[\beta, \alpha]$  as defined in section 3.1.
+
+$$
+\frac {d \hat {x}}{d x} = \left\{ \begin{array}{l l} 0, & y <   \beta \\ 1, & \beta \leq y \leq \alpha \\ 0, & y > \alpha \end{array} \right. \tag {13}
+$$
+
+table 7 summarizes the best results of both post training quantization and fine-tuned quantization. ptq best reports the best result for each quantized network in table 5 and the corresponding calibration. qat reports the accuracy after fine-tuning using the best calibration as determined by ptq. details of the finetuning methodology and the complete set of qat results can be found in appendix a.2.
+
+as table 7 shows, quantization-aware fine-tuning improves accuracy in most cases, the only exceptions being resnext-101, mask r-cnn, and gnmt where post training quantization achieves a marginally better result. it is worth noting that for all 3 of these cases the differences in accuracy are essentially at the noise level (differences in accuracy one would observe when training from different random initializations). we do not interpret these cases as evidence that fine-tuning reduces accuracy, they are more likely to indicate that fine-tuning does not appreciably change accuracy beyond run-to-run variation. likewise, we do not interpret cases where accuracy is higher than fp32 as quantization acting as a regularizer, it is more likely to be noise or the result of the additional fine-tuning. efficientnet b3 is another case worth examining - as our code did not have auto augmentation [9], used to train the original model, fine-tuning even in fp32 causes a slight accuracy drop to 81.3. nevertheless, with fine-tuning all networks were able to maintain their accuracy well within  $1\%$  of the original pre-trained fp32 model.
+
+<table><tr><td rowspan="2">model</td><td rowspan="2">fp32 accuracy</td><td colspan="3">ptq best</td><td colspan="2">qat</td></tr><tr><td>calibration</td><td>accuracy</td><td>relative</td><td>accuracy</td><td>relative</td></tr><tr><td>mobilenet v1</td><td>71.88</td><td>99.9%</td><td>70.39</td><td>-2.07%</td><td>72.07</td><td>0.26%</td></tr><tr><td>mobilenet v2</td><td>71.88</td><td>99.99%</td><td>71.14</td><td>-1.03%</td><td>71.56</td><td>-0.45%</td></tr><tr><td>resnet50 v1.5</td><td>76.16</td><td>entropy</td><td>76.05</td><td>-0.14%</td><td>76.85</td><td>0.91%</td></tr><tr><td>resnet152 v1.5</td><td>78.32</td><td>entropy</td><td>78.21</td><td>-0.14%</td><td>78.61</td><td>0.37%</td></tr><tr><td>inception v3</td><td>77.34</td><td>entropy</td><td>77.54</td><td>0.26%</td><td>78.43</td><td>1.41%</td></tr><tr><td>inception v4</td><td>79.71</td><td>99.99%</td><td>79.63</td><td>-0.10%</td><td>80.14</td><td>0.54%</td></tr><tr><td>resnext50</td><td>77.61</td><td>entropy</td><td>77.46</td><td>-0.19%</td><td>77.67</td><td>0.08%</td></tr><tr><td>resnext101</td><td>79.30</td><td>99.999%</td><td>79.17</td><td>-0.16%</td><td>79.01</td><td>-0.37%</td></tr><tr><td>efficientnet b0</td><td>76.85</td><td>entropy</td><td>72.06</td><td>-6.23%</td><td>76.95</td><td>0.13%</td></tr><tr><td>efficientnet b3</td><td>81.61</td><td>99.99%</td><td>80.28</td><td>-1.63%</td><td>81.07</td><td>-0.66%</td></tr><tr><td>faster r-cnn</td><td>36.95</td><td>entropy</td><td>36.82</td><td>-0.35%</td><td>36.76</td><td>-0.51%</td></tr><tr><td>mask r-cnn</td><td>37.89</td><td>99.9999%</td><td>37.80</td><td>-0.24%</td><td>37.75</td><td>-0.37%</td></tr><tr><td>retinanet</td><td>39.30</td><td>99.999%</td><td>39.19</td><td>-0.28%</td><td>39.25</td><td>-0.13%</td></tr><tr><td>fcn</td><td>63.70</td><td>entropy</td><td>64.00</td><td>0.47%</td><td>64.10</td><td>0.63%</td></tr><tr><td>deeplabv3</td><td>67.40</td><td>99.999%</td><td>67.50</td><td>0.15%</td><td>67.50</td><td>0.15%</td></tr><tr><td>gnmt</td><td>24.27</td><td>entropy</td><td>24.53</td><td>1.07%</td><td>24.38</td><td>0.45%</td></tr><tr><td>transformer</td><td>28.27</td><td>99.99%</td><td>27.71</td><td>-1.98%</td><td>28.21</td><td>-0.21%</td></tr><tr><td>jasper</td><td>96.09</td><td>entropy</td><td>96.11</td><td>0.02%</td><td>96.10</td><td>0.01%</td></tr><tr><td>bert large</td><td>91.01</td><td>99.999%</td><td>90.20</td><td>-0.89%</td><td>90.67</td><td>-0.37%</td></tr></table>
+
+table 7: summary of post training quantization and quantization aware training. ptq best reports the best accuracy and corresponding calibration for each model. qat reports accuracy after fine-tuning starting from the best ptq model.  
+
+<table><tr><td>models</td><td>fp32</td><td>fixed max</td><td>learned from max</td><td>fixed best</td><td>learned from best</td></tr><tr><td>inception v3</td><td>77.34</td><td>76.43</td><td>78.33</td><td>78.43</td><td>78.50</td></tr><tr><td>inception v4</td><td>79.71</td><td>68.38</td><td>73.88</td><td>80.14</td><td>80.00</td></tr><tr><td>faster r-cnn</td><td>36.95</td><td>36.62</td><td>36.68</td><td>36.76</td><td>36.81</td></tr><tr><td>fcn</td><td>63.70</td><td>63.40</td><td>63.50</td><td>64.10</td><td>64.00</td></tr><tr><td>transformer</td><td>28.27</td><td>28.42</td><td>28.08</td><td>28.21</td><td>28.39</td></tr><tr><td>jasper</td><td>96.09</td><td>96.11</td><td>96.05</td><td>96.10</td><td>96.06</td></tr><tr><td>bert large</td><td>91.01</td><td>90.29</td><td>90.55</td><td>90.67</td><td>90.61</td></tr></table>
+
+table 8: learned and fixed range fine-tuning accuracy. activation ranges initialized to max and best ptq accuracy
+
+# 5.3 learning quantization parameters
+
+while the techniques described in the previous sections relied on quantization parameters calibrated on the pre-trained network, it is also possible to jointly learn the quantization parameters along with the model weights. pact [6] proposed learning the ranges for activation quantization during training. in this section we adopt pact as an enhancement to our quantization aware fine-tuning procedure. we follow the same fine-tuning schedule as before, described in appendix a, but allow the ranges of each quantized activation tensor to be learned along with the weights, as opposed to keeping them fixed throughout fine-tuning.
+
+table 8 shows a selection of networks fine-tuned with fixed and learned activation ranges for different initial calibrations. the "best" calibration refers to the calibration that produced the best accuracy with ptq, as shown in table 5. when the activation quantization is initialized with max calibration, learning the range results in higher accuracy than keeping it fixed for most networks. in particular it results in substantial accuracy improvements where fixed max ranges resulted in a significant accuracy drop. however, when activation ranges are initialized the to the best calibration for each network, learning the ranges yield very similar results to fixed ranges. this suggests that learning the ranges does not offer additional benefit for int8 over qat if activation ranges are already carefully calibrated. however, this may not be the optimal application of pact. comparing the learned range results on inception v4 suggest that when starting from max, the network was not able to learn a good activation ranges in the given fine-tuning schedule. we expect that pact would be able to learn a better range with longer fine-tuning, or a separate optimization schedule and hyperparameters for the range parameters, such as learning rate and weight decay.
+
+![](images/875712820e2f818b165d4766434c37c90f5d66d1bc86c4e6d3af9426de70675a.jpg)  
+figure 5: flow chart of our recommended quantization workflow
+
+# 6 recommended workflow
+
+based on the results in sections 4 and 5, we recommend the following for int8 quantization:
+
+- weights:
+
+- use scale quantization with per-column/per-channel granularity  
+- use a symmetric integer range for quantization [-127, 127]) and max calibration
+
+- activations:
+
+- use scale quantization with with per-tensor granularity
+
+we recommend the following procedure to quantize a pre-trained neural network.
+
+- ptq: quantize all the computationally intensive layers (convolution, linear, matrix multiplication, etc.) and run activation calibration including max, entropy and  $99.99\%$ ,  $99.999\%$  percentile. if none of the calibrations yield the desired accuracy continue to partial quantization or qat.  
+- partial quantization: perform sensitivity analysis to identify the most sensitive layers and leave them in floating-point. if the impact on computational performance is not acceptable or an acceptable accuracy cannot be reached, continue to oat.  
+- qat: start from the best calibrated quantized model. use qat to fine-tune for around  $10\%$  of the original training schedule with an annealing learning rate schedule starting at  $1\%$  of the initial training learning rate. refer to appendix a.2 for specific hyperparameter choices.
+
+figure 5 summarizes the above workflow in a flowchart.
+
+# 7 conclusions
+
+this paper reviewed the mathematical background for integer quantization of neural networks, as well as some performance-related reasons for choosing quantization parameters. we empirically evaluated various choices for int8 quantization of a variety of models, leading to a quantization workflow proposal. following this workflow we demonstrated that all models we studied can be quantized to int8 with accuracy that either matches or is within  $1\%$  of the floating-point model accuracy. this included networks that are challenging for quantization, such as mobilenets and bert. the workflow involves only post-training quantization, partial quantization, and quantization-aware fine-tuning techniques. some more complex techniques, such as admm and distillation, were not required for int8 quantization of these models. however, these techniques should be evaluated when quantizing to even lower-bit integer representations, which we leave to future work.
+
+# references
+
+[1] martin abadi, ashish agarwal, paul barham, eugene brevdo, zhifeng chen, craig citro, greg s. corrado, andy davis, jeffrey dean, matthieu devin, sanjay ghemawat, ian goodfellow, andrew harp, geoffrey irving, michael isard, yangqing jia, rafal jozefowicz, lukasz kaiser, manjunath kudlur, josh levenberg, dan mane, rajat monga, sherry moore, derek murray, chris olah, mike schuster, jonathon shlens, benoit steiner, ilya sutskever, kunal talwar, paul tucker, vincent vanhoucke, vijay vasudevan, fernanda viesas, oriol vinyals, pete warden, martin wattenberg, martin wicke, yuan yu, and xiaoqiang zheng. tensorflow: a system for large-scale machine learning. in 12th {usenix} symposium on operating systems design and implementation (osdi) 16), pages 265-283, 2016.  
+[2] chaim baskin, eli schwartz, evgenii zheltonozhskii, natan liss, raja giryes, alex m bronstein, and avi mendelson. uniq: uniform noise injection for non-uniform quantization of neural networks. arxiv preprint arxiv:1804.10969, 2018.  
+[3] yoshua bengio, nicholas léonard, and aaron courville. estimating or propagating gradients through stochastic neurons for conditional computation. arxiv preprint arxiv:1308.3432, 2013.  
+[4] aishwarya bhandare, vamsi sripathi, deepthi karkada, vivek menon, sun choi, kushal datta, and vikram saletore. efficient 8-bit quantization of transformer neural machine language translation model. arxiv preprint arxiv:1906.00532, 2019.  
+[5] sharan chetlur, cliff woolley, philippe vandermersch, jonathan cohen, john tran, bryan catanzaro, and evan shelhamer. codnn: efficient primitives for deep learning. arxiv preprint arxiv:1410.0759, 2014.  
+[6] jungwook choi, zhuo wang, swagath venkataramani, pierce i-jen chuang, vijayalakshmi srinivasan, and kailash gopalakrishnan. pact: parameterized clipping activation for quantized neural networks. arxiv preprint arxiv:1805.06085, 2018.  
+[7] matthieu courbariaux, yoshua bengio, and jean-pierre david. training deep neural networks with low precision multiplications. arxiv preprint arxiv:1412.7024, 2014.  
+[8] matthieu courbariaux, yoshua bengio, and jean-pierre david. binaryconnect: training deep neural networks with binary weights during propagations. nips, 28:3123-3131, 2015.  
+[9] ekin d cubuk, barret zoph, dandelion mane, vijay vasudevan, and quoc v le. autoaugment: learning augmentation strategies from data. in proceedings of the ieee conference on computer vision and pattern recognition, pages 113-123, 2019.  
+[10] jacob devlin, ming-wei chang, kenton lee, and kristina toutanova. bert: pre-training of deep bidirectional transformers for language understanding. arxiv preprint arxiv:1810.04805, 2018.  
+[11] jack j dongarra, jeremy du croz, sven hammarling, and iain s duff. a set of level 3 basic linear algebra subprograms. acm transactions on mathematical software (toms), 16(1):1-17, 1990.  
+[12] boris ginsburg, patrice castonguay, oleksii hrinchuk, oleksii kuchaiev, vitaly lavrukhin, ryan leary, jason li, huyen nguyen, and jonathan m cohen. stochastic gradient methods with layer-wise adaptive moments for training of deep networks. arxiv preprint arxiv:1905.11286, 2019.  
+[13] song han, huizi mao, and william j dally. deep compression: compressing deep neural networks with pruning, trained quantization and huffman coding. arxiv preprint arxiv:1510.00149, 2015.  
+[14] kaiming he, xiangyu zhang, shaoqing ren, and jian sun. deep residual learning for image recognition. in proceedings of the ieee conference on computer vision and pattern recognition, pages 770-778, 2016.
+
+[15] dan hendrycks and kevin gimpel. gaussian error linear units (gelus). arxiv preprint arxiv:1606.08415, 2016.  
+[16] sepp hochreiter and jürgen schmidhuber. simplifying neural nets by discovering flat minima. in advances in neural information processing systems, pages 529-536, 1995.  
+[17] andrew g howard, menglong zhu, bo chen, dmitry kalenichenko, weijun wang, tobias weyand, marco andreetto, and hartwig adam. mobilenets: efficient convolutional neural networks for mobile vision applications. arxiv preprint arxiv:1704.04861, 2017.  
+[18] itay hubara, matthieu courbariaux, daniel soudry, ran el-yaniv, and yoshua bengio. binarized neural networks. in advances in neural information processing systems, pages 4107-4115, 2016.  
+[19] sergey ioffe and christian szegedy. batch normalization: accelerating deep network training by reducing internal covariate shift. arxiv preprint arxiv:1502.03167, 2015.  
+[20] benoit jacob, skirmantas kligys, bo chen, menglong zhu, matthew tang, andrew howard, hartwig adam, and dmitry kalenichenko. quantization and training of neural networks for efficient integer-arithmetic-only inference. in proceedings of the ieee conference on computer vision and pattern recognition, pages 2704-2713, 2018.  
+[21] sambhav r jain, albert gural, michael wu, and chris h dick. trained quantization thresholds for accurate and efficient fixed-point inference of deep neural networks. arxiv preprint arxiv:1903.08066, 2(3):7, 2019.  
+[22] stanisław jastrzebski, zachary kenton, devansh arpit, nicolas ballas, asja fischer, yoshua bengio, and amos storkey. three factors influencing minima in sgd. arxiv preprint arxiv:1711.04623, 2017.  
+[23] norman p. jouppi, cliff young, nishant patil, david patterson, gaurav agrawal, raminder bajwa, sarah bates, suresh bhatia, nan boden, al borchers, rick boyle, pierre-luc cantin, clifford chao, chris clark, jeremy coriell, mike daley, matt dau, jeffrey dean, ben gelb, tara vazir ghaemmaghami, rajendra gottipati, william gulland, robert hagmann, c. richard ho, doug hogberg, john hu, robert hundt, dan hurt, julian ibarz, aaron jaffey, alek jaworski, alexander kaplan, harshit khaitan, daniel killebrew, andy koch, naveen kumar, steve lacy, james laudon, james law, diemthu le, chris leary, zhuyuan liu, kyle lucke, alan lundin, gordon mackean, adriana maggiore, maire mahony, kieran miller, rahul nagarajan, ravi narayanaswami, ray ni, kathy nix, thomas norrie, mark omernick, narayana penukonda, andy phelps, jonathan ross, matt ross, amir salek, emad samadiani, chris severn, gregory sizikov, matthew snelham, jed souter, dan steinberg, andy swing, mercedes tan, gregory thorson, bo tian, horia toma, erick tuttle, vijay vasudevan, richard walter, walter wang, eric wilcox, and doe hyun yoon. in-datacenter performance analysis of a tensor processing unit. sigarch comput. archit. news, 45(2):1-12, june 2017.  
+[24] marcin junczys-dowmunt, kenneth heafield, hieu hoang, roman grundkiewicz, and anthony aue. marian: cost-effective high-quality neural machine translation in c++. arxiv preprint arxiv:1805.12096, 2018.  
+[25] alexander kozlov, ivan lazarevich, vasily shamporov, nikolay lyalyushkin, and yury gorbachev. neural network compression framework for fast model inference. arxiv preprint arxiv:2002.08679, 2020.  
+[26] raghuraman krishnamoorthi. quantizing deep convolutional networks for efficient inference: a whitepaper. arxiv preprint arxiv:1806.08342, 2018.  
+[27] alex krizhevsky, ilya sutskever, and geoffrey e hinton. imagenet classification with deep convolutional neural networks. in advances in neural information processing systems, pages 1097-1105, 2012.  
+[28] akhilesh kumar, sailesh kottapalli, ian steiner, bob valentine, israel hirsh, geetha vearaman, lily looi, mohamed arafa, andy rudoff, sreenivas mandava, bahaa fahim, and sujal vora. future intel xeon scalable processor (codename: cascade lake-sp). in hotchips 2018, 2018.  
+[29] yann lecun, bernhard e boser, john s denker, donnie henderson, richard e howard, wayne e hubbard, and lawrence d jackel. handwritten digit recognition with a back-propagation network. in advances in neural information processing systems, pages 396-404, 1990.  
+[30] dongsoo lee and byeongwook kim. retraining-based iterative weight quantization for deep neural networks. arxiv preprint arxiv:1805.11233, 2018.  
+[31] cong leng, zesheng dou, hao li, shenghuo zhu, and rong jin. extremely low bit neural network: squeeze the last bit out with admm. in thirty-second aaai conference on artificial intelligence, 2018.  
+[32] tsung-yi lin, priya goyal, ross girshick, kaiming he, and piotr dólar. focal loss for dense object detection. in proceedings of the ieee international conference on computer vision, pages 2980-2988, 2017.  
+[33] jeffrey l mckinstry, steven k esser, rathinakumar appuswamy, deepika bablani, john v arthur, izzet b yildiz, and dharmendra s modha. discovering low-precision networks close to full-precision networks for efficient embedded inference. arxiv preprint arxiv:1809.04191, 2018.
+
+[34] naveen mellempudi, abhisek kundu, dheevatsa mudigere, dipankar das, bharat kaul, and pradeep dubey. ternary neural networks with fine-grained quantization. arxiv preprint arxiv:1705.01462, 2017.  
+[35] paulius micikevicius, sharan narang, jonah alben, gregory diamos, erich elsen, david garcia, boris ginsburg, michael houston, oleksii kuchaiev, ganesh venkatesh, and hao wu. mixed precision training. arxiv preprint arxiv:1710.03740, 2017.  
+[36] szymon migacz. nvidia 8-bit inference width tensor. in gpu technology conference, 2017.  
+[37] asit mishra and debbie marr. apprentice: using knowledge distillation techniques to improve low-precision network accuracy. arxiv preprint arxiv:1711.05852, 2017.  
+[38] markus nagel, mart van baalen, tijmen blankevoort, and max welling. data-free quantization through weight equalization and bias correction. in proceedings of the ieee international conference on computer vision, pages 1325-1334, 2019.  
+[39] vinod nair and geoffrey e hinton. rectified linear units improve restricted boltzmann machines. in proceedings of the 27th international conference on machine learning (icml-10), pages 807–814, 2010.  
+[40] nvidia. nvidia turing gpu architecture: graphics reinvented. https://www.nvidia.com/content/dam/en-zz/solutions/designvisualization/technologies/turing-architecture/nvidia turing-architecture-whitepaper.pdf, 2018.  
+[41] vassil panayotov, guoguo chen, daniel povey, and sanjeev khudanpur. librispeech: an asr corpus based on public domain audio books. in 2015 ieee international conference on acoustics, speech and signal processing (icassp), pages 5206-5210. ieee, 2015.  
+[42] adam paszke, sam gross, francisco massa, adam lerer, james bradbury, gregory chanan, trevor killeen, zeming lin, natalia gimelshein, luca antiga, alban desmaison, andreas kopf, edward yang, zachary devito, martin raison, alykhan tejani, sasank chilamkurthy, benoit steiner, lu fang, junjie bai, and soumith chintala. pytorch: an imperative style, high-performance deep learning library. in h. wallach, h. larochelle, a. beygelzimer, f. d'alché-buc, e. fox, and r. garnett, editors, advances in neural information processing systems 32, pages 8024-8035. curran associates, inc., 2019.  
+[43] antonio polino, razvan pascanu, and dan alistarh. model compression via distillation and quantization. arxiv preprint arxiv:1802.05668, 2018.  
+[44] prajit ramachandran, barret zoph, and quoc v le. searching for activation functions. arxiv preprint arxiv:1710.05941, 2017.  
+[45] mohammad rastegari, vicente ordonez, joseph redmon, and ali farhadi. xnor-net: imagenet classification using binary convolutional neural networks. in european conference on computer vision, pages 525-542. springer, 2016.  
+[46] manuele rusci, alessandro capotondi, and luca benini. memory-driven mixed low precision quantization for enabling deep network inference on microcontrollers. arxiv preprint arxiv:1905.13082, 2019.  
+[47] olga russakovsky, jia deng, hao su, jonathan krause, sanjeev satheesh, sean ma, zhiheng huang, andrej karpathy, aditya khosla, michael bernstein, alexander c. berg, and li fei-fei. imagenet large scale visual recognition challenge. international journal of computer vision (ijcv), 115(3):211-252, 2015.  
+[48] mark sandler, andrew howard, menglong zhu, andrey zhmoginov, and liang-chieh chen. mobilenetv2: inverted residuals and linear bottlenecks. in proceedings of the ieee conference on computer vision and pattern recognition, pages 4510-4520, 2018.  
+[49] christian szegedy, sergey ioffe, vincent vanhoucke, and alexander a alemi. inception-v4, inception-resnet and the impact of residual connections on learning. in thirty-first aaai conference on artificial intelligence, 2017.  
+[50] christian szegedy, vincent vanhoucke, sergey ioffe, jon shlens, and zbigniew wojna. rethinking the inception architecture for computer vision. in proceedings of the ieee conference on computer vision and pattern recognition, pages 2818-2826, 2016.  
+[51] mingxing tan and quoc v le. efficientnet: rethinking model scaling for convolutional neural networks. arxiv preprint arxiv:1905.11946, 2019.  
+[52] vincent vanhoucke, andrew senior, and mark z. mao. improving the speed of neural networks on cpus. in deep learning and unsupervised feature learning workshop, nips, 2011.  
+[53] ashish vaswani, noam shazeer, niki parmar, jakob uszkoreit, llion jones, aidan n gomez, lukasz kaiser, and illia polosukhin. attention is all you need. in advances in neural information processing systems, pages 5998-6008, 2017.
+
+[54] pete warden. why gemm is at the heart of deep learning. https://petewarden.com/2016/05/03/how-to-quantize-neural-networks-with-tensorflow, 2015.  
+[55] yonghui wu, mike schuster, zhifeng chen, quoc v le, mohammad norouzi, wolfgang macherey, maxim krikun, yuan cao, qin gao, klaus macherey, et al. google's neural machine translation system: bridging the gap between human and machine translation. arxiv preprint arxiv:1609.08144, 2016.  
+[56] saining xie, ross girshick, piotr dólar, zhuowen tu, and kaiming he. aggregated residual transformations for deep neural networks. in proceedings of the ieee conference on computer vision and pattern recognition, pages 1492-1500, 2017.  
+[57] chris ying, sameer kumar, dehao chen, tao wang, and youlong cheng. image classification at supercomputer scale. arxiv preprint arxiv:1811.06992, 2018.  
+[58] ofir zafrir, guy boudoukh, peter izsak, and moshe wasserblat. q8bert: quantized 8bit bert. arxiv preprint arxiv:1910.06188, 2019.  
+[59] shuchang zhou, yuxin wu, zekun ni, xinyu zhou, he wen, and yuheng zou. dorefa-net: training low bitwidth convolutional neural networks with low bitwidth gradients. arxiv preprint arxiv:1606.06160, 2016.  
+[60] chenzhuo zhu, song han, huizi mao, and william j dally. trained ternary quantization. arxiv preprint arxiv:1612.01064, 2016.  
+[61] neta zmora, guy jacob, lev zlotnik, bar elharar, and gal novik. neural network distiller: a python package for dnn compression research. arxiv preprint arxiv:1910.12232, 2019.
+
+# appendices
+
+# a evaluation details
+
+# a.1 model definitions
+
+<table><tr><td>model</td><td>configuration</td><td>calibration samples</td><td>source</td></tr><tr><td>mobilenet v1</td><td>widthmult=1.0</td><td>1024</td><td>github.com/marvis/pytorch-mobilenet</td></tr><tr><td>mobilenet v2</td><td>widthmult=1.0</td><td>1024</td><td></td></tr><tr><td>resnet50 v1.5</td><td></td><td>1024</td><td></td></tr><tr><td>resnet152 v1.5</td><td></td><td>1024</td><td></td></tr><tr><td>inception v3</td><td></td><td>1024</td><td>github.com/pytorch/vision</td></tr><tr><td>inception v4</td><td></td><td>1024</td><td></td></tr><tr><td>resnext50</td><td>32x4d</td><td>1024</td><td></td></tr><tr><td>resnext101</td><td>32x8d</td><td>1024</td><td></td></tr><tr><td>efficientnet b0</td><td></td><td>1024</td><td>github.com/lukemelas/efficientnet-pytorch</td></tr><tr><td>efficientnet b3</td><td></td><td>1024</td><td></td></tr><tr><td>faster r-cnn</td><td>resnet50-fpn</td><td>512</td><td></td></tr><tr><td>mask r-cnn</td><td>resnet50-fpn</td><td>512</td><td>github.com/pytorch/vision</td></tr><tr><td>fcn</td><td>resnet101</td><td>512</td><td></td></tr><tr><td>deeplabv3</td><td>resnet101</td><td>512</td><td></td></tr><tr><td>retinanet</td><td>resnext101-32x4d-fpn</td><td>512</td><td>github.com/open-mmlab/mmdetection</td></tr><tr><td>transformer</td><td>vaswani_en_de/big</td><td>14336 tokens</td><td>github.com/pytorch/fairseq</td></tr><tr><td>gnmt</td><td>4 layers</td><td>128</td><td>github.com/nvidia/deeplearningexamples</td></tr><tr><td>jasper</td><td></td><td>full dev-clean</td><td></td></tr><tr><td>bert large</td><td>fine-tuned for qa</td><td>128</td><td>github.com/huggingface/pytorch-transformers</td></tr></table>
+
+table 9: network details
+
+table 9 lists additional details of the models listed in table 2. we evaluated a large variety of cnns for image classification. mobilenets are small networks that target inference on mobile devices [17, 48]. they are parameterized to scale to various channel widths and image resolutions. in this paper we evaluate the base configurations with width multiplier 1 and resolution  $224 \times 224$ . we also evaluated a number of larger cnns [14, 56, 50, 49], including efficientnets [51], which achieve state-of-the-art accuracy on imagenet. all cnns use  $224 \times 224$  inputs except for inception v3 and v4, which use  $299 \times 299$ . we evaluated two detection and two segmentation networks from torchvision, and an additional segmentation network, retinanet [32]. we evaluated two translation models, the 4 layers gnmt model [55] and the large configuration of transformer [53]. for speech recognition we evaluated jasper which achieves state-of-the-art wer on public speech datasets [41]. for language modeling we use bert large uncased and fine-tuned for question answering.
+
+models were calibrated with the number of samples listed from the training set of the respective dataset listed in table 2, except for jasper, which was calibrated on the dev set and evaluated on the test set. pytorch implementations of all the models along were provided by the listed source repositories. we used the pre-trained weights provided by each repository, except for mobilenet v1 and efficientnets where pre-trained weights were not available. mobilenet v1 was trained using the reference training script and hyperparameters for mobilenet v2 from torchvision. pre-trained weights for efficientnets were converted to pytorch from weights provided by tensorflow  $[1]^1$ .
+
+<table><tr><td>task/model</td><td>dataset</td><td>optimizer</td><td>epochs</td><td>initial learning rate</td><td>batch size</td></tr><tr><td>classification</td><td>imagenet 2012</td><td>sgd</td><td>15</td><td>1.0e-3</td><td>256</td></tr><tr><td>detection</td><td>coco 2017</td><td>sgd</td><td>3</td><td>2.5e-5</td><td>16</td></tr><tr><td>segmentation</td><td>coco 2017</td><td>sgd</td><td>3</td><td>2.5e-5</td><td>32</td></tr><tr><td>transformer</td><td>wmt16 en-de</td><td>adam</td><td>3</td><td>5.0e-4</td><td>max tokens = 3584</td></tr><tr><td>gnmt</td><td>wmt16 en-de</td><td>sgd</td><td>1</td><td>2.0e-3</td><td>1024, max seq. length = 50</td></tr><tr><td>jasper</td><td>librispeech</td><td>novograd[12]</td><td>80</td><td>1.5e-2</td><td>256</td></tr><tr><td>bert</td><td>squad v1.1</td><td>adam</td><td>2</td><td>3.0e-5</td><td>12, max seq. length = 384</td></tr></table>
+
+table 10: fine-tuning schedule and configuration  
+
+<table><tr><td>models</td><td>fp32</td><td>max</td><td>entropy</td><td>99.9%</td><td>99.99%</td><td>99.999%</td><td>99.9999%</td></tr><tr><td>mobilenet v1</td><td>71.88</td><td>71.80</td><td>72.11</td><td>72.07</td><td>72.14</td><td>71.89</td><td>71.91</td></tr><tr><td>mobilenet v2</td><td>71.88</td><td>71.11</td><td>71.50</td><td>71.48</td><td>71.56</td><td>71.28</td><td>71.34</td></tr><tr><td>resnet50 v1.5</td><td>76.16</td><td>76.68</td><td>76.85</td><td>76.59</td><td>76.67</td><td>76.77</td><td>76.81</td></tr><tr><td>resnet152 v1.5</td><td>78.32</td><td>78.64</td><td>78.61</td><td>78.61</td><td>78.69</td><td>78.65</td><td>78.65</td></tr><tr><td>inception v3</td><td>77.34</td><td>76.43</td><td>78.43</td><td>78.33</td><td>78.49</td><td>78.36</td><td>78.38</td></tr><tr><td>inception v4</td><td>79.71</td><td>68.38</td><td>80.07</td><td>80.01</td><td>80.14</td><td>79.94</td><td>78.82</td></tr><tr><td>resnext50</td><td>77.61</td><td>77.38</td><td>77.67</td><td>77.48</td><td>77.56</td><td>77.51</td><td>77.51</td></tr><tr><td>resnext101</td><td>79.30</td><td>78.98</td><td>78.99</td><td>79.00</td><td>78.99</td><td>79.01</td><td>79.04</td></tr><tr><td>efficientnet b0</td><td>76.85</td><td>76.16</td><td>76.95</td><td>76.85</td><td>77.09</td><td>76.98</td><td>76.63</td></tr><tr><td>efficientnet b3</td><td>81.61</td><td>80.51</td><td>80.63</td><td>80.62</td><td>81.07</td><td>81.09</td><td>80.92</td></tr><tr><td>faster r-cnn</td><td>36.95</td><td>36.62</td><td>36.76</td><td>36.31</td><td>36.76</td><td>36.83</td><td>36.76</td></tr><tr><td>mask r-cnn</td><td>37.89</td><td>37.63</td><td>37.74</td><td>37.26</td><td>37.67</td><td>37.76</td><td>37.75</td></tr><tr><td>retinanet</td><td>39.30</td><td>39.03</td><td>39.11</td><td>37.76</td><td>38.97</td><td>39.25</td><td>39.20</td></tr><tr><td>fcn</td><td>63.70</td><td>63.40</td><td>64.10</td><td>63.90</td><td>64.20</td><td>63.90</td><td>63.40</td></tr><tr><td>deeplabv3</td><td>67.40</td><td>67.10</td><td>67.30</td><td>66.90</td><td>67.20</td><td>67.50</td><td>67.20</td></tr><tr><td>gnmt</td><td>24.27</td><td>24.49</td><td>24.38</td><td>24.35</td><td>24.41</td><td>24.48</td><td>24.35</td></tr><tr><td>transformer</td><td>28.27</td><td>28.42</td><td>28.46</td><td>28.23</td><td>28.21</td><td>28.04</td><td>28.10</td></tr><tr><td>jasper</td><td>96.09</td><td>96.11</td><td>96.10</td><td>95.23</td><td>95.94</td><td>96.01</td><td>96.08</td></tr><tr><td>bert large</td><td>91.01</td><td>90.29</td><td>90.14</td><td>89.97</td><td>90.50</td><td>90.67</td><td>90.60</td></tr></table>
+
+table 11: fine-tuned quantization. best accuracy in bold. accuracy from best ptq calibration per network underlined.
+
+# a.2 quantization aware training
+
+table 10 shows the fine-tuning hyperparameters used in the quantization aware fine-tuning experiments. for networks that are trained on multiple datasets (detection/segmentation networks and bert) we only fine-tuned on the final dataset (coco and squad). in general, only the initial learning rate value and learning rate schedule are changed from the original training session. we fine-tune for around 1/10th of the original training steps. the fine-tuning learning rate starts at 1/100th of the initial value used in the original training session and is decayed down to 1/100th of the initial fine-tuning learning rate. bert is an exception. since it pre-trains a language model and only fine-tunes on squad for 2 epochs, we instead repeat the full fine-tuning schedule for qat. we used a cosine annealing learning rate schedule which follows the monotonically decreasing half period of the cosine function.
+
+table 11 shows fine-tuned quantization accuracy for all networks and activation range calibration settings. note that we always use the full per-column/per-channel range for weights (max calibration). it shows that with fine-tuning, accuracy improves for almost all the cases, especially those that suffer large accuracy drops after ptq, for example max calibration. for many of the models, the best ptq calibration is also the best calibration for qat, indicated by results that are both bold and underlined. even when qat achieves higher accuracy with a different calibration, the difference in results is marginal. this result suggests that evaluating multiple activation calibrations during ptq is a good heuristic to choose a calibration for qat.
+
+![](images/c100cfc85be39de13839b535a5a449e75b1e43774e168b9c405cf71fae4aaec1.jpg)  
+(a) post training quantization
+
+![](images/4fb7a13eaa65743d9580816f3c6df74da54b61228d213f7b53d3adba8e3b6f2f.jpg)  
+(b) after quantization aware fine-tuning  
+figure 6: example 1d loss function. the model,  $w$ , is scale quantized with scale factor 1. a) ptq: model converges to a narrow minimum. b) qat: model finds a wide minimum with lower loss quantization points.
+
+# b intuition for qat
+
+to gain some intuition for why quantization-aware training may improve accuracy of the quantized model, consider the simple example in figure 6. neural networks are trained by minimizing a loss function with stochastic gradient descent. loss gradients with respect to the network weights,  $\frac{\delta l}{\delta w}$ , are computed and weights are iteratively updated in the direction of the negative gradient until the model converges to some minimum. figure 6a shows a one-dimensional loss function for a model with a single parameter,  $w$ , that has converged to a local minimum,  $w \approx -0.5$ . when post training quantization is applied, with a scale factor of 1 for sake of example, the weight is quantized to the nearest integer,  $w_{q} = -1$ , causing a significant increase in the loss. in such a case we say that the model has converged to a "narrow" minimum, since a small change in the weight leads to a large change in loss.
+
+by training with quantization, we may potentially avoid these narrow minima by computing gradients with respect to the quantized weights, as shown in figure 6b. in doing so, narrow minima will result in larger gradients, potentially allowing the model to explore the loss landscape for "wide" [22] or "flat" [16, 30] minima, where quantization points have lower loss, and thus higher accuracy.
+
+# c batch normalization folding
+
+batch normalization folding is a common inference optimization applied to neural networks [20]. at inference, batch normalization layers performs the affine operation shown in equation 14:
+
+$$
+c = \frac {\gamma}{\sqrt {v a r [ y ] + \epsilon}}
+$$
+
+$$
+d = \beta - \frac {\gamma e [ y ]}{\sqrt {v a r [ y ] + \epsilon}} \tag {14}
+$$
+
+$$
+z = \operatorname {b n} (y) = c \cdot y + d
+$$
+
+where  $\beta$ ,  $\gamma$ ,  $e[y]$ , and  $var[y]$  are determined during training and fixed during inference, and  $\epsilon$  is a constant [19]. typically, following a fully connected layer the batch normalization is computed per activation. consider a fully connected layer that performs the matrix multiplication and bias add shown in equation 15:
+
+$$
+y _ {j} = \sum_ {k = 1} ^ {p} x _ {k} \cdot w _ {k j} + b _ {j} \tag {15}
+$$
+
+when the fully connected layer is followed by a batch normalization layer,  $\mathbf{z} = \mathrm{bn}(\mathbf{x}w + \mathbf{b})$ , the batch normalization can be folded into the weights and biases of the fully connected layer, as show in equation 16:
+
+$$
+z _ {j} = \sum_ {k = 1} ^ {p} x _ {k} \cdot \underbrace {c _ {j} \cdot w _ {k j}} _ {w _ {k j} ^ {\prime}} + \underbrace {c _ {j} \cdot b _ {j} + d _ {j}} _ {b _ {j} ^ {\prime}} \tag {16}
+$$
+
+resulting in a fully connected layer performing the operation  $\mathbf{z} = \mathbf{x}w' + \mathbf{b}'$ . since convolutions can be mapped to fully connected layers, and batch normalization in cnns is per channel, we can apply the same optimization.
+
+# d novel activation functions
+
+two more recently developed activation functions are swish (equation 17) [44] and gelu (equation 18) [15], used in efficientnets and bert, respectively.
+
+$$
+\operatorname {s w i s h} (x) = x \cdot \operatorname {s i g m o i d} (x) \tag {17}
+$$
+
+$$
+\operatorname {g e l u} (x) = \frac {x}{2} \left(1 + \operatorname {e r f} \left(\frac {x}{\sqrt {2}}\right)\right) \tag {18}
+$$
+
+these activation functions, shown in figure 7a, are both smooth and relu-like but with small, bounded negative output ranges. specifically, swish has an output range of  $[-0.2785,\infty]$  and gelu has an output range of  $[-0.1700,\infty]$ . this poses a challenge for uniform quantization as it should represent both small negative values and large positive values.
+
+figure 7b shows the composition of gelu and fake quantization with different symmetric ranges. if the output of gelu is quantized to  $[-50, 50]$ , then all negative values will round to zero. however, if we restrict the range to  $[-10, 10]$  then two negative values can be represented. table 12 shows the accuracy of post training quantization with gelu outputs clipped to 10 (gelu10), and then calibrated with max calibration. just by clipping the output of gelu we can achieve the best post training quantization accuracy with a simple max calibration, exceeding the previous best activation calibration by 0.46 f1. furthermore, this result almost matches the best qat result of 90.67 f1.
+
+![](images/b90c895adba4a755fe0a46853dde6c31214f2fad614b7daf72bd8c72146a302d.jpg)  
+(a) gelu and swish
+
+![](images/640a7c32fcea5d04c7da3fcbccb80b3a77ec6c0c62dbb8d38d66294658090626.jpg)  
+(b) quantizing gelu by scale quantization with different ranges
+
+figure 7: quantization mapping of real values to int8  
+
+<table><tr><td>model</td><td>fp32</td><td>max</td><td>entropy</td><td>99.9%</td><td>99.99%</td><td>99.999%</td><td>99.9999%</td><td>max with gelu10</td></tr><tr><td>bert large</td><td>91.01</td><td>85.92</td><td>37.40</td><td>26.18</td><td>89.59</td><td>90.20</td><td>90.10</td><td>90.66</td></tr></table>
+
+table 12: bert int8 post training quantization. comparing previous calibration results to max with gelu10.

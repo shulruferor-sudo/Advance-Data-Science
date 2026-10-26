@@ -1,0 +1,565 @@
+# taurus: a data plane architecture for per-packet ml
+
+tushar swamy
+
+stanford university
+
+alexander rucker
+
+stanford university
+
+muhammad shahbaz
+
+purdue university
+
+ishan gaur
+
+stanford university
+
+kunle olukotun
+
+stanford university
+
+# abstract
+
+emerging applications—cloud computing, the internet of things, and augmented/virtual reality—demand responsive, secure, and scalable datacenter networks. these networks currently implement simple, per-packet, data-plane heuristics (e.g., ecmp and sketches) under a slow, millisecond-latency control plane that runs data-driven performance and security policies. however, to meet applications' service-level objectives (slos) in a modern data center, networks must bridge the gap between line-rate, per-packet execution and complex decision making.
+
+in this work, we present the design and implementation of taurus, a data plane for line-rate inference. taurus adds custom hardware based on a flexible, parallel-patterns (mapreduce) abstraction to programmable network devices, such as switches and nics; this new hardware uses pipelined simd parallelism to enable per-packet mapreduce operations (e.g., inference). our evaluation of a taurus switch asic—supporting several real-world models—shows that taurus operates orders of magnitude faster than a server-based control plane while increasing area by  $3.8\%$  and latency for line-rate ml models by up to 221 ns. furthermore, our taurus fpga prototype achieves full model accuracy and detects two orders of magnitude more events than a state-of-the-art control-plane anomaly-detection system.
+
+# 1 introduction
+
+maintaining strict security and service-level objectives (slos) for modern disaggregated workloads (e.g., cloud computing, the internet of things, and augmented/virtual reality) demands that computationally intensive management and control decisions are made on the current state of the entire datacenter network (e.g., topology, queue sizes, and link and server loads) and applied per-packet at line rate [170]. a delay of even a few microseconds in today's petabit-bisection-bandwidth networks [60] could result in missing millions of anomalous packets [8, 17, 154], saturating switch queues and causing congestion [66, 162, 169], excessive retransmissions due to packet drops [37], or imbalanced traffic and server loads [4, 85]. however, current implementations face a dichotomy: they must choose between per-packet, line-rate execution or computational complexity.
+
+data-plane asics (e.g., switches and nics) can react in nanoseconds to network conditions, but have a constrained programming model designed to forward packets at line rate (e.g., flow tables [15, 63]). such a model restricts network operations to simple heuristics [4, 85, 98] or requires having purpose-built tasks in fixed-function hardware (e.g., middleboxes [29, 103]).
+
+control-plane servers can make complicated, data-driven decisions, but infrequently (typically, on each flow's first packet). the
+
+round trip (10 μs or more) between the controller and switch fundamentally limits the control plane's reaction speed, even with fast packet io [38, 83, 132] and dedicated hardware (e.g., tpu [84] or gpu [119]). moving computation to the switch cpu also does not help because it lacks global network knowledge, and the pcie interface between the switch asic and cpu adds around 900 ns of round-trip delay [117]—at 12.8 tb/s, the asic would have forwarded about 12k 128b packets (or 22k 64b packets) by the time a decision is made.
+
+so, we ask the question: "how can we delegate the complex decision-making of the control plane to a per-packet data-plane asic?" the control plane can learn new trends (like attacks [106, 153], traffic patterns [162, 169], and workloads [169]) over time by sampling global network state and can train a machine-learning (ml) model to handle events of such types. the data plane can then use the model, which encapsulates network-wide behavior, to make forwarding decisions without visiting the control plane. meanwhile, the control plane can continue to capture both switches' decisions and their impact on metrics (like flow-completion time), trains and optimizes the model to learn new event types (or signatures) as well as improve decision quality, and updates the switch model at fixed intervals. this training would happen at a coarser timescale (in tens of milliseconds), but off the critical path. and, using the most recently trained ml model, the data plane can make decisions starting at a flow's first packet while reacting to events of known (learned) types autonomously, requiring control-plane intervention only for new (unseen) event types.
+
+the challenge then is how to run the ml model in the data plane. we could map the output of the ml model as flow rules in the switch's match-action tables (mats) [15] if the network behavior is stable. however, modern datacenter networks are dynamic, which would result in frequent table misses and control-plane visits, thus inflating the time it takes to react to network events [170]. implementing models—specifically, deep neural networks (dnns)—directly on existing switches is also not feasible [144, 168]. most ml algorithms are built around linear algebra, which uses a significant amount of repetitive computation performed on a small number of weights with regular communication [88, 127, 150]. the match-action pipelines' vliw architecture [15] lacks the necessary loops and multiplication operations; unnecessary flexibility, such as all-to-all vliw communication [178], large memories, and ternary cams in mats [15], consumes chip area without benefiting ml [144]. in short, existing data-planes lack the compute resources needed to execute modern ml algorithms (e.g., dnns), while control-plane servers (and accelerators) are not optimized
+
+for low-latency per-packet operations at network speeds exceeding multi-terabits per second.
+
+in this paper, we propose taurus, a domain-specific architecture for per-packet ml in data planes. taurus extends the protocol-independent switch architecture (pisa) [15, 63] with a new compute block based on a parallel-patterns abstraction (i.e., mapreduce) [88], which supports data-parallelism common in modern ml applications [28]. the mapreduce block implements a spatial simd architecture, consisting of memory units (mu) and compute units (cu) interleaved in a grid and joined by a static interconnect ( $\s 4$ ). each cu has four pipelined compute stages, each performing an 8-bit fixed-point operation for each of the 16 independent data elements (lanes). when evaluating a 16-input perceptron, the cu uses the first stage to map 16 parallel multiplications; then, it uses the second stage to reduce the multiplied values into a single unit. a second cu applies an activation function (e.g., relu [112]). multiple cus can be used in parallel for hierarchical mapreduce computations (wide model layers) or in series for pipelined computations (multiple layers).
+
+the mapreduce block works alongside parsers, mats, and the scheduler to forward packets, with mats connecting mapreduce to the pipeline: preprocessing mats extract, format, and record packet-level, flow-level [154], cross-flow, and device features (using in-band network telemetry or int [87]), the mapreduce block uses these features and an ml model to generate a numeric result, and post-processing mats transform this output into a packet-forwarding decision. packets that do not need an ml decision can bypass the mapreduce block, incurring no additional latency.
+
+in summary, taurus is an integrated system, bringing together ideas from network and ml architecture domains (i.e., extending pisa pipelines with a mapreduce unit) to enable a novel computing paradigm—per-packet ml—for the industry and research community to explore and innovate on.2 we make the following contributions:
+
+- a hardware design (§3) and implementation (§4) of a taurus switch with a reconfigurable simd dataflow engine for mapreduce.  
+- analysis of the  $\mathrm{asic}^3$  (\$5.1.1) using a  $15\mathrm{nm}$  predictive pdk [12] and synthesized against real ml networking applications (\$5.1.2), microbenchmarks (\$5.1.3), and mat-only implementations (\$5.1.4) to determine speed and area overheads relative to commercially available switches. taurus's mapreduce block adds on average 122 ns latency to our line-rate (1 gpkt/s) ml models, while incurring an area and power overhead of  $3.8\%$  and  $2.8\%$ , respectively, for the largest block configuration.  
+- end-to-end system evaluation using a taurus testbed based on a programmable switch connected to an fpga that emulates our mapreduce block (§5.2.1). we show that taurus achieves full model accuracy and detects two orders of magnitude more events than the control plane (§5.2.2). furthermore, the data-plane model learns to handle new (anomalous) behaviors from the controller within milliseconds (§5.2.3).
+
+# 2 the need for per-packet ml
+
+to meet the strict slos of modern hyper-scale datacenters, the networking community is already running services (like load balancing [4, 85], anomaly detection [95, 102], and congestion control [162, 169]) in the network on a per-packet basis using programmable data planes (like barefoot's tofino chip [114, 115]). however, the constrained programming model of these data planes limits these services to simple heuristics, which cannot handle the complex interactions governing these massive datacenter networks [75]. machine learning (ml), on the other hand, can approximate many of these complex interactions [43, 52]. and, through automated decision-making, ml algorithms exploit the vast quantity of data flowing within the network to learn progressively more informed policies [6, 17, 42, 101, 110, 123, 152, 153, 172-174]—tailored to a particular data center [99, 131, 169]. moreover, recent work on ml for congestion control [162, 169], packet classification [99, 126, 131], and anomaly detection [106, 153] show that these algorithms have smoother and more accurate decision boundaries than manually-written heuristics. for example, ml provides a better throughput-delay tradeoff for congestion control compared to existing mechanisms (e.g., pcc [37] and quic [91]).
+
+however, ml typically is used in a closed-loop decision-making system; hence, its reaction speed is critical to datacenter performance and security. for example, as shown in table 1, active queue management (e.g., red [45, 70] and dctcp [5]) must make a mark/drop decision per-packet. intrusion/fault detection and mitigation schemes (e.g., for heavy hitters [148], microbursts [139], dos [17, 36]) and gray failures [77, 170]) must act quickly, as even a few microseconds' delay can miss millions of packets in a network with petabits-per-second of bisection bandwidth. these packets can have serious repercussions; for example, each missed packet during a syn-flood attack will open a new connection on the server, unnecessarily consuming cpu and memory resources, as well as network bandwidth. similarly, effective resource allocation (e.g., link bandwidth) requires timely classification of network traffic [11]. the consequences of slow ml decisions vary across these scenarios, but would generally result in sub-optimal behavior (i.e., missing security and service-level objectives)—the added latency results in delayed decisions and, ultimately, lower accuracy for the ml model ( $\s 5$ ).
+
+# 2.1 limitations of data-plane ml
+
+there have been a number of recent attempts to use current switch abstractions (i.e., mats) [136, 144, 168] and specialized hardware [53] for in-network ml; however, both these approaches have deficiencies that prevent them from providing line-rate, per-packet ml.
+
+2.1.1 inference on mats. the match-action abstraction, based on a vliw architecture, is insufficient for line-rate ml in modern data-plane devices due to both missing operations (especially loops and multiplication) and inefficient mat pipelines [15]. binary neural networks have been implemented (using tens of mats) but they are imprecise [136, 144]. likewise, an svm for iot classification [168] is shown to consume eight additional tables on a netfpga reference switch—an experimental research platform [104, 113]. as a result, the resource usage is exorbitant relative to the installed model's quality ( $\s$ 5.1.4).
+
+table 1: in-network applications demand fast reaction time (i.e., per-packet, -flowlet, -flow, or -μburst).  
+
+<table><tr><td rowspan="2">application</td><td colspan="4">reaction time</td></tr><tr><td>pkt</td><td>flowlet</td><td>flow</td><td>μburst</td></tr><tr><td>security:</td><td></td><td></td><td></td><td></td></tr><tr><td>- heavy hitters [148]</td><td></td><td></td><td>✓</td><td></td></tr><tr><td>- dos (e.g., syn flood) [159, 175]</td><td>✓</td><td></td><td>✓</td><td>✓</td></tr><tr><td>- probes (e.g., port scan) [154]</td><td></td><td></td><td>✓</td><td></td></tr><tr><td>- u2r: unauth. access to root [36]</td><td>✓</td><td></td><td></td><td></td></tr><tr><td>- r2l: unauth. remote access [36]</td><td>✓</td><td></td><td></td><td></td></tr><tr><td>performance:</td><td></td><td></td><td></td><td></td></tr><tr><td>- congestion control [82, 169]</td><td>✓</td><td></td><td></td><td></td></tr><tr><td>- active queue mgmt (aqm) [70]</td><td>✓</td><td></td><td></td><td></td></tr><tr><td>- traffic classification [168]</td><td>✓</td><td></td><td>✓</td><td></td></tr><tr><td>- load balancing [85]</td><td>✓</td><td>✓</td><td></td><td></td></tr><tr><td>- switching and routing [163]</td><td>✓</td><td></td><td>✓</td><td></td></tr></table>
+
+table 2: inference time for control-plane accelerators.  
+
+<table><tr><td>accelerator</td><td>latency (ms)</td></tr><tr><td>broadwell xeon</td><td>0.67</td></tr><tr><td>tesla t4 gpu</td><td>1.15</td></tr><tr><td>cloud tpu v2-8</td><td>3.51</td></tr></table>
+
+vliw vs. simd parallelism. single-instruction/multiple-data (simd) has cheaper per-operation costs than switches' vliw models. vliw models, used in current switch mats [15], have multiple logically-independent instructions per stage operating in parallel, reading and writing arbitrary locations in a packet-header vector (phv). this all-to-multiple input communication and multiple-to-all output communication requires large crossbars and limits the number of instructions per stage. for example, a 16-issue vliw processor has  $20 \times$  as much control logic as an equally-powerful cluster of eight dual-issue processors [178]. therefore, barefoot's tofino chip only executes 12 operations per stage: four of each of 8, 16, and 32 bits [65]. a typical dnn layer may require 72 multiplications and 144 additions [153]; even if multiplication were added to mats, this would be 18 stages (most of them).
+
+2.1.2 inference on accelerators. traditional accelerators, like tpus [84], gpus [119], and fpgas [44] could extend the data plane as bump-in-the-wire inference engines connected via pcie or ethernet. in most accelerators, inputs are batched to increase parallelism: larger batch sizes boost throughput by enabling more-efficient matrix-matrix multiplication. however, unbatched (matrix-vector) execution is needed for deterministic latency; otherwise, packets in the data plane would need to stall while waiting for a batch to fill. moreover, adding another physically-separate accelerator would either consume switch ports (wasting transceivers and bandwidth) or replicate switch functions like packet parsing and match-action rules for feature extraction. therefore, separate accelerators would add redundant area, decrease throughput, and consume power.
+
+![](images/6d5980e23fac338ccd646509fbc4b5fdfb8d8265406149cfb598a501f2a6e38b.jpg)  
+figure 1: per-packet ml: training and inference. hosts randomly mark packets to trace forwarding decisions and qos metrics in the network, to update weights.
+
+# 2.2 limitations of control-plane ml
+
+instead of executing an ml model per-packet, mats [108] could cache inference results computed in the control plane. in a caching scheme, packets with previously-unseen features would be sent to the control plane for inferences, and the results would be stored in the data plane as flow rules. however, ml models with varying inputs, like packet size, would experience frequent and expensive trips to the control plane.
+
+these cache misses have unavoidable penalties, due to the round-trip time for the control plane and software overhead—even with accelerators—that can hurt the accuracy of a model drastically. table 2 benchmarks the latency of a dnn model for anomaly detection [153] on a vectorized cpu [1], a gpu [119], and a tpu [84] for unbatched inference. this latency comes from accelerator setup overhead (e.g., tensorflow [1])—a cpu is the fastest design, but still takes  $0.67\mathrm{ms}$ . finally, rule installation time (3 ms for tcams [25]) would limit caching, especially, because it increases with flow-table size [47, 90].
+
+# 3 taurus architecture
+
+taurus is a new data-plane architecture for switches (and nics) that runs ml models at line rate for every packet and uses the model's output for forwarding decisions.
+
+high-level system overview. in a taurus-enabled data center, the control plane gathers a global view of the network and trains ml models to optimize security and switch-level metrics. meanwhile, the data plane uses these models to make per-packet, data-driven decisions. unlike traditional sdn-based data centers, the control plane now installs both weights and flow rules into switches (figure 1). weights are more space-efficient than flow rules: for example, matching the behavior of our benchmark dnn (§5.1.2) may require  $12\mathrm{mb}$  of flow rules (the full dataset), but only  $5.6\mathrm{kb}$  of weights—a  $2135\times$  reduction in memory usage. using monitoring frameworks like deep insight [78], the control plane can identify the impact of ml decisions and optimize weights accordingly.
+
+anomaly detection case study. throughout this section, we use an ml-based anomaly detection (using a 4-layer dnn [153]) as a running example to motivate and describe the various logical components of the taurus data-plane pipeline (figure 2). as packets enter a switch, they are first parsed into packet header vectors (phvs) [15]—a fixed layout, structured format—to extract header-level features (e.g., connection duration, bytes transferred, as well as
+
+![](images/4619a6ee24189c60c1338a84f92a32bd4135afe19664e69484323a87f35f32ea.jpg)  
+figure 2: the logical steps for an anomaly-detection application in taurus.
+
+protocol and service type). next, switches use preprocessing mats to look up domain-level features (e.g., matching ip addresses against autonomous systems' subnets to indicate ownership or geographic location)—discovered and installed by the control plane—and perform data integration and augmentation using vliw actions on the header fields ( $\s 3.1$ ). taurus then uses postprocessing mats to transform our ml model's output into a decision ( $\s 3.2$ ) once the mapreduce block finishes executing the model on the extracted features ( $\s 3.3$ ). this decision is then used to schedule, forward, or drop the packet. we share existing mats in pisa-based switches for pre/postprocessing.
+
+# 3.1 parsing & preprocessing
+
+before inference, taurus processes raw packet headers into canonical form through mats, adding or repairing packet-level data as needed. we use stateful elements (i.e., registers) of the switch-processing pipeline to aggregate features across packets and across flows. mats then add these aggregates to each packet's metadata to enhance per-packet predictions. data preprocessing can also use mats to convert header fields into features for the ml model. for example, in our anomaly-detection example, mats would format features as fixed-point numbers and the mapreduce block would decide if a packet is anomalous or benign.
+
+taurus replaces categorical relationships with simpler numeric relationships using lookup tables; for example, a table transforms port numbers into a linear likelihood value, which is easier to infer from [31]. preprocessing can also invert the probability distribution underlying a sampled value. taking a logarithm of an exponentially distributed variable results in a uniform distribution, which an ml model can process with fewer layers [138]. such feature engineering transfers the load from an ml model to its designer; refining features can increase accuracy with constant size [16, 138].
+
+finally, in-band network telemetry (int)—measurements embedded into packets—provides switches with a view of global network state [87]. as a result, taurus devices are not limited to inference using switches' local state. instead, models can examine the packet's entire history, through int, and the flow's entire history, through stateful registers, to increase their predictive power (e.g., counting urgent flags across a flow or monitoring connection duration).
+
+# 3.2 postprocessing & scheduling
+
+mats also interpret ml decisions. for example, if our anomaly-detection model outputs 0.9 (suggesting a likely-anomalous packet), mats decide how to handle the packet, either dropping, flagging, or quarantining it. in taurus, these postprocessing mats connect
+
+![](images/15939df4866a7b49149769bc1f26dca200b3e0b6b4aca4b5bba220a3ef810d90.jpg)  
+figure 3: the compute graph of a perceptron with the breakdown between map, reduce, and activation functions (outer-loop map). the perceptron is a building block of a larger dnn.
+
+inference to scheduling, which uses abstractions like pifo [147] to support a variety of scheduling algorithms.
+
+ml models will provide probabilistic guarantees, but we can constrain their behavior with hard bounds to ensure robust network operation. the control plane can compile high-level safety (no incorrect behavior) and liveness (eventual correct behavior) properties into per-switch constraints as postprocessing flow rules. by constraining the ml model's decision boundary, the data plane can guarantee correct network behavior without complicated model verification.
+
+# 3.3 mapreduce for per-packet ml inference
+
+for each packet, inference combines cleaned features and model weights to make a decision. ml algorithms, like support-vector machines (svms) and neural networks, use matrix-vector linear algebra operations and element-wise non-linear operations [59, 72]. non-linear operations let models learn non-linear semantics; otherwise, the output would be a linear combination of the inputs. unlike header processing, ml computation is very regular, using many multiply-add operations. in the more computationally-taxing linear portion of a single dnn neuron, input features are each multiplied by a weight, then added to yield a scalar value. generalizing this operation, vector-to-vector (map) and vector-to-scalar (reduce) operations suffice for the computationally-intensive linear portions of a neuron. this, along with the limitations of current switch architectures, motivates the need for a new data-plane abstraction, mapreduce, that is flexible enough to express a variety of ml models but specific enough to allow efficient hardware development.
+
+3.3.1 the mapreduce abstraction. our design uses mapreduce simd parallelism to provide high computational throughput, cheaply. map operations are element-wise vector operations, such as addition, multiplication, or non-linear operations. reduce operations combine a vector of elements to a scalar value using associative operations like addition or multiplication. figure 3 shows how map and reduce are used to compute a single neuron (dot product), which can be combined hierarchically into large neural networks.
+
+```prolog
+1 control parser (...){...}
+2 control preprocessmat (...){...}
+3 control mapreduce(inout metadata featureset,
+4 inout metadata output) {
+5 weights = loadmodelfromfile(anomaly.model)
+6 linearresults = map(sizeof(weights[0])){i => 
+7 mult_results = map(sizeof(weights[1])){j => 
+8 weights[i,j] * featureset[j] }
+9 reduce(mult_results){(x,y) => x + y} }
+10 output = map(sizeof(linearresults)){k => 
+11 relu(linearresults[k])
+12 } }
+13 control postprocessmat {...} {...}
+14 control deparser(...){...}
+```
+
+mapreduce is a popular form for ml models: mapreduce can accelerate ml both in distributed systems [22, 54, 55, 57, 133] and at a finer granularity [20, 21, 28, 150].
+
+a mapreduce control block in p4. to program taurus, we introduce a new dedicated control-block type in p4 [13, 122], called mapreduce, in addition to the ones used for ingress and egress match-action computations. within this new control block, mapreduce units can be invoked using the map and reduce constructs. figure 4 shows our proposed mapreduce syntax-inspired by the recently proposed spatial language [88]--for the anomaly-detection example. the outermost map iterates over all the layer's neurons, while the inner mapreduce pair performs the linear operation for each neuron. a final map instruction applies an activation function (i.e., relus or sigmoids). other than map and reduce, the only additional constructs needed are arrays and out-of-band weight updates.
+
+3.3.2 broader application support. by providing common primitives, we can support a set of applications broader than ml (figure 5), including stream processing for data analysis [18, 89], gradient aggregation for large-scale distributed training [57, 97, 111, 137], and more at the switch and nic [125]. for example, elastic rss (erss) uses mapreduce for consistent hashing to schedule packets and cores: map evaluates cores' suitability, and reduce selects the closest core [134]. mapreduce can also support sketching algorithms, including count-min-sketches (cms) [30] for flow-size estimation. furthermore, recent research shows that bloom filters can also benefit from, or be replaced by, neural networks [130]. in essence, taurus provides a programmable data-plane abstraction (mapreduce) that can support a large class of applications more efficiently (in terms of hardware resource usage and performance, §5), compared to existing data-plane abstractions (i.e., mats) alone.
+
+# 4 taurus implementation
+
+the complete physical data-plane pipeline of a taurus device is shown in figure 6, consisting of control blocks for packet parsing, ml with mapreduce, packet forwarding with mats, and scheduling as well as a bypass path for non-ml packets. taurus's packet parser, pre/postprocessing mats, and scheduler use existing hardware implementations [15, 56, 147]. we base taurus's mapreduce
+
+![](images/a5a5651ea3c9fbcd84a54c573b8be986132e1e4bb6bc0d3829e6adf1894d31ba.jpg)  
+figure 4: mapreduce syntax in p4 for a dnn layer of our anomaly-detection example, based on spatial [88].  
+figure 5: ml applications (top) map to models and simpler primitives, which compile to mapreduce. additional applications (right) map directly to mapreduce.
+
+block on plasticine [127], a coarse-grained reconfigurable array (cgra) composed of a sea of compute and memory units, which are reconfigurable to match applications' dataflow graphs. however, plasticine was originally used for designing standalone accelerators, while we need a latency-optimized streaming fabric to operate in the network.
+
+mapreduce: compute unit (cu). each compute unit (cu, figure 8) is composed of functional units (fus) organized in lanes and stages and performs a map, a reduction, or both. within a cu stage, all lanes execute the same instruction and read the same relative location. cus have pipeline registers between stages, so every fu is active on every cycle; pipelining also occurs at a higher level between cus.
+
+because the fabric needs to operate as part of a full switch asic, resource efficiency is key. we use fixed-point reduced precision hardware to execute the arithmetic needed for the linear algebra in ml algorithms. fixed-point hardware is faster, more area-efficient, and consumes less power than floating-point operations. furthermore, we customize the lane-to-stage ratio in the cus to fit the minimum requirements of our application space. a complete explanation of the design-space exploration process appears in §5.
+
+mapreduce: memory unit (mu). next, we focus on the speed of memory accesses. weights in an ml model need to be retrieved quickly if we want to make a decision on a per-packet level. sram-based operations can be done with single-cycle accesses, so we exclusively use on-chip memories. dram controllers are eliminated, because accesses take on the order of 100s of cycles. while this reduces the size of the models that taurus can support, at a 1 ghz clock it ensures nanosecond-level latencies. we use banked srams as memory units (mus), which are interspersed with cus in a checkerboard pattern for locality, to store the weights of ml models (figure 7). this also allows coarse-grained pipelining, where cus perform operations and mus act as pipeline registers.
+
+multiple levels of pipelining within each cu and pipelining in the interconnect guarantee a 1 ghz clock frequency—a crucial factor for matching the line rate of high-end switch hardware [15, 147].<sup>4</sup>
+
+pre/postprocessing mats. by using mats (vliw) for data cleaning and mapreduce (simd) for inference, taurus combines different
+
+![](images/294c316ae0dfe982ac845073857efaf3e12321042e15971e69e45fe7d10977b1.jpg)  
+figure 6: taurus's modified data-plane pipeline, including bypass paths for non-ml packets. a preprocessing mat decides whether to bypass ml, as metadata in the phv, and a round-robin (rr) selector arbitrates which path to connect to the postprocessing mat.
+
+![](images/a190bc27ba62a224b1fd0408ae7f733796d6c94f8c2abd515b548f79776720a9.jpg)  
+figure 7: taurus's mapreduce block and its interface to the rest of the pipeline.
+
+![](images/4e1f5e44ad1c0760960d9507e0ab9b96379b152dec6124c488d57e92fd7cf658.jpg)  
+figure 8: a three-stage cu, composed of functional units (fus) and pipeline registers (prs). the third stage supports map and sparse reductions.
+
+models of parallelism to build a fast and flexible data-plane pipeline. mats are connected to the mapreduce block through the same phv interface, which is used to connect other stages in the pipeline. only a fraction of the phv, containing features, enters the mapreduce block, while other headers progress directly to the postprocessing mats, as shown in figure 7.
+
+non-ml traffic bypass. for packets that do not require ml inference, taurus forwards them directly to the postprocessing mats,
+
+bypassing mapreduce (figure 6). it splits traditional switches' single, large packet queue [15] into three sub-queues: one for each of the preprocessing mats, mapreduce block, and postprocessing mats; allocating it proportionally across these blocks based on their pipeline depth. preprocessing mats forward ml packets to the mapreduce block—the phv progresses through the block and body is enqueued into the corresponding queue—and non-ml packets are sent directly to the postprocessing mats, without incurring any additional latencies. moreover, non-feature headers of a packet also follow the bypass path to the postprocessing mats, and only the required feature headers enter the mapreduce block as a dense phv (to minimize sparse data occurrences).
+
+target-independent optimizations. mapreduce is general enough to support target-independent optimizations: optimizations that consider available execution resources (parallelization factors, bandwidth, and more) without considering hardware-specific design details [128, 176]. parallelizing mapreduce programs unrolls loops in space: if sufficient hardware resources are available, a model can execute one iteration per cycle. as loop unrolling happens at compile-time, taurus can guarantee deterministic throughput: either line-rate performance, or some known fraction thereof. static line-rate reduction already occurs in switches via recirculation [15] and in datacenter networks through link oversubscription [62, 118].
+
+latency, in addition to area, also limits switch-level ml because switches must forward packets in hundreds of nanoseconds. latency increases with depth, so datacenter slos would effectively limit models' layer counts. by preprocessing features with mats, we can provide adequate accuracy with fewer layers and less latency: the model must only learn inter-feature relationships, not the header-feature mapping.
+
+target-dependent compilation. a variety of programming languages natively support mapreduce [71, 109, 121, 155]. to support our simd-based fabric, we program taurus's mapreduce block using a modified version of spatial [88], a domain-specific language (dsl) based on parallel-patterns that represents mapreduce programs as a sequence of nested loops. it supports target-dependent optimizations as well as target-independent optimizations for taurus. programs are compiled to a streaming dataflow graph: from this hierarchy, innermost loops become simd operations within a cu, and outer loops are mapped over multiple cus. then, overly-large patterns (those requiring too many compute stages, inputs, or memory banks) are split into smaller patterns that fit in cus and mus; this is necessary to map non-linear functions with long basic blocks (i.e., long sequences of code with no branches). finally, the resulting graph is placed and routed on the mapreduce block's interconnect.
+
+# 5 evaluation
+
+# 5.1 taurus asic analysis
+
+we first examine our mapreduce block by analyzing its power and area (§5.1.1). we then evaluate its performance by compiling several recently-proposed networking ml applications (§5.1.2). next, we demonstrate its flexibility using common ml components, which can be composed to express a variety of algorithms (§5.1.3). finally, we compare it with existing mat-only ml implementations (§5.1.4).
+
+table 3: accuracy of dnns for tmc iot traffic classifiers [145]; this shows minimal loss for 8-bit quantization.  
+
+<table><tr><td rowspan="2">dnn kernel</td><td colspan="3">model accuracy (%)</td></tr><tr><td>float32</td><td>fix8</td><td>diff.</td></tr><tr><td>4 × 10 × 2</td><td>67.06</td><td>67.01</td><td>-0.05</td></tr><tr><td>4 × 5 × 5 × 2</td><td>67.02</td><td>66.95</td><td>-0.07</td></tr><tr><td>4 × 10 × 10 × 2</td><td>67.04</td><td>67.02</td><td>-0.02</td></tr></table>
+
+table 4: area and power scaling (per-fu) at the target design (16 lanes, 4 stages) for different precisions. (bars represent each entry as a fraction of the largest entry in that column.)  
+
+<table><tr><td>precision</td><td>area (μm2)</td><td>power (μw)</td></tr><tr><td>fix8</td><td>670</td><td>456</td></tr><tr><td>fix16</td><td>1338</td><td>887</td></tr><tr><td>fix32</td><td>2949</td><td>2341</td></tr></table>
+
+5.1.1 design space exploration. taurus's mapreduce block is parameterized, including precision, lane count, and stage count. to estimate taurus's area and power, we use asic synthesis and freepdk15, a predictive  $15\mathrm{nm}$  standard cell library [12]; we also use cacti 7.0 [9] to estimate memory bank area. to guide our evaluation, we minimize area, power, and latency while targeting full model accuracy (i.e., no quantization loss) and per-packet throughput.
+
+fixed-point precision. for ml inference, fixed-point arithmetic is faster than floating point with equivalent accuracy [67, 84]. we use 8-bit precision for taurus, because it is shown to be sufficient for inference (compressed models use even fewer bits) [34, 100, 160]. in table 3, we can see that for a variety of dnns, the quantization error (using tensorflow lite [61, 81]) is negligible. the minimal accuracy loss and  $4 \times$  reduction in resources (table 4) justifies our reduced precision architecture.
+
+lane count. ideally, the number of lanes in a cu would be matched to the amount of available vector (simd) parallelism. if too few lanes are provisioned, a vector operation would have to be mapped across multiple cus, increasing the amount of control logic required and decreasing efficiency. similarly, provisioning more lanes than the amount of vector parallelism would cause some to be unused: the cu can execute operations on only a single vector. figure 9 shows that raw area efficiency (area per fu) increases with the number of lanes.
+
+the anomaly-detection dnn [153] is our largest model requiring line-rate operation, so we use it to set the ideal lane count. the dnn's largest layer has 12 hidden units, so the largest dot-product calculations involve 12 elements; the 16-lane configuration fully unrolls the dot product within a single cu while minimizing underutilization. currently, the 16-lane configuration balances area overhead, power, and mapping efficiency, but optimal lane counts may change as data-plane ml models evolve. because mapreduce
+
+![](images/82204ab888401bfeae82c660904e26d28a9508558d67432b5da2a395333e0c8e.jpg)  
+(a) area.
+
+![](images/52f99269a840e426c086db735828bdb9d604937d8426670bf2aae963ccf0ee88.jpg)  
+(b) power (10% switching).
+
+![](images/c5d137cb5d6b23d9626d4c9d5c897b46355f6970a1fec1406fe367c387874fd8.jpg)  
+figure 9: area and power consumption per-fu for various cu configurations (lanes and stages).  
+figure 10: area needed for activation functions as the number of stages varies, all operating at line rate (1 gpkt/s).
+
+programs are hardware agnostic, the compiler will handle the differences in unrolling factors as needed (i.e., parallelism within a cu vs. across cus).
+
+stage count. we perform a similar study to quantify the cu's stage count's impact on accuracy. inner product, the linear operation behind most of our models, uses two stages: one map (multiplication) and one reduce (addition), while non-linear operations use a sequence of maps; therefore, we study stage count's impact on nonlinear operations. figure 10 shows the total area (the product of cu count and area) needed to implement a variety of activation functions using cus of different depths. furthermore, for shallow activation functions (e.g., relu), the later stages are not mapped, leading to area increases with more stages. theoretically, more stages are more efficient (figure 9) and with context merging can allow a complier to map even more complex activation functions [177]. however, our inner product and relu microbenchmarks—which form the core of many common networks—benefit from only two stages. therefore, we pick four compute stages in our final asic design to support both.
+
+final asic configuration. our final cu has 16 lanes, four stages, and an 8-bit fixed-point data path. including routing resources [176], it takes  $0.044\mathrm{mm}^2$  (680  $\mu \mathrm{m}^2$  per fu, on average). each mu has 16 banks with 1024 entries each, and consumes  $0.029\mathrm{mm}^2$  including routing resources. overall, we provision a  $12\times 10$  grid with a 3:1
+
+table 5: performance and resource overheads of several application models. overheads are calculated relative to a  $500\mathrm{mm}^2$  chip with 4 reconfigurable pipelines [65], with the system drawing an estimated  $270\mathrm{w}$  while running at 1 gpkt/s line rate [3, 19, 114].  
+
+<table><tr><td rowspan="2">app</td><td rowspan="2">model</td><td colspan="2">perf.</td><td colspan="2">area</td><td colspan="2">power</td></tr><tr><td>gpkt/s</td><td>ns</td><td>mm2</td><td>+%</td><td>mw</td><td>+%</td></tr><tr><td>iot</td><td>kmeans</td><td>1.00</td><td>61</td><td>0.3</td><td>0.2</td><td>177</td><td>0.3</td></tr><tr><td>anom.</td><td>svm</td><td>1.00</td><td>83</td><td>0.6</td><td>0.5</td><td>395</td><td>0.6</td></tr><tr><td>anom.</td><td>dnn</td><td>1.00</td><td>221</td><td>1.0</td><td>0.8</td><td>647</td><td>1.0</td></tr><tr><td>indigo</td><td>lstm</td><td>-</td><td>805</td><td>3.0</td><td>2.4</td><td>1897</td><td>2.8</td></tr><tr><td colspan="4">12×10 grid</td><td>4.8</td><td>3.8</td><td></td><td></td></tr></table>
+
+ratio of cus to mus, taking  $4.8\mathrm{mm}^2$ . considering a switch with four reconfigurable pipelines having 32 mats each,  $50\%$  of the chip area is taken up by the mats [86]. and, the addition of a mapreduce block per pipeline increases the total chip area by  $3.8\%$ ; an iso-area design would lose 3 mats per pipeline. this is a negligible overhead in comparison to the types of programs we can support (§5.1.2). taurus's asic parameters are based on the applications and functions in use today: with new models, new parameters may provide greater efficiency.
+
+5.1.2 application benchmarks. we evaluate taurus using four ml models [106, 153, 168, 169]. the first, an iot traffic classification, implements kmeans clustering using 11 features and five categories. the first anomaly-detection algorithm is an svm [106] with eight input features selected from the kdd dataset [2, 36] and a radial-basis function to model nonlinear relationships. our second anomaly-detection algorithm is a dnn that takes six input features (also a kdd subset); it has layers with 12, 6, and 3 hidden units [153]. finally, the online congestion-control algorithm (indigo [169]) is an lstm. indigo uses 32 lstm units followed by a softmax layer and is designed to run at an end-host nic. although indigo does not run per-packet, its update interval is significantly lower with taurus: permitting more accurate control decisions and faster reaction times.
+
+area & power. we show area and power relative to an existing programmable switch  $\mathrm{asic}^5$  with a pisa pipeline [15] in table 5, considering only the number of cus and mus performing useful work. therefore, the actual area of a prototype for these benchmarks is the area of the largest benchmark, with unused cus disabled for smaller benchmarks. simple models, like svm-based anomaly detection, have as little as  $0.2\%$  area overhead and  $0.3\%$  power overhead. therefore, we choose taurus's mapreduce block area as  $4.8\mathrm{mm}^2$ , which is similar to recently-proposed switch additions (e.g., conga [4] and banzai [146] consuming an additional  $2\%$  and  $12\%$  area, respectively). if only smaller models were supported, kmeans, svms, and dnns would add only about  $0.8\%$  more area and  $0.9\%$  more power. for 16- and 32-bit data paths, both area and power will increase by about a factor of 2 and 4, respectively.
+
+![](images/4e9c86ce021bfb9f45ea1d75fb973b1ef2d732e3df0ce65bcc0e5a50fe995a8c.jpg)  
+figure 11: a small dnn, broken down into independent microbenchmarks.
+
+latency & throughput. kmeans, the svm, and the dnn process one packet header per cycle (line-rate), and their latency remains in the nanosecond range (table 5). assuming a datacenter switch latency of  $1\mu \mathrm{s}$  [35], kmeans, the svm, and the dnn add  $6.1\%$ ,  $8.3\%$ , and  $22.1\%$  more latency, respectively. in software, the indigo lstm significantly improves application-level throughput and latency [169], running every  $10\mathrm{ms}$ -likely limited by the lstm's computational requirements. in taurus, indigo can produce a decision every 805 ns: this allows the lstm network to react more quickly to changes in load and better control tail latency. taurus's bypass path also avoids adding latency for non-ml packets.
+
+5.1.3 microbenchmarks. smaller dataflow programs can be composed into a single, large program: for example, figure 11 shows a dnn built from several (linear) perceptron layers fused with nonlinear activation functions. these microbenchmarks are general building blocks intended to show the versatility of a programmable, mapreduce-based fabric. linear functions include a reduction network that limits the degree of communication-free parallelism. conversely, nonlinear functions can be perfectly simd-parallelized because there is no interaction between adjacent data elements. for example, if the output of 16 different perceptrons is input to a relu, we simply map the relu over the 16 outputs, which are then computed in parallel. table 6 shows the area and latency required for each microbenchmark when unrolled to run at line rate.
+
+linear operations. our linear microbenchmarks are comprised of a one-dimensional convolution with eight outputs and a kernel dimension of two (frequently used to find spatial or temporal correlations [94]) and a 16-element inner product, which forms the core of perceptron neural networks, lstms, and svms. because the convolution does not map well to vectorized mapreduce (there are multiple small inner reductions), it requires  $8 \times$  unrolling and much chip area. however, the inner product runs at line rate in only a single cu; it can be efficiently composed into high-performance deep neural networks. the minimum latency for a 16-lane cu to perform a mapreduce is five cycles: one cycle for map and four cycles for reduce, using different fractions of a single stage for each reduction cycle (figure 8). the remaining latency comes from data movement from the input to the cu and then to the output; tau-rus takes roughly five cycles for each data movement—a result of spatially-distributed dataflow.
+
+unrolling. using mapreduce's target-independent optimization, large ml models can run over multiple cycles with a corresponding line-rate reduction (table 7). unrolling inner and outer loops will
+
+table 6: area and latency of each microbenchmark, running at line rate in a 16-lane, four-stage cu. (latency is the sum of the perceptron and relu execution time.)  
+
+<table><tr><td></td><td>μbmark</td><td>area (mm2)</td><td>lat. (ns)</td></tr><tr><td rowspan="2">linear</td><td>conv1d</td><td>1.57</td><td>122</td></tr><tr><td>inner product</td><td>0.04</td><td>23</td></tr><tr><td rowspan="7">nonlinear</td><td>relu</td><td>0.04</td><td>22</td></tr><tr><td>leakyrelu</td><td>0.04</td><td>22</td></tr><tr><td>tanhexp</td><td>0.26</td><td>69</td></tr><tr><td>sigmoidexp</td><td>0.31</td><td>73</td></tr><tr><td>tanhpw</td><td>0.13</td><td>38</td></tr><tr><td>sigmoidpw</td><td>0.17</td><td>46</td></tr><tr><td>actlut</td><td>0.12</td><td>36</td></tr></table>
+
+table 7: throughput and area scaling of microbenchmarks with unrolling factors from 1 to 8.  
+
+<table><tr><td>μbmark</td><td>unroll</td><td>line rate</td><td>area (mm2)</td></tr><tr><td rowspan="4">conv1d</td><td>1</td><td>1/8</td><td>0.19</td></tr><tr><td>2</td><td>1/4</td><td>0.44</td></tr><tr><td>4</td><td>1/2</td><td>0.93</td></tr><tr><td>8</td><td>1</td><td>1.57</td></tr><tr><td>inner product</td><td>-</td><td>1</td><td>0.04</td></tr></table>
+
+result in higher throughput and lower latency while consuming more area. however, not all benchmarks can have their outer loop unrolled: for example, the inner product has no outer loop. the iterative (i.e., loop-based) convolution runs at one-eighth of line rate, and unrolling it to meet line rate results in an  $8 \times$  area increase.
+
+nonlinear operations. activation functions are necessary to learn nonlinear behavior; otherwise, the entire neural network would collapse into a single linear function. each activation function serves a different purpose: lstms use tanh for gating [73], while dnns use the simpler relu and leaky relu [112]. the most efficient functions (relu and leaky relu) do not use lookup tables (luts) and take only a single cu. more complicated functions, including sigmoid and tanh, have several versions: taylor series, piecewise approximations, and luts [67, 161], with taylor series and piecewise approximations requiring 2-5 times as much area. lut-based functions need memory: each table approximates activation functions by storing pre-computed output values as 1024 8-bit entries [67, 161]--a small fixed fraction of switch memory, even when replicated.
+
+5.1.4 comparisons with mat-only ml designs. as discussed in §5.1.1, our final taurus asic configuration—with 4 pipelines, each having a mapreduce block—consumes  $3.8\%$  additional chip area (or an iso-area equivalent of 3 mats per mapreduce block). in comparison, recent mat-only neural network (nn) implementations [144, 168] consumes 10s of mats. for example, n2net, a binary neural network (bnn) implementation, requires at least 12 mats per layer [144]. this would take 48 mats to support the anomaly-detection dnn [153]–taurus consumes only 3. similarly, the iisy framework [168] implements non-nn algorithms on mats,
+
+![](images/1d096c827f8454f702ee31d8c88a147dda518805f4c04b47bfe6027e945faa68.jpg)  
+figure 12: taurus testbed for inference: the server runs leading open-source software, i.e., onos [46], xdp [129], influxdb [33], and control-plane inference using tensorflow [1]. the tofino switch and fpga implement taurus's mat pipeline and the mapreduce block, respectively.
+
+consuming 8 and 2 mats for svm and kmeans, respectively. a corresponding taurus asic would incur  $0.5\%$  chip area (or a single mat), only. both n2net and iisy provide unique ways of mapping ml algorithms to mats; however, for data-plane ml to become ubiquitous we need more efficient ml hardware for networks.
+
+# 5.2 end-to-end performance
+
+5.2.1 taurus testbed. to evaluate taurus's end-to-end performance, we build a testbed using industry-standard sdn tools, a tofino switch, and an fpga that implements the mapreduce block, as shown in figure 12. with this testbed, we show that taurus decides on a per-packet basis, is faster than conventional control-plane ml solutions, and has greater accuracy (§5.2.2).
+
+control-plane ml: baseline. in our baseline, the control-plane server samples telemetry packets through a 10 gbps link using an xdp-enabled intel x710 nic [79] (running a custom xdp/ebpf program, 84 loc), and stores them in an influxdb streaming database [33]. our vectorized ml model (written in keras [64], 272 loc) runs inference on these packets in batches, and the open network operating system (onos) [46] installs the model's outcome as flow rules on the switch.
+
+data-plane ml: taurus. in taurus, a programmable barefoot wedge 100bf-32x [116] switch, running the stratum os [48] implements taurus's pisa components. the match-action pipeline of the tofino switch implements taurus's parsing and preprocessing mats (172 loc). a 100 gbps ethernet link connects the switch to a xilinx alveo u250 fpga [164], which emulates the mapreduce hardware; we compile our ml models to the fpga using spatial [88] (105 loc) and the xilinx opennic shell [166]. to stream packets, we integrate the xilinx 100g cmac [167] with an axi stream interface [165] (298 loc) to the mapreduce block in the fpga. once
+
+table 8: baseline ml's batch sizes and latency, and accuracy. taurus detects two orders of magnitude more events.  
+
+<table><tr><td rowspan="2">sampling</td><td colspan="2">batch size</td><td colspan="5">baseline latency (ms)</td><td colspan="2">detected (%)</td><td colspan="2">f1 score</td></tr><tr><td>xdp</td><td>rem.</td><td>xdp</td><td>db</td><td>ml</td><td>install</td><td>all</td><td>baseline</td><td>taurus</td><td>baseline</td><td>taurus</td></tr><tr><td>10-5</td><td>1</td><td>5</td><td>3</td><td>14</td><td>16</td><td>2</td><td>34</td><td>0.781</td><td>58.2</td><td>1.549</td><td>71.1</td></tr><tr><td>10-4</td><td>2</td><td>33</td><td>2</td><td>17</td><td>18</td><td>4</td><td>41</td><td>2.553</td><td>58.2</td><td>4.944</td><td>71.1</td></tr><tr><td>10-3</td><td>17</td><td>637</td><td>3</td><td>92</td><td>28</td><td>38</td><td>95</td><td>0.015</td><td>58.2</td><td>0.031</td><td>71.1</td></tr><tr><td>10-2</td><td>2935</td><td>4570</td><td>201</td><td>141</td><td>59</td><td>112</td><td>512</td><td>0.000</td><td>58.2</td><td>0.001</td><td>71.1</td></tr></table>
+
+processed by the fpga, the packets go through the postprocessing mats in the switch before being forwarded to the network. finally, we use an additional two 80-core intel xeon servers running moongen [39] to generate and receive traffic.
+
+5.2.2 anomaly detection case study. we implement the ml anomaly-detection model (§3) in the control and data planes. we generate labeled packet-level traces from the nsl-kdd [36] dataset by expanding connection-level records to binned packet traces (i.e., each trace element represents a set of packets) and annotating them with their status (anomalous or benign). flow-size distribution, mixing, and packet fields' rates of change are sampled from the original traces to create a realistic workload. we use this data to train the dnn, with an offline f1 score (a typical ml metric [157]) of 71.1.
+
+to test data-plane ml, we route all traffic through the switch and fpga. the switch preprocesses features using a mat. it first uses the packet's five-tuple to index a set of stateful registers, which accumulate features across packets (e.g., the number of urgent flags). then, it formats these features as fixed-point numbers and forwards packets to the fpga, where the ml model marks them as anomalous or benign. the packets then return to the switch, where a postprocessing mat interprets the ml decision.
+
+for our baseline, the switch accumulates features and sends them as telemetry packets to the control plane for inference. if the model determines that a packet is anomalous, the respective ip is extracted and a switch rule is installed marking its packets as anomalous. any packets that pass through before rule installation are (incorrectly) forwarded as-is. traffic is sent at a fixed 5 gbps while control-plane sampling varies from  $100\mathrm{kbps}$ $(10^{-5})$  to  $100\mathrm{mbps}$ $(10^{-2})$ .
+
+taurus responds per-packet. table 8 shows the control-plane's millisecond-range latencies. even at low sampling rates, the baseline has a  $32\mathrm{ms}$  latency. as load grows, so do batch sizes—this increases latency, because the batch's first element must wait for the entire batch to finish. furthermore, when approaching a per-packet system, ml is not the bottleneck. rather, table 8 shows that rule installation and packet collection overwhelm the system.[7]
+
+taurus sustains full model accuracy. most anomalous packets are undetected by the baseline, while taurus captures over half (table 8). we use an f1 score to evaluate accuracy, which takes into account the number of identified anomalies, missed anomalies, and benign packets incorrectly marked as anomalous [8, 153]. taurus
+
+![](images/091f1a07629adacd661c6462ad7eaffab3529eed10b9cef31af8b4006fdfdf8b.jpg)  
+figure 13: taurus's accuracy improves over time. training with higher sampling rates converges faster.
+
+![](images/204c8e91531c7f30bbdf27a3eb01637e87ec57358c0c1e40ec4eda2155d4ff10.jpg)  
+figure 14: training with smaller batches and more epochs converges faster (sampling rate is  $10^{-2}$ ).
+
+achieves the same f1 score as the model in isolation. however, the baseline misses packets due to the rule-installation and other processing delays, yielding a lower effective f1 score.
+
+5.2.3 online training. taurus's ml models can also be updated to optimize global metrics; this accounts for behavior (like downstream congestion) that cannot be observed at a single switch. we feed telemetry packets to a control-plane training application and evaluate, using flow-rule installation time as an estimate, the time needed to update data-plane model weights.
+
+figure 13 shows that higher sampling rates (corresponding to larger batches) converge faster (tens to hundreds of milliseconds), demonstrating that online training is possible and is aided by higher packet ingestion rates at the control plane. moreover, figure 14 shows that the configuration with the smallest batch size (64) and most epochs (10) results in convergence to the highest f1 score and that the added time to train is offset by faster convergence. hence, smaller batches and larger epochs lead to less frequent but more substantial updates as opposed to frequent, less informed updates.
+
+# 6 limitations & future work
+
+while taurus can support per-packet ml algorithms in a more efficient manner than existing platforms, the model sizes are still limited by the available hardware resources. to fit larger models, we must look into model compression techniques. furthermore, additional research is needed to provide provably-correct model assertions and faster training times.
+
+shrinking models. a major taurus application will be network control and coordination. neural networks can solve a variety of control problems [10, 149, 156] and are getting smaller. for example, structured control nets [149] for non-linear control perform almost as well as 512-neuron dnns using as few as four neurons per layer. with such small networks, taurus can run multiple models simultaneously (e.g., one model for intrusion detection and another for traffic optimization). in addition, techniques like quantization, pruning, and distillation can further reduce a models' size [7, 69, 81, 158].
+
+correctness. some applications, like routing, have definitive correct and incorrect answers and are hard to guarantee without safeguards. instead, ml is best suited for applications that are inherently heuristic, such as congestion control [162, 169], load balancing [4, 85], and anomaly detection [106, 153]; their decisions impact only networks' performance and security, not their core packetforwarding behavior. when an ml decision could impact network correctness, postprocessing rules can ensure that the final decision is bounded.
+
+training speed. finally, the training reaction time would likely be higher for a larger datacenter network. this means that instantaneous network problems (like load on a specific link) cannot be handled via training—the event would be over before training completes. instead, training gradually learns what causes these problems and how to avoid them. to detect and react to specific events, lower-latency techniques, like int, can instead provide network status to the model as features.
+
+# 7 related work
+
+architectures for ml. field programmable gate arrays (fpgas) are the most widely-available reconfigurable architectures, used as both custom accelerators [140] and prototyping tools (e.g., the netfpga [104, 113]). however, fpgas' on-chip interconnects consume up to  $70\%$  of the total chip power [23], and their variable, slow clock frequencies complicate interfacing and operating at network switch speeds (multi-terabits per second). cgras are optimized for ml arithmetic and typically have a fast, fixed clock frequency that allows seamless integration between the mapreduce block and mats in taurus [32, 50, 58, 105, 107, 143]. other architectures, like eyeriss [26], brainwave [49], and eie [68], achieve high efficiency by focusing on specific algorithms. these could be used for in-switch ml, but are too rigid: if a specific accelerator were standardized, networks would be unable to benefit from future ml research due to the lack of a flexible abstraction (like mapreduce).
+
+data planes for ml. inside a datacenter core, programmable mat-based data-plane switches (like barefoot tofino [114, 115]), today,
+
+allow networks to easily support and perform tasks (such as heavy-hitter detection [148], load balancing [85], security [93, 175], fast rerouting [74], and scheduling [147]), previously implemented using end-host servers, middleboxes, or fixed-function switches. recent efforts (n2net [144] and iisy [168]) are now looking into running more complicated machine-learning algorithms on these switches. however, mats alone are ill-suited to support ml algorithms: for data-plane ml to become ubiquitous, we need more efficient hardware to minimize unnecessary resource usage (i.e., area and power). we believe taurus is a first step in that direction.
+
+at the datacenter end-hosts, modern smartnics (and network accelerators) provide higher computational capacity for servers to offload not only packet-processing logic but also application-specific logic closer to the network interface for lower latency and higher throughput. products like intel's infrastructure units (ipus) [80], nvidia's data processing units (dpus) [120], and fpga-based smartnics [44, 164] all aim at accelerating a variety of end-host workloads (e.g., hypervisors, virtual switching, batch-based ml training and inference, storage). however, these smartnics are a poor fit for per-packet operations that need to happen at a network-wide scale in a data center. packets would still have to visit the server (and nic) from the switch, resulting in an rtt worth of delay between when a packet is seen and when the corresponding decision is applied at the switch. middleboxes experience similar issues on top of their fixed-function hardware implementation, which limits flexibility and prompts frequent upgrades [141].
+
+ml for networking. many networking applications can benefit from ml. for example, learned algorithms for congestion control [162, 169] have been shown to outperform their human-designed counterparts [37, 66, 171]. in addition, boutaba et al. [17] identify ml use cases for network tasks such as traffic classification [40, 41], traffic prediction [24, 27], active queue management [151, 179], and security [124]. all of these applications could immediately be deployed using taurus.
+
+networking for ml. specialized networks can also accelerate ml algorithms themselves. with minor enhancements to modern data-plane hardware, switches can aggregate gradients in-network, accelerating training by up to  $300\%$  [51, 92, 137]. gaia, a system for distributed ml [76], also accounts for wide-area network bandwidth and regulates the movements of gradients during the training process. while taurus is not explicitly designed to accelerate distributed training, mapreduce can aggregate numeric weights, contained in packets, more efficiently than mats.
+
+# 8 conclusion
+
+currently, datacenter networks are partitioned into a line-rate, per-packet data plane and a slower control plane, where the control plane runs complex, data-driven management policies to configure the data plane. this approach is too slow because transiting the control plane adds unavoidable latency, so the control plane cannot react quickly enough to network events. taurus brings complex decision-making to the data plane, bringing the reaction time down to per-packet and increasing the specificity of managemnet and control policies. we demonstrate that taurus operates at line rate and adds minimal overhead to a programmable switch pipeline
+
+(rmt)  $-3.8\%$  more area and 122 ns average latency—while accelerating several recently-proposed ml networking benchmarks.
+
+looking forward, to realize a self-driving network, hardware must be deployed before large-scale training can begin. we believe, taurus gives a foothold for in-network ml with hardware that can be installed in next-generation data planes—to improve performance and security.
+
+# a artifact appendix
+
+# a.1 abstract
+
+the artifact contains the source code for the proposed taurus's mapreduce block (§3.3) and the anomaly-detection (ad) application used in the end-to-end performance evaluation (§5.2). the mapreduce block is integrated with the xilinx opennic shell [166] and is programmed via a high-level dsl, called spatial [88]. the ad application runs on the end-to-end testbed and consists of various components: p4 programs, python scripts, onos application, and the spatial code (§5.2.2).
+
+# a.2 scope
+
+the artifact provides the two new contributions: mapreduce block and the anomaly-detection code. the goal is to provide the two missing components needed to implement the complete testbed (\$5.2) for running the end-to-end performance evaluation. the remaining components are a collection of existing propriety and specialized hardware (barefoot tofino switch [114], xilinx alveo board [164]) and software codebases (p4 [14], onos [46], spatial [88], and more), which are readily available for purchase and download (please see the dependencies, below).
+
+# a.3 contents
+
+- mapreduce block in fpga: this repository contains the source code and instructions for building an fpga-based implementation of the mapreduce block. the detailed documentation for running the mapreduce block on fpga is provided here: https://gitlab.com/dataplane-ai/taurus/mapreduce.  
+- anomaly-detection application: in this repository, we share the source code (p4, python, onos, spatial) for the anomaly-detection application (ad). we also provide details on what is needed to replicate the end-to-end testbed used for evaluating the ad application. the description of the ad application is located here: https://gitlab.com/dataplane-ai/taurus/applications/anomaly-detection-asplos22.
+
+# a.4 hosting
+
+the source code is publicly available on gitlab<sup>9</sup> and figshare.<sup>10</sup>
+
+# a.5 dependencies
+
+the artifact relies on the following third-party hardware and software tools:
+
+# - edgecore wedge 100bf-32x switch
+
+we expect users to buy the required hardware and gain individual access to the necessary tools and licenses and, therefore, do not expand on setting up these components in the artifact.  
+<sup>9</sup>https://gitlab.com/dataplane-ai/taurus  
+10https://doi.org/10.6084/m9.figshare.17097524
+
+xilinx alveo u250 fpga board  
+intel p4 studio  
+xilinx vivado design tool  
+xilinx opennic shell  
+- spatial dsl  
+onf stratum os  
+onf open network operating system (onos)  
+- moongen traffic generator
+
+# references
+
+[1] martin abadi, paul barham, jianmin chen, zhifeng chen, andy davis, jeffrey dean, matthieu devin, sanjay ghemawat, geoffrey irving, michael isard, et al. 2016. tensorflow: a system for large-scale machine learning. in usenix osdi '16.  
+[2] preeti aggarwal and sudhir kumar sharma. 2015. analysis of kdd dataset attributes-class wise for intrusion detection. computer science 57 (2015), 842-851. https://doi.org/10.1016/j.procs.2015.07.490  
+[3] anurag agrawal and changhoon kim. 2020. intel tofino2 - a 12.9tbps p4-programmable ethernet switch. in hot chips '20.  
+[4] mohammad alizadeh, tom edsall, sarang dharmapurikar, ramanan vaidyanathan, kevin chu, andy fingerhut, vinh the lam, francis matus, rong pan, navindra yadav, and george varghese. 2014. conga: distributed congestion-aware load balancing for datacenters. in acm sigcomm '14. https://doi.org/10.1145/2619239.2626316  
+[5] mohammad alizadeh, albert greenberg, david a maltz, jitendra padhye, parveen patel, balaji prabhakar, sudipta sengupta, and murari sridharan. 2010. data center tcp (dctcp). in acm sigcomm '10. https://doi.org/10.1145/1851182.1851192  
+[6] tom auld, andrew w moore, and stephen f gull. 2007. bayesian neural networks for internet traffic classification. ieee transactions on neural networks '07 18, 1 (2007), 223-239. https://doi.org/10.1109/tnn.2006.883010  
+[7] jimmy ba and rich caruana. 2014. do deep nets really need to be deep?. in neurips '14.  
+[8] jarrod bakker, bryan ng, winston kg seah, and adrian pekar. 2019. traffic classification with machine learning in a live network. in 2019 ifip/ieee symposium on integrated network and service management (im) '19.  
+[9] rajeev balasubramonian, andrew b kahn, naveen muralimanohar, ali shafiee, and vaishnav srinivas. 2017. cacti 7: new tools for interconnect exploration in innovative off-chip memories. acm transactions on architecture and code optimization (taco '17) 14, 2 (2017), 1-25. https://doi.org/10.1145/3085572  
+[10] marc g bellemare, yavar naddaf, joel veness, and michael bowling. 2013. the arcade learning environment: an evaluation platform for general agents. journal of artificial intelligence research (jair) 47 (2013), 253-279.  
+[11] laurent bernaille, renata teixeira, ismael akodkenou, augustin soule, and kave salamatian. 2006. traffic classification on the fly. acm sigcomm computer communication review (ccr) 36, 2 (2006), 23-26. https://doi.org/10.1145/1129582.1129589  
+[12] kirti bhanushali and w rhett davis. 2015. freepdk15: an open-source predictive process design kit for  $15\mathrm{nm}$  finfet technology. in proceedings of the 2015 symposium on international symposium on physical design. 165-170. https://doi.org/10.1145/2717764.2717782  
+[13] pat bosshart, dan daly, glen gibb, martin izzard, nick mckeown, jennifer rexford, cole schlesinger, dan talayco, amin vahdat, george varghese, et al. 2014. p4: programming protocol-independent packet processors. acm sigcomm computer communication review 44, 3 (2014), 87-95. https://doi.org/10.1145/2656877.2656890  
+[14] pat bosshart, dan daly, glen gibb, martin izzard, nick mckeown, jennifer rexford, cole schlesinger, dan talayco, amin vahdat, george varghese, et al. 2014. p4: programming protocol-independent packet processors. acm sigcomm computer communication review (ccr) 44, 3 (2014), 87–95. https://doi.org/10.1145/2656877.2656890  
+[15] pat bosshart, glen gibb, hun-seok kim, george varghese, nick mckeown, martin izzard, fernando mujica, and mark horowitz. 2013. forwarding metamorphosis: fast programmable match-action processing in hardware for sdn. in acm sigcomm '13. https://doi.org/10.1145/2534169.2486011  
+[16] leon bottou. 2010. feature engineering. https://www.cs.princeton.edu/courses/archive/spring10/cos424/slides/18-feat.pdf. accessed on 08/12/2021.  
+[17] raouf boutaba, mohammad a salahuddin, noura limam, sara ayoubi, nashid shahriar, felipe estrada-solano, and oscar m caicedo. 2018. a comprehensive survey on machine learning for networking: evolution, applications and research opportunities. journal of internet services and applications (jisa) 9, 1 (2018), 16. https://doi.org/10.1186/s13174-018-0087-2  
+[18] andrey brito, andre martin, thomas knauth, stephan creutz, diogo becker, stefan weigert, and christof fetzer. 2011. scalable and low-latency data
+
+processing with stream mapreduce. in ieee cloudcom '11. https://doi.org/10.1109/cloudcom.2011.17  
+[19] broadcom. [n.d]. tomahawk/bcm56960 series. https://www.broadcom/products/ethernet-connectivity/switching/prataxgs/bcm56960-series. accessed on 08/12/2021.  
+[20] kevin j brown, hyoukjoong lee, tiark romp, arvind k sujeeth, christopher de sa, christopher aberger, and kunle olukotun. 2016. have abstraction and eat performance, too: optimized heterogeneous computing with parallel patterns. in ieee/acm cgo '16. https://doi.org/10.1145/2854038.2854042  
+[21] kevin j brown, arvind k sujeeth, hyouk joong lee, tiark rompf, hassan chafi, martin odersky, and kunle olukotun. 2011. a heterogeneous parallel framework for domain-specific languages. in ieee pact '11. https://doi.org/10.1109/pact.2011.15  
+[22] douglas ronald burdick, amol ghoting, rajasekar krishnamurthy, edwin peter dawson pednault, berthold reinwald, vikas sindhwani, shirish tatikonda, yuanyuan tian, and shivakumar vaithyanathan. 2013. systems and methods for processing machine learning algorithms in a mapreduce environment. us patent 8,612,368.  
+[23] benton highsmith calhoun, joseph f ryan, sudhanshu khanna, mateja putic, and john lach. 2010. flexible circuits and architectures for ultralow power. proc. ieee 98, 2 (2010), 267-282.  
+[24] samira chabaa, abdelouhab zeroual, and jilali antari. 2010. identification and prediction of internet traffic using artificial neural networks. journal of intelligent learning systems and applications (jilsa) 2, 03 (2010), 147. https://doi.org/10.4236/jilsa.2010.23018  
+[25] huan chen and theophilus benson. 2017. the case for making tight control plane latency guarantees in sdn switches. in acm sosr '17. https://doi.org/10.1145/3050220.3050237  
+[26] yu-hsin chen, tushar krishna, joel s emer, and vivienne sze. 2016. eyeriss: an energy-efficient reconfigurable accelerator for deep convolutional neural networks. ieee journal of solid-state circuits 52, 1 (2016), 127-138. https://doi.org/10.1109/jssc.2016.2616357  
+[27] zhitang chen, jiayao wen, and yanhui geng. 2016. predicting future traffic using hidden markov models. in ieee icnp '16.  
+[28] cheng-tao chu, sang k kim, yi-an lin, yuanyuan yu, gary bradski, kunle olukotun, and andrew y ng. 2007. map-reduce for machine learning on multicore. in neurips '07. 281-288.  
+[29] cisco systems, inc. [n.d.]. cisco meraki (mx450): powerful security and sd-wan for the branch & campus. https://meraki.cisco.com/products/appliances/mx450. accessed on 08/12/2021.  
+[30] graham cormode and shan muthukrishnan. 2005. an improved data stream summary: the count-min sketch and its applications. journal of algorithms 55, 1 (2005), 58-75. https://doi.org/10.1016/j.jalgor.2003.12.001  
+[31] paul covington, jay adams, and emre sargin. 2016. deep neural networks for youtube recommendations. in acm recsys '16. https://doi.org/10.1145/2959100.2959190  
+[32] darren c cronquist, chris fisher, miguel figueroa, paul franklin, and carl ebeling. 1999. architecture design of reconfigurable pipelined datapaths. in ieee arvlsi '99.  
+[33] influx data. [n.d.]. influxdb. https://www.influxdata.com/products/influxdb-overview/. accessed on 08/12/2021.  
+[34] christopher de sa, megan lesczynski, jian zhang, alana marzoev, christopher r aberger, kunle olukotun, and christopher re. 2018. high-accuracy low-precision training. arxiv preprint arxiv:1803.03383 (2018).  
+[35] dell emc. [n.d.]. data center switching quick reference guide. https://i.dell.com/sites/doccontent/shared-content/datasheets/en/documents/dell-networking-data-center-quick-reference-guide.pdf. accessed on 08/12/2021.  
+[36] l dhanabal and sp shantharajah. 2015. a study on nsl-kdd dataset for intrusion detection system based on classification algorithms. international journal of advanced research in computer and communication engineering (ijarcce) 4, 6 (2015), 446-452. https://doi.org/10.17148/ijarcce.2015.4696  
+[37] mo dong, qingxi li, doron zarchy, p brighten godfrey, and michael schapira. 2015. pcc: re-architecting congestion control for consistent high performance. in usenix nsdi '15.  
+[38] dpdk. [n.d.]. dpdk. https://www.dpk.org/. accessed on 08/12/2021.  
+[39] paul emmerich, sebastian gallenmüller, daniel raumer, florian wohlfart, and georg carle. 2015. moongen: a scriptable high-speed packet generator. in acm imc '15.  
+[40] jeffrey erman, martin arlitt, and anirban mahanti. 2006. traffic classification using clustering algorithms. in acm minenet '06. https://doi.org/10.1145/1162678.1162679  
+[41] jeffrey erman, anirban mahanti, martin arlitt, and carey williamson. 2007. identifying and discriminating between web and peer-to-peer traffic in the network core. in www '07. https://doi.org/10.1145/1242572.1242692  
+[42] alice este, francesco gringoli, and luca salgarelli. 2009. support vector machines for tcp traffic classification. computer networks 53, 14 (2009), 2476-2490. https://doi.org/10.1016/j.comnet.2009.05.003
+
+[43] nick feamster and jennifer rexford. 2018. why (and how) networks should run themselves. in acm anrw '18.  
+[44] daniel firestone, andrew putnam, sambhrama mundkur, derek chiou, alireza dabagh, mike andrewartha, hari angepat, vivek bhanu, adrian caulfield, eric chung, et al. 2018. azure accelerated networking: smartnics in the public cloud. in usenix nsdi '18.  
+[45] sally floyd and van jacobson. 1993. random early detection gateways for congestion avoidance. ieee/acm transactions on networking 1, 4 (1993), 397-413.  
+[46] open networking foundation. [n.d.]. onos: open network operating system. https://www.opennetworking.org/onos/. accessed on 08/12/2021.  
+[47] open networking foundation. [n.d.]. onos: single bench flow latency test. https://wiki.onosproject.org/display/onos/2%3a+experiment+i++single+bench+flow+latency+test. accessed on 08/12/2021.  
+[48] open networking foundation. [n.d.]. stratum os. https://www.opennetworking.org/stratum/. accessed on 08/12/2021.  
+[49] jeremy fowers, kalin ovtcharov, michael papamichael, todd massengill, ming liu, daniel lo, shlomi alkalay, michael haselman, logan adams, mahdi ghandi, et al. 2018. a configurable cloud-scale dnn processor for real-time ai. in ieee isca '18. https://doi.org/10.1109/isca.2018.00012  
+[50] mingyu gao and christos kozyrakis. 2016. hrl: efficient and flexible reconfigurable logic for near-data processing. in ieee hpca '16.  
+[51] nadeen gebara, manya ghobadi, and paolo costa. 2021. in-network aggregation for shared machine learning clusters. in mlsys '21.  
+[52] yilong geng, shiyu liu, feiran wang, zi yin, balaji prabhakar, and mendel rosenblum. 2017. self-programming networks: architecture and algorithms. in ieee allerton '17.  
+[53] yilong geng, shiyu liu, zi yin, ashish naik, balaji prabhakar, mendel rosenblum, and amin vahdat. 2019. simon: a simple and scalable method for sensing, inference and measurement in data center networks. in usenix nsdi '19.  
+[54] amol ghoting, prabhanjan kambadur, edwin pednault, and ramakrishnan kannan. 2011. nimble: a toolkit for the implementation of parallel data mining and machine learning algorithms on mapreduce. in acm sigkdd kdd '11. https://doi.org/10.1145/2020408.2020464  
+[55] amol ghoting, rajasekar krishnamurthy, edwin pednault, berthold reinwald, vikas sindhwani, shirish tatikonda, yuanyuan tian, and shivakumar vaithyanathan. 2011. systemml: declarative machine learning on mapreduce. in ieee icde '11.  
+[56] glen gibb, george varghese, mark horowitz, and nick mckeown. 2013. design principles for packet parsers. in acm/iee ancs '13. https://doi.org/10.1109/ancs.2013.6665172  
+[57] dan gillick, arlo faria, and john denero. 2006. mapreduce: distributed computing for machine learning. berkley, dec 18 (2006).  
+[58] seth copen goldstein, herman schmit, mihai budiu, srihari cadambi, matthew moe, and r reed taylor. 2000. piperench: a reconfigurable architecture and compiler. computer 33, 4 (2000), 70-77.  
+[59] ian goodfellow, *yoshua bengio*, aaron courville, and *yoshua bengio*. 2016. *deep learning*. vol. 1. mit press, cambridge.  
+[60] google. [n.d.]. a look inside google's data center networks. https://cloudplatform.googleblog.com/2015/06/a-look-inside-goggles-data-center-networks.html. accessed on 08/12/2021.  
+[61] google. 2021. tensorflow lite. https://www.tensorflow.org/tflite.  
+[62] albert greenberg, james r. hamilton, navendu jain, srikanth kandula, changhoon kim, parantap lahiri, david a. maltz, parveen patel, and sudipta sengupta. 2009. vl2: a scalable and flexible data center network. in acm sigcomm '09. https://doi.org/10.1145/1592568.1592576  
+[63] p4.org architecture working group. 2018. p4-16 portable switch architecture. https://p4.org/p4-spec/docs/psa-v1.1.0.pdf.  
+[64] antonio gulli and sujit pal. 2017. deep learning with keras. packt publishing ltd.  
+[65] vladimir gurevich. 2018. programmable data plane at terabit speeds. https://p4.org/assets/p4_d2_2017_computable_dataplane_at_terabit_speeds.pdf. accessed on 08/12/2021.  
+[66] sangtae ha, injong rhee, and lisong xu. 2008. cubic: a new tcp-friendly high-speed tcp variant. acm sigops operating systems review 42, 5 (2008), 64-74. https://doi.org/10.1145/1400097.1400105  
+[67] song han, junlong kang, huizi mao, yiming hu, xin li, yubin li, dongliang xie, hong luo, song yao, yu wang, et al. 2017. ese: efficient speech recognition engine with sparse lstm on fpga. in acm/sigda fpga '17. https://doi.org/10.1145/3020078.3021745  
+[68] song han, xingyu liu, huizi mao, jing pu, ardavan pedram, mark a horowitz, and william j dally. 2016. eie: efficient inference engine on compressed deep neural network. in acm/ieee isca '16. https://doi.org/10.1145/3007787.3001163  
+[69] song han, jeff pool, john tran, and william dally. 2015. learning both weights and connections for efficient neural network. in neurips '15.  
+[70] b hariri and n sadati. 2007. nn-red: an aqm mechanism based on neural networks. *electronics letters* 43, 19 (2007), 1053–1055. https://doi.org/10.1049/el
+
+20071791  
+[71] robert harper, david macqueen, and robin milner. 1986. standard ml. department of computer science, university of edinburgh.  
+[72] marti a. hearst, susan t dumas, edgar osuna, john platt, and bernhard scholkopf. 1998. support vector machines (svms). ieee intelligent systems and their applications 13, 4 (1998), 18-28.  
+[73] sepp hochreiter and jürgen schmidhuber. 1997. long short-term memory (lstm). neural computation 9, 8 (1997), 1735-1780.  
+[74] thomas holterbach, edgar costa molero, maria apostolaki, alberto dainotti, stefano vissicchio, and laurent vanbever. 2019. blink: fast connectivity recovery entirely in the data plane. in usenix nsdi '19.  
+[75] kurt hornik. 1991. approximation capabilities of multilayer feedforward networks. neural networks 4, 2 (1991), 251-257. https://doi.org/10.1016/0893-6080(91)90009-t  
+[76] kevin hsieh, aaron harlap, nandita vijaykumar, dimitris konomis, gregory r ganger, phillip b gibbons, and onur mutilu. 2017. gaia: geo-distributed machine learning approaching lan speeds. in usenix nsdi '17.  
+[77] peng huang, chuanxiong guo, lidong zhou, jacob r lorch, yingnong dang, murali chintalapati, and randolph yao. 2017. gray failure: the achilles' heel of cloud-scale systems. in acm hotos '17. https://doi.org/10.1145/3102980.3103005  
+[78] intel. [n.d.]. intel deep insight network analytics software. https://www.intel.com/content/www/us/en/products/network-io/programmable-ethernet-switch/network-analyzs/deep-insight.html. accessed on 08/12/2021.  
+[79] intel. [n.d.]. intel® ethernet network adapter x710-da2 for ocp 3.0. https://ark.intel.com/content/www/us/en/ark/products/184822/intel-ethernet-network-adapter-x710-da4-for-ocp-3-0.html. accessed on 08/12/2021.  
+[80] intel. 2021. intel infrastructure processing unit (intel ipu) and smartnics. https://www.intel.com/content/www/us/en/products/network-io/smartnic.html  
+[81] benoit jacob, skirmantas kligys, bo chen, menglong zhu, matthew tang, andrew howard, hartwig adam, and dmitry kalenichenko. 2018. quantization and training of neural networks for efficient integer-arithmetic-only inference. in ieee cvpr '18.  
+[82] nathan jay, noga rotman, brighten godfrey, michael schapira, and aviv tamar. 2019. a deep reinforcement learning perspective on internet congestion control. in icml '19.  
+[83] eun young jeong, shinae woo, muhammad jamshed, haewon jeong, sunghwan ihm, dongsu han, and kyoungsoo park. 2014. mtcp: a highly scalable user-level tcp stack for multicore systems. in usenix nsdi '14.  
+[84] norman p jouppi, cliff young, nishant patil, david patterson, gaurav agrawal, raminder bajwa, sarah bates, suresh bhatia, nan boden, al borchers, et al. 2017. in datacenter performance analysis of a tensor processing unit. in ieee isca '17. https://doi.org/10.1145/3079856.3080246  
+[85] naga katta, mukesh hira, changhoon kim, anirudh sivaraman, and jennifer rexford. 2016. hula: scalable load balancing using programmable data planes. in acm sosr '16. https://doi.org/10.1145/2890955.2890968  
+[86] changhoon kim. [n.d.]. programming the network data plane: what, how, and why? https://conferences sigcomm.org/events/apnet2017/slides/chang.pdf. accessed on 08/12/2021.  
+[87] changhoon kim, anirudh sivaraman, naga katta, antonin bas, advait dixit, and lawrence j wobker. 2015. in-band network telemetry via programmable dataplanes. in acm sigcomm '15 (demo).  
+[88] david koeplinger, matthew feldman, raghu prabhakar, yaqi zhang, stefan hadjis, ruben fiszel, tian zhao, luigi nardi, ardavan pedram, christos kozyrakis, and kunle olukotun. 2018. spatial: a language and compiler for application accelerators. in acm/sigplan pldi '18. https://doi.org/10.1145/3192366.3192379  
+[89] vibhore kumar, henrique andrade, bugra gedik, and kun-lung wu. 2010. deduce: at the intersection of mapreduce and stream processing. in acm edbt '10. https://doi.org/10.1145/1739041.1739120  
+[90] maciej kuzniar, peter peresini, and dejan kostić. 2015. what you need to know about sdn flow tables. in pam '15. springer.  
+[91] adam langley, alistair riddoch, alyssa wilk, antonio vicente, charles krasic, dan zhang, fan yang, fedor kouranov, ian swett, janardhan iyengar, et al. 2017. the quic transport protocol: design and internet-scale deployment. in acm sigcomm '17. https://doi.org/10.1145/3098822.3098842  
+[92] chonlam lao, yanfang le, kshiteej mahajan, yixi chen, wenfei wu, aditya akella, and michael m swift. 2021. atp: in-network aggregation for multitenant learning. in nsdi '21.  
+[93] angelo cardoso lapolli, jonatas adilson marques, and luciano paschoal gaspary. 2019. offloading real-time ddos attack detection to programmable data planes. in 2019 ifip/ieee symposium on integrated network and service management (im) '19. ieee, 19-27.  
+[94] yann lecun, ld jackel, leon bottou, a brunot, corinna cortes, js denker, harris drucker, i guyon, ua muller, eduard sackinger, p simard, and v vapnik. 1995. comparison of learning algorithms for handwritten digit recognition. in icann '95.
+
+[95] guanyu li, menghao zhang, shicheng wang, chang liu, mingwei xu, ang chen, hongxin hu, guofei gu, qi li, and jianping wu. 2021. enabling performant, flexible and cost-efficient ddos defense with programmable switches. ieee/acm transactions on networking '21 (2021). https://doi.org/10.1109/tnet.2021.3062621  
+[96] ruey-hsia li and geneva g. belford. 2002. instability of decision tree classification algorithms. in acm sigkdd '02. https://doi.org/10.1145/775047.775131  
+[97] youjie li, iou-jen liu, yifan yuan, deming chen, alexander schwing, and jian huang. 2019. accelerating distributed reinforcement learning with in-switch computing. in acm/ieee isca '19. https://doi.org/10.1145/3307650.3322259  
+[98] yuliang li, rui miao, hongqiang harry liu, yan zhuang, fei feng, lingbo tang, zheng cao, ming zhang, frank kelly, mohammad alizadeh, and minlan yu. 2019. hpcc: high precision congestion control. in acm sigcomm '19. https://doi.org/10.1145/3341302.3342085  
+[99] eric liang, hang zhu, xin jin, and ion stoica. 2019. neural packet classification. in acm sigcomm '19. https://doi.org/10.1145/3341302.3342221  
+[100] darryl lin, sachin talathi, and sreekanth annapureddy. 2016. fixed point quantization of deep convolutional networks. in icml '16.  
+101] yingqiu liu, wei li, and yun-chun li. 2007. network traffic classification using k-means clustering. in ieee imsccs '07. https://doi.org/10.1109/imsccs.2007.52  
+102] zaoxing liu, hun namkung, georgios nikolaidis, jeongkeun lee, changhoon kim, xin jin, vladimir braverman, minlan yu, and vyas sekar. 2021. jaqen: a high-performance switch-native approach for detecting and mitigating volumetric ddos attacks with programmable switches. in usenix security '21.  
+103] loadbalancer.org. [n.d.]. hardware adc. https://www.loadbalancer.org/products/hardware/. accessed on 08/12/2021.  
+[104] john w lockwood, nick mckeown, greg watson, glen gibb, paul hartke, jad naous, ramanan raghuraman, and jianying luo. 2007. netfpga: an open platform for gigabit-rate network switching and routing. in ieee mse '07.  
+[105] alan marshall, tony stansfield, igor kostarnov, jean vuillemin, and brad hutchings. 1999. a reconfigurable arithmetic array for multimedia applications. in ieee fpga '99. https://doi.org/10.1145/296399.296444  
+106] tahir mehmood and helmi b md rais. 2015. svm for network anomaly detection using aco feature subset. in ieee imsc '15.  
+107] bingfeng mei, serge vernalde, diederik verkest, hugo de man, and rudy lauwereins. 2002. dresc: a retargetable compiler for coarse-grained reconfigurable architectures. in ieee fpt '02.  
+[108] albert mestres, alberto rodriguez-natal, josep carner, pere barlet-ros, eduard alarcón, marc solé, victor muntés-mulero, david meyer, sharon barkai, mike j hibbett, et al. 2017. knowledge-defined networking. acm sigcomm computer communication review (ccr) 47, 3 (2017), 2-10. https://doi.org/10.1145/3138808.3138810  
+[109] yaron minsky, anil madhavapeddy, and jason hickey. 2013. real world ocaml: functional programming for the masses. o'reilly media, inc.  
+110] andrew w moore and denis zuev. 2005. internet traffic classification using bayesian analysis techniques. in acm sigmetrics '05. https://doi.org/10.1145/1064212.1064220  
+[111] manya ghobadi nadeen gebara, paolo costa. 2021. in-network aggregation for shared machine learning clusters. in misys.  
+[112] vinod nair and geoffrey e hinton. 2010. rectified linear units improve restricted boltzmann machines. in icml '10.  
+113] netfpga. [n.d.]. netfpga: a line-rate, flexible, and open platform for research and classroom experimentation. https://netfpga.org/. accessed on 08/12/2021.  
+114] barefoot networks. [n.d.]. barefoot tofino. https://www.intel.com/content/www/us/en/products/network-io/programmable-ethernet-switch/tofinoseries.html. accessed on 08/12/2021.  
+115] barefoot networks. [n.d.]. barefoot tofino 2. https://www.intel.com/content/www/us/en/products/network-io/programmable-ethernet-switch/tofino2-series.html. accessed on 08/12/2021.  
+116] edgecore networks. [n.d.]. wedge 100bf-32x: 100gbe data center switch. https://www(edge-core.com/productsinfo.php?cls=1&cls2=5&cls3=181&id=335. accessed on 08/12/2021.  
+117] rolf neugebauer, gianni antichi, josé fernando zazo, yury audzevich, sergio lópez-buedo, and andrew w. moore. 2018. understanding pcie performance for end host networking. in acm sigcomm '18. https://doi.org/10.1145/3230543.3230560  
+118] radhika niranjan mysore, andreas pamboris, nathan farrington, nelson huang, pardis miri, sivasankar radhakrishnan, vikram subramanya, and amin vahdat. 2009. portland: a scalable fault-tolerant layer 2 data center network fabric. in acm sigcomm '09. https://doi.org/10.1145/1592568.1592575  
+119] nvidia. [n.d.]. tesla t4. https://www.nvidia.com/en-us/data-center/tesla-t4/. accessed on 08/12/2021.  
+[120] nvidia. 2021. nvidia bluefield data processing units. https://www.nvidia.com/en-us/networking/products/data-processing-unit/.  
+[121] martin odersky, lex spoon, and bill venners. 2008. *programming in scala*. artima inc.
+
+[122] p4.org. 2020. p4-16 language specification. https://p4.org/p4-spec/docs/p4-16-v1.2.1.pdf.  
+[123] junghun park, hsiao-rong tian, and c-c jay kuo. 2006. internet traffic classification for scalable qos provision. in ieee icme '06.  
+[124] roberto perdisci, davide ariu, prahlad fogla, giorgio giacinto, and wenke lee. 2009. mcpad: a multiple classifier system for accurate payload-based anomaly detection. computer networks 53, 6 (2009), 864-881. https://doi.org/10.1016/j.comnet.2008.11.011  
+[125] dan rk ports and jacob nelson. 2019. when should the network be the computer?. in acm hotos '19. https://doi.org/10.1145/3317550.3321439  
+[126] pascal poupart, zhitang chen, priyank jaini, fred fung, hengky susanto, yanhui geng, li chen, kai chen, and hao jin. 2016. online flow size prediction for improved network routing. in ieee icnp '16.  
+[127] raghu prabhakar, yaqi zhang, david koeplinger, matt feldman, tian zhao, stefan hadjis, ardavan pedram, christos kozyrakis, and kunle olukotun. 2017. plasticine: a reconfigurable architecture for parallel patterns. in acm/ieee isca '17. https://doi.org/10.1145/3079856.3080256  
+[128] raghu prabhakar, yaqi zhang, and kunle olokotun. 2020. coarse-grained reconfigurable architectures. in nano-chips 2030. springer, 227-246. https://doi.org/10.1007/978-3-030-18338-7_14  
+[129] io visor project. [n.d.]. xdp: express data path. https://www.iovisor.org/technology/xdp. accessed on 08/12/2021.  
+[130] jack w rae, sergey bartunov, and timothy p lillicrap. 2019. meta-learning neural bloom filters. arxiv:1906.04304 (2019).  
+[131] alon raselbach, ori rottensreich, and mark silberstein. 2020. a computational approach to packet classification. in acm sigcomm '20. https://doi.org/10.1145/3387514.3405886  
+[132] luigi rizzo. 2012. netmap: a novel framework for fast packet i/o. in usenix atc '12.  
+[133] joshua rosen, neoklis polyzotis, vinayak borkar, yingyi bu, michael j carey, markus weimer, tyson condie, and raghu ramakrishnan. 2013. iterative mapreduce for large scale machine learning. arxiv preprint arxiv:1303.3517 (2013).  
+[134] alexander rucker, tushar swamy, muhammad shahbaz, and kunle olukotun. 2019. elastic rss: co-scheduling packets and cores using programmable nics. in acm apnet '19. https://doi.org/10.1145/3343180.3343184  
+[135] alexander rucker, matthew vilim, tian zhao, yaqi zhang, raghu prabhakar, and kunle olukotun. 2021. capstan: a vector rda for sparsity. association for computing machinery, new york, ny, usa, 1022-1035.  
+[136] davide sanvito, giuseppe siracusano, and roberto bifulco. 2018. can the network be the ai accelerator?. in netcompute '18. https://doi.org/10.1145/3229591.3229594  
+[137] amedeo sapio, marco canini, chen-yu ho, jacob nelson, panos kalnis, changhoon kim, arvind krishnamurthy, masoud moshref, dan rk ports, and peter richtárik. 2019. scaling distributed machine learning with in-network aggregation. arxiv:1903.06701 (2019).  
+[138] dipanjan sarkar. 2018. continuous numeric data - strategies for working with continuous, numerical data. https://towardsdatascience.com/understanding-feature-engineering-part-1-continuous-numeric-data-da4e47099a7b. accessed on 08/12/2021.  
+[139] danfeng shan, fengyuan ren, peng cheng, ran shu, and chuanxiong guo. 2018. micro-burst in data centers: observations, analysis, and mitigations. in ieee icnp '18. https://doi.org/10.1109/icnp.2018.00019  
+[140] ahmad shawahna, sadiq m sait, and aiman el-maleh. 2018. fpga-based accelerators of deep learning networks for learning and classification: a review. ieee access 7 (2018), 7823-7859.  
+[141] justine sherry, sylvia ratnasamy, and justine sherry at. 2012. a survey of enterprise middlebox deployments. (2012).  
+[142] anton shilov. [n.d.]. tsmc & broadcom develop 1700-mm2 cowos interposer: 2x larger than reticles. https://www.anandtech.com/show/15582/tsmc-broadcom-develop-1700-mm2-cowos-interposer-2x-larger-than-reticles. accessed on 08/12/2021.  
+[143] hartej singh, ming-hau lee, guangming lu, fadi j kurdahi, nader bagherzadeh, and eliseu m chaves filho. 2000. morphosys: an integrated reconfigurable system for data-parallel and computation-intensive applications. ieee transactions on computers '00 49, 5 (2000), 465–481.  
+[144] giuseppe siracusano and roberto bifulco. 2018. in-network neural networks. arxiv:1801.05731 (2018).  
+[145] arunan sivanathan, hassan habibi gharakheili, franco loi, adam radford, chamith wijenayake, arun vishwanath, and vijay sivaraman. 2018. classifying iot devices in smart environments using network traffic characteristics. ieee transactions on mobile computing '18 18, 8 (2018), 1745-1759. https://doi.org/10.1109/tmc.2018.2866249  
+[146] anirudh sivaraman, alvin cheung, mihai budiu, changhoon kim, mohammad alizadeh, hari balakrishnan, george varghese, nick mckeown, and steve licking. 2016. packet transactions: high-level programming for line-rate switches. in acm sigcomm '16. https://doi.org/10.1145/2934872.2934900
+
+[147] anirudh sivaraman, suvinay subramanian, mohammad alizadeh, sharad chole, shang-tse chuang, anurag agrawal, hari balakrishnan, tom edsall, sachin katti, and nick mckeown. 2016. programmable packet scheduling at line rate. in acm sigcomm '16. https://doi.org/10.1145/2934872.2934899  
+[148] vibhaalakshmi sivaraman, srinivas narayana, ori rottenstreich, shan muthukrishnan, and jennifer rexford. 2017. heavy-hitter detection entirely in the data plane. in acm sosr '17. https://doi.org/10.1145/3050220.3063772  
+[149] mario srouji, jian zhang, and ruslan salakhutdinov. 2018. structured control nets for deep reinforcement learning. in icml '18. pmlr, 4742-4751.  
+[150] arvind k sujeeth, hyoukjoong lee, kevin j brown, tiark rompf, hassan chafi, michael wu, anand r atreya, martin odersky, and kunle olukotun. 2011. optiml: an implicitly parallel domain-specific language for machine learning. in icml '11.  
+[151] jinsheng sun and moshe zukerman. 2007. an adaptive neuron aqm for a stable internet. in international conference on research in networking '07. springer.  
+[152] runyuan sun, bo yang, lizhi peng, zhenxiang chen, lei zhang, and shan jing. 2010. traffic classification using probabilistic neural networks. in ieee icnc '10.  
+[153] tuan a tang, lotfi mhamdi, des mclernon, syed ali raza zaidi, and mounir ghogho. 2016. deep learning approach for network intrusion detection in software defined networking. in ieee wincom '16.  
+[154] mahbod tavallae, ebrahim bagheri, wei lu, and ali a ghorbani. 2009. a detailed analysis of the kdd cup 99 data set. in ieee cisda '09.  
+[155] simon thompson. 2011. haskell: the craft of functional programming. vol. 2. addison-wesley.  
+[156] emanuel todorov, tom erez, and yuval tassa. 2012. mujoco: a physics engine for model-based control. in ieee iros '12.  
+[157] c van rijsbergen. 1979. information retrieval: theory and practice. in proceedings of the joint ibm/university of newcastle upon tyne seminar on data base systems 79.  
+[158] erwei wang, james j davis, ruizhe zhao, ho-cheung ng, xinyu niu, wayne luk, peter yk cheung, and george a constantinides. 2019. deep neural network approximation for custom hardware: where we've been, where we're going. acm computing surveys (csur) '19 52, 2 (2019), 1-39. https://doi.org/10.1145/3309551  
+[159] haining wang, danlu zhang, and kang g shin. 2002. detecting syn flooding attacks. in twenty-first annual joint conference of the ieee computer and communications societies '02, vol. 3. 1530–1539.  
+[160] naigang wang, jungwook choi, daniel brand, chia-yu chen, and kailash gopalakrishnan. 2018. training deep neural networks with 8-bit floating point numbers. in neurips '18.  
+[161] shuo wang, zhe li, caiwen ding, bo yuan, qinru qiu, yanzhi wang, and yun liang. 2018. c-lstm: enabling efficient lstm using structured compression techniques on fpgas. in acm/sigda fpga '18. https://doi.org/10.1145/3174243.3174253  
+[162] keith winstein and hari balakrishnan. 2013. tcp ex machina: computer-generated congestion control. in acm sigcomm '13. https://doi.org/10.1145/2534169.2486020  
+[163] shihan xiao, haiyan mao, bo wu, wenjie liu, and fenglin li. 2020. neural packet routing. in acm netai '20. https://doi.org/10.1145/3405671.3405813  
+[164] xilinx. [n.d.]. alveo u250 data center accelerator card. https://www.xilinx.com/products/boards-and-kits/alveo/u250.html. accessed on 08/12/2021.  
+[165] xilinx. [n.d.]. xilinx: axi reference guide. https://www.xilinx.com/support/documentation/ip-documentation/ug761_axi_reference_guide.pdf. accessed on 08/12/2021.  
+[166] xilinx. [n.d.]. xilinx opennic shell. https://github.com/xilinx/open-nic-shell. accessed on 09/30/2021.  
+[167] xilinx. [n.d.]. xilinx: ultrascale+ integrated 100g ethernet subsystem. https://www.xilinx.com/products/intellectual-property/cmac_usplus.html. accessed on 08/12/2021.  
+[168] zhaoqi xiong and noa zilberman. 2019. do switches dream of machine learning? toward in-network classification. in acm hotnets '19. https://doi.org/10.1145/3365609.3365864  
+[169] francis y yan, jestin ma, greg d hill, deepti raghavan, riad s wahby, philip levis, and keith winstein. 2018. pantheon: the training ground for internet congestion-control research. in usenix atc '18.  
+[170] liangcheng yu, john sonchack, and vincent liu. 2020. mantis: reactive programmable switches. in acm sigcomm '20. https://doi.org/10.1145/3387514.3405870  
+[171] yasir zaki, thomas potsch, jay chen, lakshminarayanan subramanian, and carmelita gorg. 2015. adaptive congestion control for unpredictable cellular networks. in acm sigcomm '15. https://doi.org/10.1145/2785956.2787498  
+[172] sebastian zander, thuy nguyen, and grenville armitage. 2005. automated traffic classification and application identification using machine learning. in ieee lcn '05.  
+[173] jun zhang, chao chen, yang xiang, wanlei zhou, and yong xiang. 2012. internet traffic classification by aggregating correlated naive bayes predictions. ieee transactions on information forensics and security '12 8, 1 (2012), 5-15. https://doi.org/10.1109/tifs.2012.2223675
+
+[174] jun zhang, xiao chen, yang xiang, wanlei zhou, and jie wu. 2014. robust network traffic classification. ieee/acm transactions on networking '14 23, 4 (2014), 1257-1270. https://doi.org/10.1109/tnet.2014.2320577  
+[175] menghao zhang, guanyu li, shicheng wang, chang liu, ang chen, hongxin hu, guofei gu, qianqian li, mingwei xu, and jianping wu. 2020. poseidon: mitigating volumetric ddos attacks with programmable switches. in ndss '20. https://doi.org/10.14722/ndss.2020.24007  
+[176] yaqi zhang, alexander rucker, matthew vilim, raghu prabhakar, william hwang, and kunle olukotun. 2019. scalable interconnects for reconfigurable
+
+spatial architectures. in acm/ieee isca '19. https://doi.org/10.1145/3307650.3322249  
+[177] yaqi zhang, nathan zhang, tian zhao, matt vilim, muhammad shahbaz, and kunle olokotun. 2021. sara: scaling a reconfigurable dataflow accelerator. in acm/ieee isca '21. https://doi.org/10.1109/isca52012.2021.00085  
+[178] hongtao zhong, kevin fan, scott mahlke, and michael schlansker. 2005. a distributed control path architecture for vliw processors. in ieee pact '05.  
+[179] chuan zhou, dongjie di, qingwei chen, and jian guo. 2009. an adaptive aqm algorithm based on neuron reinforcement learning. in ieee icca '09.

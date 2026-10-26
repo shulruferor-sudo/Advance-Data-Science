@@ -1,0 +1,601 @@
+# xda: accurate, robust disassembly with transfer learning
+
+kexin pei*
+
+columbia university
+
+kpei@cs.columbia.edu
+
+jonas guan*
+
+university of toronto
+
+jonas@cs.toronto.edu
+
+david williams-king
+
+columbia university
+
+dwk@cs.columbia.edu
+
+junfeng yang
+
+columbia university
+
+junfeng@cs.columbia.edu
+
+suman jana
+
+columbia university
+
+suman@cs.columbia.edu
+
+abstract—accurate and robust disassembly of stripped binaries is challenging. the root of the difficulty is that high-level structures, such as instruction and function boundaries, are absent in stripped binaries and must be recovered based on incomplete information. current disassembly approaches rely on heuristics or simple pattern matching to approximate the recovery, but these methods are often inaccurate and brittle, especially across different compiler optimizations.
+
+we present xda, a transfer-learning-based disassembly framework that learns different contextual dependencies present in machine code and transfers this knowledge for accurate and robust disassembly. we design a self-supervised learning task motivated by masked language modeling to learn interactions among byte sequences in binaries. the outputs from this task are byte embeddings that encode sophisticated contextual dependencies between input binaries' byte tokens, which can then be finetuned for downstream disassembly tasks.
+
+we evaluate xda's performance on two disassembly tasks, recovering function boundaries and assembly instructions, on a collection of 3,121 binaries taken from spec cpu2017, spec cpu2006, and the bap corpus. the binaries are compiled by gcc, icc, and msvc on x86/x64 windows and linux platforms over 4 optimization levels. xda achieves  $99.0\%$  and  $99.7\%$  f1 score at recovering function boundaries and instructions, respectively, surpassing the previous state-of-the-art on both tasks. it also maintains speed on par with the fastest ml-based approach and is up to  $38\times$  faster than hand-written disassemblers like ida pro. we release the code of xda at https://github.com/cumlsec/xda.
+
+# i. introduction
+
+disassembly is the backbone of many binary analysis tasks, such as malware analysis, reverse engineering, retrofitting control-flow integrity defenses, binary rewriting, and binary instrumentation [20], [40], [50], [51], [55]. binary analysis relies on disassembly to recover higher-level constructs such as
+
+assembly instructions and function boundaries from machine code.
+
+disassembly is difficult because high-level information from symbol tables and source code are absent in stripped binaries. this information is either discarded during compilation or stripped before distribution to decrease program size or deter reverse engineering. therefore, disassemblers must approximate the recovery of higher-level constructs from incomplete information. complex assembly constructs such as inline data and tail calls, further complicate disassembly.
+
+traditional approaches to this problem rely on handcrafted heuristics to guide the recovery, but these methods are inaccurate and brittle [5], [7], [58]. for example, many popular disassemblers, like ida pro and ghidra, recover assembly instructions by recursively following direct control flow transfers (e.g., call 0x2ed4). similarly, they recover function boundaries by looking for known instruction patterns. these heuristics-based methods are insufficient - prior research has shown that ida pro misidentifies up to  $58\%$  of function boundaries [7] and  $4\%$  of assembly instructions [4] in optimized binaries. furthermore, many heuristics for detecting functions require continual manual maintenance of large databases to adapt to code and compiler changes [7]: ida pro's current database for identifying common library functions is over 41mb in size, and ghidra's is over 179mb.
+
+previous research has explored using machine learning (ml) to address these challenges. the resulting models surpassed the accuracy of traditional disassemblers at both recovering assembly instructions [58] and function boundaries [7], [48], and are easier to maintain. however, current ml-based approaches still face two critical challenges:
+
+accuracy. recent research has shown that previous ml-based methods are likely not as accurate as reported [5]. this is because their accuracies were inadvertently measured on testing data with significant overlap with training data, and therefore their performance may not generalize to real-world binaries. more concretely, andriesse et al. [5] showed that the f1 score of byteweight [7] degrades from the reported  $97\%$  to  $65\%$  when evaluated on a dataset without overlap.
+
+robustness. the current most accurate ml approach for recovering function boundaries, bidirectional recurrent neural
+
+![](images/0507f2db28d3b0a0e96c52ab584944f26a3ee2778faf66118eacaf447d12ef8e.jpg)  
+fig. 1. the workflow of xda. we first pretrain the model with the masked lm task, and then finetune the pretrained model with new stacked nn layers for disassembly tasks. finetuning updates both the pretrained model and the stacked layers. during inference, the finetuned models takes the binary and output disassembly information, depending on the finetuned tasks.
+
+net (bi-rnn) [48], is not robust to compiler optimization changes (see section vii-b). similar concerns have also been raised by wang et al. [56], who proposed a more robust method by combining ml with symbolic execution. however, this method does not scale well to larger binaries.
+
+in this paper, we present xda (xfer-learning disassembler), a new ml-based disassembly framework that uses transfer learning to address these challenges. we train and evaluate xda on 3,121 binaries, and separate the testing and training data such that they have minimal overlap (less than  $3\%$ ). we show that xda outperforms all state-of-the-art tools in accuracy at recovering function boundaries and assembly instructions, and is robust to changes in compiler optimization. additionally, xda's speed is on par with the fastest tools.
+
+our key insight is to teach the ml model general dependencies between bytes in machine code before training it to perform specific disassembly tasks - we transfer its learned knowledge of these byte dependencies to tackling disassembly. intuitively, we first teach our model to read and gain a basic understanding of machine code and then teach it to solve a disassembly task. we achieve this by splitting our training into two stages, as shown in figure 1. in the first stage, we pretrain our model using masked language modeling (masked lm) to teach it the byte dependencies of x86/x64 machine code. in the second stage, we finetune our model to leverage its knowledge of byte dependencies to solve a specific disassembly task accurately and robustly.
+
+the masked lm task asks the model to predict randomly masked bytes, which requires the model to produce missing bytes given the context. this design compels the model to learn dependencies between the masked byte and surrounding bytes, teaching the model a basic understanding of machine code semantics. as we will show in section vii, this understanding improves not only the model's accuracy but also its robustness to compiler and optimization changes. in contrast, previous ml approaches rely on superficial patterns, such as function prologues, which limits their accuracy and robustness when
+
+such patterns are absent or changed. an additional benefit is that the masked byte prediction task does not require labeled data. therefore, xda can be further trained and improved using stripped binaries found in the wild.
+
+we give some intuition on why the masked lm task is helpful for disassembly. consider a function that uses  $0 \times 28$  bytes of stack space for local variables. to allocate this space, the function uses sub rsp,  $0 \times 28$  to decrement the stack register by  $0 \times 28$  bytes. now assume the byte  $0 \times 28$  is masked, like so: sub rsp, ??. to predict the value of this masked byte, our pretrained model learns to search for the corresponding stack deallocation instruction (add rsp,  $0 \times 28$ ) and read its value (see section viii-b for more details). since stack allocation/deallocation often occurs near the start/end of a function, the knowledge of this dependency is a helpful feature for identifying function boundaries. such scenarios that naturally occur in predicting randomly masked bytes, in sum, teaches the model a powerful, general understanding of machine code semantics that helps disassembly.
+
+to evaluate xda's performance, we test it on 3,121 linux and windows x86/x64 binaries taken from the spec cpu2017 [14], spec cpu2006 [15] benchmark suites and the bap corpus [7]. these binaries are compiled using the gnu compiler collection (gcc), intel c++ compiler (icc), and microsoft visual c++ (msvc) over 4 optimization levels (00-03 for gcc and icc, 01, 02, 0d, 0x for msvc). we choose two popular disassembly tasks, recovering function boundaries and assembly instructions, to test our model's performance, but xda can be easily finetuned for other disassembly and binary analysis tasks. across these binaries, xda achieves  $99\%$  f1 score at recovering function boundaries,  $17.2\%$  higher than the second-best tool. xda also achieves a  $99.7\%$  f1 score at recovering assembly instructions. furthermore, xda's underlying neural architecture is highly parallelizable and efficient, running up to  $38\times$  faster than handwritten disassemblers like ida pro.
+
+we also evaluate the robustness of xda to the changes of
+
+compiler optimizations. xda achieves at least  $98.5\%$  f1 score at recovering function boundaries in highly optimized binaries, even when it is only finetuned on unoptimized binaries.
+
+we make the following contributions.
+
+- we propose a new approach to disassembly using a two-step transfer learning paradigm: we first pretrain the model to teach it a basic understanding of machine code, then finetune it to solve disassembly tasks.  
+- we demonstrate that masked lm is an effective pretraining task for disassembly because it compels the model to learn machine code semantics (section iii). we then show how this semantic knowledge can be leveraged in finetuning to accurately and robustly solve two popular disassembly tasks, recovering function boundaries and assembly instructions.  
+- we implement xda and evaluate it on a collection of x86/x64 binaries from the spec cpu2017, spec cpu2006, and bap dataset on both the windows and linux platforms (sections vi and vii). the binaries are compiled by gcc, icc, and msvc over 4 optimization levels. even when the pretraining, fine-tuning, and testing datasets are strictly separated, xda achieves an average f1 score of  $99.0\%$  at recovering function boundaries, outperforming the state-of-the-art by  $17.2\%$ , and an average f1 score of  $99.7\%$  at recovering assembly instructions. we open-source our implementation at https://github.com/cumlsec/xda.
+
+# ii. background
+
+we briefly overview the two disassembly tasks we tackle, recovering function boundaries and assembly instructions, two fundamental building blocks in binary analysis research [4]. we then describe their challenges faced by existing tools using real-world examples.
+
+the definition of disassembly can be ambiguous, as some authors refer only to the process of recovering instructions from binaries [8], [36], [58]. we adopt the more inclusive interpretation defined by andriesse et al. [4], [5]: disassembly is the process of recovering higher-level program constructs lost during compilation, such as assembly instructions, function boundaries, function signatures, and control flow graphs.
+
+most disassembly tools recover these constructs via static analysis, because dynamic analysis has large runtime overheads and struggles to achieve high completeness in complex programs. therefore, we also limit our methods to operate on information acquirable without executing the program.
+
+# a. recovering function boundaries
+
+the task of recovering function boundaries consists of identifying the matched start and end addresses of each function in a stripped binary. we inherit the formal definition of this task by bao et al. [7]: given a binary that contains a set of functions  $f = \{f_1, f_2, \dots, f_n\}$ , recover a set of function start and end address pairs  $s = \{(s_1, e_1), (s_2, e_2), \dots, (s_n, e_n)\}$  such that for all  $f_i \in f$ ,  $s_i$  is the address of the first byte of  $f_i$  and  $e_i$  marks the end of  $f_i$  (the first byte not contained in  $f_i$ ).
+
+recovering function boundaries from stripped binaries is one of the most challenging disassembly tasks [4], [7], [18], [26], [32], [49], [50], [54]. functions are source-level constructs but decay to simple control-flow transfer at the machine code level, and symbol tables containing function information are removed. compiler optimizations exacerbate the problem by removing indicative structures such as function prologues. for disassemblers operating on recovered assembly instructions instead of machine code, an additional concern is functions whose instructions are not recovered cannot be identified.
+
+# b. recovering assembly instructions
+
+the task of recovering assembly instructions consists of identifying the bounds of each individual assembly instruction within the code sections of a stripped binary.
+
+the main difficulty of recovering assembly instructions comes from distinguishing inline data from code via static analysis [36]. architectures like x86 and x64 have variable-length instructions and do not make syntactic distinctions between inline data and code [8], [58]. however, compilers such as msvc interleave data with code for code efficiency. in the worst case, the only difference between data and code at the machine code level is that code bytes are reachable at runtime. therefore, perfectly recovering assembly instructions from x86 and x64 binaries is undecidable [57], [58]. mistakenly parsing a data byte as the start of a multi-byte instruction can desynchronize the disassembled instruction stream alignment, propagating the error forward [4].
+
+# c. challenging cases
+
+we use code snippets from vim 8.2 compiled by msvc 2019 to demonstrate some challenges faced by heuristic-based approaches. this serves primarily as a motivating example. for a more thorough listing of challenging disassembly cases, we refer interested readers to andriesse et al. [4].
+
+traditional disassemblers rely on heuristics to recover function boundaries and assembly instructions, requiring data such as control flow information and function prologues/epilogues, which restricts their accuracy and robustness. for example, figure 2 shows the linear disassembler objdump and the recursive traversal disassembler ghidra failing to disassemble a section of code. objdump misinterpreted a jump table as instructions, whereas ghidra missed an entire function of code. similarly, in figure 3 ida pro and bi-rnn fail to recognize a function when the compiler optimization is increased, removing the function prologue.
+
+in contrast, xda correctly recovers all instructions and functions in this code. the key to this success is xda's transfer learning approach, which enables it to capture general patterns that match real program dependencies and semantics. we provide the intuition behind this in the following section.
+
+# iii. overview of our approach
+
+we have shown xda's workflow of pretraining and finetuning in figure 1. in this section, we describe how the pretraining task, masked lm, compels the model to learn machine code dependencies that could support many downstream disassembly tasks. although formally proving such claims remains an open
+
+![](images/50181e70ab6953ade631c3cd12aff83ecebb964275c9e268789bc5b2c6ae029c.jpg)  
+fig. 2. real-world example that fails objdump and ghidra. the ground truth assembly instructions include (1) a jump table in the code section that objdump cannot identify, and (2) a function reached via an indirect control flow transfer that ghidra cannot statically determine.
+
+![](images/5f8fc1f40eb2f0d93ab60bc4a65b8acb6f3f5abb39097957f50e0951c914f141.jpg)  
+fig. 3. both ida pro and bi-rnn recognized this function when it was not optimized (o1), but failed to recognize it in higher optimization (o2) when the function prologue is optimized away.
+
+question [6], we sketch two intuitive cases below to motivate why predicting masked bytes teaches the model machine code semantics that helps disassembly. we include the more complete details in sections viii-a.
+
+recall the definition of the masked lm pretraining task: given a byte sequence, we mask out some random bytes, and train the model to predict the masked bytes using the non-masked bytes. the non-masked bytes are known as the contextual information. we use two examples to show that pretraining with masked lm allows a model to thoroughly understand properties of machine code, aiding recovery of function boundaries and assembly instructions.
+
+masking local variable allocation. consider the code snippet in figure 3, where we mask four bytes (48 83 ec 28), representing sub rsp,  $0 \times 28$  that decrements the stack pointer to allocate 40 bytes for local variables. unlike the example described in section i, the model does not have access to the corresponding stack deallocation instruction. we found that our model still correctly predicts the four bytes with high confidence, which implies the model understands the semantics of stack allocation and can deduce the space required by local variables by looking at the surrounding bytes in the function body. besides, the understanding of
+
+such semantics can significantly help in recovering function boundaries, because the function prologue strongly indicates a function start. section vii-e shows pretraining with such tasks improves the results by  $50\%$  at recovering function boundaries.
+
+masking jump table entries. now consider the jump table example in figure 2, where we mask out the jump table entry 77 33 13 00. we find that our model correctly predicts the four bytes with high confidence, which indicates it learns to distinguish inline data from code. for example, if it treats the masked bytes as instructions (like those disassembled by objdump shown on the right), it is highly unlikely for the model to predict 77 33 (the ja instruction) right after the instructions ret; nop. the reason is that compiler-generated byte code (xda's training data) rarely places a conditional jump like ja, which depends on flags set by cmp or test, after an nop. therefore, the model should understand the masked bytes are part of the inline data section, which should be similar to the following (as opposed to the preceding) bytes corresponding to other jump table entries.
+
+to confirm that the model is not simply memorizing the byte order in vim, we remove all vim binaries (shown in figures 2 and 3) from the training set. therefore, the model's high accuracy strongly indicates that the semantics described above is captured in the pretraining process.
+
+# iv. threat model
+
+robustness. we focus on binaries generated by standard compilers. like other disassemblers, we do not aim to be robust in the presence of arbitrarily obfuscated code. instead, we aim to be robust against compiler changes, which often occur due to improvements in optimization. in section vii-b, we evaluate the robustness of our model by testing it on binaries compiled on higher optimization levels than the model is trained on.
+
+false positives and negatives. like most disassemblers, we assume a small number of false positives and negatives can be tolerated. certain use cases in binary rewriting require recovered instructions to contain strictly no false positives or no false negatives; we do not enforce these requirements.
+
+![](images/4adc61b3826dd4fcc11afbc40a2b25ad47de2d1600e82308a08198c81e00386f.jpg)  
+(a) xda architecture  
+fig. 4. architectural differences between xda and bi-rnn used by shin et al. [48]. two key distinguishing components of xda are: (1) the pretraining (masked lm) steps, and (2) self-attention connections between arbitrary tokens instead of only between neighbors.
+
+![](images/193f3c62598a266609d7a71b552e3ac4de0c67c2fbadbc36527dd67b622e9626.jpg)  
+(b) bi-rnn architecture [48]
+
+# v. methodology
+
+we describe the design specifics of xda, including the key components of the architecture and workflow of pretraining and finetuning. we then elaborate on the technical details in the following subsections.
+
+general design. figure 4 shows the simplified architecture of xda and bi-rnn [48] and their example input-output. it highlights xda's two key design differences with a typical ml-based technique, bi-rnn [48]. the first is the employment of a pretraining task. as discussed in section iii, this design encourages the model to learn machine code contextual dependencies helpful for many binary analysis tasks.
+
+second, we employ self-attention layers [53] in the model to compute information flow between every pair of bytes. specifically, we follow the encoder architecture in transformer [53] with several modifications (section v-a). this design is shown more capable than the sequential connections in rnns in capturing long-range dependencies between distant bytes. as we will show in section viii, the model often needs to learn and understand long-range dependencies in the binaries to recover functions boundaries and instructions accurately.
+
+input representation. formally, we define the input  $x$  as a sequence of byte tokens of size  $n$ :  $x = \{0 \times 00, \dots, 0 \times f\}^n$ . each input byte  $x_i \in x$  is represented as a one-hot encoded vector (e.g., a3 is encoded as a 256-dimensional vector with all 0s but single 1 at position 163). besides 256 possible byte values, the input vocabulary has 5 additional reserved tokens (i.e., padding  $<\mathrm{pad}>$ , start-of-sequence  $<s>$  and end-of-sequence  $</s>$ , unknown  $<\mathrm{unk}>$ , and mask  $<\mathrm{mask}>$ ). also, note that here we do not put constraints on  $n$ . for example, the byte sequences can span multiple binary programs, or include only a subset of byte sequence within a single binary.
+
+pretraining task. we pretrain the model using the masked lm objective. formally, for each byte sequence  $x_{1}, \ldots, x_{n}$  in a given training set, we mask out some percentage of byte tokens in each sequence randomly (see section v-c for details). the
+
+masked byte tokens are replaced by the mask tokens (<mask>).
+
+let  $\text{mask}(x_i)$  denote the output of applying the mask on the  $i$ -th byte in  $x$  and  $mpos$  a set of masked byte's positions in  $x$ . the model to be pretrained,  $f_p$ , will take as input the byte sequence with random bytes masked:  $(x_1, \dots, \text{mask}(x_i), \dots, x_n), i \in mpos$ , and predicts the byte values of the masked tokens:  $\{\hat{x}_i | i \in mpos\} = f_p(x_1, \dots, \text{mask}(x_i), \dots, x_n)$ . let  $f_p$  be parameterized by  $\theta$  ( $f_p(-; \theta)$ ), the objective of training  $f_p$  is thus to search for  $\theta$  that minimizes the cross entropy loss between the predicted masked bytes and the actual bytes. for ease of exposition, we omit summation over all samples in the training set.
+
+$$
+\underset {\theta} {\arg \min } \sum_ {i = 1} ^ {| m p o s |} - x _ {i} \log \left(\hat {x} _ {i}\right) \tag {1}
+$$
+
+while the pretrained model's input and output are one-hot encoded byte tokens, all of its intermediate layers operate on the embedding vectors. for each byte  $x_{i}$ , let  $e_{1,i}$  denote its embedding after 1-st layer, the embeddings produced by the  $l$ -th layer of the model is  $e_{l} = (e_{l,1},\dots,e_{l,n})$ . let layer  $l$  be the  $f_{p}$ 's last layer;  $e_{l}$  is not the actual outputs of  $f_{p}$ , as  $f_{p}$  will take  $e_{l}$  and stack a classification layer (e.g., softmax) to predict the value of the byte tokens. given the produced embeddings  $e_{l}$ , we define finetuning tasks in the following.
+
+finetuning tasks. given a sequence of embedding vectors produced by the pretrained model  $e_{l} = (e_{l,1},e_{l,2},\dots,e_{l,n})$ , the corresponding ground truth  $y$  in our finetuning task is a sequence of labels of same length  $n$ :  $\{y_i|y_i\in c_y\} ^n$ , where  $c_y$  denote the set of all possible class labels of  $y$ . each byte embedding  $e_{l,i}$  will be mapped to a label  $y_{i}$ .
+
+let  $f_{t}$  denote the model to be finetuned. it takes as input each byte embedding  $e_{l,i}$ , and predicts the label  $\hat{y}_i$ , where  $\hat{y}_i = f_t(e_{l,i})$ . now let  $f_{t}$  be parameterized by  $\theta$ :  $f_{t}(e_{l,i};\theta)$ , the objective of training  $f_{t}$  is thus to search for  $\theta$  that minimizes the cross entropy between the predicted labels of all byte embeddings and their actual labels:
+
+$$
+\underset {\theta} {\arg \min } \sum_ {i = 1} ^ {n} - y _ {i} \log \left(\hat {y} _ {i}\right) \tag {2}
+$$
+
+as both  $f_{p}$  and  $f_{t}$  in our setting are neural networks, solving equations 1 and 2 can be efficiently guided by gradient descent via backpropagation. the gradient can flow through both  $\theta$ s in  $f_{p}$  and  $f_{t}$  during finetuning, as  $f_{p}$  is also part of the computation of  $\hat{y}_{j}^{(i)}$ . thus, the pretrained parameters in  $f_{p}$  also get updated during finetuning to adjust for specific downstream tasks.
+
+as a concrete example, consider recovering function boundaries. the possible class labels  $c_y = \{s, e, n\}$  denote the function start  $(s)$ , end  $(e)$ , and neither  $(n)$ .  $f_t$  takes each byte embedding as input and produces the probability distributions of three possible labels, where the predicted label will be the one with the highest probability. this is illustrated in figure 4a.
+
+# a. masked language model on binaries
+
+as illustrated in figure 4a, the forward pass within the xda's architecture consists of the following steps.
+
+first, xda embeds the one-hot vectors of each input byte (both masked and not masked) as a fixed-dimension embedding vector. what is not shown in figure 4a is that xda also computes the positional embeddings, which encode the position of each byte within the sequence as another vector that has the same size with the byte embeddings. the rationale of using the positional embeddings is to assign distinctive meanings to the same byte tokens appearing in different locations within the sequence. note that in recurrent-based networks, such spacial relationship is naturally encoded as the information flow follows the order in the input sequence [53]. two embeddings (i.e., byte embeddings and positional embeddings) are then combined as the actual embeddings of input for the next layer.
+
+xda then employs multi-head self-attention to update the embeddings. at each self-attention layer, each embedding combines itself with a weighted sum of all other embeddings, where the attention strength determines the weight.
+
+finally, xda predicts the byte values of masked bytes based on its updated embeddings in the last layer. to this end, xda stacks a 2-layer fully-connected network with the output dimension equal to the input vocabulary size. the updated embedding here is known as contextualized embedding [17], [34], [35], [41], [42] as it takes into account the information of other byte tokens within the sequence.
+
+in the following, we elaborate on the key concepts described above. we will use the same notations defined in section v wherever they are applicable.
+
+byte position embeddings. the position of each input byte is critical for inferring binary semantics. unlike natural language, where swapping two words can roughly preserve the same semantic meaning, swapping two bytes can significantly change the instructions. therefore, we use the learned positional embedding  $e_{pos}$  (embedding matrix itself is learnable) and stack a feedforward network  $f$  with one hidden layer to combine  $e_{pos}$  with byte embeddings  $e_{byte}$ . specifically, let  $e_{byte}(x)$  denote applying the embedding to the one-hot encoded byte token  $x_i$ , and let  $e_{pos}(i)$  denote applying the learned positional embedding to  $x_i$ 's position  $i$ , we have:  $e_{1,i} = f(\text{concat}(e_{byte}(x_i), e_{pos}(i)))$ . as defined in section v,  $e_{1,i}$  here refers to the embedding of  $x_i$  in the 1st attention layer.
+
+multi-head self-attention. given the embeddings of all bytes in  $k$ -th layer,  $(e_{k,1},\dots,e_{k,n})$ , the core operations of a single attention head in self-attention layer is to update each embedding by the following steps.
+
+first, each embedding  $e_{k,i}$  will get mapped to three values following query-key-value computation:  $query_i = f_query(w_query; e_{k,i})$ ,  $key_i = f_key(w_key; e_{k,i})$ ,  $value_i = f_value(w_value; e_{k,i})$ . here  $f_query$ ,  $f_key$ , and  $f_value$  are affine transformation functions (i.e., a fully-connected layer) parameterized by  $w_query$ ,  $w_key$ , and  $w_value$ , respectively.
+
+each embedding  $e_{k,i}$  then computes attention score  $s_{ij}$  with all other embeddings  $e_{k,\{j|j\neq i\}}$  by taking the dot product between the  $e_{k,i}$ 's query  $query_i$  and  $e_{k,j}$ 's key  $key_j$ :  $s_{ij} = query_i \cdot key_j$ . intuitively, attention scores  $s$  for all pairs will end up as a square matrix, where each cell  $s_{ij}$  indicates how much attention  $e_{k,i}$  should pay to  $e_{k,j}$  when updating itself. we then divide every row of  $s$  by  $\sqrt{d_{emb}}$  (the dimension of the embedding vectors) and scale it by softmax to ensure
+
+them sum up to 1:  $s_{ij}' = \frac{\exp(s_{ij})}{\sum_{j=1}^{n} \exp(s_{ij})}$ . the scaled attention score  $s_{ij}'$  will be multiplied with  $value_j$  and summed up:  $e_{k+1,i}^h = \sum_{j=1}^{n} s_{ij}' v_j$
+
+here  $h$  in  $e_{k+1,i}^h$  denote the updated embeddings belong to attention head  $h$ . assume we have total  $h$  attention heads, the updated embeddings will finally go through an 2-layer feedforward network  $f_{out}$  parameterized by  $w_{out}$  with skip connections [27] to update embeddings from all heads:  $e_{k+1,i} = f_{out}(\text{concat}(e_{k+1,i}^0, \dots, e_{k+1,i}^h); w_{out})$ .
+
+contextualized embeddings. the multi-layer attention mechanism updates its embeddings iteratively up to the last layer. the embeddings at each self-attention layer are known as contextualized (or context-aware) embeddings. one significant feature of contextualized embeddings is that the underlying meaning of each embedding depends on the other tokens in the input sequence. so the embeddings for the same byte token can be different if the byte is in a different context (surrounded by different bytes). this is in contrast with static embeddings (e.g., word2vec [35]) commonly used by other related works (e.g., learn binary embeddings [19], [21]), where a byte token is always assigned to the same fixed embedding regardless of the changed context (i.e., surrounding bytes).
+
+# b. distilling the learned semantics
+
+the examples in section iii motivate how pretraining on masked lm task encourages learning semantics. however, they are all implicitly embedded in the weight parameters of the underlying neural network. to distill the learned semantics for different downstream tasks, we leverage the contextualized embeddings produced by the pretrained model's last layer and stack a simple 2-layer multi-layer perceptron (mlp) for prediction. explicitly, for each embedding  $e_{l,i}$  in the last layer, we fix the network to perform the following computation:  $mlp(e_{l,i}) = \text{softmax}(\tanh(e_{l,i} \cdot w_1) \cdot w_2)$ . here  $w_1 \in \mathbb{r}^{d_{emb} \times d_{emb}}$  and  $w_2 \in \mathbb{r}^{d_{emb} \times |c_y|}$  where  $|c_y|$  is the number of output classes (defined in section v). note that we apply mlp to each byte embedding. therefore, the output of mlp is of shape  $\mathbb{r}^{n \times |c_y|}$ , where  $n$  is the length of the input sequence.
+
+# c. masking input bytes
+
+for each input sequence in pretraining, we choose  $20\%$  random bytes to mask. among the chosen bytes, we select  $50\%$  of them to be replaced by the special token  $\langle \text{mask} \rangle$ . for the remaining  $50\%$  of the masked bytes, we replace with random bytes in the vocabulary  $\{0 \times 00, \dots, 0 \times f f\}$ . the reason of not replacing all chosen bytes by  $\langle \text{mask} \rangle$  is that, in the finetuning task, there is no such token. therefore, we try to prevent the model from discovering any spurious meanings of the  $\langle \text{mask} \rangle$  token itself, but encourage the model to focus on using the context to predict the masked tokens.
+
+for the same input sequences at different epoch, we rerandomize the bytes to mask instead of fixing the same set of masked bytes throughout different epochs. therefore, we implement a dynamic masking scheme and do not apply masking in the data preprocessing stage.
+
+table i. general statistics of all binaries and performance of xda on all binaries (discussed in section vii-a). the byte sequences are of length 512 (see appendix section a). we use  ${10}\%$  of the binaries for training (in finetuning) across all datasets and the corresponding train-test overlap rate is shown in each row.  
+
+<table><tr><td>dataset</td><td>total # binaries</td><td>platform</td><td>compiler</td><td>isa</td><td># binaries</td><td># bytes</td><td># byte sequences</td><td>train-test overlap</td></tr><tr><td rowspan="4">spec 2017</td><td rowspan="4">588</td><td rowspan="2">linux</td><td rowspan="2">gcc-9.2</td><td>x86</td><td>120</td><td>198,019,576</td><td>386,757</td><td>0.001%</td></tr><tr><td>x64</td><td>224</td><td>464,906,401</td><td>908,021</td><td>0.2%</td></tr><tr><td rowspan="2">windows</td><td rowspan="2">msvc-2019</td><td>x86</td><td>88</td><td>175,057,814</td><td>341,910</td><td>0.93%</td></tr><tr><td>x64</td><td>156</td><td>955,201,152</td><td>1,865,628</td><td>0.97%</td></tr><tr><td rowspan="4">spec 2006</td><td rowspan="4">333</td><td rowspan="2">linux</td><td rowspan="2">gcc-5.1.1</td><td>x86</td><td>90</td><td>55,637,428</td><td>108,667</td><td>0.002%</td></tr><tr><td>x64</td><td>95</td><td>74,006,029</td><td>144,543</td><td>0%</td></tr><tr><td rowspan="2">windows</td><td rowspan="2">msvc-2019</td><td>x86</td><td>76</td><td>40,417,016</td><td>78,940</td><td>0.36%</td></tr><tr><td>x64</td><td>72</td><td>48,403,456</td><td>94,538</td><td>0.21%</td></tr><tr><td rowspan="4">bap</td><td rowspan="4">2,200</td><td rowspan="2">linux</td><td rowspan="2">gcc-4.7.2 &amp; icc-14.0.1</td><td>x86</td><td>1,032</td><td>138,547,936</td><td>270,602</td><td>1%</td></tr><tr><td>x64</td><td>1,032</td><td>145,544,012</td><td>284,266</td><td>1.1%</td></tr><tr><td rowspan="2">windows</td><td rowspan="2">msvc-2010 &amp; 2012 &amp; 2013</td><td>x86</td><td>68</td><td>29,093,888</td><td>56,824</td><td>0.4%</td></tr><tr><td>x64</td><td>68</td><td>33,351,168</td><td>65,139</td><td>2.3%</td></tr></table>
+
+# vi. implementation and experimental setup
+
+we build the learning module of xda in pytorch 1.4.0 with cuda 10.1 and cuda7.6.3. we implement the self-attention architecture using fairseq toolkit [39]. we run the training and inference of our models on a linux server running ubuntu 18.04, with an intel xeon e5-2623 at  $2.60\mathrm{ghz}$  with 16 virtual cores including hyperthreading, 256gb ram, and 3 nvidia gtx 1080-ti gpus.
+
+datasets. table i summarizes the datasets we use for training and evaluating xda. the first dataset is spec cpu2017 [15], the updated version of spec cpu benchmarks. it includes 39 c/c++/fortran compute-intensive programs. we compile each program using 2 compilers, gcc-9.2 and msvc 2019 on linux and windows, respectively. each compiler compiles the program on 2 isas (x86 and x64) with respective 4 optimization levels (e.g., 01, 02, 0x, 0d for msvc, and 00-03 for gcc/icc). due to various constraints (e.g., some speed testing programs do not support x86), we cannot compile all programs using all optimization flags. in total, we have 588 compiled binaries for spec cpu2017.
+
+the second dataset is spec cpu2006 [15], the former generation of spec benchmarks. it includes  $19\mathrm{c} / \mathrm{c} + + /$  fortran programs. we follow the same configurations as andriesse et al. [4] to compile spec cpu2006 so that we can easily obtain the ground truth for function and instruction boundaries. for example, we use the legacy gcc-5.1.1 to compile on linux platforms. however, the windows compilation and configuration are not available and no longer maintained after we have contacted the authors. therefore, we use msvc 2008 on a windows xp virtual machine to compile the binaries for the windows platform. to compensate for relatively small number of available binaries comparing to spec cpu2017, we turn on one extra optimization flag in gcc (os), just to enlarge the pretraining dataset and introduce more byte patterns. as the default installations of gcc-5.1.1 and msvc 2008 cannot compile certain legacy programs in spec cpu2006, we have in total 333 compiled binaries.
+
+the third dataset is from bap corpora [7]. it includes 2,200 compiled binaries where 136 popular open-source programs (e.g., vim) are on windows platform, and the remaining 2,064 elf binaries (from coreutils, binutils, and findutils packages) are compiled on linux platform. both sets are further divided equally into x86 and x64 binaries.
+
+baselines. we use ida pro v7.4 [47], ghidra v9.1 [2], and objdump as baselines. we also compare xda with the other two research prototypes that achieve state-of-the-art results on recovering function boundaries. the first one is nucleus [5], which is based on the control-flow analysis. the second one is from shin et al. [48], who designed a bi-rnn [48] to recover function boundaries. since shin et al. did not release their source code, we re-implement bi-rnn in pytorch following the same setup described in their paper. specifically, we adopt the 2-layer architecture with 16 hidden layer size, which reportedly achieves the best result.
+
+label collection. we collect the ground truth labels for function boundaries and assembly instructions using the debug symbols and source code of the binaries. (1) to get function boundaries for windows binaries, we parse pdb files using dia2dump [33]. for linux binaries, we parse dwarf information using the pyelftools [9]. like bao et al. [7] and many disassemblers, we do not count thunks in windows binaries and trampolines in the .plt section of linux binaries as functions. we remove thunks and trampolines from the outputs of function recovery tools that count them as functions, to ensure that they are not inadvertently seen as false positives. (2) to get assembly instructions, we collect instruction boundaries as our ground truth, rather than the instructions themselves. this allows us to modularize the design of our model. given the instruction boundaries, we can then deterministically map the bytes in each boundary to their corresponding instruction. to collect the instruction boundaries, we use source-level information to guide a linear disassembler to get the labels for most bytes, and then manually analyze the remaining bytes [4]. the linear disassembler we use is the capstone library [43].
+
+metrics. both tasks (i.e., recovering functions and instructions) have the imbalanced label problem. for example, the number of function boundaries (both start and end) in the spec cpu2006 dataset accounts for only  $1.05\%$  of the total number of bytes. a predictor that always outputs "not boundary" can achieve a  $98.95\%$  accuracy. therefore, we use alternative metrics, described in the following.
+
+precision, recall,  $f1$  score. we use precision  $(p)$ , recall  $(r)$ , and  $f1$  score to measure the actual performance of xda and all other tools. consider recovering function boundaries. let  $tp$  (true positive) denote the number of correctly predicted (e.g., function) boundaries,  $fp$  denote the number of incorrectly
+
+predicted boundaries,  $fn$  denote the number of incorrectly predicted not-boundaries, and  $tn$  denote the number of correctly predicted non-boundaries.  $p = tp / (tp + fp)$ ,  $r = tp / (tp + fn)$ , and  $f1 = 2 \cdot p \cdot r / (p + r)$ .
+
+perplexity. we use perplexity (ppl) to evaluate the masked lm pretraining task, which intuitively measures how "confused" the model is about the masked bytes being equal to the ground truth bytes. the less confused is the model, the smaller the perplexity. specifically,  $ppl = 2^{-\frac{1}{n}\sum \log(p(x))}$ . here  $p(x)$  is the probability produced by the pretrained model on the masked byte  $x$  of being the ground-truth byte value. the summation applies to all the masked bytes. the smallest perplexity is thus 1 when the model is  $100\%$  certain  $p(x) = 1$ .
+
+train-test overlap rate. we use the train-test overlap rate of the dataset to quantify the introduced learning difficulties. the intuition is that it is easier for an ml model to achieve good testing performance if the testing samples also appear in the training set. we define the train-test overlap rate as the percentage of overlapping byte sequences between testing and training. particularly, we measure the percentage of test byte sequences that appear in the training set. this percentage reflects how challenging the test set is, as the model cannot just memorize all sequences for predicting the masked bytes [5].
+
+pretraining setup. to strictly separate the binaries used for pretraining, finetuning, and testing, we pretrain xda on pairs of datasets shown in table i, and finetune on the third dataset. for example, all reported results of spec cpu2017 in table ii are finetuned (detailed in the following) on the model pretrained on spec cpu2006 and bap.
+
+note that pretraining does not get access to any labeled data of any downstream task (e.g., disassembled instructions or function boundaries). therefore, the common practice in transfer learning is often to pretrain on large-scale corpora that can potentially include the finetuning data (without labels) [16], [17], [24], [44]. however, in our evaluation, we strictly keep all pretraining, finetuning, and testing data separated to ensure that no testing binaries in finetuning are shared across the training dataset even though it is unfair to us.
+
+we pretrain models for each dataset pairs (described above) for 10 epochs. we hold out 4 binaries, each randomly selected from windows x86, windows x64, linux x86, and linux x64, respectively, as our validation set. we keep the pretrained model weights that achieve the best validation ppl and load its copy for finetuning experiment.
+
+finetuning setup. for finetuning each subset of binaries (i.e., in each row of table i), we randomly choose only  $10\%$  of the dataset as our training set and treat the remaining binaries as the testing set. as opposed to the typical train-test split, where the training set is often larger than the testing set, our setting creates a very challenging scenario for ml. it increases the possibility that a large portion of test byte sequences and their underlying patterns do not appear in the training data.
+
+as andriesse et al. [5] argue, one limitation of the bap dataset is that duplicated functions are prevalent. consequently, high accuracy for recovering function boundaries (e.g., birnn [48]) can be trivial to achieve on the bap dataset. our setting of using a small fraction of data as training mitigates this issue. for example, in table i, the highest train-test overlap
+
+rate is not more than  $3\%$ . besides, on other datasets (spec cpu2017 and cpu2006) we have evaluated, the duplicated functions are much less (we do not statically link the libraries when compiling the program, and spec programs are collected from diverse domains).
+
+we run 30 epochs for both finetuning xda and training bi-rnn. we observe that xda converges after 5 epochs of finetuning, but we selected 30 epochs for a fair comparison with bi-rnn, which often takes around 20 epochs to converge. as shin et al. [48] trains their model for 2 hours on a cpu, another reason we choose 30 epochs to train bi-rnn is that we find 30 training epochs consumes at least 2 hours on our cpus for all datasets.
+
+# vii. evaluation
+
+our evaluation aims to answer the following questions.
+
+rq1: how accurate is xda in recovering function boundaries and instructions compared to other tools?  
+- rq2: how robust is xda under different platforms, compilers, architectures, and optimizations, compared to other tools?  
+rq3: how fast is xda compared to other tools?  
+- rq4: how efficient is xda in terms of saving labeling effort and training epochs compared to other tools?  
+rq5: how effective is pretraining, and how does it help finetuning tasks?
+
+# a. rq1: accuracy
+
+we first evaluate how accurate xda is for the tasks of recovering function boundaries and assembly instructions.
+
+overall result. table ii shows that, on average, xda achieves an f1 score of  $99\%$  on recovering function boundaries,  $17.2\%$  better than the second-best tool, and  $99.7\%$  on recovering assembly instructions, outperforming all other tools across all platforms, isas, compilers, datasets, and number of training and testing binaries.
+
+we note that the linear disassembler objdump achieves a high f1 score at recovering instructions. even though it might seem counter-intuitive, the high f1 score results from the fact that objdump naively disassembles all bytes as code, making no attempt to identify inline data. since inline data only account for a tiny fraction of bytes (usually  $< 1\%$ ), simply disassembling every byte as instruction is sufficient to achieve a high f1 score [4]. objdump achieves a perfect f1 score on binaries compiled by gcc, because gcc does not generate inline data. however, objdump cannot handle the hard cases, but achieves a high f1 score because the hard cases are rare. to handle inline data, the recursive traversal disassemblers ida pro and ghidra act more conservatively, which sacrifice their accuracy in easier cases and result in lower f1 scores. in contrast, xda can both identify inline data, such as jump tables (see section viii for details), and maintain a high f1 score.
+
+in figure 5, we show in further detail that xda outperforms other tools by even greater margin at recovering function boundaries, when tested on high optimization levels (o3 for
+
+table ii. results on recovering function boundaries averaged over all compier optimization levels. for results on recovering instructions, we compute on the highest optimization levels considering lower optimization levels are too simple for all tools.  
+
+<table><tr><td rowspan="2">dataset</td><td rowspan="2">platform</td><td rowspan="2">isa</td><td colspan="5">recovering function boundaries f1 (%)</td><td colspan="5">recovering instructions f1 (%)</td></tr><tr><td>xda</td><td>nucleus</td><td>bi-rnn</td><td>ida</td><td>ghidra</td><td>xda</td><td>bi-rnn</td><td>ida</td><td>ghidra</td><td>objdump</td></tr><tr><td rowspan="4">spec 2017</td><td rowspan="2">linux</td><td>x86</td><td>98.4</td><td>55.4</td><td>79.9</td><td>91.8</td><td>89.0</td><td>99.9</td><td>87.1</td><td>95.9</td><td>94.6</td><td>100.0†</td></tr><tr><td>x64</td><td>99.1</td><td>55.0</td><td>79.2</td><td>90.2</td><td>89.5</td><td>99.9</td><td>88.9</td><td>95.8</td><td>95.9</td><td>100.0†</td></tr><tr><td rowspan="2">windows</td><td>x86</td><td>99.1</td><td>60.8</td><td>73.8</td><td>67.6</td><td>70.4</td><td>99.2</td><td>82.3</td><td>96.7</td><td>92.1</td><td>99.3</td></tr><tr><td>x64</td><td>98.9</td><td>65.0</td><td>78.4</td><td>78.0</td><td>71.6</td><td>99.4</td><td>81.9</td><td>97.1</td><td>93.1</td><td>99.3</td></tr><tr><td rowspan="4">spec 2006</td><td rowspan="2">linux</td><td>x86</td><td>98.2</td><td>57.2</td><td>86.7</td><td>95.7</td><td>92.2</td><td>99.9</td><td>89.0</td><td>96.3</td><td>95.5</td><td>100.0†</td></tr><tr><td>x64</td><td>98.7</td><td>56.8</td><td>73.8</td><td>92.8</td><td>92.0</td><td>99.8</td><td>85.9</td><td>96.4</td><td>94.9</td><td>100.0†</td></tr><tr><td rowspan="2">windows</td><td>x86</td><td>99.4</td><td>68.2</td><td>78.5</td><td>77.9</td><td>76.3</td><td>99.7</td><td>89.9</td><td>98.1</td><td>94.5</td><td>99.1</td></tr><tr><td>x64</td><td>98.3</td><td>56.8</td><td>72.7</td><td>90.1</td><td>86.2</td><td>99.4</td><td>86.2</td><td>97.9</td><td>95.7</td><td>99.4</td></tr><tr><td rowspan="4">bap</td><td rowspan="2">linux</td><td>x86</td><td>99.5</td><td>61.5</td><td>74.1</td><td>59.0</td><td>57.2</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td></tr><tr><td>x64</td><td>98.7</td><td>53.5</td><td>79.0</td><td>58.3</td><td>56.5</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td></tr><tr><td rowspan="2">windows</td><td>x86</td><td>99.5</td><td>69.0</td><td>80.1</td><td>89.9</td><td>87.0</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td></tr><tr><td>x64</td><td>99.4</td><td>70.0</td><td>81.4</td><td>90.5</td><td>80.6</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td></tr><tr><td colspan="3">average</td><td>99.0</td><td>60.8</td><td>78.1</td><td>81.8</td><td>79.0</td><td>99.7</td><td>86.4</td><td>96.8</td><td>94.4</td><td>99.6</td></tr></table>
+
+\*the bap corpus does not contain source code and pdb files, which are necessary to obtain the assembly instruction ground truth.  
+gcc does not generate inline data, so a simple linear disassembler can achieve  $100\%$  f1 score [4]. objdump always fails to identify inline data, but because inline data makes up only a tiny fraction  $(< 1\%)$  of the code section, objdump's overall f1 score is high.
+
+![](images/4d433c106ae87e309c0852f58e3eda7042215150b09ca616ba5e549d31f97a0f.jpg)  
+(a) function - linux x86
+
+![](images/b7ebd13522a1e3ca339ccea80ab6dc9933d923046901b904095ee335b5bf91a5.jpg)  
+(b) function - linux x64  
+fig. 5. precision, recall, and f1 score of recovering function boundaries by xda and other tools on four types of binaries categorized by the platforms and isas, on the highest compiler optimization levels.
+
+![](images/a8183cb99b6d669a49995485114b39efe1be8695e81c62dc4dc994b9bf806f5a.jpg)  
+(c) function - windows x86
+
+![](images/27f86fced3b202817041765737ce7a112fc962fec35f98658feb5b2dada88a24.jpg)  
+(d) function - windows x64
+
+gcc and icc; 02 for msvc). while shin et al. [48] (bi-rnn) reports  $>95\%$  f1 score in recovering function boundaries on all metrics (precision, recall, and f1) on the bap dataset, we find that its performance is not as ideal in this setting (high optimization levels, small training set and low train-test overlap rate, and inclusion of other datasets such as spec cpu2017).
+
+we noticed that in our experiments nucleus has a lower f1 score compared to its performance in [5], and worked with the nucleus team to investigate potential causes. with their help, we found 3 types of function patterns prevalent in samples in our datasets that nucleus struggled to detect: functions ending with tailjumps; functions with instructions after a return, that are only reachable indirectly; and functions reached only via jumps. these cases often cause compounding errors, where failing to detect one function causes the tool to fail to detect related functions. the findings are consistent with the analysis of nucleus error cases in [5]. we concur with the authors' opinion that in some of these cases nucleus's predictions are usable results for human analysts, despite differing from the ground truth generated from symbolic information.
+
+the lower f1 score is potentially caused by compiler changes since the nucleus tool was written, which increased the use of the above function patterns, and the inclusion of icc, a compiler on which nucleus was not previously tested. the nucleus team is working to analyze the issue more completely.
+
+table iii. f1 score  $(\%)$  of xda and bi-rnn on recovering function boundaries on varying train-test overlap rate.  
+
+<table><tr><td></td><td colspan="4">train-test overlap rate</td></tr><tr><td></td><td>20%</td><td>40%</td><td>60%</td><td>80%</td></tr><tr><td>bi-rnn</td><td>70.1</td><td>82.3</td><td>89.8</td><td>96.5</td></tr><tr><td>xda</td><td>99.1</td><td>99.5</td><td>99.8</td><td>99.9</td></tr></table>
+
+generalizability. we test how xda generalizes to unseen byte sequences. specifically, we vary the train-test overlap rate and compare the test f1 score achieved by xda and bi-rnn. we use spec cpu2017 binaries compiled on windows x64 with optimization level  $\mathbb{o}\mathbb{x}$  as our target for this test. as described in section vi, we finetune on the model that has been pretrained on spec cpu2016 and bap corpus. we choose 4 target train-test overlap rate (20%, 40%, 60%, and 80%). for each rate, we select as the training set random sequences from the entire testing sequences to construct the target train-test overlap rate.
+
+table iii shows the testing f1 scores of both xda and birnn with different train-test overlap rate. note that in table ii, xda performs reasonably well on low train-test overlap rate (<3%, see table i). when we increased the train-test overlap rate, we found that xda still reaches a 99%+ f1 score after finetuning for 30 epochs. however, bi-rnn obtains a high f1 score only at a high train-test overlap rate (>80%). this supports findings by andriesse et al. [5] that the performance
+
+table iv. f1 score of xda's function boundary recovery (pretrained on bap and spec cpu2006 and finetuned on spec cpu2017 x64 binaries compiled on linux with gcc) on unseen binaries collected from popular opensource projects.  
+
+<table><tr><td></td><td>00</td><td>01</td><td>02</td><td>03</td></tr><tr><td>curl</td><td>98.6</td><td>98.5</td><td>98.6</td><td>98.2</td></tr><tr><td>diffutils</td><td>98.7</td><td>98.7</td><td>98.8</td><td>98.6</td></tr><tr><td>gmp</td><td>99.2</td><td>98.8</td><td>98.9</td><td>98.6</td></tr><tr><td>imagemagick</td><td>98.4</td><td>98.3</td><td>98.2</td><td>98.2</td></tr><tr><td>libmicrohttpd</td><td>98.9</td><td>98.8</td><td>98.9</td><td>98.7</td></tr><tr><td>libtomcrypt</td><td>99.0</td><td>99.0</td><td>98.7</td><td>98.6</td></tr><tr><td>openssl</td><td>98.4</td><td>98.3</td><td>98.4</td><td>98.2</td></tr><tr><td>putty</td><td>98.3</td><td>98.3</td><td>98.2</td><td>98.1</td></tr><tr><td>sqlite</td><td>98.8</td><td>98.7</td><td>98.4</td><td>98.3</td></tr><tr><td>zlib</td><td>98.9</td><td>98.9</td><td>99.0</td><td>98.8</td></tr></table>
+
+of previous ml-based tools is biased. one possible explanation is that bi-rnn relies heavily on memorizing syntactic function boundary patterns, and it fails to generalize when the patterns are absent in the training set.
+
+generalizability to real-world software projects. besides the dataset in table i, we also test the strict generalizability of xda on real-world datasets. in total, we collected 10 real-world popular opensource real-world software projects, including curl-7.71.1, diffutils-3.7, gmp-6.2.0, imagemagick-7.0.10, libmicrohttpd-0.9.71, libtomcrypt-1.18.2, openssl-1.0.1f and openssl-1.0.1u, putty-0.74, sqlite-3.34.0, and zlib-1.2.11. note that we neither pretrain nor finetune xda on these software projects, but just use them to test how xda performs on the unseen binary programs. we thus compile them using gcc-7.5 on linux x64 with 4 optimizations (○0-○3).
+
+table iv shows the testing f1 score of each software project and optimization achieved by the model pretrained on bap and spec cpu2006, and finetuned (in 30 epochs) on spec cpu2017 x64 binaries compiled on linux. we find that xda achieves at least 98.1 (and up to 99.1) f1 score at recovering function boundaries even when none of these binaries are seen during pretraining and finetuning, which is close to the average performance that xda obtains in table ii.
+
+tuning false positives/negatives. some downstream binary analysis tasks, which potentially use xda as the building block, are highly sensitive to false positives and negatives, depending on their nature. for example, reverse engineering malware can be intolerant of false negatives (e.g., the malicious code is overlooked), while binary re-writer cannot afford false positives (e.g., the data treated as code and getting re-written corrupts the entire program).
+
+while xda achieves  $99\% + \mathrm{f1}$  score, with only a minimal number of false positives and negatives (figure 5), we discuss a possible mechanism to tune the false positives/negatives to improve its practicality for diverse downstream tasks. a common practice to control the tradeoff between false positive/negative is to threshold the model's output probability. for example, we can predict a certain byte as a function boundary only if the model's output probability on that byte is greater than a threshold. the model can thus be tuned to act more conservatively/aggressively in predicting function boundaries by varying the threshold.
+
+specifically, we use the roc (receiver operating charac
+
+![](images/62cf7d0516f136d84e4bf412225d0d91fe9736906b80b41ba0e228b8c57d4736.jpg)  
+fig. 6. the roc curve of xda and bi-rnn, when finetuning and testing on spec cpu2017 windows x64 binaries compiled by msvc.
+
+teristics) curve and its auc (area under the curve) score to quantify the trade-off between false positive/negative. intuitively, roc curve measures under different threshold (i.e., beyond what confidence score does the model predict as boundary), what is the model's resulting false positive rate and false positive rate. the higher the auc score of the roc curve, the better the model. therefore, given such curve, to tune the false positives, we can (ideally) choose the threshold that achieves  $0\%$  false positive rate with  $100\%$  true positive rate.
+
+figure 6 shows the roc curves of xda and bi-rnn, when they are finetuned for 30 epochs and tested for recovering function boundaries on spec cpu2017 windows x64 binaries compiled on windows by msvc. we find that xda has higher auc score (0.994) than that of bi-rnn (0.9), which indicates that xda consistently outperforms bi-rnn on different thresholds.
+
+# b. rq2: robustness
+
+in this section, we analyze the robustness of xda to high compiler optimization. in section vii-a, we can see that xda generalizes well across different platforms, compilers (different platforms imply different compilers), and isas, but we have not explicitly shown the robustness on different optimization levels. for example, in figure 5, we can only see xda is robust to binaries compiled with the highest optimization. however, we have not seen whether xda and other disassemblers can remain robust under different optimizations. therefore, we evaluate the robustness of xda under varying optimization levels and compare them with bi-rnn.
+
+robustness to different optimizations. we deliberately chose spec cpu2017 x64 binaries compiled on the windows platform as our target for this test, because these binaries represent the hardest cases in our dataset for an ml model to learn. first, it has less overlapping functions between training and testing than bap, so simple patterns seen in the training data may not be useful [5]. second, the function length in spec cpu2017 is often very diverse, as opposed to the bap dataset that has mostly similar-length common library functions. third, we observe that msvc uses inline data in the code section for jump tables, while modern versions of gcc keep the code and data separated [4]. such features make it even harder for recovering function boundaries, as inline data can disrupt the patterns in the code. finally, the total number of bytes in spec
+
+![](images/daed613a43863dac5d6afcff06153ed658d28464d106d18ff18c4fd96d8e1d72.jpg)  
+(a) o1
+
+![](images/3475a010cf1b030d998b0e77824676405d25de2ef02694f204189ace95c84ea4.jpg)  
+(b) 02
+
+![](images/b1a0724e11fb4f1763418e82772203d3b8e7ad93daaf520c8f7b9ab5da717c43.jpg)  
+(c) 0d
+
+![](images/cedd4c04cf4dc36f299369cc1b679dfc9e65ee8a9e8e3e93427ee0c09b2135da.jpg)  
+(d) 0x  
+fig. 7. comparison between xda and bi-rnn on recovering function boundaries with varying optimization levels (01, 02, 0x, 0d).
+
+cpu2017 is large (see table i). since we only keep  $10\%$  for training, the large testing set makes it more challenging to obtain good results. similar to previous setting, the model to be finetuned is pretrained on spec cpu2016 and bap corpus.
+
+we separate the binaries based on their optimization flags (01, 02, 0d, 0x) and evaluate xda's performance of recovering function boundaries. figure 7 shows the testing f1 scores in 50 training epochs of both xda and bi-rnn under each optimization level. we find that xda's performance remains robust under different optimization levels ( $>98.8\%$  f1), while bi-rnn performs worse on binaries with higher optimization levels and remains at least  $20\%$  worse than xda on all optimization levels. in addition, impressively, xda can always reach a very high f1 score even after the first epoch, while bi-rnn struggles in the first 30 epochs.
+
+transferability across optimization levels. the above experiment tests xda on different optimization levels, but it still finetunes/trains on all optimization levels. in this experiment, we test if finetuning xda on only one optimization level can still achieve a good f1 score on another optimization level. we use the same dataset (spec cpu2017) and same pretrained model (on spec cpu2006 and bap) described above. we use bi-rnn as the baseline.
+
+table v shows that xda always achieves a  $98.5\%+$  f1 score when finetuning on binaries with one optimization level and testing on binaries with another optimization level. however, bi-rnn has an apparent decrease in f1 scores when the training and testing binaries are compiled in different optimization levels. the excellent transferability of xda implies that the model learns machine code semantics that is robust across different optimization levels.
+
+robustness to obfuscated binaries. we also checked how xda performs on obfuscated binaries, even when we do not pretrain nor finetune xda on any obfuscated binaries.
+
+table v. test f1 score  $(\%)$  of xda and bi-rnn trained and tested on different optimization flags.  
+
+<table><tr><td></td><td>test opt train opt</td><td>01</td><td>02</td><td>0d</td><td>0x</td></tr><tr><td rowspan="4">bi-rnn</td><td>01</td><td>81</td><td>80</td><td>47</td><td>2.8</td></tr><tr><td>02</td><td>44</td><td>85</td><td>81</td><td>75</td></tr><tr><td>0d</td><td>34.5</td><td>4.1</td><td>85.2</td><td>43.6</td></tr><tr><td>0x</td><td>80</td><td>39</td><td>44</td><td>87</td></tr><tr><td rowspan="4">xda</td><td>01</td><td>99.8</td><td>98.6</td><td>98.8</td><td>98.5</td></tr><tr><td>02</td><td>99.8</td><td>98.7</td><td>99</td><td>98.9</td></tr><tr><td>0d</td><td>99.6</td><td>98.5</td><td>99</td><td>98.7</td></tr><tr><td>0x</td><td>99.7</td><td>98.7</td><td>98.8</td><td>98.9</td></tr></table>
+
+table vi. f1 score of xda's function boundary recovery on unseen binaries obfuscated with 5 different obfuscation types.  
+
+<table><tr><td></td><td>bcf</td><td>cff</td><td>ibr</td><td>spl</td><td>sub</td></tr><tr><td>curl</td><td>98.3</td><td>98.5</td><td>98.6</td><td>98.5</td><td>99.0</td></tr><tr><td>diffutils</td><td>98.6</td><td>98.7</td><td>98.4</td><td>98.7</td><td>99.1</td></tr><tr><td>gmp</td><td>99.0</td><td>98.9</td><td>98.9</td><td>98.5</td><td>99.2</td></tr><tr><td>imagemagick</td><td>98.3</td><td>98.3</td><td>98.1</td><td>98.0</td><td>98.4</td></tr><tr><td>libmicrohttpd</td><td>98.6</td><td>98.7</td><td>98.8</td><td>98.6</td><td>98.9</td></tr><tr><td>libtomcrypt</td><td>98.7</td><td>98.6</td><td>98.7</td><td>98.6</td><td>98.9</td></tr><tr><td>openssl</td><td>98.3</td><td>98.9</td><td>98.6</td><td>98.9</td><td>99.0</td></tr><tr><td>putty</td><td>98.2</td><td>98.1</td><td>98.1</td><td>98.0</td><td>98.3</td></tr><tr><td>sqlite</td><td>98.7</td><td>98.6</td><td>98.1</td><td>98.4</td><td>98.8</td></tr><tr><td>zlib</td><td>98.0</td><td>98.4</td><td>98.1</td><td>98.6</td><td>99.0</td></tr></table>
+
+we obfuscate all our collected real-world software projects (described in section vii-a) using 5 types of obfuscations (obf) by hikari [63] on x64 - an obfuscator based on clang-8. the obfuscation strategies include bogus control flow (bcf), control flow flattening (cff), register-based indirect branching (ibr), basic block splitting (spl), and instruction substitution (sub). we turn off the compiler optimization in case it optimizes away the obfuscated code. we then evaluate the robustness of xda on each of the software project shown in table iv obfuscated by each of the obfuscation types.
+
+table vi lists the f1 score achieved by xda at recovering function boundaries, with the same pretraining and finetuning setup described in section vii-a. we observe that xda remains robust for all obfuscated software projects, achieving at least 98 and up to 99.2 f1 score. notably, xda performs the best on the binaries obfuscated by instruction substitution (sub), which is intuitive as such obfuscation only tampers with the arithmetic operation [63] without affecting the function prologues and epilogues. again, we neither pretrained nor finetuned xda on any obfuscated binaries. indeed, in practice, we can easily collect a large number of obfuscated binaries for pretraining and finetuning. we thus expect that the model can have even stronger results when it can learn the dependencies between bytes in the obfuscated binaries.
+
+# c.  $rq3$ : execution time
+
+comparison with other tools. we compare the speed of recovering function boundaries between xda and two well-known manual-written disassemblers, ida pro and ghidra. specifically, we choose 4 x64 binaries with different sizes in spec cpu2017 compiled by msvc with  $\circ 2$ . we run both ida and ghidra in command-line mode to eliminate the runtime overhead of their guis. table vii shows the time taken by
+
+table vii. execution time of xda, ida, and ghidra (in seconds) on binaries with different size. we also show the speedup achieved by xda over the second-fastest tool.  
+
+<table><tr><td rowspan="2">binary</td><td rowspan="2">size</td><td colspan="4">speed</td><td rowspan="2">xda speedup</td></tr><tr><td>xda gpu</td><td>xda cpu</td><td>ida</td><td>ghidra</td></tr><tr><td>specrand_is</td><td>556k</td><td>1.6</td><td>12</td><td>4.8</td><td>16.4</td><td>3×</td></tr><tr><td>omnetpp_r</td><td>4.1m</td><td>3.5</td><td>29</td><td>92.3</td><td>146.3</td><td>26×</td></tr><tr><td>cpuxalan_r</td><td>7.8m</td><td>4.9</td><td>50.1</td><td>192.0</td><td>185.7</td><td>38×</td></tr><tr><td>blender_r</td><td>22.0m</td><td>16.1</td><td>136.0</td><td>317.1</td><td>246.2</td><td>15×</td></tr></table>
+
+table viii. the required number of training binaries and epochs by xda and bi-rnn to surpass the f1 score thresholds.  
+
+<table><tr><td></td><td></td><td colspan="5">f1 score threshold</td></tr><tr><td></td><td></td><td>&gt;0.9</td><td>&gt;0.7</td><td>&gt;0.5</td><td>&gt;0.3</td><td>&gt;0.1</td></tr><tr><td rowspan="2"># training binaries</td><td>bi-rnn</td><td>n/a</td><td>8</td><td>4</td><td>1</td><td>1</td></tr><tr><td>xda</td><td>2</td><td>1</td><td>1</td><td>1</td><td>1</td></tr><tr><td rowspan="2"># training epochs</td><td>bi-rnn</td><td>n/a</td><td>28</td><td>24</td><td>14</td><td>13</td></tr><tr><td>xda</td><td>2</td><td>2</td><td>1</td><td>1</td><td>1</td></tr></table>
+
+each tool to recover the function boundaries from a binary. xda outperforms both ida and ghidra by up to  $38\times$
+
+gpu vs. cpu. we compare the speed of xda running on cpus versus on gpus. since xda's architecture (i.e., self-attention layers) can be significantly accelerated by gpus, its inference time on cpu is up to  $10 \times$  slower than on a gpu. however, as seen in table vii, xda on cpu still typically outperforms ida and ghidra by up to  $3 \times$ .
+
+# d. rq4: training efficiency
+
+in this section, we aim to quantify the training efficiency of xda in comparison with other ml-based tools. intuitively, since pretraining has already encoded rich knowledge useful for downstream tasks, xda only requires a small amount of the labeled data and training epochs for finetuning to achieve good results on downstream tasks. in particular, we compare xda with bi-rnn at recovering function boundaries, on (1) the number of labeled training data required to achieve certain f1 scores, and (2) the number of training epochs needed to achieve specific f1 scores, using the same training data. we use windows x64 spec cpu2017 binaries compiled by msvc with all 4 optimizations as our dataset. we base the finetuning on the pretrained model on spec cpu2006 and bap.
+
+labeled training data. we test if xda requires less training data than bi-rnn to achieve a comparable f1 score. to control the number of labeled training data, we sort the binaries by their size and start with training on the largest binary. then we gradually increase the number of training binaries (e.g., the second largest, and so on) until the testing f1 score surpasses a chosen threshold. we choose the last half of the sorted binaries as the test set. we choose five f1 score thresholds (0.9, 0.7, 0.5, 0.3, 0.1), and test how many training binaries are required for both xda and bi-rnn to go beyond these chosen thresholds. we train both models for 30 epochs.
+
+the upper two rows of table viii shows that xda always needs only 1 training binary to surpass 0.7 testing f1 score while 2 binaries to go above 0.9. however, bi-rnn needs at least 8 training binaries to obtain better than 0.7 f1 score. moreover, it cannot go beyond 0.9, even if it uses up all the
+
+remaining 78 training binaries (total 156 binaries except half used for testing).
+
+training epochs. now we test if xda can be trained in less training epochs than bi-rnn to achieve comparable f1 score. following the above setup, we keep only the largest binary as the training file and take the last half of the sorted binaries as the testing set. we then show the number of required training epochs f1 score in table viii (lower two rows) to surpass the same chosen testing threshold defined above. we observe that the number of training epochs required by xda is much less than bi-rnn. for example, xda needs at most 2 training epochs to surpass all f1 thresholds, while bi-rnn takes 28 epochs to go beyond 0.7.
+
+# e. rq5: pretraining effectiveness
+
+pretraining robustness. we first evaluate the robustness of xda's pretraining task, where we test if xda could transfer the learned knowledge on one platform/compiler/architecture to another for the masked lm task. the rationale is that the compiler idiom varies significantly between platforms and architectures (e.g., calling conventions), generating completely different binaries. therefore, if the pretrained model on all binaries can generalize to different compiler configurations and instruction sets, we can use a single pretrained model for all downstream tasks instead of pretraining on a specific dataset every time for each finetuning task.
+
+note that in previous experiments, we pretrained multiple models with different dataset partitions to strictly separate the pretraining and finetuning data (see section vi) just for the fair comparison with other baselines. however, in practice, we can always collect a large corpus of binaries in the wild for pretraining, and always reuse the same pretrained model for finetuning on different labeled datasets. pretraining can thus be a one-time cost. $^{1}$
+
+we combine all datasets in table i, and pretrain 5 different models where their training data is partitioned based on the platforms/compilers or isas. specifically, we pretrain models on (1) all binaries, (2) all linux x86 binaries, (3) all linux x64 binaries, (4) all windows x86 binaries, and (5) all windows x64 binaries. we leave 4 programs from spec cpu2017 dataset out as the test binaries, each from one platform (windows and linux) and one isa (x86 and x64). to test pretrained models on all binaries, we combine all 4 programs as the test set.
+
+table ix shows the test ppl xda achieves after 10 epochs of pretraining. when pretrained on all binaries (first row), its ppl drops to at least  $1.56$ . we also test the generalizability of the pretrained model across different platforms and isas. we note that xda also performs reasonably well across binaries. for example, ppl can drop to 2.5 when training on windows x86 but testing on linux x64, which is far below that of random guessing ( $e.g., 2^{-\log(1/256)} = 256$ ). more importantly, pretraining on all binaries (table ix first row) has obtained the best ppl to all platforms and isas (only worse than the cases where training and testing are from the same platforms and isas), because its training data includes all type of binaries.
+
+table ix. test ppl of pretrained models. we also include cross-dataset ppl (e.g., train on x86 and test on x64).  
+
+<table><tr><td>testing training</td><td>all</td><td>linux x86 gcc/icc</td><td>linux x64 gcc/icc</td><td>win x86 msvc</td><td>win x64 msvc</td></tr><tr><td>all</td><td>1.41</td><td>1.56</td><td>1.25</td><td>1.45</td><td>1.26</td></tr><tr><td>linux x86 gcc/icc</td><td>2.26</td><td>1.55</td><td>2.31</td><td>2.14</td><td>2.88</td></tr><tr><td>linux x64 gcc/icc</td><td>2.41</td><td>2.57</td><td>1.25</td><td>3.03</td><td>2.25</td></tr><tr><td>win x86 msvc</td><td>2.26</td><td>2.26</td><td>2.5</td><td>1.44</td><td>2.7</td></tr><tr><td>win x64 msvc</td><td>1.98</td><td>2.72</td><td>2.02</td><td>2.5</td><td>1.26</td></tr></table>
+
+![](images/6b3cb1980c29b0b55d74d713fe416d2fa97e1065d98e67bd49ce186bafd0a5f2.jpg)  
+fig. 8. comparison of testing f1 score on recovering function boundaries between (1) with  $100\%$  pretraining data, (2) with  $66\%$  pretraining data, (3) with  $33\%$  pretraining data, (4) without pretraining, and (5) bi-rnn.
+
+benefit of pretraining. we quantify how much pretraining can improve the finetuning tasks. specifically, we test performance of recovering function boundaries on spec cpu2017 windows x64 binaries compiled by msvc (using  $10\%$  random binary as the training set). we compare xda's f1 scores achieved by varying pretraining data size. we compare pretrained model on (1)  $100\%$  of pretraining data (i.e., on spec cpu2006 and bap), (2)  $75\%$  of pretraining data, (3)  $50\%$  of pretraining data, (4)  $25\%$  of pretraining data, and (5) without pretraining. we also include the f1 scores of bi-rnn for comparison.
+
+figure 8 shows that pretraining helps greatly in improving the f1 score of recovering function boundaries. the model always reaches  $>94\%$  f1 score within the first epoch, e.g., even when the model is pretrained on only  $25\%$  of pretraining data. with more epochs of finetuning, they can always reach  $>98\%$  f1 scores. besides, the more pretraining data, the better the finetuning performance. without pretraining, xda's f1 scores gradually converges to  $90\%$  after 28 epochs and are lower than bi-rnn in first 14 epochs. one possible reason is that the underlying model of xda has many trainable parameters (see section v-a and appendix section a), which requires more training epochs and data than bi-rnn.
+
+pretraining other neural architectures. in theory, any neural net architecture can be pretrained, including our bi-rnn baseline. in this paper, we specifically pretrained on the transformer architecture, as its self-attention layers are known to be amenable to parallelization using gpus, supporting scalable pretraining. in comparison, recurrent neural network,
+
+<table><tr><td colspan="3">0: 48 8b 7b 10 mov rdi, qword ptr [rbx+0x10]</td></tr><tr><td colspan="3">4: 48 3b 3d 49 9f 9b 00 cmp rdi, qword ptr [rip+0x9b9f49]</td></tr><tr><td colspan="3">b: 74 42 je 0x4f</td></tr><tr><td colspan="3">...</td></tr><tr><td colspan="3">34: e8 02 b3 d5 ff call 0xffffffffff5b33b xda prediction</td></tr><tr><td colspan="3">39: 4c 8b c8 mov r9,rax</td></tr><tr><td colspan="3">3c: 4c 8b c3 mov r8, rbx</td></tr><tr><td colspan="3">3f: 48 8b d7 mov rdx, rdi←</td></tr><tr><td colspan="3">42: b9 96 00 00 00 mov ecx, 0x96</td></tr><tr><td colspan="3">47: e8 6c 17 d6 ff call 0xffffffffff617b8</td></tr><tr><td colspan="3">...</td></tr><tr><td colspan="3">59: 48 83 c4 20 add rsp, 0x20</td></tr><tr><td colspan="3">5d: 5e pop rsi</td></tr><tr><td colspan="3">5e: c3 ret</td></tr><tr><td colspan="3">5f: cc int3</td></tr></table>
+
+fig. 9. we mask  $\begin{array}{lll}48 & 8b & d7 \end{array}$ , one of the argument-passing instructions of the function call at  $0 \times 47$ . xda's top-2 predictions with confidence are shown on the right-hand side. we highlight byte  $c3$ , as predicting the masked bytes requires distinguishing the meaning of  $c3$ , which can be both ret or a register depending on the context. we highlight register rdi where xda likely leverages to predict rdi in the masked bytes.
+
+such as bi-rnn, is known for its limited scalability (due to its sequential nature) on longer sequences and larger datasets [53]. therefore, given the scale of our pretraining dataset (over 5 gigabytes), training bi-rnn is prohibitively expensive (e.g., our tests show bi-rnn is  $100 \times$  slower than the transformer training on the same amount of data), so we omit pretraining bi-rnn in this paper.
+
+# viii. case studies
+
+we show some concrete examples to demonstrate that xda learns various byte dependencies and semantics. we also illustrate the attentions of xda when making predictions to help explain xda's decision process.
+
+# a. probing learned semantics
+
+predicting instructions. consider the byte sequence shown in figure 9, taken from the spec cpu2017 sgcc compiled by msvc x64 with 02. we mask out the bytes of whole instruction at  $0 \times 3\mathrm{f}$  and feed the sequence to xda to predict the masked bytes. we find that xda can recover the correct bytes with high confidence (i.e.,  $>70\%$ ). we make following two interesting observations. these observations further justifies the usefulness of pretraining in helping recovering assembly instructions and function boundaries.
+
+xda learns calling convention. as the masked instruction belong to the argument passing procedures, correctly predicting the exact instructions implies that xda understands the calling conventions of windows x64 (i.e., saving arguments to the registers in the order of r9 r8 rdx rcx [45]). we can see that xda is very confident that the first two bytes are 48 8b (which translates to mov rdx, -), as it has seen the r9 r8 appeared before and ecx (lower 32-bit of rcx). in contrast, it is less certain on the third byte, as moving which register's value to rdx is harder to infer. therefore, we see  $73\%$  confidence of d7, which will be decoded as rdi, while  $20\%$  confidence of d6, which will be decoded as rsi.
+
+xda learns instruction semantics. note that the highlighted c3 in the byte sequence have completely different meanings depending on the context. recall that the input to xda is only the plain byte sequence. as c3 itself denote ret instruction, if xda mistakenly treat c3 at location 0x3d as ret, the next
+
+![](images/cf171f6054e1d7c218d3eec2dffd7f0a1560bc253ab9a6299c61dc6058d7010e.jpg)  
+fig. 10. we mask a sequence of padding bytes cc, which reside between two functions. we highlight the typical function prologue/epilogue that xda leverages to make predictions for the masked bytes.
+
+most likely bytes would be a sequence of padding bytes ccc that usually lie between functions for alignment. therefore, the only explanation is xda implicitly learns that c3 at location  $0 \times 3d$  is part of another instruction.
+
+predicting the gaps between functions. consider the same binary (spec cpu2017 sgcc program compiled by msvc x64 with 02), where we feed a different byte sequence, as shown in figure 10, to xda. we mask out all the padding bytes cc between two functions. the byte before the first cc is a function end at  $0 \times 5\mathrm{e}$ , and byte after the last cc is the function start at  $0 \times 84$ .
+
+we can see that xda predicts all the masked bytes correctly in the right-hand table. as the model cannot leverage any patterns of padding between functions (we have masked out all cc), the only context left for xda to correctly predict the masked bytes are the function epilogue at  $0 \times 5d$  (pop rsi) to  $0 \times 5e$  (ret), and the following likely function prologue at  $0 \times 84$  (mov qword ptr [rsp+0x8], rbx) to  $0 \times 8e$  (push rdi). as xda only sees byte sequences, we speculate that xda must understand that the corresponding bytes before/after the masked bytes represent the function epilogue/prologue, in order to predict those masked bytes are padding. we thus perform a sanity check to ask xda to predict the function boundary. this time we load the finetuned xda and feed the same byte sequence without masking and ask the finetuned model to predict the function boundaries. xda then predicts that there is a function end at  $0 \times 5f$  and a function start at  $0 \times 84$ , which match the ground truth. we thus conclude that the task of predicting masked bytes can effectively help the model to recover function boundaries.
+
+predicting jump table entries. consider the vim compiled by visual studio x64 with 01 in figure 11, where we mask out one jump table entry. we can see that xda correctly predicts all the masked bytes in the jump table with high confidence. more interestingly, we find that while xda can predict the least significant byte of the jump target (the left-most byte in the jump table entry), it is less confident than predicting other bytes. as the least significant byte is the finest-grained byte the determines the address of the jump target, it is understandable that it is extremely difficult to guess. moreover, xda predicts 8b as the second possible candidate byte after 77, as 8b appears twice in the context in other jump table entries. this indicates xda still leverage the pattern as an important hint, but it is not dominated by only pattern matching because it
+
+![](images/746c45d9a1c4affc782be57602acbc3075cd4ba2675ebe281c5d56b0ecd5dc0c.jpg)  
+fig. 11. we mask a jump table entry which consists of 4 bytes 77 33 13 00. we highlight the function epilogue and other jump table entries in the context that help xda to guess the masked bytes.
+
+![](images/7db2f5f314a5138a7850cca472fc56216234dd9e6d98438a3b788473a9113e34.jpg)  
+fig. 12. we mask the instruction that adjust the stack pointer to allocate  $0 \times 28$  (30) bytes on stack for storing the local variable. it consists of 4 bytes  $48 \times 83 \times 28$ . we mark the instruction that increases the stack pointer to free the local variable that xda leverages to make predictions.
+
+still predicts 77 as the most probable byte.
+
+predicting local variable allocation size. consider vim compiled on windows x64 by visual studio with 01 in figure 12, where we mask out the instruction of decreasing the stack pointer rsp to allocate 40 bytes (0x28) space for local variables. at position 0x24, we can see the corresponding instruction (add rsp, 0x28) that increases the stack pointer to free the space. while the instruction of increasing and decreasing stack pointer are similar with only the third byte (ec and c4, respectively) different, xda predicts the masked third byte to be ec with  $99\%$  confidence. this observation implies that the model is not simply matching similar patterns in its input sequence. instead, it learns the necessary function prologue/epilogue signature and understands the semantics of underlying instructions, e.g., by correctly predicting local variable size 28 that the program intends to allocate.
+
+# b. attention visualization
+
+we visualize xda's internal attentions when predicting masked bytes, which explains which input part the model focuses on to make predictions [13], [59]. we use the example of allocating local variables described in section iii to visualize xda's attention in predicting the (masked) instruction of local variable allocation. as xda consists of 12 attention layers with 12 attention heads (detailed in section v-a), we take the summation from all layers and attention heads.
+
+figure 13 shows xda's attention distribution when predicting the masked bytes 48 83 ec 28. we find that xda
+
+![](images/c7693091e39c701a85a2a8ce11e344616f15d898e0b2cb3c8f44ce8a9b71ed1f.jpg)  
+fig. 13. the byte sequence example shown in figure 3 with more bytes in the context. we illustrate the attention distribution of xda when predicting the masked bytes (the instruction sub rsp, 0x28). the darker the color, the larger the attention value. we put the corresponding instructions beside the most attended bytes.
+
+focuses the most on the hints from the prologue and epilogue. for example, it notices (with high attention value) the typical argument passing instructions (push rdi; push r14; push r14; push r15;) before the masked bytes, which strongly indicates the following instruction should be decreasing stack pointer (sub rsp, -) for local variable allocation. then it focuses on the last two bytes (c4 28) in the instruction add rsp, 0x28, which increases the stack pointer to free the local variable. these two bytes provide the necessary information to decide how many bytes to allocate in the masked instructions. moreover, it also pays attention to some other instructions (e.g., pop r15; pop r14; pop rdi;) in the epilogue. this probably further validates that the masked instruction resides within a function body, so that it should leverage the bytes c4 28 in the epilogue to predict the masked ec 28. again, note that all instruction, prologue and epilogue information are provided by us for explanation purpose. xda does not have access to such information but plain bytes. however, the attention visualization strongly implies that xda implicitly learns all such knowledge.
+
+# ix. related work
+
+besides works described in sections i and ii, this section discusses a more comprehensive list of related research papers.
+
+learned disassembly. statistical learning has long been used for disassembling and binary analysis [7], [46], [48]. one major path most ml-based approaches take to boost the accuracy is to incorporate the program semantics. for example, wartell et al. [58] leverage the statistical language modeling to capture byte sequence semantics to compress the binaries. shingled graph disassembly [57] further employs graph-based learning algorithm with cheaper training cost to distinguish code and inline data. other works [3], [36], [56] introduce control/dataflow to improve the accuracy and robustness. xda employs masked lm as a pretraining step to automate learning semantics and transfer to downstream disassembly tasks.
+
+applications based on disassembly. disassembly serves as the building block for many security-critical applications. for
+
+example, binary rewriting and hardening [36], [61] aims to improve the size, efficiency or security of binaries without source code access, and rely on disassembly to recover functions as building blocks for rewriting. control-flow integrity [1], [37] and code randomization defenses [60] aim to improve the security of binaries by preventing the redirection of controlflow and increasing the difficulty of code injection, respectively. when source code is absent, which is often the case for legacy software in most dire need of such protections, these defenses can be retrofitted to binaries with the help of disassembly and binary rewriting. decompilation [11], [23] aims to automatically reverse binaries to source code, and relies on disassembly as an initial step to recovering higher-level structure abstracted away during compilation.
+
+use of ml in other binary analysis tasks. beyond disassembly, ml has been increasingly applied in other binary analysis tasks. for example, eklavya [12] learns function type signatures. deepvsa [25] and renn [38] learn memory alias dependencies. deepbindiff [22] and gemini [62] learn function similarity by neural embeddings. most of these methods are based on either recurrent networks or graph neural nets that requires nontrivial engineering effort for encoding domain knowledge, which are shown not as effective as xda's underlying self-attention architecture in capturing long-range dependencies, which is also fully-automated [53]. as shown in section viii, xda learns much broader knowledge useful beyond the two tasks considered in this paper. therefore, we believe xda has huge potential in other downstream binary analysis tasks and plan to explore in the future work.
+
+# x. conclusion
+
+we have presented xda, a novel disassembling technique based on transfer learning. it leverages machine code semantics learned in pretraining masked language modeling to solve downstream disassembly tasks accurately, robustly, and efficiently. xda is  $17.2\%$  more accurate than the state-of-the-art at recovering function boundaries, and achieves a  $99.7\%$  f1 score at recovering assembly instructions. furthermore, xda is robust against various compilers, architectures, platforms, and optimization levels. our case studies have shown xda's potential for a wide range of downstream disassembly and binary analysis tasks beyond recovering functions and instructions. we open-source xda at https://github.com/cumlsec/xda.
+
+# acknowledgment
+
+we thank our shepherd kevin hamlen and the anonymous reviewers for their constructive and valuable feedback. this work is sponsored in part by nsf grants cns-18-42456, cns18-01426, cns-16-17670, cns-16-18771, ccf-16-19123, cns-15-63843, and cns-15-64055; onr grants n00014-17-1-2010, n00014-16-1-2263, and n00014-17-1-2788; an nsf career award; an arl young investigator (yip) award; a google faculty fellowship; a jp morgan faculty research award; a didi faculty research award; a google cloud grant; a capital one research grant; and an amazon web services grant. any opinions, findings, conclusions, or recommendations expressed herein are those of the authors, and do not necessarily reflect those of the us government, onr, arl, nsf, capital one, google, jp morgan, didi, or amazon.
+
+# references
+
+[1] martin abadi, mihai budiu, ülfar erlingsson, and jay ligatti. control-flow integrity principles, implementations, and applications. acm transactions on information and system security (tissec), 2009.  
+[2] national security agency. ghidra disassembler. https://ghidra-sre.org/.  
+[3] saed alrabaee, lingyu wang, and mourad debbabi. bingold: towards robust binary analysis by extracting the semantics of binary code as semantic flow graphs (sfgs). digital investigation, 2016.  
+[4] dennis andriesse, xi chen, victor van der veen, asia slowinska, and herbert bos. an in-depth analysis of disassembly on full-scale x86/x64 binaries. in 25th usenix security symposium, 2016.  
+[5] dennis andriesse, asia slowinska, and herbert bos. compiler-agnostic function detection in binaries. in proceedings of the 2017 ieee european symposium on security and privacy, 2017.  
+[6] sanjeev arora, hrishikesh khandeparkar, mikhail khodak, orestis plevrakis, and nikunj saunshi. a theoretical analysis of contrastive unsupervised representation learning. arxiv preprint arxiv:1902.09229, 2019.  
+[7] tiffany bao, jonathan burket, maverick woo, rafael turner, and david brumley. byteweight: learning to recognize functions in binary code. in 23rd usenix security symposium, 2014.  
+[8] erick bauman, zhiqiang lin, and kevin w hamlen. superset disassembly: statically rewriting x86 binaries without heuristics. in proceedings of the 2018 network and distributed system security symposium (ndss), 2018.  
+[9] eli bendersky. pyefltools. https://github.com/eliben/pyelftools.  
+[10] james bergstra and yoshua bengio. random search for hyper-parameter optimization. journal of machine learning research (jmlr), 2012.  
+[11] david brumley, jonghyup lee, edward j schwartz, and maverick woo. native x86 decomposition using semantics-preserving structural analysis and iterative control-flow structuring. in proceedings of the 22nd usenix security symposium, 2013.  
+[12] zheng leong chua, shiqi shen, prateek saxena, and zhenkai liang. neural nets can learn function type signatures from binaries. in proceedings of the 26th usenix security symposium, 2017.  
+[13] kevin clark, urvashi khandelwal, omer levy, and christopher d. manning. what does bert look at? an analysis of bert's attention. in blackboxnlp@acl, 2019.  
+[14] standard performance evaluation corporation. spec cpu2006 benchmark, 2006.  
+[15] standard performance evaluation corporation. spec cpu2017 benchmark, 2017.  
+[16] ido dagan, oren glickman, and bernardo magnini. the pascal recognising textual entailment challenge. in machine learning challenges workshop, 2005.  
+[17] jacob devlin, ming-wei chang, kenton lee, and kristina toutanova. bert: pre-training of deep bidirectional transformers for language understanding. arxiv preprint arxiv:1810.04805, 2018.  
+[18] alessandro di federico, mathias payer, and giovanni agosta. rev.ng: a unified binary analysis framework to recover cfgs and function boundaries. in proceedings of the 26th international conference on compiler construction, 2017.  
+[19] steven hh ding, benjamin cm fung, and philippe charland. asm2vec: boosting static representation robustness for binary clone search against code obfuscation and compiler optimization. in 2019 ieee symposium on security and privacy (s&p), 2019.  
+[20] brendan dolan-gavitt, josh hodosh, patrick hulin, tim leek, and ryan whelan. repeatabile reverse engineering with panda. in proceedings of the 5th program protection and reverse engineering workshop, 2015.  
+[21] yue duan, xuezixiang li, jinghan wang, and heng yin. deepbindiff: learning program-wide code representations for binary diffing. in network and distributed system security symposium (ndss), 2020.  
+[22] yue duan, xuezixiang li, jinghan wang, and heng yin. deepbindiff: learning program-wide code representations for binary diffing. in proceedings of the 2020 network and distributed system security symposium (ndss), 2020.  
+[23] mv emmerik and trent waddington. using a decompiler for real-world
+
+source recovery. in proceedings of the 11th working conference on reverse engineering (wcre), 2004.  
+[24] priya goyal, piotr dólar, ross girshick, pieter noordhuis, lukasz wesolowski, aapo kyrola, andrew tulloch, yangqing jia, and kaiming he. accurate, large minibatch sgd: training imagenet in 1 hour. arxiv preprint arxiv:1706.02677, 2017.  
+[25] wenbo guo, dongliang mu, xinyu xing, min du, and dawn song. deepvsa: facilitating value-set analysis with deep learning for postmortem program analysis. in 28th usenix security symposium (usenix security 19), 2019.  
+[26] laune c harris and barton p miller. practical analysis of stripped binary code. acm sigarch computer architecture news, 2005.  
+[27] kaiming he, xiangyu zhang, shaoqing ren, and jian sun. deep residual learning for image recognition. in proceedings of the 2016 ieee conference on computer vision and pattern recognition (cvpr), 2016.  
+[28] dan hendrycks and kevin gimpel. gaussian error linear units (gelus). arxiv preprint arxiv:1606.08415, 2016.  
+[29] intel. intel® 64 and ia-32 architectures software developer's manual. volume 3b: system programming guide, part, 2011.  
+[30] yann lecun, patrice y simard, and barak pearlmutter. automatic learning rate maximization by on-line estimation of the hessian's eigenvectors. in proceedings of the 1993 advances in neural information processing systems (nips), 1993.  
+[31] yinhan liu, myle ott, naman goyal, jingfei du, mandar joshi, danqi chen, omer levy, mike lewis, luke zettlemoyer, and veselin stoyanov. roberta: a robustly optimized bert pretraining approach. arxiv preprint arxiv:1907.11692, 2019.  
+[32] xiaozhu meng and barton p miller. binary code is not easy. in proceedings of the 25th international symposium on software testing and analysis (issta), 2016.  
+[33] microsoft. dia2dump. https://docs.microsoft.com/en-us/visualstudio/ debugger-debug-interface-access/dia2dump-sample.  
+[34] tomas mikolov, kai chen, greg corrado, and jeffrey dean. efficient estimation of word representations in vector space. arxiv preprint arxiv:1301.3781, 2013.  
+[35] tomas mikolov, ilya sutskever, kai chen, greg s corrado, and jeff dean. distributed representations of words and phrases and their compositionality. in advances in neural information processing systems, 2013.  
+[36] kenneth miller, yonghwi kwon, yi sun, zhuo zhang, xiangyu zhang, and zhiqiang lin. probabilistic disassembly. in proceedings of the 41st international conference on software engineering (icse), 2019.  
+[37] vishwath mohan, per larsen, stefan brunthaler, kevin w hamlen, and michael franz. opaque control-flow integrity. in network and distributed system security symposium (ndss), 2015.  
+[38] dongliang mu, wenbo guo, alejandro cuevas, yueqi chen, jinxuan gai, xinyu xing, bing mao, and chengyu song. renn: efficient reverse execution with neural-network-assisted alias analysis. in 2019 34th ieee/acm international conference on automated software engineering (ase), 2019.  
+[39] myle ott, sergey edunov, alexei baevski, angela fan, sam gross, nathan ng, david grangier, and michael auli. fairseq: a fast, extensible toolkit for sequence modeling. in proceedings of naacl-hlt 2019: demonstrations, 2019.  
+[40] hui peng, yan shoshitaishvili, and mathias payer. t-fuzz: fuzzing by program transformation. in 2018 ieee symposium on security and privacy (s&p), 2018.  
+[41] jeffrey pennington, richard socher, and christopher d manning. glove: global vectors for word representation. in proceedings of the 2014 conference on empirical methods in natural language processing (emnlp), 2014.  
+[42] matthew e. peters, mark neumann, mohit iyyer, matt gardner, christopher clark, kenton lee, and luke zettlemoyer. deep contextualized word representations. in proceedings of the 2018 naacl, 2018.  
+[43] nguyen anh quynh. capstone: next-gen disassembly framework. black hat usa, 2014.  
+[44] pranav rajpurkar, jian zhang, konstantin lopyrev, and percy liang.
+
+squad: 100,000+ questions for machine comprehension of text. arxiv preprint arxiv:1606.05250, 2016.  
+[45] microsoft. retrieved. x64 software conventions - stack allocation. https://docs.microsoft.com/en-us/previous-versions/visualstudio/visual-studio-2008/ew5tede7(v=vs.90)?redirectedfrom=msdn, 2010.  
+[46] nathan e rosenblum, xiaojin zhu, barton p miller, and karen hunt. learning to analyze binary computer code. in proceedings of the 2008 association for the advancement of artificial intelligence (aaai), 2008.  
+[47] hex-rays sa. ida pro disassembler, 2008.  
+[48] eui chul richard shin, dawn song, and reza moazzezi. recognizing functions in binaries with neural networks. in 24th usenix security symposium, 2015.  
+[49] yan shoshitaishvili, ruoyu wang, christophe hauser, christopher kruegel, and giovanni vigna. firmalice-automatic detection of authentication bypass vulnerabilities in binary firmware. in network and distributed system security symposium (ndss), 2015.  
+[50] yan shoshitaishvili, ruoyu wang, christopher salls, nick stephens, mario polino, audrey dutcher, john grosen, siji feng, christophe hauser, christopher kruegel, and giovanni vigna. sok: (state of) the art of war: offensive techniques in binary analysis. in proceedings of the 2016 ieee symposium on security and privacy (s&p), 2016.  
+[51] kevin z snow, fabian monrose, lucas davi, alexandra dmitrienko, christopher liebchen, and ahmad-reza sadeghi. just-in-time code reuse: on the effectiveness of fine-grained address space layout randomization. in 2013 ieee symposium on security and privacy, 2013.  
+[52] nitish srivastava, geoffrey hinton, alex krizhevsky, ilya sutskever, and ruslan salakhutdinov. dropout: a simple way to prevent neural networks from overfitting. the journal of machine learning research (jmlr), 2014.  
+[53] ashish vaswani, noam shazeer, niki parmar, jakob uszkoreit, llion jones, aidan n gomez, łukasz kaiser, and illia polosukhin. attention is all you need. in proceedings of the 2017 advances in neural information processing systems (nips), 2017.  
+[54] giovanni vigna. static disassembly and code analysis. in malware detection, pages 19-41. springer, 2007.  
+[55] ruoyu wang, yan shoshitaishvili, antonio bianchi, aravind machiry, john grosen, paul grosen, christopher kruegel, and giovanni vigna. ramblr: making reassembly great again. in network and distributed system security symposium (ndss), 2017.  
+[56] shuai wang, pei wang, and dinghao wu. semantics-aware machine learning for function recognition in binary code. in 2017 ieee international conference on software maintenance and evolution (icsme), 2017.  
+[57] richard wartell, yan zhou, kevin w hamlen, and murat kantarcioglu. shingled graph disassembly: finding the undecidable path. in proceedings of the pacific-asia conference on knowledge discovery and data mining (pakdd), 2014.  
+[58] richard wartell, yan zhou, kevin w hamlen, murat kantarcioglu, and bhavani thuraisingham. differentiating code from data in x86 binaries. in joint european conference on machine learning and knowledge discovery in databases, 2011.  
+[59] sarah wiegreffe and yuval pinter. attention is not not explanation. arxiv preprint arxiv:1908.04626, 2019.  
+[60] david williams-king, graham gobieski, kent williams-king, james p blake, xinhao yuan, patrick colp, michelle zheng, vasileios p kemerlis, junfeng yang, and william aiello. shuffler: fast and deployable continuous code re-randomization. in proceedings of the 12th usenix symposium on operating systems design and implementation (osdi), 2016.  
+[61] david williams-king, hidenori kobayashi, kent williams-king, graham patterson, frank spano, yu jian wu, junfeng yang, and vasileios p. kemerlis. egalito: layout-agnostic binary recompilation. in proceedings of the 25th international conference on architectural support for programming languages and operating systems (asplos), 2020.  
+[62] xiaojun xu, chang liu, qian feng, heng yin, le song, and dawn song. neural network-based graph embedding for cross-platform binary code similarity detection. in proceedings of the 2017 acm sigsac conference on computer and communications security, 2017.  
+[63] naville zhang. hikari - an improvement over obfuscator-llvm. https://github.com/hikariobfuscator/hikari, 2017.
+
+# appendix
+
+# a. xda hyperparameters
+
+we describe the hyperparameters that we used throughout all our experiments, if not mentioned elsewhere explicitly.
+
+network architecture. we use 12 self-attention layers with each having 12 self-attention heads. the embedding dimension is  $d_{emb} = 768$ . we set 3072 as the hidden layer size of mlp  $f_{out}$  in the self attention layer. overall, we have roughly 110 million network parameters. we adopt gelu [28], known for addressing the problem of vanishing gradient, as the activation function for xda's self-attention module. we use the hyperbolic tangent (tanh) as the activation function in finetuning mlp (equation 2). we set the dropout [52] rate 0.1 for pretraining task while refrain from using dropout in the finetuning task.
+
+pretraining and finetuning. we fix the largest input length to be 512 and choose the batch size for both pretraining and finetuning as 8. for pretraining we use the update frequency as 16, but for finetuning we set as 4. the update frequency 16 here means the model will aggregate the gradient for 16 batches before it updates the weight parameter. so pretraining has  $16 \times 8 = 128$  effective batch size while finetuning has  $4 \times 8 = 32$  effective batch size. we choose the smaller update frequency for finetuning is because the training data of finetuning is larger due to the extra labels (unlike pretraining where the data is only input bytes). so we restrict loading too much batch size in case running out of gpu memory. consequently, to account for the smaller effective batch size, we adopt a relatively smaller learning rate as suggested by the common training tricks [24]. we pick  $10^{-5}$  for finetuning while pretraining has a larger learning rate  $10^{-4}$  as its effective batch size is larger. instead of starting with the chosen learning rate at first epoch, we follow the common practice of using small warmup learning rate at first epoch. we use  $10^{-7}$  as the initial warmup learning rate, which gets gradually increased until it reaches the actual learning rate after first epoch. finally, we use adam optimizer, with  $\beta_{1} = 0.9$ ,  $\beta_{2} = 0.98$ ,  $\epsilon = 10^{-6}$ , and weight decay  $10^{-2}$ .
+
+in this paper, we adopt the hyperparameters that have shown success in other domains such as sentence entailment in natural language processing [17], [31]. for example, we stack 2-layer fully-connected network for finetuning tasks, because finetuning is often assumed as a simple task as the sophisticated dependency learning is offloaded to the pretraining. while it is possible to search for better hyperparameter choices (e.g., more layers or changing connections) from using manual trial [10] to sophisticated algorithms [30], hyperparameter tuning in general is known as an unsolved task. we thus leave the comprehensive studies of tuning xda's hyperparameters in our future work.
+
+# b. common instructions
+
+we include the most common instructions or byte sequences, we include the top 5 n-grams of each dataset in table x. we choose  $n = 1,2,3$  as most instruction types can be denoted within these lengths of bytes [29]. we divide each dataset by the instruction set, as x86 and x86-64 can have highly different mapping rules of disassembling instructions. we exclude the most common bytes in the results, such as cc (padding bytes used to call to interrupt procedure), and 00 and
+
+table x. most frequent n-grams  $(n = 1,2,3)$  for each dataset. we omit the cases that include padding cc, and the common bytes introduced by two's complement ff and 00.  
+
+<table><tr><td rowspan="2"></td><td colspan="7">x86</td><td colspan="7">x86-64</td></tr><tr><td>1-gram</td><td>count</td><td>2-gram</td><td>count</td><td colspan="2">3-gram</td><td>count</td><td>1-gram</td><td>count</td><td>2-gram</td><td>count</td><td colspan="2">3-gram</td><td>count</td></tr><tr><td rowspan="5">spec 2017</td><td>8b</td><td>16,309,260</td><td>83 c4</td><td>4,055,543</td><td>83 c4</td><td>10</td><td>2,094,343</td><td>48</td><td>67,406,284</td><td>48 8b</td><td>23,456,799</td><td>20</td><td>20 20</td><td>3,217,114</td></tr><tr><td>83</td><td>11,315,789</td><td>44 24</td><td>2,747,236</td><td>8b 44</td><td>24</td><td>1,079,364</td><td>8b</td><td>35,597,922</td><td>48 89</td><td>14,122,963</td><td>48</td><td>8b 85</td><td>3,105,839</td></tr><tr><td>24</td><td>9,407,287</td><td>83 ec</td><td>2,568,435</td><td>83 ec</td><td>08</td><td>680,529</td><td>89</td><td>22,438,962</td><td>48 8d</td><td>7,953,318</td><td>48</td><td>8b 45</td><td>2,417,498</td></tr><tr><td>89</td><td>7,644,124</td><td>8b 45</td><td>2,332,870</td><td>89 44</td><td>24</td><td>633,151</td><td>24</td><td>17,730,247</td><td>44 24</td><td>4,730,699</td><td>48</td><td>89 c7</td><td>1,700,933</td></tr><tr><td>e8</td><td>7,036,366</td><td>c4 10</td><td>2,095,990</td><td>8b 45</td><td>08</td><td>592,854</td><td>85</td><td>14,285,564</td><td>48 83</td><td>4,475,293</td><td>8b</td><td>44 24</td><td>1,691,308</td></tr><tr><td rowspan="5">spec 2006</td><td>8b</td><td>4,411,454</td><td>83 c4</td><td>1,106,643</td><td>83 c4</td><td>10</td><td>616,278</td><td>48</td><td>9,048,147</td><td>48 8b</td><td>3,271,527</td><td>48</td><td>8b 45</td><td>383,183</td></tr><tr><td>83</td><td>3,036,396</td><td>83 ec</td><td>778,944</td><td>83 ec</td><td>0c</td><td>376,601</td><td>8b</td><td>5,226,813</td><td>48 89</td><td>2,224,299</td><td>8b</td><td>44 24</td><td>309780</td></tr><tr><td>08</td><td>2,112,428</td><td>8b 45</td><td>656,627</td><td>83 ec</td><td>08</td><td>198,326</td><td>89</td><td>3,690,654</td><td>44 24</td><td>868,788</td><td>48</td><td>89 c7</td><td>305,582</td></tr><tr><td>89</td><td>2,037,985</td><td>c4 10</td><td>616,663</td><td>8b 45</td><td>08</td><td>193,443</td><td>24</td><td>3,152,961</td><td>48 83</td><td>831,444</td><td>89 c7</td><td>e8</td><td>280,042</td></tr><tr><td>e8</td><td>2,014,742</td><td>44 24</td><td>470,326</td><td>8b 44</td><td>24</td><td>162,405</td><td>0f</td><td>2,995,076</td><td>48 8d</td><td>789,078</td><td>89</td><td>44 24</td><td>271,837</td></tr><tr><td rowspan="5">bap</td><td>8b</td><td>4,859,036</td><td>44 24</td><td>1,428,109</td><td>c7 44</td><td>24</td><td>554,131</td><td>48</td><td>7,525,125</td><td>48 8b</td><td>2,881,802</td><td>48</td><td>8b 45</td><td>534,246</td></tr><tr><td>24</td><td>4,753,064</td><td>8b 45</td><td>1,007,213</td><td>89 44</td><td>24</td><td>474,436</td><td>8b</td><td>4,495,772</td><td>48 89</td><td>1,725,358</td><td>8b</td><td>44 24</td><td>233,303</td></tr><tr><td>89</td><td>3,503,718</td><td>24 04</td><td>572,253</td><td>44 24</td><td>04</td><td>385,919</td><td>89</td><td>3,055,089</td><td>48 83</td><td>703,937</td><td>89</td><td>44 24</td><td>214,676</td></tr><tr><td>08</td><td>2,034,947</td><td>c7 44</td><td>555,754</td><td>89 04</td><td>24</td><td>326,154</td><td>24</td><td>2,579,139</td><td>44 24</td><td>653,945</td><td>48</td><td>85 c0</td><td>185,531</td></tr><tr><td>04</td><td>1,919,547</td><td>54 24</td><td>518,124</td><td>8b 44</td><td>24</td><td>270,141</td><td>0f</td><td>1,799,445</td><td>8b 45</td><td>605,920</td><td>48</td><td>89 c7</td><td>180,814</td></tr></table>
+
+table xi. we update the results of xda in table ii by using the pretrained model on all available datasets.  
+
+<table><tr><td rowspan="2">dataset</td><td rowspan="2">platform</td><td rowspan="2">isa</td><td colspan="5">recovering function boundaries f1 (%)</td><td colspan="5">recovering instructions f1 (%)</td></tr><tr><td>xda</td><td>nucleus</td><td>bi-rnn</td><td>ida</td><td>ghidra</td><td>xda</td><td>bi-rnn</td><td>ida</td><td>ghidra</td><td>objdump</td></tr><tr><td rowspan="4">spec 2017</td><td rowspan="2">linux</td><td>x86</td><td>98.4</td><td>55.4</td><td>79.9</td><td>91.8</td><td>89.0</td><td>99.9</td><td>87.1</td><td>95.9</td><td>94.6</td><td>100.0†</td></tr><tr><td>x64</td><td>99.6</td><td>55.0</td><td>79.2</td><td>90.2</td><td>89.5</td><td>99.9</td><td>88.9</td><td>95.8</td><td>95.9</td><td>100.0†</td></tr><tr><td rowspan="2">windows</td><td>x86</td><td>99.9</td><td>60.8</td><td>73.8</td><td>67.6</td><td>70.4</td><td>99.3</td><td>82.3</td><td>96.7</td><td>92.1</td><td>99.3</td></tr><tr><td>x64</td><td>99.9</td><td>65.0</td><td>78.4</td><td>78.0</td><td>71.6</td><td>99.6</td><td>81.9</td><td>97.1</td><td>93.1</td><td>99.3</td></tr><tr><td rowspan="4">spec 2006</td><td rowspan="2">linux</td><td>x86</td><td>99.8</td><td>57.2</td><td>86.7</td><td>95.7</td><td>92.2</td><td>99.9</td><td>89.0</td><td>96.3</td><td>95.5</td><td>100.0†</td></tr><tr><td>x64</td><td>99.9</td><td>56.8</td><td>73.8</td><td>92.8</td><td>92.0</td><td>99.9</td><td>85.9</td><td>96.4</td><td>94.9</td><td>100.0†</td></tr><tr><td rowspan="2">windows</td><td>x86</td><td>99.9</td><td>68.2</td><td>78.5</td><td>77.9</td><td>76.3</td><td>99.9</td><td>89.9</td><td>98.1</td><td>94.5</td><td>99.1</td></tr><tr><td>x64</td><td>99.9</td><td>56.8</td><td>72.7</td><td>90.1</td><td>86.2</td><td>99.5</td><td>86.2</td><td>97.9</td><td>95.7</td><td>99.4</td></tr><tr><td rowspan="4">bap</td><td rowspan="2">linux</td><td>x86</td><td>99.6</td><td>61.5</td><td>74.1</td><td>59.0</td><td>57.2</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td></tr><tr><td>x64</td><td>99.7</td><td>53.5</td><td>79.0</td><td>58.3</td><td>56.5</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td></tr><tr><td rowspan="2">windows</td><td>x86</td><td>99.5</td><td>69.0</td><td>80.1</td><td>89.9</td><td>87.0</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td></tr><tr><td>x64</td><td>99.9</td><td>70.0</td><td>81.4</td><td>90.5</td><td>80.6</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td><td>n/a*</td></tr><tr><td colspan="3">average</td><td>99.6</td><td>60.8</td><td>78.1</td><td>81.8</td><td>79.0</td><td>99.8</td><td>86.4</td><td>96.8</td><td>94.4</td><td>99.6</td></tr></table>
+
+\*the bap corpus does not contain source code and pdb files, which are necessary to obtain the assembly instruction ground truth.  
+gcc does not generate inline data, so a simple linear disassembler can achieve  $100\%$  f1 score [4]. objdump always fails to identify inline data, but because inline data makes up only a tiny fraction  $(< 1\%)$  of the code section, objdump's overall f1 score is high.
+
+ff introduced in two's complement (for addressing). there are several interesting patterns emerge in the dataset. for example, 8b (mov instruction) always ranks among the top. when 8b appears in the 2-gram, the top-ranked is 8b 45 in x86, which maps to mov *, eax. while in x86-64, 48 appears the most, which is the prefix that specifies the 64 bit operand. therefore, the top 2-gram in x86-64 is 48 8b, which indicates the mov instruction with 64-bit operand.
+
+# c. pretraining on all datasets
+
+as described in section vi, we always keep the data used for pretraining, finetuning, and testing strictly separated, to compare with other baselines fairly. however, as argued in section vii-e, we can always collect a large corpus of binaries in the wild for pretraining, and always reuse the same pretrained model for finetuning on different labeled datasets. therefore, we have also pretrained a single model using all datasets available in table i. we then re-run all finetuning experiments of table ii, and include the updated results in table xi.
+
+table xi shows that the average performance of xda can
+
+be further improved by  $0.6\%$  and  $0.1\%$  for recovering function boundaries and assembly instructions, respectively. while in such case, pretraining and finetuning data can overlap, note that pretraining does not train with any labels (e.g., function boundaries) but just raw bytes. indeed, this is the common practice in transfer learning [16], [17], [31], [44].

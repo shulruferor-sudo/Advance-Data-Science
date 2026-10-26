@@ -1,0 +1,367 @@
+# accelerating training of transformer-based language models with progressive layer dropping
+
+minjia zhang yuxiong he
+
+microsoft corporation
+
+{minjiaz,yuxhe}@microsoft.com
+
+# abstract
+
+recently, transformer-based language models have demonstrated remarkable performance across many nlp domains. however, the unsupervised pre-training step of these models suffers from unbearable overall computational expenses. current methods for accelerating the pre-training either rely on massive parallelism with advanced hardware or are not applicable to language modeling. in this work, we propose a method based on progressive layer dropping that speeds the training of transformer-based language models, not at the cost of excessive hardware resources but from model architecture change and training technique boosted efficiency. extensive experiments on bert show that the proposed method achieves a  $24\%$  time reduction on average per sample and allows the pre-training to be  $2.5 \times$  faster than the baseline to get a similar accuracy on downstream tasks. while being faster, our pre-trained models are equipped with strong knowledge transferability, achieving comparable and sometimes higher glue score than the baseline when pre-trained with the same number of samples.
+
+# 1 introduction
+
+natural language processing (nlp) tasks, such as natural language inference [1, 2] and question answering [3-5], have achieved great success with the development of neural networks. it has been demonstrated recently that transformer-based networks have obtained superior performance in many nlp tasks (e.g., the glue benchmark [6] and the challenging multi-hop reasoning task [7]) than recurrent neural networks or convolutional neural networks. bert trains a deep bidirectional transformer and obtains outstanding results with transfer learning [3]. roberta [2], which is a robustly optimized version of bert trained with more steps and larger corpora, achieves state-of-the-art results on 9 glue tasks. megatron-lm [8] further advances the state-of-the-art in nlp by significantly increasing the size of bert model. finally, there are multiple research proposing different enhanced versions of transformer-based networks, such as gpt-2/3 [9, 10], xlnet [1], spanbert [11], biobert [12], unilm [13], turing-nlg [14], and t5 [15]. due to the exciting prospect, pre-training transformer networks with a large corpus of text followed by fine-tuning on specific tasks has become a new paradigm for natural language processing.
+
+despite great success, a big challenge of transformer networks comes from the training efficiency – even with self-attention and parallelizable recurrence [16], and extremely high performance hardware [17], the pre-training step still takes a significant amount of time. to address this challenge, mixed-precision training is explored [8, 18], where the forward pass and backward pass are computed in half-precision and parameter update is in single precision. however, it requires tensor cores [19], which do not exist in all hardware. some work resort to distributed training [20, 21, 8]. however, distributed training uses large mini-batch sizes to increase the parallelism, where the training often converges to sharp local minima with poor generalizability even with significant hyperparameter tuning [22]. subsequently, yang et al. propose a layer-wise adaptive large batch optimizer called lamb [23], allowing to train bert with  $32\mathrm{k}$  batch size on 1024 tpu chips. however, this type of approach often requires dedicated clusters with hundreds or even thousands of gpus and sophisti
+
+cated system techniques at managing and tuning distributed training, not to mention that the amount of computational resources is intractable for most research labs or individual practitioners.
+
+in this paper, we speedup pre-training transformer networks by exploring architectural change and training techniques, not at the cost of excessive hardware resources. given that the training cost grows linearly with the number of transformer layers, one straightforward idea to reduce the computation cost is to reduce the depth of the transformer networks. however, this is restrictive as it often results in lower accuracy in downstream tasks compared to full model pre-training, presumably because of having smaller model capacities [24, 25]. techniques such as stochastic depth have been demonstrated to be useful in accelerating supervised training in the image recognition domain [26]. however, we observe that stochastically removing transformer layers destabilizes the performance and easily results in severe consequences such as model divergence or convergence to bad/suspicious local optima. why are transformer networks difficult to train with stochastic depth? moreover, can we speed up the (unsupervised) pre-training of transformer networks without hurting downstream performance?
+
+to address the above challenges, we propose to accelerate pre-training of transformer networks by making the following contributions. (i) we conduct a comprehensive analysis to answer the question: what makes transformer networks difficult to train with stochastic depth. we find that both the choice of transformer architecture as well as training dynamics would have a big impact on layer dropping. (ii) we propose a new architecture unit, called the switchable-transformer (st) block, that not only allows switching on/off a transformer layer for only a set portion of the training schedule, excluding them from both forward and backward pass but also stabilizes transformer network training. (iii) we further propose a progressive schedule to add extra-stableness for pre-training transformer networks with layer dropping – our schedule smoothly increases the layer dropping rate for each mini-batch as training evolves by adapting in time the parameter of the bernoulli distribution used for sampling. within each gradient update, we distribute a global layer dropping rate across all the st blocks to favor different layers. (iv) we use bert as an example, and we conduct extensive experiments to show that the proposed method not only allows to train bert  $24\%$  faster than the baseline under the same number of samples but also allows the pre-training to be  $2.5 \times$  faster to get similar accuracy on downstream tasks. furthermore, we evaluate the generalizability of models pre-trained with the same number of samples as the baseline, and we observe that while faster to train, our approach achieves a  $1.1\%$  higher glue score than the baseline, indicating a strong knowledge transferability.
+
+# 2 background and related work
+
+pre-training with transformer-based architectures like bert [3] has been demonstrated as an effective strategy for language representation learning [2, 1, 27, 8]. the approach provides a better model initialization for downstream tasks by training on large-scale unlabeled corpora, which often leads to a better generalization performance on the target task through fine-tuning on small data. consider bert, which consists a stack of  $l$  transformer layers [16]. each transformer layer encodes the input of the i-th transformer layer  $x_{i}$  with  $h_i = f_{ln}(x_i + f_{s - attn}(x_i))$ , which is a multi-head self-attention sub-layer  $f_{attn}$ , and then by  $x_{i + 1} = f_{ln}(h_i + f_{ffn}(h_i))$ , which is a feed-forward network  $f_{ffn}$ , where  $x_{i + 1}$  is the output of the i-th transformer layer. both sub-layers have an addnorm operation that consists a residual connection [28] and a layer normalization  $(f_{ln})$  [29]. the bert model recursively applies the transformer block to the input to get the output.
+
+while the transformer-based architecture has achieved breakthrough results in modeling sequences for unsupervised language modeling [3, 9], previous work has also highlighted the training difficulties and excessively long training time [2]. to speed up the pre-training, electra [30] explores the adversarial training scheme by replacing masked tokens with alternatives sampled from a generator framework and training a discriminator to predict the replaced token. this increases the relative per-step cost, but leads to fewer steps, leading to the overall reduced costs. another line of work focuses on reducing the per-step cost. since the total number of floating-point operations (flops) of the forward and backward passes in the bert pre-training process is linearly proportional to the depth of the transformer blocks, reducing the number of transformer layers brings opportunities to significantly speed up bert pre-training. to show this, we plot the flops per training iteration in fig. 6, assuming we can remove a fraction of layers at each step. each line in the figure shows the flops using different layer removal schedules. regardless of which schedule to choose, the
+
+majority of flops are reduced in the later steps, with the rate of keep probability saturating to a fixed value  $\bar{\theta}$  (e.g., 0.5). we will describe our schedule in section 4.2.
+
+![](images/a4c34231e14adbe1520fb30881d2b75de14cb2de74e0bf4a325f799d057343a8.jpg)  
+figure 1: the norm of the gradient with respect to the weights, with postln and preln.
+
+![](images/19eb886ca09870439d9ce9f1a48e28399340ea5227cd629c562a94a03ace555d.jpg)  
+figure 2: the norm preserving ratio with respect to the inputs, with postln and preln.
+
+![](images/51ed13b3420ea602232f1c25b33dcfa3b65f4d767c5c34417f49881485d3dba0.jpg)  
+figure 3: lesioning analysis with postln and preln.
+
+despite the flops reduction, directly training models like bert with a smaller depth incurs a significant loss in accuracy even with knowledge distillation [24, 25]. prior work [31] proposes to accelerate pre-training by first training a 3-layer bert model and then growing the network depth to 6-layer and subsequently 12-layer. however, the number of steps required at each depth before the network growth is not known a prior, making applying this approach challenging in practice. on the other hand, stochastic depth has been successfully demonstrated to train deep models with reduced expected depth [26, 32]. however, we observe that directly pre-training bert with randomly dropping  $f_{attn}$  and  $f_{ffn}$  converges to bad/suspicious local optima under the same hyperparameter setting. when increasing the learning rate, the training often diverges even by tuning the warmup ratio. what causes the instability of bert pre-training with layer drop?
+
+# 3 preliminary analysis
+
+this section presents several studies that guided the design of the approach introduced in section 4. we used bert trained on bookcorpus and wikipedia dataset from devlin et. al. with standard settings as the baseline  ${}^{1}$  . first,we carry out a comparison between bert with postln and preln. our goal is to measure how effective these two methods at stabilizing bert training. our second analysis considers measuring the dynamics of bert pre-training, including both spatial and temporal dimensions. finally, we analyze the effect of the removal of the transformer layers. this leads us to identify appealing choices for our target operating points.
+
+# 3.1 training stability: postln or preln?
+
+we consider two variants of bert, namely the postln and preln. the default bert employs postln, with layer normalization applied after the addition in transformer blocks. the preln changes the placement of the location of  $f_{ln}$  by placing it only on the input stream of the sublayers so that  $h_i = x_i + f_{s-attn}(f_{ln}(x_i))$  and then  $x_{i+1} = h_i + f_{ffn}(f_{ln}(h_i))$ , which is a modification described by several recent works to establish identity mapping for neural machine translation [33-37]. fig. 1 reports the norm of gradients with respect to weights in backward propagation for both methods, varying the depth  $l$  (e.g., 12, 24, 48). the plot shows that while postln suffers from unbalanced gradients (e.g., vanishing gradients as the layer id decreases), preln eliminates the unbalanced gradient problem (solid green lines) and the gradient norm stays almost same for any layer. furthermore, fig. 2 shows that for preln the gradients with respect to input  $x_i$  have very similar magnitudes (norm preserving ratio close to 1) at different layers, which is consistent with prior findings that a neural model should preserve the gradient norm between layers so as to have well-conditioning and faster convergence [38, 39]. indeed, we find that postln is more sensitive to the choice of hyperparameters, and training often diverges with more aggressive learning rates (more results in section 5), whereas preln avoids vanishing gradients and leads to more stable optimization. we also provide preliminary theoretical results in appendix b on why preln is beneficial.
+
+# 3.2 corroboration of training dynamics
+
+hereafter we investigate the representation  $x_{i}$  learned at different phases of bert pre-training and at different layers. fig. 4 shows the l2 norm distances and cosine similarity, which measures the angle between two vectors and ignores their norms, between the input and output embeddings, with postln and preln, respectively. we draw several observations.
+
+first, the dissimilarity (fig. 4a and fig. 4b) stays high for both postln and preln at those higher layers in the beginning, and the l2 and cosine similarity seems to be less correlated (e.g., step = 300). this is presumably because, at the beginning of the training, the model weights are randomly initialized, and the network is still actively adjusting weights to derive richer features from input data. since the model is still positively self-organizing on the network parameters toward their optimal configuration, dropping layers at this stage is not an interesting strategy, because it can create inputs with large noise and disturb the positive co-adaption process.
+
+second, as the training proceeds (fig. 4c and fig. 4d), although the dissimilarity remains relatively high and bumpy for postln, the similarity from preln starts to increase over successive layers, indicating that while postln is still trying to produce new representations that are very different across layers, the dissimilarity from preln is getting close to zero for upper layers, indicating that the upper layers are getting similar estimations. this can be viewed as doing an unrolled iterative refinement [40], where a group of successive layers iteratively refines their estimates of the same representations instead of computing an entirely new representation. although the viewpoint was originally proposed to explain resnet, we demonstrate that it is also true for language modeling and transformer-based networks. appendix c provides additional analysis on how preln provides extra preservation of feature identity through unrolled iterative refinement.
+
+![](images/45bf0a2bf561700dff4ae186e0ee1c05590f49a3a68d21ad9ec1bab856cb2e25.jpg)  
+(a)
+
+![](images/212caf92b5007fd072313b062be2a5958100a981164ebd8bf3f8a022f20ceffd.jpg)  
+(b)  
+figure 4: the l2 distance and cosine similarity of the input and output embeddings for bert with postln and preln, at different layers and different steps. we plot the inverse of cosine similarity (arccosine) in degrees, so that for both l2 and arccosine, the lower the more similar.
+
+![](images/f2aaa293337015fb306cf24c8c0cc6db1f092d89a841291a8571268c2b41ca34.jpg)  
+(c)
+
+![](images/6855049c029936625588fa8054eef63602865dc95e78cc97e80646f22b04128a.jpg)  
+(d)
+
+# 3.3 effect of lesioning
+
+we randomly drop layers with a keep ratio  $\theta = 0.5$  to test if dropping layers would break the training because dropping any layer changes the input distribution of all subsequent layers. the results are shown in fig. 3. as shown, removing layers in postln significantly reduces performance. moreover, when increasing the learning rate, it results in diverged training. in contrast, this is not the case for preln. given that later layers in preln tend to refine an estimate of the representation, the model with preln has less dependence on the downsampling individual layers. as a result, removing transformer layers with preln has a modest impact on performance (slightly worse validation loss at the same number of training samples). however, the change is much smaller than with postln. it further indicates that if we remove layers, especially those higher ones, it should have only a mild effect on the final result because doing so does not change the overall estimation the next layer receives, only its quality. the following layers can still perform mostly the same operation, even with some relatively little noisy input. furthermore, as fig. 4 indicates, since the lower layers remain to have a relatively high dissimilarity (deriving new features), they should be less frequently dropped. overall, these results show that, to some extent, the structure of a transformer network with preln can be changed at runtime without significantly affecting performance.
+
+# 4 our approach: progressive layer dropping
+
+this section describes our approach, namely progressive layer dropping (pld), to accelerate the pre-training of transformer-based models. we first present the switchable-transformer blocks, a new unit that allows us to train models like bert with layer drop and improved stability. then we introduce the progressive layer drop procedure.
+
+# 4.1 switchable-transformer blocks
+
+in this work, we propose a novel transformer unit, which we call "switchable-transformer" (st) block. compared with the original transformer block (fig. 5a), it contains two changes.
+
+identity mapping reordering. the first change is to establish identity mapping within a transformer block by placing the layer normalization only on the input stream of the sublayers (i.e., use preln to replace postln) (fig. 5b) for the stability reason described in section 3.1.
+
+![](images/f299cb1a856f6bb4c65d55ef4945c1f2b0bd6c95c82428349393a006f08989f7.jpg)  
+(a) original
+
+![](images/b968e21fcf91f425b57ef59cafb0fb0186611b7775153566527c4233d6e6637a.jpg)  
+(b) identity mapping reordering
+
+![](images/5530111e2764b9c2b0aeadc888db9e93eef11ab015108aac4ac9a94c4676e597.jpg)  
+(c) switchable transformer  
+figure 5: transformer variants, showing a single layer block.
+
+![](images/4ecafe3f157d98cf5efe6b4e4cae45737b77b4a2b9e68b92b847f7479bafea41.jpg)  
+figure 6: flops per training iteration normalized to the baseline.
+
+switchable gates. next, we extend the architecture to include a gate for each sub-layer (fig. 5c), which controls whether a sub-layer is disabled or not during training. in particular, for each mini-batch, the two gates for the two sublayers decide whether to remove their corresponding transformation functions and only keep the identify mapping connection, which is equivalent to applying a conditional gate function  $g$  to each sub-layer as follows:
+
+$$
+h _ {i} = x _ {i} + g _ {i} \times f _ {s - a t t n} \left(f _ {l n} \left(x _ {i}\right)\right) \times \frac {1}{p _ {i}} \tag {1}
+$$
+
+$$
+x _ {i + 1} = h _ {i} + g _ {i} \times f _ {f f n} \left(f _ {l n} \left(h _ {i}\right)\right) \times \frac {1}{p _ {i}}
+$$
+
+in our design, the function  $g_{i}$  only takes 0 or 1 as values, which is chosen randomly from a bernoulli distribution (with two possible outcomes),  $g_{i} \sim b(1, p_{i})$ , where  $p_{i}$  is the probability of choosing 1. because the blocks are selected with probability  $p_{i}$  during training and are always presented during inference, we re-calibrate the layers' output by a scaling factor of  $\frac{1}{p_{i}}$  whenever they are selected.
+
+# 4.2 a progressive layer dropping schedule
+
+based on the insights from section 3.2, and inspired by prior work on curriculum learning [41, 42] we propose a progressive schedule  $\theta(t)$  - a temporal schedule for the expected number of st blocks that are retained. we limit ourselves to monotonically decreasing functions so that the likelihood of layer dropping can only increase along the temporal dimension. we constrain  $\theta(t)$  to be  $\theta(t) \geq \bar{\theta}$  for any  $t$ , where  $\bar{\theta}$  is a limit value, to be taken as  $0.5 \leq \bar{\theta} \leq 0.9$  (section 5). based on this, we define the progressive schedule  $\theta(t)$  as:
+
+definition 4.1. a progressive schedule is a function  $t \to \theta(t)$  such that  $\theta(0) = 1$  and  $\lim_{t \to \infty} \theta(t) \to \bar{\theta}$ , where  $\bar{\theta} \in (0,1]$ .
+
+progress along the time dimension. starting from the initial condition  $\theta(0) = 1$  where no layer drop is performed, layer drop is gradually introduced. eventually (i.e., when  $t$  is sufficiently large),  $\theta(t) \to \bar{\theta}$ . according to def. 4.1, in our work, we use the following schedule function:
+
+$$
+\bar {\theta} (t) = (1 - \bar {\theta}) e x p (- \gamma \cdot t) + \bar {\theta}, \gamma > 0 \tag {2}
+$$
+
+by considering fig. 6, we provide intuitive and straightforward motivation for our choice. the blue curve in fig. 6 are polynomials of increasing degree  $\delta = \{1,..,8\}$  (left to right). despite fulfilling the initial constraint  $\theta(0) = 1$ , they have to be manually thresholded to impose  $\theta(t) \to \bar{\theta}$  when  $t \to \infty$  which introduces two more parameters ( $\delta$  and the threshold). in contrast, in our schedule, we fix  $\gamma$  using the following simple heuristics  $\gamma = \frac{100}{t}$ , since it implies  $|\theta(t) - \bar{\theta}| < 10^{-5}$  for  $\theta(t) \approx \bar{\theta}$  when  $t \approx t$ , and it is reasonable to assume that  $\mathrm{t}$  is at the order of magnitude of  $10^{4}$  or  $10^{5}$  when training transformer networks. in other words, this means that for a big portion of the training, we are dropping  $(1 - \bar{\theta})$  st blocks, accelerating the training efficiency.
+
+distribution along the depth dimension. the above progressive schedule assumes all gates in st blocks take the same  $p$  value at each step  $t$ . however, as shown in fig. 4, the lower layers of the networks should be more reliably present. therefore, we distribute the global  $\bar{\theta}$  across the entire stack so that lower layers have lower drop probability linearly scaled by their depth according to equation 3. furthermore, we let the sub-layers inside each block share the same schedule, so when  $g_{i} = 1$ , both the inner function  $f_{attn}$  and  $f_{ffn}$  are activated, while they are skipped when  $g_{i} = 0$ . therefore, each gate has the following form during training:
+
+$$
+p _ {l} (t) = \frac {i}{l} (1 - \bar {\theta} (t)) \tag {3}
+$$
+
+combining eqn. 3 and eqn. 2, we have the progressive schedule for an st block below.
+
+$$
+\theta_ {i} (t) = \frac {i}{l} (1 - (1 - \bar {\theta} (t)) e x p (- \gamma \cdot t) - \bar {\theta} (t)) \tag {4}
+$$
+
+putting it together. note that because of the exist of the identity mapping, when an st block is bypassed for a specific iteration, there is no need to perform forward-backward computation or gradient updates, and there will be updates with significantly shorter networks and more direct paths to individual layers. based on this, we design a stochastic training algorithm based on st blocks and the progressive layer-drop schedule to train models like bert faster, which we call progressive layer dropping (alg. 1). the expected network depth, denoted as  $\bar{l}$ , becomes a random variable. its expectation is given by:  $e(\bar{l}) = \sum_{t=0}^{t} \sum_{i=1}^{l} \theta(i, t)$ . with  $\bar{\theta} = 0.5$ , the expected number of st blocks during training reduces to  $e(\bar{l}) = (3l - 1)/4$  or  $e(\bar{l}) \approx 3l/4$  when t is large. for the 12-layer bert model with l=12 used in our experiments, we have  $e(\bar{l}) \approx 9$ . in other words, with progressive layer dropping, we train bert with an average number of 9 layers. this significantly improves the pre-training speed of the bert model. following the calculations above, approximately 25% of
+
+flops could be saved under the drop schedule with  $\bar{\theta} = 0.5$ . we recover the model with full-depth blocks at fine-tuning and testing time.
+
+algorithm 1 progressive_layer_dropping   
+1: input: keepprob  $\bar{\theta}$    
+2: initbert(switchable_transformer_block)   
+3:  $\gamma \leftarrow \frac{100}{t}$    
+4: for t  $\leftarrow 1$  to t do   
+5:  $\theta_t\gets (1 - \bar{\theta})exp(-\gamma \cdot t) + \bar{\theta}$    
+6: step  $\leftarrow \frac{1 - \theta_t}{l}$    
+7:  $p\gets 1$    
+8: for 1  $\leftarrow 1$  to l do   
+9: action  $\sim$  bernoulli(p)   
+10: if action  $\equiv = 0$  then   
+11:  $x_{i + 1}\gets x_i$    
+12: else   
+13:  $x_{i}^{\prime}\gets x_{i} + f_{attn}(f_{ln}(x_{i}))\times \frac{1}{p}$    
+14:  $x_{i + 1}\gets x_i' + f_{ffn}(f_{ln}(x_i'))\times \frac{1}{p}$    
+15:  $x_{i}\gets x_{i + 1}$    
+16: p  $\leftarrow$  p-step   
+17: y  $\leftarrow$  output_layer(xl)   
+18: loss  $\leftarrow$  loss_fn(y,y)   
+19: backward(loss)
+
+# 5 evaluation
+
+we show that our method improves the pre-training efficiency of transformer networks, and the trained models achieve competitive or even better performance compared to the baseline on transfer learning downstream tasks. we also show ablation studies to analyze the proposed training techniques.
+
+![](images/040b5aa0d2a1c8384bff92eb3a44f3d3e154804c97ca2c91c3b0833dad87337e.jpg)  
+figure 7: the convergence curve of the baseline and our proposed method regarding the wall-clock time.
+
+![](images/f8245c4663badb13b90a60fda296d58835a40a7dba72ee04f9ad28b427114cf9.jpg)
+
+table 1: training time comparison. sample rd standards for sample reduction. spd represents speedup.  
+
+<table><tr><td></td><td>training time</td><td>sample rd</td><td>spd</td></tr><tr><td>baseline ckp186</td><td>38.45h</td><td>0</td><td>1</td></tr><tr><td>pld ckp186</td><td>29.22h</td><td>0</td><td>1.3×</td></tr><tr><td>pld ckp100</td><td>15.56h</td><td>46%</td><td>2.5×</td></tr><tr><td>pld ckp87</td><td>13.53h</td><td>53%</td><td>2.8×</td></tr></table>
+
+datasets. we follow devlin et al. [3] to use english wikipedia corpus and bookcorpus for pretraining. by concatenating the two datasets, we obtain our corpus with roughly 2.8b word tokens in total, which is comparable with the data corpus used in devlin et al. [3]. we segment documents into sentences with 128 tokens; we normalize, lower-case, and tokenize texts using wordpiece tokenizer [3]. the final vocabulary contains 30,528 word pieces. we split documents into one training set and one validation set (300:1). for fine-tuning, we use glue (general language understanding evaluation), a collection of 9 sentence or sentence-pair natural language understanding tasks including question answering, sentiment analysis, and textual entailment. it is designed to favor sample-efficient learning and knowledge-transfer across a range of different linguistic tasks in different domains.
+
+training details. we use our own implementation of the bert model [3] based on the huggingface[1] pytorch implementation. all experiments are performed on  $4 \times \mathrm{dgx}-2$  boxes with  $64 \times \mathrm{v100}$  gpus. data parallelism is handled via pytorch ddp (distributed data parallel) library [43]. we recognize and eliminate additional computation overhead: we overlap data loading with computation through the asynchronous prefetching queue; we optimize the bert output processing through sparse computation on masked tokens. using our pre-processed data, we train a 12-layer bert-base model from scratch as the baseline. we use a warm-up ratio of 0.02 with  $\mathrm{lr}_{\max} = 1\mathrm{e}^{-4}$ . following [3], we use adam as the optimizer. we train with batch size 4k for 200k steps, which is approximately 186 epochs. the detailed parameter settings are listed in the appendix a. we fine-tune glue tasks for 5 epochs and report the median development set results for each task over five random initializations.
+
+# 5.1 experimental results
+
+pre-training convergence comparisons. fig. 7a visualizes the convergence of validation loss regarding the computational time. we make the following observations. first, with  $\mathrm{lr}_{max} = 1\mathrm{e}^{-4}$ , the convergence rate of our algorithm and the baseline is very close. this verifies empirically that our progressive layer dropping method does not hurt model convergence. second, when using a larger learning rate  $\mathrm{lr}_{max} = 1\mathrm{e}^{-3}$ , the baseline diverges. in contrast, our method shows a healthy convergence curve and is much faster. this confirms that our architectural changes stabilize training and allows bert training with more aggressive learning rates.
+
+speedup. fig. 7b shows both the training curve (dotted) and the validation curve (solid) of the baseline and pld with a zoomed-in view. the baseline curve becomes almost flat at epoch 186, getting a validation loss of 1.75. in contrast, pld reaches the same validation loss at epoch 87, with  $53\%$  fewer training samples. furthermore, pld achieves a  $24\%$  time reduction when training the same number of samples. this is because our approach trains the model with a smaller number of expected depth for the same number of steps. it is slightly lower than the  $25\%$  gflops reduction in the analysis because the output layer still takes a small amount of computation even after optimizations. the combination of these two factors, yields  $2.8\times$  speedup in end-to-end wall-clock training time over the baseline, as shown in table 1.
+
+downstream task accuracy. despite improved training speed, one may still wonder whether such a method is as effective as the baseline model on downstream tasks. table 2 shows our results on the glue dataset compared to the baseline. our baseline is comparable with the original bert-base
+
+(on the test set), and our pld method achieves a higher glue score than our baseline (83.2 vs. 82.1) when fine-tuning the checkpoint (186). we also dump model checkpoints from different epochs during pre-training and fine-tune these models. the checkpoint 87 corresponds to the validation loss at 1.75 achieved by pld. the glue score is slightly worse than the baseline (81.6 vs. 82.1). however, by fine-tuning at checkpoint 100, pld achieves a higher score than the baseline (82.3 vs. 82.1) at checkpoint 186. in terms of the pre-training wall clock time, pld requires 15.56h vs. the baseline with 39.15h to get similar accuracy on downstream tasks, which corresponds to a  $2.5 \times$  speedup.
+
+table 2: the results on the glue benchmark. the number below each task denotes the number of training examples. the metrics for these tasks can be found in the glue paper [6]. we compute the geometric mean of the metrics as the glue score.  
+
+<table><tr><td rowspan="2">model</td><td>rte (acc.)</td><td>mrpc (f1/acc.)</td><td>sts-b (pcc/scc)</td><td>cola (mcc)</td><td>sst-2 (acc.)</td><td>qnli (acc.)</td><td>qqp (f1/acc.)</td><td>mnli-mm (-m (acc.)</td><td rowspan="2">glue</td></tr><tr><td>2.5k</td><td>3.7k</td><td>5.7k</td><td>8.5k</td><td>67k</td><td>108k</td><td>368k</td><td>393k</td></tr><tr><td>bertbase (original)</td><td>66.4</td><td>88.9/84.8</td><td>87.1/89.2</td><td>52.1</td><td>93.5</td><td>90.5</td><td>71.2/89.2</td><td>84.6/83.4</td><td>80.7</td></tr><tr><td>bertbase (baseline, ckp186)</td><td>67.8</td><td>88.0/86.0</td><td>89.5/89.2</td><td>52.5</td><td>91.2</td><td>87.1</td><td>89.0/90.6</td><td>82.5/83.4</td><td>82.1</td></tr><tr><td>bertbase (pld, ckp87)</td><td>66</td><td>88.2/85.6</td><td>88.9/88.4</td><td>54.5</td><td>91</td><td>86.3</td><td>87.4/89.1</td><td>81.6/82.4</td><td>81.6</td></tr><tr><td>bertbase (pld, ckp100)</td><td>68.2</td><td>88.2/85.8</td><td>89.3/88.9</td><td>56.1</td><td>91.5</td><td>86.9</td><td>87.7/89.3</td><td>82.4/82.6</td><td>82.3</td></tr><tr><td>bertbase (pld, ckp186)</td><td>69</td><td>88.9/86.5</td><td>89.6/89.1</td><td>59.4</td><td>91.8</td><td>88</td><td>89.4/90.9</td><td>83.1/83.5</td><td>83.2</td></tr></table>
+
+fig. 8 illustrates the fine-tuning results between the baseline and pld on glue tasks over different checkpoints overall, we observe that pld not only trains bert faster in pre-training but also preserves the performance on downstream tasks. in each figure, we observe that both curves have a similar shape at the beginning because no layer drop is added. for later checkpoints, pld smoothly adds layer drop. interestingly, we note that the baseline model has fluctuations in testing accuracy. in contrast, the downstream task accuracy from pld is consistently increasing as the number of training epochs increases. this indicates that pld takes a more robust optimization path toward the optimum. we also observe that our model achieves higher performance on mnli, qnli, qqp, rte, sst-2, and cola on later checkpoints, indicating that the model trained with our approach also generalizes better on downstream tasks than our baseline does.
+
+from a knowledge transferability perspective, the goal of training a language model is to learn a good representation of natural language that ideally ignores the data-dependent noise and generalizes well to downstream tasks. however, training a model with a constant depth is at least somewhat noisy and can bias the model to prefer certain representations, whereas pld enables more sub-network configurations to be created during training transformer networks. each of the l st blocks is either active or inactive, resulting in  $2^{l}$  possible network combinations. by selecting a different submodular in each mini-batch, pld encourages the submodular to produce good results independently. this allows the unsupervised pre-training model to obtain a more general representation by averaging the noise patterns, which helps the model to better generalize to new tasks. on the other hand, during inference, the full network is presented, causing the effect of assembling different sub-networks.
+
+# 5.2 ablation studies
+
+downstream task fine-tuning sensitivity. to further verify that our approach not only stabilizes training but also improves downstream tasks, we show a grid search on learning rates  $\{1\mathrm{e} - 5,3\mathrm{e} - 5,$ $5\mathrm{e} - 5,7\mathrm{e} - 5,9\mathrm{e} - 5,1\mathrm{e} - 4\}$ . as illustrated in fig. 9, the baseline is vulnerable to the choice of learning rates. specifically, the fine-tuning results are often much worse with a large learning rate, while pld is more robust and often achieves better results with large learning rates.
+
+the effect of  $\bar{\theta}$ . we test different values of the keep ratio  $\bar{\theta}$  and identify  $0.5 \leq \bar{\theta} \leq 0.9$  as a good range, as shown in fig. 10 in the appendix. we observe that the algorithm may diverge if  $\bar{\theta}$  is too small (e.g., 0.3).
+
+pld vs. preln. to investigate the question on how pld compares with preln, we run both preln with the hyperparameters used for training postln (lr=1e-4) and the hyperparameters used for pld (lr=1e-3) to address the effect from the choice of hyperparameters. we train all configurations for the same number of epochs and fine-tune following the standard procedure. in both cases, preln is  $24\%$  slower than pld, because preln still needs to perform the full forward and backward propagation in each iteration.
+
+![](images/62f03bd575ac96ea4118e6599c3aa94e259413869e233112522cc034ac8fc57a.jpg)  
+(a) mnli-m
+
+![](images/fcd28f22f7c262fc9d65ab3efda1df7e8f90f429a4c34fb35eb6b5cebc5f3649.jpg)  
+(b) mnli-mm
+
+![](images/02a5c11558bdd2ec83747b744daa580abc073a12278884d950e966215619a69b.jpg)  
+(c)qnli
+
+![](images/a2c924303e4c912a9f2c1be1c712c3d3b31e0bfb59ebcbdb48e3d2cbcf488408.jpg)  
+(d) qqp
+
+![](images/b47c398207bd3328d47c803a599cf3af06d5ee1db9a70756d8761f1b4c66d57b.jpg)  
+(e) rte
+
+![](images/93c155a2a98b9923ac76d8d794a432359825908c1b5e93dcbed4ba57291c1553.jpg)  
+(f) sst-2
+
+![](images/1c051d9b0ec294708b115c0f86249a9b1eb1132b20d607d76abc2c4ddac5b56d.jpg)  
+(g) wnli
+
+![](images/a1301c2dcd49fac5066d034caf4b359a06a6797b6abcf36b243f8e02113d24cc.jpg)  
+(h) cola
+
+![](images/b40b439b5c9b61c3fc08338c821ae1014359510a0ec667be06429d6da52b345f.jpg)  
+(i) mrpc (acc.)
+
+![](images/f1ab32479e3441d2def4813aa85c6815ccd266d08417ae20909643a195735058.jpg)  
+(j) mrpc (f1.)
+
+![](images/c00a4f7223019358de44cfe4db951fb43227fd5162bbef70efb254be8ea5c571.jpg)  
+(k) sst-b (pcc)
+
+![](images/8f7d9f67ac709fd5e3972ded38a20414d7e8077162ec39ebc1b034d98c67469a.jpg)  
+(1) sst-b (scc)  
+figure 8: the fine-tuning results at different checkpoints.
+
+table 3 shows the fine-tuning results on glue tasks. when trained with the same hyperparameters as postln, preln appears to have a much worse glue score (80.2) compared with postln (82.1) on downstream tasks. this is because preln restricts layer outputs from depending too much on their own residual branches and inhibits the network from reaching its full potential, as recently studied in [44]. when trained with the large learning rate as pld, preln's result have improved to 82.6 but is 0.6 points worse than pld (83.2), despite using  $24\%$  more compute resource. pld achieves better accuracy than preln because it encourages each residual branch to produce good results independently.
+
+pld vs. shallow network. shallow bert + preln + large lr in table 3 shows the downstream task accuracy of the 9-layer bert. although having the same same number of training computational gflops as ours, the shallow bert underperforms preln by 0.8 points and is 1.4 points worse than pld likely because the model capacity has been reduced by the loss of parameters.
+
+pld vs. random drop.  $bert + preln + large lr + random$  drops layers randomly with a fixed ratio (i.e., it has the same compute cost but without any schedule), similar to stochastic depth [26]. the glue score is 0.9 points better than shallow bert under the same compute cost and 0.1 point
+
+![](images/a056cbe529897deb1707a6c6b9129c11515392ea40d9a8a17dc63a8b805405cd.jpg)  
+figure 9: the fine-tuning results at different checkpoints.
+
+![](images/f39affafbdd1e71bb43673fce56e3b1bc2615370a78d01ecc849d02cd1a6a9a1.jpg)  
+figure 10: convergence curves varying the keep ratio  $\bar{\theta}$ .
+
+table 3: ablation studies of the fine-tuning results on the glue benchmark.  
+
+<table><tr><td>model</td><td>rte (acc.)</td><td>mrpc (f1/acc.)</td><td>sts-b (pcc/scc)</td><td>cola (mcc)</td><td>sst-2 (acc.)</td><td>qnli (acc.)</td><td>qqp (f1/acc.)</td><td>mnli-m/mm (acc.)</td><td>glue</td></tr><tr><td>bert (original)</td><td>66.4</td><td>88.9/84.8</td><td>87.1/89.2</td><td>52.1</td><td>93.5</td><td>90.5</td><td>71.2/89.2</td><td>84.6/83.4</td><td>80.7</td></tr><tr><td>bert + postln</td><td>67.8</td><td>88.0/86.0</td><td>89.5/89.2</td><td>52.5</td><td>91.2</td><td>87.1</td><td>89.0/90.6</td><td>82.5/83.4</td><td>82.1</td></tr><tr><td>bert + preln + same lr</td><td>66.0</td><td>85.9/83.3</td><td>88.2/87.9</td><td>46.4</td><td>90.5</td><td>85.5</td><td>89.0/90.6</td><td>81.6/81.6</td><td>80.2</td></tr><tr><td>bert + preln + lr↑</td><td>67.8</td><td>86.7/84.5</td><td>89.6/89.1</td><td>54.6</td><td>91.9</td><td>88.1</td><td>89.3/90.9</td><td>83.6/83.7</td><td>82.6</td></tr><tr><td>shallow bert + preln + lr↑</td><td>66.0</td><td>85.9/83.5</td><td>89.5/88.9</td><td>54.7</td><td>91.8</td><td>86.1</td><td>89.0/90.6</td><td>82.7/82.9</td><td>81.8</td></tr><tr><td>bert + preln + lr↑ + rand.</td><td>68.2</td><td>88.2/86.2</td><td>89.3/88.8</td><td>56.8</td><td>91.5</td><td>87.2</td><td>88.6/90.3</td><td>82.9/83.3</td><td>82.7</td></tr><tr><td>bert + preln + lr↑ + td</td><td>68.2</td><td>88.6/86.7</td><td>89.4/88.9</td><td>55.9</td><td>91.3</td><td>86.8</td><td>89.1/90.7</td><td>82.7/83.1</td><td>82.7</td></tr><tr><td>bert + preln + lr↑ + pld</td><td>69.0</td><td>88.9/86.5</td><td>89.6/89.1</td><td>59.4</td><td>91.8</td><td>88.0</td><td>89.4/90.9</td><td>83.1/83.5</td><td>83.2</td></tr></table>
+
+better than preln while being  $24\%$  faster, indicating the strong regularization effect from stochastic depth. it is 0.5 points worse than pld, presumably because a fixed ratio does not take into account the training dynamics of transformer networks.
+
+schedule impact analysis.  $bert + preln + large lr + td$  only (32-bit*) disables the schedule along the depth dimension (dd) and enables only the schedule along the temporal dimension (td) in training. its glue score matches "random", suggesting that the temporal schedule has similar performance as the fixed constant schedule along the time dimension and accuracy gains of pld is mostly from the depth dimension. however, without the temporal schedule enabled, the model diverges with nan in the middle of half-precision (16-bit) training and has to switch to full-precision
+
+(32-bit) training, slowing down training speed. furthermore, this concept of starting-easy and gradually increasing the difficulty of the learning problem has its roots in curriculum learning and often makes optimization easier. we adopt the temporal schedule since it is robust and helpful for training stability, retaining similar accuracy while reducing training cost considerably.
+
+# 6 conclusion
+
+unsupervised language model pre-training is a crucial step for getting state-of-the-art performance on nlp tasks. the current time for training such a model is excruciatingly long, and it is very much desirable to reduce the turnaround time for training such models. in this paper, we study the efficient training algorithms for pre-training bert model for nlp tasks. we have conducted extensive analysis and found that model architecture is important when training transformer-based models with stochastic depth. using this insight, we propose the switchable-transformer block and a progressive layer-wise drop schedule. our experiment results show that our training strategy achieves competitive performance to training a deep model from scratch at a faster rate.
+
+# references
+
+[1] zhilin yang, zihang dai, yiming yang, jaime g. carbonell, ruslan salakhutdinov, and quoc v. le. xlnet: generalized autoregressive pretraining for language understanding. in advances in neural information processing systems 32: annual conference on neural information processing systems 2019, neurips 2019, 8-14 december 2019, vancouver, bc, canada, pages 5754-5764, 2019.  
+[2] yinhan liu, myle ott, naman goyal, jingfei du, mandar joshi, danqi chen, omer levy, mike lewis, luke zettlemoyer, and veselin stoyanov. roberta: a robustly optimized bert pretraining approach. corr, abs/1907.11692, 2019.  
+[3] jacob devlin, ming-wei chang, kenton lee, and kristina toutanova. bert: pre-training of deep bidirectional transformers for language understanding. in proceedings of the 2019 conference of the north american chapter of the association for computational linguistics: human language technologies, naacl-hlt 2019), pages 4171-4186, 2019.  
+[4] alon talmor, jonathan herzig, nicholas lourie, and jonathan berant. commonsenseqa: a question answering challenge targeting commonsense knowledge. in proceedings of the 2019 conference of the north american chapter of the association for computational linguistics: human language technologies, naacl-hlt 2019, minneapolis, mn, usa, june 2-7, 2019, volume 1 (long and short papers), pages 4149-4158, 2019.  
+[5] wei yang, yuqing xie, aileen lin, xingyu li, luchen tan, kun xiong, ming li, and jimmy lin. end-to-end open-domain question answering with bertserini. in proceedings of the 2019 conference of the north american chapter of the association for computational linguistics: human language technologies, naacl-hlt 2019, minneapolis, mn, usa, june 2-7, 2019, demonstrations, pages 72-77, 2019.  
+[6] alex wang, amanpreet singh, julian michael, felix hill, omer levy, and samuel r. bowman. glue: a multi-task benchmark and analysis platform for natural language understanding. in 7th international conference on learning representations, 2019.  
+[7] ming ding, chang zhou, qibin chen, hongxia yang, and jie tang. cognitive graph for multi-hop reading comprehension at scale. in proceedings of the 57th conference of the association for computational linguistics, acl 2019, florence, italy, july 28-august 2, 2019, volume 1: long papers, pages 2694-2703, 2019.  
+[8] mohammad shoeybi, mostofa patwary, raul puri, patrick legresley, jared casper, and bryan catanzaro. megatron-lm: training multi-billion parameter language models using model parallelism. corr, abs/1909.08053, 2019.  
+[9] alec radford, jeff wu, rewon child, david luan, dario amodei, and ilya sutskever. language models are unsupervised multitask learners. online post, 2019.  
+[10] tom b. brown, benjamin mann, nick ryder, melanie subbiah, jared kaplan, prafulla dhariwal, arvind neelakantan, pranav shyam, girish sastry, amanda askell, sandhini agarwal, ariel herbert-voss, gretchen krueger, tom henighan, rewon child, aditya ramesh, daniel m. ziegler, jeffrey wu, clemens winter, christopher hesse, mark chen, eric sigler, mateusz litwin, scott gray, benjamin chess, jack
+
+clark, christopher berner, sam mccandlish, alec radford, ilya sutskever, and dario amodei. language models are few-shot learners. corr, abs/2005.14165, 2020.  
+[11] mandar joshi, danqi chen, yinhan liu, daniel s. weld, luke zettlemoyer, and omer levy. spanbert: improving pre-training by representing and predicting spans. corr, abs/1907.10529, 2019.  
+[12] jinhyuk lee, wonjin yoon, sungdong kim, donghyeon kim, sunkyu kim, chan ho so, and jaewoo kang. biobert: a pre-trained biomedical language representation model for biomedical text mining. bioinform., 36(4):1234-1240, 2020.  
+[13] li dong, nan yang, wenhui wang, furu wei, xiaodong liu, yu wang, jianfeng gao, ming zhou, and hsiao-wuen hon. unified language model pre-training for natural language understanding and generation. in advances in neural information processing systems, pages 13042-13054, 2019.  
+[14] turing-nlg: a 17-billion-parameter language model by microsoft. https://www.microsoft.com/en-us/research/blog/turing-nlg-a-17-billion-parameter-language-model-by-microsoft/. accessed: 19-may-2020.  
+[15] colin raffel, noam shazeer, adam roberts, katherine lee, sharan narang, michael matena, yanqi zhou, wei li, and peter j. liu. exploring the limits of transfer learning with a unified text-to-text transformer. corr, abs/1910.10683, 2019.  
+[16] ashish vaswani, noam shazeer, niki parmar, jakob uszkoreit, llion jones, aidan n. gomez, lukasz kaiser, and illia polosukhin. attention is all you need. in advances in neural information processing systems 30: annual conference on neural information processing systems 2017, pages 5998-6008, 2017.  
+[17] norman p. jouppi, cliff young, nishant patil, david patterson, gaurav agrawal, raminder bajwa, sarah bates, suresh bhatia, nan boden, al borchers, rick boyle, pierre-luc cantin, clifford chao, chris clark, jeremy coriell, mike daley, matt dau, jeffrey dean, ben gelb, tara vazir ghaemmaghami, rajendra gottipati, william gulland, robert hagmann, c. richard ho, doug hogberg, john hu, robert hundt, dan hurt, julian ibarz, aaron jaffey, alek jaworski, alexander kaplan, harshit khaitan, daniel killebrew, andy koch, naveen kumar, steve lacy, james laudon, james law, diemthu le, chris leary, zhuyuan liu, kyle lucke, alan lundin, gordon mackean, adriana maggiore, maire mahony, kieran miller, rahul nagarajan, ravi narayanaswami, ray ni, kathy nix, thomas norrie, mark omernick, narayana penukonda, andy phelps, jonathan ross, matt ross, amir salek, emad samadiani, chris severn, gregory sizikov, matthew snelham, jed souter, dan steinberg, andy swing, mercedes tan, gregory thorson, bo tian, horia toma, erick tuttle, vijay vasudevan, richard walter, walter wang, eric wilcox, and doe hyun yoon. in-datacenter performance analysis of a tensor processing unit. in proceedings of the 44th annual international symposium on computer architecture, isca '17, pages 1-12, 2017.  
+[18] paulius micikevicius, sharan narang, jonah alben, gregory f. diamos, erich elsen, david garcía, boris ginsburg, michael houston, oleksii kuchaiev, ganesh venkatesh, and hao wu. mixed precision training. in 6th international conference on learning representations, iclr 2018, 2018.  
+[19] stefano markidis, steven wei der chien, erwin laure, ivy bo peng, and jeffrey s. vetter. nvidia tensor core programmability, performance & precision. in 2018 ieee international parallel and distributed processing symposium workshops, ipdps workshops 2018, vancouver, bc, canada, may 21-25, 2018, pages 522-531, 2018.  
+[20] yanping huang, youlong cheng, ankur bapna, orhan first, dehao chen, mia xu chen, hyoukjoong lee, jiquan ngiam, quoc v. le, yonghui wu, and zhifeng chen. gpipe: efficient training of giant neural networks using pipeline parallelism. in advances in neural information processing systems 32: annual conference on neural information processing systems 2019, pages 103-112, 2019.  
+[21] noam shazeer, youlong cheng, niki parmar, dustin tran, ashish vaswani, penporn koanantakool, peter hawkins, hyoukjoong lee, mingsheng hong, cliff young, ryan sepassi, and blake a. hechtman. meshtensorflow: deep learning for supercomputers. in advances in neural information processing systems 31: annual conference on neural information processing systems 2018, pages 10435-10444, 2018.  
+[22] nitish shirish keskar, dheevatsa mudigere, jorge nocedal, mikhail smelyanskiy, and ping tak peter tang. on large-batch training for deep learning: generalization gap and sharp minima. in 5th international conference on learning representations, iclr 2017, toulouse, france, april 24-26, 2017, conference track proceedings, 2017.  
+[23] yang you, jing li, jonathan hseu, xiaodan song, james demmel, and cho-jui hsieh. reducing bert pre-training time from 3 days to 76 minutes. corr, abs/1904.00962, 2019.
+
+[24] victor sanh, lysandre debut, julien chaumont, and thomas wolf. distilbert, a distilled version of bert: smaller, faster, cheaper and lighter. corr, abs/1910.01108, 2019.  
+[25] xiaoqi jiao, yichun yin, lifeng shang, xin jiang, xiao chen, linlin li, fang wang, and qun liu. tinybert: distilling bert for natural language understanding. corr, abs/1909.10351, 2019.  
+[26] gao huang, yu sun, zhuang liu, daniel sedra, and kilian q. weinberger. deep networks with stochastic depth. in computer vision - eccv 2016 - 14th european conference, amsterdam, the netherlands, october 11-14, 2016, proceedings, part iv, pages 646-661, 2016.  
+[27] zhenzhong lan, mingda chen, sebastian goodman, kevin gimpel, piyush sharma, and radu soricut. albert: a lite bert for self-supervised learning of language representations. in 8th international conference on learning representations, iclr 2020, addis ababa, ethiopia, april 26-30, 2020, 2020.  
+[28] kaiming he, xiangyu zhang, shaoqing ren, and jian sun. deep residual learning for image recognition. in 2016 ieee conference on computer vision and pattern recognition, pages 770-778, 2016.  
+[29] lei jimmy ba, jamie ryan kiros, and geoffrey e. hinton. layer normalization. corr, abs/1607.06450, 2016.  
+[30] kevin clark, minh-thang luong, quoc v. le, and christopher d. manning. electra: pre-training text encoders as discriminators rather than generators. in 8th international conference on learning representations, iclr 2020, addis ababa, ethiopia, april 26-30, 2020. openreview.net, 2020.  
+[31] linyuan gong, di he, zhuohan li, tao qin, liwei wang, and tie-yan liu. efficient training of bert by progressively stacking. in proceedings of the 36th international conference on machine learning, icml 2019, 9-15 june 2019, long beach, california, usa, pages 2337-2346, 2019.  
+[32] angela fan, edouard grave, and armand joulin. reducing transformer depth on demand with structured dropout. in 8th international conference on learning representations, iclr 2020, addis ababa, ethiopia, april 26-30, 2020. openreview.net, 2020.  
+[33] qiang wang, bei li, tong xiao, jingbo zhu, changliang li, derek f. wong, and lidia s. chao. learning deep transformer models for machine translation. in proceedings of the 57th conference of the association for computational linguistics, acl 2019, florence, italy, july 28-august 2, 2019, volume 1: long papers, pages 1810-1822, 2019.  
+[34] ruibin xiong, yunchang yang, di he, kai zheng, shuxin zheng, chen xing, huishuai zhang, yanyan lan, liwei wang, and tie-yan liu. on layer normalization in the transformer architecture. arxiv preprint arxiv:2002.04745, 2020.  
+[35] alexei baevski and michael auli. adaptive input representations for neural language modeling. in 7th international conference on learning representations, 2019.  
+[36] rewon child, scott gray, alec radford, and ilya sutskever. generating long sequences with sparse transformers. corr, abs/1904.10509, 2019.  
+[37] toan q. nguyen and julian salazar. transformers without tears: improving the normalization of self-attention. corr, abs/1910.05895, 2019.  
+[38] xavier glorot and yoshua bengio. understanding the difficulty of training deep feedforward neural networks. in proceedings of the thirteenth international conference on artificial intelligence and statistics, aistats 2010, chia laguna resort, sardinia, italy, may 13-15, 2010, pages 249-256, 2010.  
+[39] alireza zaeemzadeh, nazanin rahnavard, and mubarak shah. norm-preservation: why residual networks can become extremely deep? corr, abs/1805.07477, 2018.  
+[40] klaus greff, rupesh kumar srivastava, and jürgen schmidhuber. highway and residual networks learn unrolled iterative estimation. in 5th international conference on learning representations, iclr 2017, toulouse, france, april 24-26, 2017, conference track proceedings, 2017.  
+[41] pietro morerio, jacopo cavazza, riccardo volpi, rené vidal, and vittorio murino. curriculum dropout. in ieee international conference on computer vision, iccv 2017, venice, italy, october 22-29, 2017, pages 3564-3572, 2017.  
+[42] yoshua bengio, jérôme louradour, ronan collobert, and jason weston. curriculum learning. in proceedings of the 26th annual international conference on machine learning, icml 2009, montreal, quebec, canada, june 14-18, 2009, pages 41-48, 2009.
+
+[43] pytorch distributed data parallel. https://pytorch.org/docs/stable/notes/ddp.html. accessed: 28-april-2020.  
+[44] liyuan liu, xiaodong liu, jianfeng gao, weizhu chen, and jiawei han. understanding the difficulty of training transformers. corr, abs/2004.08249, 2020.  
+[45] kaiming he, xiangyu zhang, shaoqing ren, and jian sun. identity mappings in deep residual networks. in computer vision - eccv 2016 - 14th european conference, pages 630-645, 2016.  
+[46] atilim gunes baydin, barak a. pearlmutter, alexey andreyevich radul, and jeffrey mark siskind. automatic differentiation in machine learning: a survey. j. mach. learn. res., 18:153:1-153:43, 2017.
+
+# a pre-training hyperparameters
+
+table 4 describes the hyperparameters for pre-training the baseline and pld.  
+table 4: hyperparameters for pre-training the baseline and pld.  
+
+<table><tr><td>hyperparameter</td><td>baseline</td><td>pld</td></tr><tr><td>number of layers</td><td>12</td><td>12</td></tr><tr><td>hidden zies</td><td>768</td><td>768</td></tr><tr><td>attention heads</td><td>12</td><td>12</td></tr><tr><td>dropout</td><td>0.1</td><td>0.1</td></tr><tr><td>attention dropout</td><td>0.1</td><td>0.1</td></tr><tr><td>total batch size</td><td>4k</td><td>4k</td></tr><tr><td>train micro batch size pergpu</td><td>16</td><td>16</td></tr><tr><td>optimizer</td><td>adam</td><td>adam</td></tr><tr><td>peak learning rate</td><td>1e-04</td><td>1e-03</td></tr><tr><td>learning rate scheduler</td><td>warmup_linear(decay_exp</td><td>warmup_linear(decay_exp</td></tr><tr><td>warmup ratio</td><td>0.02</td><td>0.02</td></tr><tr><td>decay rate</td><td>0.99</td><td>0.99</td></tr><tr><td>decay step</td><td>1000</td><td>1000</td></tr><tr><td>max training steps</td><td>200000</td><td>200000</td></tr><tr><td>weight decay</td><td>0.01</td><td>0.01</td></tr><tr><td>gradient clipping</td><td>1</td><td>1</td></tr></table>
+
+# b establishing identity mapping with preln
+
+prior studies [28, 45] suggest that establishing identity mapping to keep a clean information path (no operations except addition) is helpful for easing optimization of networks with residual connections. with the change of preln, we can express the output of the i-th transformer layer as the input  $x_{i}$  of that layer plus a residual transformation function  $f_{rt} = f_{s - attn}(f_{ln}(x_i)) + f_{ffn}(f_{ln}(x_i'))$ , and the output layer  $x_{l} = x_{l} + \sum_{i = l}^{l - 1}f_{rt}(x_{i})$  as the recursive summation of preceding  $f_{rt}$  functions in shallower layers (plus  $x_{l}$ ). if we denote the loss function as  $\mathcal{e}$ , from the chain rule of backpropagation [46] we have:
+
+$$
+\frac {\partial \mathcal {e}}{\partial x _ {l}} = \frac {\partial \mathcal {e}}{\partial x _ {l}} \frac {\partial x _ {l}}{\partial x _ {l}} = \frac {\partial \mathcal {e}}{\partial x _ {l}} \left(1 + \frac {\partial}{\partial x _ {l}} \sum_ {i = l} ^ {l - 1} f _ {r t} \left(x _ {i}\right)\right) \tag {5}
+$$
+
+eqn. 5 indicates that the gradient  $\frac{\partial \mathcal{e}}{\partial x_l}$  can be decomposed into two additive terms: a term of  $\frac{\partial \mathcal{e}}{\partial x_l}$  that propagates information directly back to any shallower  $l$ -th block without concerning how complex  $\frac{\partial}{\partial x_l} \sum_{i=l}^{l-1} f_{rt}(x_i)$  would be, and another term of  $\frac{\partial \mathcal{e}}{\partial x_l} \left( \frac{\partial}{\partial x_l} \sum_{i=l}^{l-1} f_{rt}(x_i) \right)$  that propagates through the transformer blocks. the equation also suggests that it is unlikely for the gradient  $\frac{\partial}{\partial x_l}$  to be canceled out for a mini-batch, and in general the term  $\frac{\partial}{\partial x_l} \sum_{i=l}^{l-1} f_{rt}(x_i)$  cannot be always -1 for all samples in a mini-batch. this explains why the gradients of transformer layers in fig. 1 become more balanced and do not vanish after identity mapping reordering. in contrast, the postln architecture has a series of layer normalization operations that constantly alter the signal that passes through the skip connection and impedes information propagation, causing both vanishing gradients and training instability. overall, preln results in several useful characteristics such as avoiding vanishing/exploding gradient, stable optimization, and performance gain.
+
+# c preln from the view of unrolled iterative refinement
+
+from a theoretical point of view [40], a noisy estimate for a representation by the first transformer layer should, on average, be correct even though it might have high variance. the unrolled iterative refinement view says if we treat "identity mapping" (as in preln) as being an unbiased estimator for the target representation, then beyond the first layer, the subsequent transformer layer outputs  $x_{i}^{n}$  (e.g.,  $i \in 2\dots l$ ) are all estimators for the same latent representation  $h^{n}$ , where  $h^{n}$  refers to the (unknown)
+
+value towards which the  $n$ -th representation is converging. the unbiased estimator condition can then be written as the expected difference between the estimator and the final representation:
+
+$$
+\underset {x \in x} {\mathbb {e}} \left[ x _ {i} ^ {n} - h ^ {n} \right] = 0 \tag {6}
+$$
+
+with the preln equation, it follows that the expected difference between outputs of two consecutive layers is zero, because
+
+$$
+\mathbb {e} \left[ x _ {i} ^ {n} - h ^ {n} \right] - \mathbb {e} \left[ x _ {i - 1} ^ {n} - h ^ {n} \right] = 0 \rightarrow \mathbb {e} \left[ x _ {i} ^ {n} - x _ {i - 1} ^ {n} \right] = 0 \tag {7}
+$$
+
+if we write representation  $x_{i}^{n}$  as a combination of  $x_{i - 1^n}$  and a residual  $f_{rt}^n$ , it follows from the above equation that the residual has to be zero-mean:
+
+$$
+x _ {i} ^ {n} = x _ {i - 1} ^ {n} + f _ {r t} ^ {n} \rightarrow \mathbb {e} \left[ f _ {r t} ^ {n} \right] = 0 \tag {8}
+$$
+
+which we have empirically verified to be correct, as shown in figure 2. therefore, preln ensures that the expectation of the new estimate will be correct, and the iterative summation of the residual functions in the remaining layers determines the variance of the new estimate  $\mathbb{e}[f_{rti}]$ .
+
+the effect of learning rates on downstream tasks. we focus on evaluating larger datasets and exclude very small datasets, as we find that the validation scores on those datasets have a large variance for different random seeds.
+
+for fine-tuning models on downstream tasks, we consider training with batch size 32 and performing a linear warmup for the first  $10\%$  of steps followed by a linear decay to 0. we fine-tune for 5 epochs and perform the evaluation on the development set. we report the median development set results for each task over five random initializations, without model ensemble.
+
+results are visualized in fig. 9, which shows that the baseline is less robust on the choice of learning rates. specifically, the fine-tuning results are often much worse with a large learning rate. in comparison, pld is more robust and often achieves better results with large learning rates.

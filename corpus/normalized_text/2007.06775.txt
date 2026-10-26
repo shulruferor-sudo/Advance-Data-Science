@@ -1,0 +1,941 @@
+# analyzing and mitigating data stalls in dnn training
+
+jayashree mohan*
+
+university of texas at austin
+
+jaya@cs.utexas.edu
+
+ashish raniwala
+
+microsoft
+
+ashish.raniwala@microsoft.com
+
+amar phanishayee
+
+microsoft research
+
+amar@microsoft.com
+
+vijay chidambaram
+
+university of texas at austin & vmware research
+
+vijay@cs.utexas.edu
+
+# abstract
+
+training deep neural networks (dnns) is resource-intensive and time-consuming. while prior research has explored many different ways of reducing dnn training time, the impact of input data pipeline, i.e., fetching raw data items from storage and performing data pre-processing in memory, has been relatively unexplored. this paper makes the following contributions: (1) we present the first comprehensive analysis of how the input data pipeline affects the training time of widely-used computer vision and audio deep neural networks (dnns), that typically involve complex data preprocessing. we analyze nine different models across three tasks and four datasets while varying factors such as the amount of memory, number of cpu threads, storage device, gpu generation etc on servers that are a part of a large production cluster at microsoft. we find that in many cases, dnn training time is dominated by data stall time: time spent waiting for data to be fetched and preprocessed. (2) we build a tool, ds-analyzer to precisely measure data stalls using a differential technique, and perform predictive what-if analysis on data stalls. (3) finally, based on the insights from our analysis, we design and implement three simple but effective techniques in a data-loading library, coordl, to mitigate data stalls. our experiments on a range of dnn tasks, models, datasets, and hardware config show that when pytorch uses coordl instead of the state-of-the-art dali data loading library, dnn training time is reduced significantly (by as much as  $5 \times$  on a single server).
+
+# pvldb reference format:
+
+jayashree mohan*, amar phanishayee, ashish raniwala, and vijay chidambaram. analyzing and mitigating data stalls in dnn training. pvldb, 14(5): 2021.
+
+doi:10.14778/3446095.3446100
+
+# pvldb artifact availability:
+
+the source code, data, and/or other artifacts have been made available at https://github.com/msr-fiddle/ds-analyzer.
+
+# 1 introduction
+
+data is the fuel powering machine learning [71]. large training datasets are empowering state-of-the-art accuracy for several machine learning tasks. particularly, deep neural networks (dnns), have gained prominence, as they allow us to tackle problems that were previously intractable, such as image classification [44, 57, 83], translation [90], speech recognition[41], video captioning [88], and even predictive health-care [85].
+
+empowering dnns to push state-of-the-art accuracy requires the model to be trained with a large volume of data. during training, the model predicts the output given training data; based on the output, the model's weights are tuned. this happens iteratively, in many rounds called epochs.
+
+however, dnn training is data-hungry, resource-intensive, and time-consuming. it involves the holistic use of all the resources in a server from storage and cpu for fetching and pre-processing the dataset to the gpus that perform computation on the transformed data. researchers have tackled how to efficiently use these resources to reduce dnn training time, such as reducing communication overhead [43, 50, 63, 69, 92], gpu memory optimizations [29, 49, 77], and compiler-based operator optimizations [28, 52, 87]. however, the impact of storage systems, specifically the data pipeline, on dnn training has been relatively unexplored.
+
+the dnn data pipeline. during dnn training, the data pipeline works as follows. data items are first fetched from storage and then pre-processed in memory. for example, for many important and widely-used classes of dnns in computer vision, there are several pre-processing steps: data is first decompressed, and then random perturbations such as cropping the image or rotating it are performed to improve the model's accuracy [74]. once pre-processed, the data items are sent to the gpus for processing. one complete pass over the training dataset is termed an epoch; models are iteratively trained for several epochs to achieve desired accuracy.
+
+the dnn data pipeline operates in parallel with gpu computation. ideally, the data pipeline should steadily feed pre-processed data items to the gpus to keep them continuously busy processing data; we term this gpu-bound. unfortunately, dnn training is often i/o-bound, bottlenecked by fetching the data from storage, or cpu-bound, bottlenecked by applying data pre-processing in memory. collectively, we term these bottlenecks data stalls and differentiate between prep stalls (time spent on data pre-processing) and fetch stalls (time spent on i/o).
+
+novelty over prior work. recent work like quiver [58] demonstrate how to speed up dnn training by efficiently caching data from remote object storage on local storage. in contrast, our work
+
+table 1: key findings and implications of our analysis of data stalls  
+
+<table><tr><td>finding</td><td>insights</td></tr><tr><td>os page cache is inefficient for dnn training due to thrashing</td><td>dnn-aware caching can eliminate thrashing across epochs</td></tr><tr><td>dnns need anywhere between 3 - 24 cpu cores per gpu for data pre-processing</td><td>if hardware is upgraded to overcome workload bottlenecks, it must be done carefully with an eye towards designing balanced server skus.</td></tr><tr><td>dnns spend upto 65% of the epoch time in data pre-processing, primarily on redundant decoding</td><td>decoded data can be cached (as opposed to caching encoded data), if space amplification due to decoding can be addressed</td></tr><tr><td>lack of coordination among local caches lead to redundant i/o in distributed training across servers</td><td>to overcome local storage i/o bottlenecks, local in-memory caches of servers allocated to a job can be coordinated to fetch data from distributed in-memory caches</td></tr><tr><td>hyperparameter search workloads perform redundant i/o &amp; prep</td><td>hyperparameter search jobs must coordinate data fetch &amp; prep to mitigate data stalls</td></tr></table>
+
+assumes as baseline the setting where all data is available on local storage (as most publicly available datasets for popular models fit on local storage [10, 23, 25, 35, 59, 78], §4.3.1), and shows how to further optimize the data pipeline (\$4.3.2, §4.3.3). this work therefore fundamentally improves performance on top of what quiver can achieve. while prior work like cerebro [68], and deepio [95] have looked at optimizing data fetch in distributed training, they do not systematically analyze data stalls in different training scenarios, or demonstrate how to accelerate single-server training.
+
+# 1.1 contributions
+
+categorizing, measuring, and analyzing data stalls. we present the first comprehensive analysis of data stalls (categorized as fetch and prep stalls) in dnn training. we analyze nine popular dnn models from three domains (image classification, object detection, and audio classification) and four datasets in a production cluster at microsoft. we vary factors such as the storage media, amount of data that can be cached in memory, the number of cpu threads used to fetch and pre-process data, and gpu generation. we then analyze how these factors affect the data pipeline and dnn training. our analysis finds that data stalls squander away the improved performance of faster gpus, even on ml optimized servers like the dgx-2 [14]. revisiting the insights from stonebraker et al. [84], our analysis corroborates that relying on os abstractions (like page cache) is inefficient for dnn workloads. we also find that the data pipelines in popular training frameworks like pytorch and tensorflow are inefficient in their use of cpu and memory resources, despite using state-of-the-art data-loading libraries like dali [8] that reduce prep stalls using gpu-accelerated data pre-processing. table 1 summarizes the findings and insights of our analysis.
+
+performing predictive what-if analysis of data stalls. performing an analysis of how the data pipeline impacts dnn training is challenging since dnn training has a high degree of concurrency; it is hard to isolate the time taken to perform a single task especially as data prefetching and pre-processing are pipelined with gpu computation. we develop a tool, ds-analyzer, that uses differential analysis between runs (e.g., comparing a run where data is completely cached vs when data needs to be fetched from storage) to accurately identify data-stall bottlenecks. using the measured data stalls, ds-analyzer answers what-if questions to help practitioners predict and analyze data stalls (e.g., what would be the impact on data stalls if dram capacity increased by  $2 \times ?$ ).
+
+mitigating data stalls. we use the insights from our analysis to identify opportunities for improvement. we build a new data- loading library, coordl, that does not require any changes to the
+
+cluster infrastructure. coordl uses three main techniques to mitigate data stalls. first, inspired by the pioneering work of stonebraker et al. on database caching [84], we demonstrate that relying on the os page cache is sub-optimal for dnn training. we implement minio, a software cache that is specialized for dnn training. second, we describe the partitioned caching technique to coordinate the minio caches of servers involved in distributed training over commodity network stack. third, we discuss the coordinated prep technique to carefully eliminate redundancy in data prep among concurrent hyperparameter search jobs in a server. we implement these techniques as part of the user-space library coordl, built on top of the state-of-the-art data pipeline dali [8]. we evaluate coordl across different models, datasets, and hardware and show that it can accelerate training by up-to  $5 \times$  on a single server by mitigating data stalls over dali.
+
+# 2 background
+
+deep neural networks (dnns) are a class of ml models that automatically extract higher level features from the input data. the dnn is trained over multiple rounds termed epochs. each epoch processes all items in the dataset exactly once, and consists of multiple iterations; each iteration processes a random, disjoint subset of the data termed a minibatch. the dnn is trained until a target accuracy is reached. training a dnn model to reach a given accuracy consists of two steps:
+
+(1) hyperparameter (hp) search. there are many parameters for the learning algorithm that must be provided before the start of training. these hyperparameters (for e.g., learning rate, its decay, dropout, and momentum) influence the speed and quality of learning. during the search process, we start several training jobs; each job trains the model with different hyperparameters, on each available gpu (or a distributed job across several gpus); progress is checked after a few epochs and the worst-performing candidates are killed and replaced by new jobs with different hyperparameters that are chosen algorithmically [26, 38, 48, 60]. tuning hyperparameters is crucial for generating dnn models that have high accuracy [75].  
+(2) training the model to target accuracy. the second step is to obtain models with high accuracy by training it with input data, using the hyperparameters chosen in the previous step.
+
+# 2.1 the dnn etl requirements
+
+in every epoch of training, the input dataset is subjected to a etl (extract-transform-load) before being processed at the gpu (or any other accelerator). the etl process in the data pipeline of dnn
+
+![](images/bf4709c62bfb3471489dbc297f55ddb64d038ac937f00160689500fdddfbc48a.jpg)  
+figure 1: data pipeline in dnn training. this figure shows the different stages in the data pipeline.
+
+training imposes several unique data ordering constraints to ensure model convergence and achieve state-of-the-art accuracy.
+
+- the dataset must be shuffled every epoch to ensure the order in which data items are accessed are random in each epoch  
+- an epoch must use all data items in the dataset exactly once  
+- in every epoch, the data transformations(pre-processing) must be random; the same transformed item should not be used across epochs
+
+several prior work have theoretically and empirically demonstrated that relaxing these constraints will affect the convergence rate of sgd [31, 62, 66, 74]. therefore, in this work, all our experiments abide by the aforementioned etl requirements.
+
+# 2.2 dali:fast data pipelining
+
+state-of-the-art data loading and pre-processing libraries like dali can be used as a drop in replacement for the default dataloaders in frameworks like pytorch, tensorflow, or mxnet. dali accelerates data pre-processing operations using gpu-accelerated data preprocessing operations. dali also prefetches and pipelines the data fetch and pre-processing with the gpu compute, similar to the default datalloader in pytorch. we empirically verified that dali outperforms the default data pipelines of pytorch, tensorflow, and mxnet. therefore, throughout this work, unless and otherwise stated, we use dali, as it is the strongest baseline.
+
+# 3 data stalls in dnn training
+
+we now discuss our formulation of data stalls. consider the training process of a typical dnn. it executes the following steps in each iteration of an epoch:
+
+(1) a minibatch of data items is fetched from storage.  
+(2) the data items are pre-processed, for e.g., for image classification, data items are decompressed, and then randomly cropped, resized, and flipped.  
+(3) the minibatch is then processed at the gpu to obtain the model's prediction  
+(4) a loss function is used to determine how much the prediction deviates from the right answer  
+(5) model weights are updated using computed gradients
+
+ideally, most of the time in each epoch should be spent on steps 3-5 (which we collectively term the gpu compute time), i.e., training is gpu bound. when performing multi-gpu training, individual gpus (workers) exchange weight gradients with other workers before performing weight update. for this work, we roll the communication time for gradient exchange during multi-gpu training into computation time.
+
+in most frameworks including pytorch, tensorflow, and mxnet, data preparation (steps 1 and 2) and gpu computation execute in a pipelined fashion; i.e., subsequent minibatches are prefetch and pre-processed by data preparation threads, using multiple cpu cores
+
+table 2: models and datasets used in this work.  
+
+<table><tr><td>task</td><td>model</td><td>dataset (size)</td></tr><tr><td rowspan="7">image classification</td><td>shufflenetv2 [93]</td><td></td></tr><tr><td>alexnet [57]</td><td>imagenet-22k [10]</td></tr><tr><td>resnet18 [44]</td><td>(1.3tb)</td></tr><tr><td>squeezenet [46]</td><td>openimages-extended</td></tr><tr><td>mobilenetv2 [80]</td><td>[59, 81] (645gb)</td></tr><tr><td>resnet50 [44]</td><td>imagenet-1k [78]</td></tr><tr><td>vgg11 [83]</td><td>(146gb)</td></tr><tr><td>obj detection</td><td>ssd+res18 [64]</td><td>openimages [59] (561gb)</td></tr><tr><td>audio classify</td><td>m5 [33]</td><td>free music [35] (950gb)</td></tr></table>
+
+on the machine, as the gpu computes on the current minibatch of data. if the gpu is waiting for steps 1-2 to happen, we term it a data stall. specifically, if training is blocked on step 1, we call it a fetch stall; the training is i/o bound in this case. training blocked due to step 2 is termed prep stall; this causes the training to be cpu bound. data stalls cause the gpu to be idle, and must be minimized to increase gpu utilization.
+
+the rate at which data items can be fetched from storage (step 1) depends primarily on the storage media. the rate at which data items can be pre-processed (step 2) depends upon the preprocessing operations and the number of cpu cores available for pre-processing.
+
+in general, if we prefetch data at rate  $f$ , pre-process it at rate  $p$  and perform gpu computation on it at rate  $g$ , then data stalls appear if  $g > \min(f, p)$ , i.e., gpu processes data at a rate faster than it can be prefetched or pre-processed.
+
+any fetch or prep stall implies idle gpu time, which must be minimized. the fetch and prep stalls reported in this work are unmasked stall time; i.e., the stall time that shows up in the critical path, inspite of being pipelined with compute. from now on, we call data prefetching simply fetch, and pre-processing prep.
+
+# 4 analyzing data stalls
+
+to understand data stalls in dnn training and the fundamental reasons why data stalls exist, we perform a comprehensive analysis on several dnns by varying a number of factors, such as the number of gpus, gpu generation, the size of the dram cache, the number of cpu threads etc.
+
+# 4.1 methodology
+
+models and datasets. we analyze nine state-of-the-art dnn models across three different tasks and four different datasets as shown in table 2. this section focuses on the smaller imagenet-1k dataset for image classification models. evaluation with large datasets like imagenet-22k and openimages is presented in section §7. the image and audio classification models are taken from torchvision [22] and torchaudio [21] respectively; for object detection, we use nvidia's official release of ssd300 v1.1 [16].
+
+pre-processing. for all dnns, we use the same pre-processing as in their original papers. more precisely, for the image classification task, pre-processing includes image decoding, random crop, resizing
+
+table 3: server configurations used. we use two skus; each server has 24 cpu cores, 500gib dram, and 8 gpus.  
+
+<table><tr><td></td><td>gpu config</td><td>gpu mem(gb)</td><td>storage media</td><td>rand read (mbps)</td></tr><tr><td>ssd-v100</td><td>8xv100</td><td>32</td><td>ssd</td><td>530</td></tr><tr><td>hdd-1080ti</td><td>8x1080ti</td><td>11</td><td>hdd</td><td>15 - 50</td></tr></table>
+
+to a fixed size, and a random horizontal flip of the image. the object detection task performs a color twist of the image, and a random crop and horizontal flip of the bounding box in addition to the image transformations described for image classification. the audio model decodes and down-samples input to  $8\mathrm{khz}$ .
+
+training environment. all experiments are performed on pytorch 1.1.0 using the state-of-the-art nvidia data loading pipeline, dali. we have empirically verified that dali's performance is strictly better than pytorch, tf and mxnet's default data loaders; therefore we perform our analysis of data stalls using the strongest baseline, dali. we use two distinct server configurations for our analysis as shown in table 3. both these are part of a large production and research cluster at microsoft [11, 51], whose workload have guided the design of several research systems for ml training [27, 42, 65, 91]. these servers also closely resemble publicly available cloud gpu skus [1, 2]. config-ssd-v100 has configuration closest to aws p3.16xlarge [1] with gp2 storage [7], while config-hdd-1080ti is closest to aws p2.8xlarge [2] with st1 storage [7]. both our servers have 500gb dram, 24 physical cpu cores, and 8 gpus per server.
+
+training parameters. for experiments on config-ssd-v100, we use a batch size of 512 per gpu for all image classification models, 128 per gpu for ssd-res18, 16 per gpu for m5 and perform weak scaling for distributed training (while ensuring that the global batch size is consistent with those widely used in the ml community). since v100 gpus have tensor cores, we use apex mixed precision training with larc (layer-wise adaptive rate clipping), and state-of-the art learning rate warmup schedules [40]. on config-hdd-1080ti, we use the maximum batch size that fits the gpu memory (less than 256 for all models) and perform full-precision training.
+
+training metrics. we run all the experiments presented here for three epochs, and report the average epoch time (or throughput in samples per second), ignoring the first epoch. since we start with a cold cache in our experiments, first epoch is used for warmup. measuring data stall time does not require training to accuracy; per-epoch time remains stable.
+
+# 4.2 measuring data stalls using ds-analyzer
+
+we develop a standalone tool, ds-analyzer that profiles data stalls in dnn training. frameworks like pytorch and tensorflow provide an approximate time spent on data loading and pre-processing per minibatch, by simply placing timers in the training script. this is insufficient and inaccurate for two reasons. first, this technique cannot accurately provide the split up of time spent in data fetch (from disk or cache) and pre-processing operations. to understand if the training is bottlenecked on i/o or cpu, it is important to
+
+know this split. second, frameworks like pytorch and libraries like dali use several concurrent processes (or threads) to fetch and pre-process data; for a multi-gpu data parallel training job, a data stall in one of the data loading processes may reflect as gpu compute time for the other processes, because all gpu processes wait to synchronize weight updates at batch boundaries. naively adding timers around data path does not provide accurate timing information. therefore, ds-analyzer uses a differential approach. ds-analyzer runs in three phases;
+
+(1) measure ingestion rate. first, ds-analyzer pre-populates synthetic data at the gpus and runs the job for a fixed number of epochs. this identifies the max data ingestion rate at the gpus, with no fetch or prep stalls.  
+(2) measure prep stalls. next, ds-analyzer runs the training script with a subset of the given dataset, such that it is entirely cached in memory, using all available cpu cores, and estimates the training speed. since this run eliminates fetch stalls, any drop in throughput compared to (1) is due to prep stalls.  
+(3) measure fetch stalls. finally, ds-analyzer runs the training script by clearing all caches, and setting maximum cache size to a user-given limit, to account for fetch stalls. the difference between (2) and (3) is the impact of fetch stalls.
+
+# 4.3 data stalls in dnn training
+
+our analysis aims to answer the following questions:
+
+<table><tr><td>fetch stalls (remote)</td><td>is remote storage a bottleneck for training?</td><td>§4.3.1</td></tr><tr><td>fetch stalls (local)</td><td>when does the local storage device (ssd/hdd) become a bottleneck for dnn training?</td><td>§4.3.2</td></tr><tr><td>prep stalls</td><td>when does data prep at the cpu become a bottleneck for dnn training?</td><td>§4.3.3</td></tr><tr><td>generality</td><td>do fetch and prep stalls exist in other training platforms like tensorflow?</td><td>§4.3.4</td></tr></table>
+
+4.3.1 when dataset resides on remote storage. datasets used for training dnns could reside locally on the persistent storage of a server, or on shared remote storage such as distributed file systems (hdfs, glusterfs - gfs), or object stores (s3, azure blobs). we analyze the impact of two kinds of remote backends; a distributed file system, glusterfs (gfs) and the azure blob object store accessed via blobfuse. when data resides remotely, the first epoch of training fetches data over the network and stores it locally for subsequent use. cluster file systems like gfs use the os page cache to speed up subsequent accesses. blobfuse downloads the dataset on to local ssd, and mimics local training from the second epoch. figure 2a compares the epoch time for resnet18 on config-ssd-v100 using gfs, blobfuse, and local ssd for the first epoch and a stable-state epoch with warmed up cache.
+
+the data stall overhead of blobfuse is especially high in the first epoch when it downloads the entire dataset to local storage, and can result in  $20 \times$  higher training time as compared to gfs. unsurprisingly, during the steady state epochs, data stall overheads when using the local ssd and blobfuse are similar (as the blob data is cached on the local ssd); gfs results in more data stalls as it validates metadata of cached data items over the network every
+
+![](images/4b1ad1f69edcb4840d8e156b067a0e65e8d89bd8921457b76e19bd09c1d3861e.jpg)  
+figure 2: training with remote stores. the high download cost of blob is amortized over training for a large # of epochs
+
+time a data item is accessed. blobfuse does not incur any network cost beyond first epoch, if the dataset fits on local ssd.
+
+as shown in figure 2b, for the imagenet1k dataset, for blobfuse, the cost of downloading the entire dataset in the first epoch is amortized as we train for a longer number of epochs, making the remote blobstore a better fit compared to gfs when models are trained to accuracy for over 60 epochs.
+
+although datasets are growing in size, large datasets that are publicly available fit entirely on local storage (but not in memory) [10, 23, 25, 35, 59, 78]. therefore, a common training scenario is to pay a one-time download cost for the dataset, and reap benefits of local-ssd accesses thereafter (default and recommended mode in the microsoft clusters). therefore, in the rest of the work, we analyze fetch stalls in scenarios where dataset is present locally on a server, but is not entirely cached in memory.
+
+4.3.2 when datasets cannot be fully cached. ml-optimized cloud servers with 500gb dram can only cache  $35\%$  of imagenet-22k, or  $45\%$  of the fma dataset, or  $65\%$  of the openimages dataset, although they entirely fit on local storage. popular datasets like imagenet-1k cannot be fully cached on commonly used cloud skus like aws p3.2xlarge, which has 61 gib dram. when datasets don't fit in memory, and the fetch rate  $(f) <$  compute rate  $(min(p,g))$ , fetch stalls occur.
+
+fetch stalls are common if the dataset is not fully cached in memory. figure 3 shows the percentage of per epoch time spent on i/o for nine different dnns when  $35\%$  (for e.g., imagenet-22k on 500gb server) of their respective datasets can be cached in memory on config-ssd-v100. dnns spend  $10 - 70\%$  of their epoch time on blocking i/o, despite pipelining and prefetching, simply because the compute rate is higher than fetch rate.
+
+os page cache is inefficient for dnn training. dnn training platforms like pytorch, tensorflow and libraries like dali, rely on the operating system's page cache to cache raw training data in memory. unfortunately, the os page cache leads to thrashing as it is not efficient for dnn training. if  $35\%$  of the data can be cached, then an effective cache should provide  $35\%$  hits; instead, the page cache provides a lower hit rate. for a 146 gib data set, each epoch should see only  $65\%$  of the dataset, or 95gib, fetched from storage. instead, we observe  $85\%$  of the dataset fetched from storage every epoch; the  $20\%$  difference is due to thrashing. figure 4 shows the fetch stalls, including those due to thrashing, when using pytorch with dali. an effective cache for dnn training must eliminate thrashing to reduce fetch stalls to the minimum shown in figure 4.
+
+lack of coordination among caches leads to redundant i/o in distributed training. in distributed training jobs, the data to
+
+![](images/d931e70cdf2e6531c60b987969d28123f193c1e06e55f392b67aea355a1096d4.jpg)  
+figure 3: fetch stalls. several dnns experience significant stalls waiting for i/o, when training on config-ssd-v100 with  $35\%$  of their dataset cached.
+
+![](images/12d84bce47489e331941fb91d7e8a8b81f8625dcf198cf3679a20fb714ad034e.jpg)  
+(a) config-ssd-v100  
+figure 4: resnet18 with varying cache. this stacked bar chart splits epoch time into time spent in compute, ideal fetch stalls, and the additional fetch stall due to thrashing.
+
+![](images/a5ac5e685fbf829521e9bd5bd3226a790a78702ca98ba976d24cb3b03c4e47f7.jpg)  
+(b) config-hdd-1080ti
+
+be fetched and processed is divided randomly among servers, and changes every epoch. as a result, each server often has to fetch data from storage every epoch; this is done even if the required data item is cached in an another server that is a part of the distributed training job. this lack of coordination among caches makes distributed training storage i/o-bound. when training resnet50 on imagenet-1k (146gib) across two servers having a total cache size of 150gib, each server fetches 45gib from storage in each epoch (despite the fact that the other server might have this data item in its cache). on config-hdd-1080ti, this leaves resnet50 stalled on i/o for  $75\%$  of its epoch time.
+
+lack of coordination in hp search results in redundant i/o. hp search is performed by launching several parallel jobs with different hp on all available gpus in a server [61]. all hp jobs access the same dataset in a random order in each epoch, resulting in cache thrashing and read amplification. when 8 single-gpu jobs are run in a server (35% cache), there is  $7 \times$  read amplification per epoch (884 gib read off storage compared to 125 gib for one job), which slows down hp search on resnet18 by  $2 \times$  on config-ssd-v100.
+
+4.3.3 when datasets fit in memory. we now analyze the impact of cpu pre-processing on dnn training in the scenario where the entire dataset is cached in memory of a single server, thus eliminating fetch stalls due to storage i/o.
+
+dnns need 3-24 cpu cores per gpu for pre-processing. figure 5 shows how dnn training throughput changes as we vary the number of cpu pre-processing threads (per v100 gpu) for four models. for computationally complex models like resnet50, 3 - 4 cpu cores per gpu is enough to prevent prep stalls; for computationally lighter models like resnet18 or alexnet, as many as 12 -
+
+![](images/a5cd87bf69b073b90f7210c581dac463c792464427cb7feea341f6209a326160.jpg)  
+figure 5: impact of cpu cores on training
+
+![](images/d25783c9f251673ac76f69d6a5c0e3de2bde234f724acb5fb764ebf7db8bcbdd.jpg)  
+figure 6: prep stall across dnns
+
+![](images/65f18f4e9efe9acebf9d1573774f7be408babe166e2031e8c947f5c177b09629.jpg)  
+figure 7: breakdown prep
+
+![](images/b1c70e80dc1218972db6b992ee85ca55987bc5a61b629f2bca3553d9fc1ab77f.jpg)
+
+![](images/015d8a21fd965ba552a91f052518affa497f70b660f25e461a889f73fed744ac.jpg)  
+(a) pytorch vs dali(3 cpu per gpu)  
+(b) varying cluster config  
+figure 8: 8-gpu resnet18 training. even with dali, faster gpus like v100 have upto  $50\%$  prep stalls.
+
+24 cpus per gpu are needed to mask prep stalls. even on nvidia's ai-optimized dgx-2, there are only three cpu cores per gpu; thus, many models have prep stalls on the dgx-2 ( $\s 7.6$ )
+
+dali is able to reduce, but not eliminate prep stalls. dali has a gpu-based prep mode to offload a part of pre-processing to the gpu. as shown in figure 8 (a), when all pre-processing except decoding is offloaded to the gpu for training resnet18, prep stalls reduce. the effectiveness of dali depends on the gpu speed; for example, on the slower 1080ti, dali is able to eliminate prep stalls using three cpu threads per gpu. on the faster v100 though, dali still results in  $50\%$  prep stalls when using three cpu cores per gpu, and the gpu for pre-processing. since dali cannot automatically split pre-processing between cpu and gpu, we empirically find that offloading all operations except decoding to the gpus offered best performance for the object detection and image classification models except resnet50 and vgg11. these two models are computationally complex and slow down if pre-processing is performed at the gpu. furthermore, dali does not support audio decoding at the gpu. therefore, pre-processing is entirely done at the cpu for resnet50, vgg11 and audio m5 models. figure 6 shows that prep stalls exist across different dnns when training with eight gpus each with 3 cpus when using the best of cpu or gpu-based prep mode of dali as described above.
+
+decoding is very expensive! to understand what makes prep expensive, we run a microbenchmark to breakdown the cost of different stages in a typical prep pipeline for image classification tasks. an input image is first loaded into memory, decoded, and then randomly transformed (crop, flip), and finally copied over to the gpu as a tensor that can be processed. fig 7 shows the time taken for each operation when prep is done on cpu and gpu by dali. we see that offloading prep to the gpu provides significant speedup at the expense of gpu memory usage (+5gb!). second, a majority of time during prep is spent in decoding images.
+
+![](images/14c12e13b499f66ac460c8b17c68b141eb1b970cb76113ff8fc4f62bc33d5769.jpg)  
+figure 9: impact of batch size on prep.
+
+![](images/ef6474769dfea58bcd55e44427478ced3809f84c94a6b717648c7c7a9ae42299.jpg)  
+(a)  $100\%$  cache  
+figure 10: data stalls across frameworks
+
+<table><tr><td>% cached (sz:146gb)</td><td>8-gpu job cache miss</td><td>8-job hp i/o (gb)</td><td>read amp</td></tr><tr><td>50%</td><td>91%</td><td>860</td><td>6.14×</td></tr><tr><td>35%</td><td>94%</td><td>1010</td><td>7.21×</td></tr><tr><td>25%</td><td>97%</td><td>1019</td><td>7.28×</td></tr></table>
+
+(b) varying cache (tensorflow)
+
+impact of batch size. the impact of batch size on gpu computational efficiency is well studied [47, 89]; larger batch sizes utilize the massive gpu parallelism better, and also reduce the number of weight updates (inter-gpu communication) per epoch, resulting in faster training. figure 9 shows the impact of varying the batch size on epoch time and the percentage of epoch time spent on prep stalls for mobilenetv2. as computational efficiency increases with larger batches, training becomes cpu bound due to data prep. note that, although the required gpu compute time dropped with a larger batch size, per epoch time remained same due to prep stalls. this graph makes an important point; as compute gets faster (either due to large batch sizes, or the gpu getting faster), data stalls squander the benefits due to fast compute.
+
+redundant pre-processing in hp search results in high prep stalls. during hp search, concurrent jobs process the same data. currently, there is no coordination; if there are 8 hp jobs, the same data item is processed eight times. this is made worse by the fact that all hp jobs share the same set of cpu threads, leading to fewer cpu threads per gpu, and higher prep stalls. when 8 single-gpu resnet18 hp jobs run on config-ssd-v100, each job gets 3 cpu for prep and incurs a  $50\%$  prep stall as shown in figure 6. coordinating these hp search jobs on a single server can potentially eliminate prep stalls, as all available cpu (24 cores) can be used to prep the dataset exactly once per epoch and reused across jobs (figure 5 shows resnet18 requires 12 cpus per gpu to eliminate prep stalls).
+
+4.3.4 data stalls exist across training frameworks. to generalize our findings on data stalls across different training platforms and data formats, we analyze the prep and fetch stalls in tensorflow (tf) using the binary tfrecord format, and mxnet using recordio format. unlike pytorch, tf does not store training data as small individual raw files. instead, it shuffles the small random files, serializes it, and stores them as a set of files (100-200mb each) called tfrecords. tfrecords make reads more sequential. mxnet also use a similar serializing technique for data called recordio [67].
+
+figure 10a shows that both native tf and mxnet spend  $65\%$  and  $50\%$  of the epoch time on prep stall for a 8-gpu resnet18 training job when the dataset is entirely cached in memory. next, table 10b shows the percentage of misses in the page cache for a 8-gpu training job and the i/o amplification due to lack of coordination in hp search for varying cache sizes in tf. tfrecord format results in  $40\%$  higher cache misses than the ideal because, the sequential access nature of tfrecords (and recordio) is at odds with lru cache replacement policy of the page cache, resulting in a pathological case for lru (this is  $20\%$  higher than pytorch). the lack of co-ordination in hp jobs results in upto  $7.2\times$  read amplification; although all jobs read the same 140 gib dataset, the total disk i/o was 1.1 tb.
+
+4.3.5 analysis of nlp models. in addition to vision and audio models in table 2, we evaluated data stalls on two language models; bert-large pretraining [37] on wikipedia & bookcorpus dataset [96] for language modeling and gnmt [90] on wmt16 [24] (en-de) dataset for translation, which do not exhibit data stalls. language models have a distinct pre-processing regime compared to vision-based models. text-based models pre-process and shuffle the data corpus once before training, and then reuse it every epoch. there is no online, random, heavy-weight pre-processing performed in every epoch unlike vision models. therefore, the language models do not exhibit data stalls in our training environment. however, data stalls may show up in these models if gpus get faster or the computation requirements for these models gets lower due to compact model representations.
+
+# 5 ds-analyzer: predictive analysis
+
+while all the experiments in §4.3 are run on physical servers, we extend ds-analyzer to help a user simulate these experiments without having to run all different configurations on physical servers. while there exists prior work that predict the performance of a dnn, they focus on profiling the layer-wise performance of dnn [5, 18], low level perf counters for accelerators [17, 47], or finding optimization opportunities at the neural network layer level [94]. in contrast, ds-analyzer analyzes the implication of cpu, memory, and storage on the performance of a dnn and answers what-if questions.
+
+this is a powerful means of analyzing whether throwing more hardware at the problem will solve the issue of data stalls. for instance, if training is dominated by fetch stalls (bottlenecked on disk bandwidth), then increasing the number of cpu cores on the machine has no benefit; either dram capacity has to be increased, or the disk must be replaced with a higher bandwidth one. similarly, if the training job is bottlenecked on prep, then increasing dram has no effect on training time. ds-analyzer is useful in scenarios
+
+![](images/4f6737009a67916334bc14cd5d4019f84339928d3dc3b6ee3a4215583f42d59e.jpg)  
+figure 11: estimating optimal cache size with ds-analyzer.
+
+like this, to predict the performance of a model as we scale up cpu, memory, or storage.
+
+# 5.1 estimating data stalls
+
+consider the different components involved in a typical dnn data pipeline as in figure 17; data is fetched from cache (and store) with an effective prefetch rate  $f$ , pre-processed at the cpu at a rate  $p$  and processed at the gpu at a rate  $g$ . to perform predictive analysis, ds-analyzer measures several metrics related to the data pipeline of the model; the maximum ingestion rate at the gpu ( $g$ ), the rate of cpu prep ( $p$ ), the rate of cache fetch ( $c$ ), and the rate of storage fetch ( $s$ ). using these metrics, ds-analyzer models the training iteration to answer what-if questions such as, how much dram cache is required for this model to eliminate fetch stalls? ds-analyzer collects these metrics for a model as follows.
+
+(i) measure ingestion rate  $(g)$ . to find the maximum possible speed at which the dnn can train, ds-analyzer first runs the job script for a fixed number iterations (default:100) with synthetic data that is pre-populated at the gpus. it then calculates  $g$  as,
+
+$$
+g = \frac {\text {t o t a l s a m p l e s p r o c e s s e d i n (i)}}{\text {t i m e f o r (i)}} \tag {1}
+$$
+
+$$
+\text {s a m p l e s} = \# \text {i t e r a t i o n s} \times \text {g l o b a l b a t c h s i z e} \tag {2}
+$$
+
+(ii) measure prep rate  $(p)$ . next, ds-analyzer executes the training script with the given dataset by ensuring that the subset of data used is cached in memory, using all available cpu cores. additionally, the gpu computation is disabled to only run the data loader. this is required because, if  $p \geq g$ , then we cannot measure p using the knowledge of runs (i) and (ii), as prep will be pipelined with gpu compute. therefore, ds-analyzer disables gpu computation and estimates p in the same way as eq (1).  
+(iii) measure storage fetch rate (s). storage fetch rate is the maximum random read throughput of the storage device. to measure this, ds-analyzer runs the data loader (with a cold cache, disabling both pre-processing and gpu compute), with all cpu cores.  
+(iv) measure cache fetch rate  $(c)$ . to measure the rate at which data can be fetched from cache, ds-analyzer uses a microbenchmark to measure memory bandwidth and uses it as an approximation for  $c$ . note that run (ii) actually includes the time to fetch cached items as well; however we see that the cache fetch rate is very high (few tens of gbps), and does not add noise to the measurement of prep rate.
+
+# 5.2 example : predicting optimal cache size
+
+we now describe an example of what-if analysis with ds-analyzer. we show how ds-analyzer answers the question: how much dram cache does the dnn need to eliminate fetch stalls?
+
+to predict the implication of cache size, ds-analyzer calculates the effective prefetch rate  $(f)$  for a given cache size ( $x\%$  of the dataset). here, we assume that the cache implements an efficient policy like minio; i.e., a cache of size  $x$  items has at least  $x$  hits per epoch.
+
+$f$  is computed as follows. say the size of the dataset is  $d$  samples, and cache is  $x\%$  of the dataset. therefore, in an epoch, the total time to read the dataset is given by
+
+$$
+t _ {f} = \frac {d \times x}{c} + \frac {d \times (1 - x)}{s} \tag {3}
+$$
+
+the fetch rate is then calculated as,
+
+$$
+f = \frac {d}{t _ {f}} = \frac {d}{\frac {d \times x}{c} + \frac {d \times (1 - x)}{s}} \tag {4}
+$$
+
+since  $c >> s$ ,  $f \propto \frac{1}{1 - x}$ , i.e., the effective fetch rate increases, as the number of uncached items per epoch decreases. since ds-analyzer has already estimated values of  $d$ ,  $c$ , and  $s$ , given a cache percentage  $x$ , ds-analyzer can predict the fetch rate using eq (4).
+
+to evaluate how accurately ds-analyzer can answer this question, we run the actual experiment by varying cache size on a physical server (empirical), and comparing it to the predictions of ds-analyzer for alexnet on config-ssd-v100 with imagenet-1k. figure 11 plots the predicted values of  $f$ ,  $p$ , and  $g$ , alongside empirical speed while varying cache size. first, we observe that the predicted training speed ( $\min(f, p, g)$ ) is a maximum of  $4\%$  off the empirical results. second, using these predictions, ds-analyzer can estimate the optimal cache size for the model by comparing it with prep rate (p) and gpu ingestion rate (g). to eliminate fetch stalls,  $f > \min(p, g)$  as shown by the intersection in figure 11. at lower cache sizes, training is i/o bound, however, a cache that is  $50\%$  of the dataset size is sufficient to eliminate fetch stalls; larger cache (more dram) is not beneficial beyond this point, as training becomes cpu-bound. a comprehensive list of data pipeline rates ( $g, p, f$ ) for several models, datasets, and configurations is in the appendix (§a.1).
+
+# 6 mitigating data stalls
+
+based on the insights from our analysis, we explore ways of mitigating data stalls using domain specific techniques that reduces cache misses, and eliminates redundancy in data fetch and prep. we further discuss how to reduce the cost of decoding in future work (§8).
+
+<table><tr><td>technique</td><td>impact</td><td>benefits</td></tr><tr><td>minio cache</td><td>dnn-aware caching to minimize io by reducing cache misses per epoch ( §6.1)</td><td>single-server training</td></tr><tr><td>partitioned minio cache</td><td>eliminate redundant fetch by coordinating remote minio caches ( §6.2)</td><td>distributed training</td></tr><tr><td>coordinated prep</td><td>eliminates redundant fetch and prep across jobs ( §6.3)</td><td>single-server training</td></tr></table>
+
+![](images/06408764e2c872e833262b44325965695385890f54765119c39240ae84f70ddd.jpg)  
+figure 12: cache hits with minio. cache activity for two "epochs" of training for page cache and minio.
+
+# 6.1 the minio cache
+
+as datasets increase in size, they cannot be cached entirely in the memory of a server during training. in such cases, dnns suffer from fetch stalls if the rate of data fetch is lower than the rate of compute (despite prefetching and pipelining data fetch with compute) as discussed in ( $\s 4.3$ ). note that, when fetch stalls occur, training is bottlenecked by the bandwidth of storage device, therefore it is crucial to minimize i/o by maximizing cache hits every epoch.
+
+dnn training frameworks today, rely on the os page cache to cache the training dataset. however, we tap on the piercing insight of stonebraker et al.'s pioneering work on database caching [84], that the abstractions provided by os can hinder the development of efficient databases, and validate it in the context of dnn workloads. therefore, we study the dnn data access pattern to design a domain-specific cache minio.
+
+os page cache works as follows; whenever a data item is read from storage, it is cached in the page cache to speed up future accesses. when the page cache reaches its capacity, a cache replacement policy decides which of the existing items to evict to make space for the new one. linux uses a variant of least recently used (lru) for cache replacement [39].
+
+however, dnn training has a unique data access pattern: it is repetitive across epochs and random within an epoch. training is split into epochs: each epoch accesses all the data items in the dataset exactly once in a random order. we make a key observation about the dnn access pattern that is at odds with such os cache replacement policies. all data items in the dataset have equal probability of access in an epoch. therefore, it is not important which data item is cached. instead, it is crucial that cached items are not replaced before they are used, to minimize storage i/o per epoch.
+
+therefore, minio recommends a simple and unintuitive solution; items, once cached, are never replaced in the dnn cache. minio works as follows. in the first epoch of the training job, minio caches random data items as they are fetched from storage, to populate the cache. once the cache capacity is reached, minio will not evict any items in the cache; instead, the requests to other data items default to storage accesses. the items in the minio cache survive across epochs until the end of the training job. every epoch beyond the first gets exactly as many hits as the number of items in the cache; this reduces the per-epoch disk i/o to the difference in the size of dataset and the cache.
+
+figure 12 contrasts the caching policy of the os page cache and minio. consider a dataset of size 4 (with items a - d) and a cache of size 2 (50% cache). let's say after warmup, the cache has two items d and b. figure 12 shows the state of the cache for two training epochs. minio only incurs capacity misses per epoch (here 2); the page cache on the other hand, can result in anywhere between 2-4
+
+misses per epoch because of thrashing. for instance, in the first epoch, d is in the cache to begin with, but kicked out to make way for a new item c, and later in the same epoch it is requested again (thrashing). we empirically verified this using large datasets and varying cache sizes ( $\s 7$ ) and found that page cache results in close to  $20\%$  more misses than minio due to thrashing.
+
+minio's no replacement policy simplifies the design of the cache as we do not need bookkeeping about the time or frequency of access of data items. moreover, we choose to implement minio in user-space and not as a new replacement policy in the kernel, making it flexible to use in scenarios where the user has no root privileges to modify the kernel. the strength of minio thus lies in its simplicity and effectiveness.
+
+# 6.2 partitioned minio caching
+
+minio reduces the amount of disk i/o (fetch stalls) in single-server training. in distributed training, the dataset is partitioned and processed by a group of servers. each server operates on a random shard of the dataset per epoch, and this partition changes every epoch ( $\s 2.1$ ). the minio cache alone, is not efficient in this setting. for example, consider a distributed training job across two servers, each of which can cache  $50\%$  of the dataset. in every epoch, each server has to process a random  $50\%$  partition of the dataset, some of which may be hits in the local minio cache but the misses result in storage i/o, which is expensive and results in fetch stalls.
+
+we observe that the cross-node network bandwidth in publicly available cloud gpu instances and our clusters(10-40 gbps) is up to  $4 \times$  higher than the read bandwidth of local sata ssds (530 mbps). data transfer over commodity tcp stack is much faster than fetching a data item from its local storage, on a cache miss. therefore, we can coordinate the remote minio caches across all servers.
+
+partitioned minio caching works as follows. in the first epoch, the dataset is sharded across all servers, and each server populates it's local minio cache with data items in the shard assigned to it. at the end of the first epoch, we collectively cache a part of the dataset of size equal to the sum of capacities of individual minio caches. to route data fetch requests to the appropriate server, we maintain metadata about data items present in each server's cache. whenever a local cache miss happens in the subsequent epoch at any server, the item is first looked up in the metadata; if present, it is fetched from the respective server over tcp, else from its local storage. if the aggregate memory on the participating servers is large enough to cache the entire dataset, then partitioned caching ensures that there is no storage i/o on any server beyond the first epoch; the entire dataset is fetched exactly once from disk in the duration of distributed training.
+
+# 6.3 coordinated prep
+
+hyperparameter (hp) search for a model involves running several concurrent training jobs, each with a different value for the hp and picking the best performing one. our analysis shows that colocating hp search jobs on the same server results in both fetch and prep stalls ( $\s 4$ ) due to lack of coordination in data fetch and prep among these jobs.
+
+we introduce coordinated prep to address this issue. the idea behind coordinated prep is simple. each job in the hp search operates
+
+on the same data; hence, instead of accessing data independently for each job, they can be coordinated to fetch and prep the dataset exactly once per epoch. each epoch is completed in a synchronized fashion by all hp jobs; as a result, pre-processed minibatches created by one job can be reused by all concurrent jobs.
+
+coordinating hp search jobs must be done carefully to ensure that: each job processes the entire dataset exactly once per epoch. a naive way of doing this is to pre-process the dataset once and reuse across all hp jobs and all epochs as suggested by prior work [55, 68]. this approach will not work for two reasons. first, reusing preprocessed data across epochs may result in lower accuracy, as the random transformations are crucial for learning. second, the preprocessed items are  $5 - 7 \times$  larger in size when compared to the raw data items. caching pre-processed items will overflow the system memory capacity quickly for large datasets. if we store them on storage, we may incur fetch stalls.
+
+coordinated prep addresses these challenges by staging preprocessed minibatches in memory for a short duration within an epoch. since each job has identical per-minibatch processing time, the minibatch is short lived in the staging area. coordinated prep works as follows.
+
+each hp search job on a server receives a random shard of the dataset when they start. each job fetches and pre-processes the assigned shard, creating minibatches as they would normally do. when ready, these minibatches are exposed to the other jobs in the cross-job staging area. this is a memory region that is accessible to all running jobs on the server. additionally, each minibatch has a unique id and an associated atomic counter that tracks how many jobs have used this minibatch so far in the current epoch. when a job needs a minibatch for gpu processing, it retrieves it from the staging area and updates its usage counter. a minibatch is deleted from the staging area when it is used exactly once by all running jobs, as we want to ensure that it is not used across epochs. we empirically show in §7 that the addition of cross-job staging area does not introduce additional memory overhead.
+
+thus, coordinated prep ensures one sweep over the dataset per epoch for both data fetch and pre-processing, eliminating redundant work. note that coordinated prep allows addition or removal of jobs only at epoch boundaries; this is not an issue because popular hp search algorithms evaluate the objective function (for e.g., accuracy), and make decisions on terminating or continuing the job at epoch boundaries [48, 60]
+
+to handle job failures in hp search, we implement a failure detection module to monitor the status of running jobs. every prepared minibatch fetched from the staging area has an associated timeout. if any job times out waiting for a minibatch, it notifies the driver process of a possible failure. all the jobs can deterministically identify which job failed to populate the batch it is waiting on. if the job indeed failed, a new process is spawned to resume data loading for the failed shard.
+
+# 6.4 tying it all together with coordl
+
+we implement the three techniques discussed thus far as a part of a user-space data loading library, coordl. we build coordl on top of dali to take advantage of the gpu-accelerated data pre-processing
+
+operations. coordl can be used as a drop-in replacement for the default pytorch datalocator.
+
+the overall architecture of coordl is as follows. the training dataset resides on a local storage device like ssd/hdd. if the data resides on a remote storage service, it is cached in local storage when first accessed [3]. for all later epochs, the data is fetched from local storage. in each training iteration, a minibatch of data must be fetched from disk (or cache), pre-processed to apply random transformations and collated to a tensor that can be copied over to the gpu for computation. coordl manages its own minio cache of the raw data items (before any stochastic pre-processing transformations are applied). the data sampling and randomization is unmodified; in each epoch, every minibatch is sampled randomly from the dataset. every data item is then subjected to the random pre-processing pipeline specified in the training workload. the prepared minibatch is then placed in a cross-job staging area for consumption by the gpu. if a single data-parallel job is running across multiple gpus in a server, then the minibatches in the staging are used exactly once per epoch and discarded; if there are concurrent hp jobs on a server, then the staging area retains minibatches until each concurrent job has used it exactly once in the current epoch. any minibatch that satisfies this criteria is evicted from the staging area to make way for newer batches.
+
+# 7 evaluation
+
+we now evaluate the efficacy of coordl on three different aspects of the training process: multi-gpu training on a single server, distributed training across multiple servers, and hyperparameter tuning. we evaluate our techniques on nine models, performing three different ml tasks (image classification, object detection and audio classification) on four different datasets, each over 500gb as shown in table 2. since dali strictly outperforms pytorch dl, we use dali as the baseline in our experiments. for each model, we run both cpu-based (all pre-processing on cpu) and gpu-based (part of decoding and all other transformations on gpu) mode of dali, and present the best of the two results.
+
+experimental setup. we evaluate coordl on two representative server configurations from microsoft clusters (tbl 3) each with 500 gib dram, 24 cpu cores, 40 gbps ethernet, eight gpus, and 1.8 tib of storage space. config-ssd-v100 uses v100 gpus and a sata ssd, while config-hdd-1080ti uses 1080ti gpus and a magnetic hard drive. we use the same training methodology we used for analysis (§4.1). we seek to answer the following questions:
+
+<table><tr><td>how does the minio cache affect multi-gpu training on a server?</td><td>§7.1</td></tr><tr><td>how does partitioned caching improve training time for jobs distributed across multiple servers?</td><td>§7.2</td></tr><tr><td>how does coordinated prep benefit hp search?</td><td>§7.3</td></tr><tr><td>does coordl affect dnn training accuracy?</td><td>§7.4</td></tr><tr><td>does coordl enable better resource utilization compared to dali?</td><td>§7.5</td></tr><tr><td>does coordl accelerate training on ml servers like the dgx-2?</td><td>§7.6</td></tr></table>
+
+# 7.1 single-server multi-gpu training
+
+coordl speeds up a single-server training job by reducing cache misses using the minio cache. figure 13 (a) plots the relative speedup with respect to dali while training the image classification and object detection models on the openimages dataset, and
+
+audio classification on fma dataset. we evaluate minio against two modes of dali. dali's default mode is dali-seq, where it reads data sequentially off storage and shuffles them in memory [6]. dali-shuffle accesses the dataset in a randomized order (doing random reads, similar to the native dataloder of pytorch).
+
+minio results in up to  $1.8 \times$  higher training speed compared to dali-seq by eliminating thrashing on config-ssd-v100. when the image classification models are trained with imagenet-22k dataset, coordl results in up to  $1.5 \times$  speedup. on config-hdd-1080ti, coordl accelerates resnet50 training on openimages by  $2.1 \times$  compared to dali-seq and  $1.53 \times$  compared to dali-shuffle respectively.
+
+reduction in cache misses. we measure the disk i/o and number of cache misses when training shufflenet on openimages dataset on config-ssd-v100. this server can cache  $65\%$  of the dataset. coordl reduces misses to the minimum number of  $35\%$ , resulting in 225 gb of i/o. in contrast, dali-seq results in  $66\%$  cache misses, increasing i/o by  $87\%$  to 422 gb; dali-shuffle results in  $53\%$  cache misses, increasing i/o by  $50\%$  compared to coordl to 340 gb.
+
+note that, when the whole dataset does not fit in memory, dali-shuffle performs better than dali-seq (because sequential access is a pathological case for the linux lru page cache). therefore, our evaluation in the rest of this section compares coordl to the stronger baseline, dali-shuffle.
+
+# 7.2 multi-server distributed training
+
+we now evaluate coordl on a distributed training scenario. the lack of cache co-ordination between the participating servers results in fetch misses that lead to disk i/o. coordl uses partitioned caching to avoid redundant i/o.
+
+figure 13(b) shows that coordl improves the throughput of distributed training jobs by upto  $15 \times$  (alexnet on openimages) when trained across two config-hdd-1080ti servers (16 gpus). on config-hdd-1080ti servers,  $65\%$  of the openimages dataset can be cached on a single server; and it can be fully cached in the aggregated memory of two servers. therefore, coordl moves the training job from being i/o bound to gpu bound.
+
+when trained across two servers on config-ssd-v100, coordl accelerates shufflenet on imagenet-22k by  $1.3 \times$ , and audio-m5 on fma by  $2.9 \times$ . the relative gains are lower on config-ssd-v100 because the cost of a fetch miss is lower on ssds due to its high random read throughput, as compared to hdds on config-hdd-1080ti.
+
+# 7.3 hyperparameter search
+
+figure 13 (d) plots the relative increase in throughput of individual jobs across several models when eight concurrent hp search jobs are run on a config-ssd-v100 server. on less computationally complex models like alexnet and shufflenet, coordl increases training speed by  $3 \times$ , because these models are originally cpu bound due to prep. for the audio model, coordl increases the training speed by  $5.6 \times$ . coordl reduced the total disk i/o from 3.5tb to 550gb. similarly, on config-hdd-1080ti, coordl results in  $5.3 \times$  faster training on the audio model, and  $4.5 \times$  faster training on resnet50. on config-hdd-1080ti, coordl results in  $5.3 \times$  faster training on the audio model, and  $4.5 \times$  faster training on resnet50 by coordinating data fetch and prep.
+
+![](images/32f439485fab9097f91e2841fa028c38574231c6433006c7135763b147a12f41.jpg)
+
+![](images/c2097d9446707dbd81a91fcc068075c5b1532476a495b7885baef1c48f909a78.jpg)  
+(b) config-hdd-1080ti : distributed training across servers
+
+![](images/3aae5c0de82210c3b03339c306cdc6c743e4083096ad3a98b5372bdcee476a46.jpg)
+
+![](images/59e913cd67770d208b5c5d920e4e9f5cf643fb2f1c59533dae599f01fbc84b6b.jpg)
+
+![](images/143e65f2beb482b0ba1f9e397b7450530a9237bdb0d7047d64b9a48780eb99db.jpg)
+
+![](images/ee6de60bd56cdec330901145e31d0e5f95fb998620e74cf931084c056a5d4e64.jpg)  
+figure 13: this graph compares dali against coordl for a variety of training scenarios; single server, multi-server and hp search, across 2 clusters and 9 models. coordl significantly accelerates training by eliminating redundant data fetch and prep.
+
+![](images/a2d937fed40f65422969a329cea0fff381357e73c3af592f50bc7fdf06c09135.jpg)
+
+![](images/f16b5c82916ca492283af9b79b9dd5fff3984d988445699a6904c174fee29897.jpg)
+
+![](images/2d4848b72cb48a4ac3ffec3f761b4a57383c85de2190508f92b1df714c1aa1cc.jpg)  
+figure 14: training to accuracy
+
+![](images/e4d73e19f717a92121208b9855ff0511d717a4c62bbe31de804fc5107f822931.jpg)  
+figure 15: disk i/o profile
+
+![](images/1cecb182d427224cd0270c8d918c45eb09fecdb794adbc9b6fc1e055cd948a7a.jpg)  
+figure 16: evaluation on dgx-2
+
+split of coordinated prep benefits. next, we show the breakdown of speedup due to coordination of data fetch and prep during hp search. when fetch is coordinated, concurrent jobs use data fetched by other jobs; but each job performs its own data prep. coordl coordinates both; eliminating redundant fetch and prep. figure 13 (e) plots the results on config-ssd-v100. in this case, data stall is dominated by prep, which coordl mitigates unlike prior work like quiver [58] that only coordinates fetch.
+
+multi-gpu hp search jobs. figure 13 (f) shows training with different config of hp search jobs on a machine; 8 1-gpu jobs, 4 2-gpu jobs, 2 4-gpu jobs, or 1 8-gpu job for alexnet on openimages. for a single job case, the benefit is due to the minio cache; in other config, it is due to coordinated prep. more the number of concurrent jobs, higher the benefit with coordination.
+
+# 7.4 training to accuracy with coordl
+
+coordl does not change the randomness of data pre-processing involved. its techniques do not affect the learning algorithm. to demonstrate this, we train resnet50 to accuracy on imagenet-1k using 16 gpus across two config-hdd-1080ti servers, where each server is capable of caching  $50\%$  of the dataset. figure 14 shows that coordl reduces the time to target accuracy  $(75.9\%)$  from two days to just 12 hours  $(4\times$  better), due to partitioned caching.
+
+# 7.5 resource utilization
+
+minio results in lower disk i/o and better cpu utilization. figure 15 shows the i/o for two epochs of training resnet18 on openimages on config-ssd-v100. the i/o behavior is similar across models and server configurations. dali observes cache hits
+
+at the beginning of the epoch, but soon becomes i/o bound (disk bandwidth: 530 mb/s). since minio is caching a random subset of the dataset, cache hits are uniformly distributed across the epoch in coordl. this results in a predictable i/o access pattern and faster training (epochs end earlier in figure 15). profiling the cpu during training shows that the pre-processing threads in dali are often stalled waiting for i/o. since minio reduces the total disk i/o, coordl is able to better utilize the cpu for pre-processing. the combination of lower disk i/o and better cpu utilization leads to shorter training times when using coordl.
+
+coordl uses a fraction of available network bandwidth. coordl shards the dataset equally among all servers in distributed training to ensure load balancing. we track the network activity during the distributed training for resnet50 on openimages across two, three, and four servers with dali and coordl. coordl used 5.7 gbps per server of network bandwidth (14% of the 40 gbps available). dali used 1.18 gbps of network bandwidth per server. coordl used  $4.8 \times$  higher network bandwidth to train  $4.3 \times$  faster.
+
+co-ordinated prep has low memory overhead. by design, co-ordinated prep has the same memory requirements as dali. to experimentally validate this, we track the memory utilization of running hyperparameter search on alexnet on openimages on a config-ssd-v100 server using eight concurrent jobs. coordl uses 5 gb of extra process memory to store prepared mini-batches in memory until all hyperparameter jobs consume it. we reduce the cache space given to coordl by 5 gb (keeping the total memory consumption same for coordl and dali). despite the lower cache space, coordl still accelerated training by  $2.9 \times$ .
+
+# 7.6 coordl on dgx-2
+
+we now compare coordl against dali on the bleeding-edge ml optimized server dgx-2 while performing hp search across 16 gpus using openimages dataset. since this dataset can be fully cached in the memory of dgx-2 (1.5tb dram), we observe no stalls due to data fetch beyond the first epoch. however, the imbalance in the ratio of cpu-gpu results in prep stalls which coordl mitigates by coordinating pre-processing. coordl accelerates hp search by  $1.5 \times -2.5 \times$  over dali by eliminating redundant data prep, enabling efficient usage of cpu to mask prep stalls.
+
+# 8 discussion
+
+our analysis of data stalls reveals several key insights to utilize the computational capabilities of gpus by minimizing data stalls. while we explore ways of mitigating data stalls in a user-space library coordl, we believe there is more to be done.
+
+decoded cache to reduce pre-processing overhead. coordl does not address the high cost of decoding/decompressing raw images, which our analysis identifies to be the most expensive operation during data prep. a future direction is to evaluate the benefits of caching decoded data items instead of the current approach of caching raw encoded items. since decoding is deterministic, it is possible to cache it across epochs. however, this is non trivial; decoding increases the dataset size by  $5 - 7 \times$ . it is an interesting future direction to enable decoded caching without incurring the high space overhead, possibly using serialized data formats.
+
+automatic prep offload to gpus. data pipelining frameworks like dali have the ability to perform certain image and audio based pre-processing (prep) such as crop, flip, and other transformations on gpu accelerators. however, there is a memory-performance tradeoff in deciding how many steps of prep are offloaded to the gpu for two reasons. (1) performing prep at the gpu takes up a part of the already scarce gpu memory which may result in training with lower batch sizes, thereby affecting training efficiency. (2) prep at the gpu may interfere with the computations performed by the learning algorithm; this adversely affects the overall throughput of training for computationally expensive and deeper networks. therefore, the split of prep operations must be carefully chosen considering the model's architecture, batch size, and data stalls. while this split is determined manually by trial-and-error today, automating it with a careful eye on gpu and cpu utilization is an interesting future direction.
+
+minibatch as a service. our analysis shows that the imbalance in cpu cores per gpu in ml optimized servers result in data stalls for several models. in such cases where single-host capacities are maxed out, a viable approach is to offload data prep to other idle host machines in a cluster. this is especially useful in production clusters with high-bandwidth ethernet, where several jobs use the same dataset and similar pre-processing pipelines; a dedicated set of servers can be used to centrally pre-process minibatches of data, while the training jobs can request minibatch as a service, thereby entirely disaggregating learning from data management.
+
+cost-performance tradeoff of upgrading hardware. our analysis finds that data stalls squander away the improved performance of faster, expensive gpus, resulting in lower value/\$ spent as shown in figure 8 (b). therefore, it may be economical to train some models on slower, less expensive gpus with no data stalls, rather than underutilizing the accelerator capabilities due to stalls on faster, expensive gpus. in practice, such techniques may improve the overall efficiency in multi-tenant clusters by assigning jobs to accelerators in such a way that they maximize gpu utilization.
+
+data stalls in inference. this work addresses data stalls in the training pipeline which have three distinct features from inference. (1) training requires a large volume of data samples, (2) performs a larger set of data prep for every batch, and (3) requires backpropagation during the learning phase. while inference jobs require fewer prep steps per sample or batch, it also performs lesser gpu computation compared to training. moreover, the limited memory and compute availability at edge devices may also introduce data stalls in inference. we hope our analysis encourages similar research and possibly unique optimizations in inference land.
+
+trade-off between convergence rate and epoch time for other sgd variants. this work focuses on the most common case of mini-batch sgd with a random shuffling of the data in every epoch which is the default for the models we analyzed. a future direction is to understand the impact of relaxing the etl requirements assumed in this work (such as random prep and shuffling every epoch) on epoch time and model convergence. although relaxing these constraints may reduce data stalls and hence epoch time, it may prolong convergence, or affect the accuracy of some models. it is worth investigating this behavior theoretically and empirically.
+
+# 9 related work
+
+to the best of our knowledge, this paper presents the first comprehensive analysis of data stalls in dnn training. we place our work in the context of prior work.
+
+optimizing remote storage via local caching. quiver [58] uses local ssd caches to eliminate the impact of slow reads from remote storage. the best case for quiver is when the dataset is completely cached on local storage; our system starts from this baseline and further improves performance. quiver does not consider or optimize prep stalls, only handling fetch stalls.
+
+partitioned caching. cerebro [68] introduces a new parallel sgd strategy for model selection tasks. it partitions the dataset across the servers in a cluster and hops the models from one server to other, instead of shuffling data. cerebro does not improve performance for dnn training on a single server, while coordl optimizes performance in this scenario. furthermore, cerebro is designed for a specific scenario - distributed model search; on the contrary, our analysis and coordl have a broader scope. deepio [95] uses a partitioned caching technique for distributed training with remote data, but relies on specialized hardware like rdma. in contrast, our work shows that it is possible to mask fetch stalls using commodity tcp stacks.
+
+redundancy in dnn training. prior work like model batch- ing [70] addressed redundancy in model search when running multiple dnns together on a single gpu, by sharing gpu computation across jobs. our analysis looks at the setting where gpus are not shared between jobs. oneaccess [55] is a preliminary study that makes a strong case for storing pre-processed data across epochs to reduce prep stalls; however such an approach precludes commonly used online data pre-processing techniques and this can affect model convergence. in contrast, coordl carefully eliminates redundancy while preserving accuracy and providing significant speedups.
+
+hardware solutions to fetch stalls. new hardware like nvidia's magnum io [13], and purestorage's airi [19] provide high throughput storage solutions to address fetch stalls. while these fast hardware may mask fetch stalls in some models, they may not help if the model is bottlenecked on prep stalls. our work mitigates data stalls with existing commodity servers as opposed to relying on expensive hardware solutions, by efficiently using available hardware.
+
+optimizing dnn training time. a number of solutions have been proposed to reduce the training time for dnns including specialized hardware [4, 9, 51, 54, 72, 73, 76, 82], parallel training [30, 34, 45, 53, 56, 57, 69], gpu memory optimizations [29, 49, 77], lowering communication overhead [12, 43, 50, 63, 89, 92], and operator optimizations [28, 52, 87]. this paper presents a new point in this spectrum, data stalls.
+
+domain specific caching. the idea of designing a caching policy that is aware of application semantics is not new. stonebraker et al. highlighted the importance of domain-aware caching for databases [84]. tomkins et al. show that informed prefetching
+
+and caching in file systems can reduce the execution time of i/o-intensive applications [86]. our work draws parallels to such techniques by first understanding dnn access pattern and then devising a caching policy based on these observations.
+
+# 10 conclusion
+
+we present the first detailed study of data stalls in several dnns, and show that it accounts for up to  $65\%$  of the training time. the insights from our study, guide the design of a coordinated caching and pre-processing library, coordl, that can accelerate dnn training by mitigating data stalls. coordl accelerates training by up to  $15\times$  for distributed training across two servers, and  $5.3\times$  for hp search (on the audio model), by coordinating data fetch and prep across jobs. the techniques behind coordl are simple and intuitive, easing adoption into production systems.
+
+# acknowledgements
+
+this work was done during an internship at microsoft research as part of project fiddle. we thank all the anonymous vldb reviewers, members of the ut saslab, jorgen thelin, jack kosian, deepak narayanan, keshav santhanam and many of our msr colleagues for their invaluable feedback that made this work better. we sincerely thank msr labs for their generous, unwavering support in procuring the many resources required for this work.
+
+# references
+
+[1] 2020. aws instance types. https://aws.amazon.com/ec2/instance-types/#p3.  
+[2] 2020. aws instance types. https://aws.amazon.com/ec2/instance-types/#p2.  
+[3] 2020. blobfuse. https://github.com/azure/azure-storage-fuse.  
+[4] 2020. cerebras wafer scale engine. https://www.cerebras.net/.  
+[5] 2020. cloud tpu tools. https://cloud.google.com/tpu/docs/cloud-tpu-tools.  
+[6] 2020. dali: supported operations. https://docs.nvidia.com/deeplearning/dali/user-guide/docs/supported ops.html#nvidia.dali ops.filereader.  
+[7] 2020. ebs volume types. https://docsaws.amazon.com/awsc2/latest/userguide/ecs-volume-types.html.  
+[8] 2020. fast ai data preprocessing with nvidia dali. https://devblogs.nvidia.com/fast-ai-data-preprocessing-with-nvidia-dali/.  
+[9] 2020. graphcore intelligence processing unit. https://www.graphcore.ai/.  
+[10] 2020. imagenet-22k. http://www(image-net.org/releases.  
+[11] 2020. microsoft philly traces. https://github.com/msr-fiddle/philly-traces.  
+[12] 2020. nccl. https://developer.nvidia.com/nclc.  
+[13] 2020. nvidia: magnum-io. https://www.nvidia.com/en-us/data-center/magnum-io/.  
+[14] 2020. nvidia dgx-2: enterprise ai research system. https://www.nvidia.com/en-us/data-center/dgx-2/.  
+[15] 2020. nvidia nvjpeg library. https://docs.nvidia.com/cuda/nvjpeg/index.html.  
+[16] 2020. nvidia object detection. https://github.com/nvidia/deeplearningexamples/tree/master/pytorch/detection/ssd.  
+[17] 2020. nvidia profiler. https://docs.nvidia.com/cuda/profiler-users-guide/index.html.  
+[18] 2020. profiling mxnet models. https://mxnet.apache.org/api/python/docs/tutorials/performance/dashboard/profiler.html.  
+[19] 2020. purestorage: airi. https://www.purestorage.com/products/flashblade/aiinfrastructure.html.  
+[20] 2020. pytorch: ddp vs dp. https://pytorch.org/tutorials/intermediate/ddp_tutorial.html.  
+[21] 2020. torchaudio classifier. https://pytorch.org/tutorials/beginner/ audio(classifier_tutorial.html?highlight=audio.  
+[22] 2020. torchvision models. https://pytorch.org/docs/stable/torchvision/models.html.  
+[23] 2020. training a champion: building deep neural nets for big data analytics. https://www.kdnuggets.com/training-a-champion-building-deep-neuralnets-for-big-data-analytics.html/.  
+[24] 2020. wmt16. http://www.statmt.org/wmt16/.  
+[25] sami abu-el-haija, nisarg kothari, joonseok lee, paul natsev, george toderici, balakrishnan varadarajan, and sudheendra vijayananasimhan. 2016. youtube-8m:
+
+a large-scale video classification benchmark. arxiv preprint arxiv:1609.08675 (2016).  
+[26] james bergstra and yoshua bengio. 2012. random search for hyper-parameter optimization. journal of machine learning research 13, feb (2012), 281-305.  
+[27] shubham chaudhary, ramachandran ramjee, muthian sivathanu, nipun kwatra, and srinidhi viswanatha. 2020. balancing efficiency and fairness in heterogeneous gpu clusters for deep learning. in eurosys '20: fifteenth eurosys conference 2020, heraklion, greece, april 27-30, 2020. acm, 1:1-1:16. https://doi.org/10.1145/3342195.3387555  
+[28] tianqi chen, thierry moreau, ziheng jiang, lianmin zheng, eddie yan, haichen shen, meghan cowan, leyuan wang, yuwei hu, luis ceze, carlos guestrin, and arvind krishnamurthy. 2018. tvm: an automated end-to-end optimizing compiler for deep learning. in 13th usenix symposium on operating systems design and implementation (osdi 18). 578-594.  
+[29] tianqi chen, bing xu, chiyuan zhang, and carlos guestrin. 2016. training deep nets with sublinear memory cost. arxiv preprint arxiv:1604.06174 (2016).  
+[30] trishul m chilimbi, yutaka suzue, johnson apacible, and karthik kalyanaraman. 2014. project adam: building an efficient and scalable deep learning training system... in 11th usenix symposium on operating systems design and implementation (osdi '14), vol. 14, 571-582.  
+[31] jichan chung, kangwook lee, ramtin pedarsani, dimitris papailiopoulos, and kannan ramchandran. 2017. übershuffle: communication-efficient data shuffling for sgd via coding theory. advances in neural information processing systems (nips) (2017).  
+[32] alex clark. 2015. pillow (pil fork) documentation.  
+[33] wei dai, chia dai, shuhui qu, juncheng li, and samarjit das. 2017. very deep convolutional neural networks for raw waveforms. in 2017 ieee international conference on acoustics, speech and signal processing (icassp). ieee, 421-425.  
+[34] jeffrey dean, greg corrado, rajat monga, kai chen, matthieu devin, mark mao, andrew senior, paul tucker, ke yang, quoc v le, and andrew y. ng. 2012. large scale distributed deep networks. in advances in neural information processing systems. 1223-1231.  
+[35] michael defferrard, kirell benzi, pierre vandergheynst, and xavier bresson. 2016. fma: a dataset for music analysis. arxiv preprint arxiv:1612.01840 (2016).  
+[36] jia deng, wei dong, richard socher, li-jia li, kai li, and li fei-fei. 2009. imagenet: a large-scale hierarchical image database. in 2009 ieee conference on computer vision and pattern recognition. ieee, 248-255.  
+[37] jacob devlin, ming-wei chang, kenton lee, and kristina toutanova. 2019. bert: pre-training of deep bidirectional transformers for language understanding. in proceedings of the 2019 conference of the north american chapter of the association for computational linguistics: human language technologies, naacl-hlt 2019, minneapolis, mn, usa, june 2-7, 2019, volume 1 (long and short papers). association for computational linguistics, 4171-4186. https://doi.org/10.18653/v1/n19-1423  
+[38] daniel golovin, benjamin solnik, subhodeep moitra, greg kochanski, john karro, and d sculley. 2017. google vizier: a service for black-box optimization. in proceedings of the 23rd acm sigkdd international conference on knowledge discovery and data mining. 1487-1495.  
+[39] mel gorman. 2020. understanding the linux virtual memory manager. https://www.kernel.org/doc/gorman/html/understand/understand013.html.  
+[40] priya goyal, piotr dólar, ross girshick, pieter noordhuis, lukasz wesolowski, aapo kyrola, andrew tulloch, yangqing jia, and kaiming he. 2017. accurate, large minibatch sgd: trainingimagenet in 1 hour. arxiv preprint arxiv:1706.02677 (2017).  
+[41] alex graves, abdel-rahman mohamed, and geoffrey hinton. 2013. speech recognition with deep recurrent neural networks. in 2013 ieee international conference on acoustics, speech and signal processing. ieee, 6645-6649.  
+[42] juncheng gu, mosharaf chowdhury, kang g. shin, yibo zhu, myeongjae jeon, junjie qian, hongqiang harry liu, and chuanxiong guo. 2019. tiresias: a gpu cluster manager for distributed deep learning. in 16th usenix symposium on networked systems design and implementation, nsdi 2019, boston, ma, february 26-28, 2019. usenix association, 485-500. https://www.usenix.org/conference/nsdi19/presentation/gu  
+[43] sayed hadi hashemi, sangeetha abdu jyothi, and roy h. campbell. 2019. tictac: accelerating distributed deep learning with communication scheduling. in proceedings of machine learning and systems 2019, mlsys 2019, stanford, ca, usa, march 31 - april 2, 2019. mlsys.org.  
+[44] kaiming he, xiangyu zhang, shaoqing ren, and jian sun. 2016. deep residual learning for image recognition. in proceedings of the ieee conference on computer vision and pattern recognition. 770-778.  
+[45] yanping huang, youlong cheng, ankur bapna, orhan firat, dehao chen, mia xu chen, hyoukjoong lee, jiquan ngiam, quoc v. le, yonghui wu, and zhifeng chen. 2019. gpipe: efficient training of giant neural networks using pipeline parallelism. in advances in neural information processing systems 32: annual conference on neural information processing systems 2019, neurips 2019, 8-14 december 2019, vancouver, bc, canada. 103-112. http://papers.nips.cc/paper/8305-gpipe-efficient-training-of-giant-neural-networks-using-pipeline-parallelism  
+[46] forrest n iandola, song han, matthew w moskewicz, khalid ashraf, william j dally, and kurt keutzer. 2016. squeezenet: alexnet-level accuracy with 50x
+
+fewer parameters and  $< 0.5$  mb model size. arxiv preprint arxiv:1602.07360 (2016).  
+[47] kumar iyer and jeffrey kiel. 2016. gpu debugging and profiling with nvidia parallel nsight. in game development tools. ak peters/crc press, 303-324.  
+[48] max jaderberg, valentin dalibard, simon osindero, wojciech m czarnecki, jeff donahue, ali razavi, oriol vinyals, tim green, iain dunning, karen simonyan, et al. 2017. population based training of neural networks. arxiv preprint arxiv:1711.09846 (2017).  
+[49] animesh jain, amar phanishayee, jason mars, lingjia tang, and gennady pekhimenko. 2018. gist: efficient data encoding for deep neural network training. in acm/ieee 45th annual international symposium on computer architecture (isca '18).  
+[50] anand jayarajan, jinliang wei, garth gibson, alexandra fedorova, and gennady pekhimenko. 2019. priority-based parameter propagation for distributed dnn training. in proceedings of machine learning and systems 2019, mlsys 2019, stanford, ca, usa, march 31 - april 2, 2019. mlsys.org.  
+[51] myeongjae jeon, shivaram venkataraman, amar phanishayee, junjie qian, wencong xiao, and fan yang. 2019. analysis of large-scale multi-tenant gpu clusters for dnn training workloads. in 2019 usenix annual technical conference (usenix atc 19). 947-960.  
+[52] zhihao jia, oded padon, james thomas, todd warszawski, matei zaharia, and alex aiken. 2019. taso: optimizing deep learning computation with automated generation of graph substitutions. in proceedings of the 27th acm symposium on operating systems principles. acm.  
+[53] zhihao jia, matei zaharia, and alex aiken. 2019. beyond data and model parallelism for deep neural networks. in proceedings of the 2nd sysml conference, sysml '19. palo alto, ca, usa.  
+[54] norman p. jouppi, cliff young, nishant patil, david patterson, gaurav agrawal, raminder bajwa, sarah bates, suresh bhatia, nan boden, al borchers, rick boyle, pierre-luc cantin, clifford chao, chris clark, jeremy coriell, mike daley, matt dau, jeffrey dean, ben gelb, tara vazir ghaemmaghami, rajendra gottipati, william gulland, robert hagmann, c. richard ho, doug hogberg, john hu, robert hundt, dan hurt, julian ibarz, aaron jaffey, alek jaworski, alexander kaplan, harshit khaitan, daniel killebrew, andy koch, naveen kumar, steve lacy, james laudon, james law, diemthu le, chris leary, zhuyuan liu, kyle lucke, alan lundin, gordon mackean, adriana maggiore, maire mahony, kieran miller, rahul nagarajan, ravi narayanaswami, ray ni, kathy nix, thomas norrie, mark omernick, narayana penukonda, andy phelps, jonathan ross, matt ross, amir salek, emad samadiani, chris severn, gregory sizikov, matthew snelham, jed souter, dan steinberg, andy swing, mercedes tan, gregory thorson, bo tian, horia toma, erick tuttle, vijay vasudevan, richard walter, walter wang, eric wilcox, and doe hyun yoon. 2017. in-datacenter performance analysis of a tensor processing unit. in proceedings of the 44th annual international symposium on computer architecture (toronto, on, canada) (isca 2017). acm, new york, ny, usa, 1-12. https://doi.org/10.1145/3079856.3080246  
+[55] aarati kakaraparthy, abhay venkatesh, amar phanishayee, and shivaram venkataraman. 2019. the case for unifying data loading in machine learning clusters. in 11th usenix workshop on hot topics in cloud computing (hotcloud 19).  
+[56] alex krizhevsky. 2014. one weird trick for parallelizing convolutional neural networks. arxiv preprint arxiv:1404.5997 (2014).  
+[57] alex krizhevsky, ilya sutskever, and geoffrey e hinton. 2012. imagenet classification with deep convolutional neural networks. in advances in neural information processing systems. 1097-1105.  
+[58] abhishek vijaya kumar and muthian sivathanu. 2020. quiver: an informed storage cache for deep learning. in 18th usenix conference on file and storage technologies, fast 2020, santa clara, ca, usa, february 24-27, 2020. usenix association, 283-296.  
+[59] alina kuznetsova, hassan rom, neil alldrin, jasper uijlings, ivan krasin, jordi pont-tuset, shahab kamali, stefan popov, matteo malloci, tom duerig, et al. 2018. the open images dataset v4: unified image classification, object detection, and visual relationship detection at scale. arxiv preprint arxiv:1811.00982 (2018).  
+[60] lisha li, kevin g. jamieson, giulia desalvo, afshin rostamizadeh, and ameet talwalkar. 2017. hyperband: a novel bandit-based approach to hyperparameter optimization. j. mach. learn. res. 18 (2017), 185:1-185:52. http://jmlr.org/papers/v18/16-558.html  
+[61] richard liaw, eric liang, robert nishihara, philipp moritz, joseph e. gonzalez, and ion stoica. 2018. tune: a research platform for distributed model selection and training. arxiv preprint arxiv:1807.05118 (2018).  
+[62] tao lin, sebastian u. stich, kumar kshitij patel, and martin jaggi. 2020. don't use large mini-batches, use local sgd. in 8th international conference on learning representations, iclr 2020, addis ababa, ethiopia, april 26-30, 2020. openreview.net. https://openreview.net/forum?id=b1eyo1bfpr  
+[63] yujun lin, song han, huizi mao, yu wang, and william j dally. 2017. deep gradient compression: reducing the communication bandwidth for distributed training. arxiv preprint arxiv:1712.01887 (2017).  
+[64] wei liu, dragomir anguelov, dumitru erhan, christian szegedy, scott reed, cheng-yang fu, and alexander c berg. 2016. ssd: single shot multibox detector.
+
+in european conference on computer vision. springer, 21-37.  
+[65] kshiteej mahajan, arjun balasubramanian, arjun singhvi, shivaram venkataraman, aditya akella, amar phanishayee, and shuchi chawla. 2020. themis: fair and efficient gpu cluster scheduling. in 17th usenix symposium on networked systems design and implementation, nsdi 2020, santa clara, ca, usa, february 25-27, 2020. usenix association, 289-304. https://www.usenix.org/conference/nsdi20/presentation/mahajan  
+[66] qi meng, wei chen, yue wang, zhi-ming ma, and tie-yan liu. 2019. convergence analysis of distributed stochastic gradient descent with shuffling. neurocomputing 337 (2019), 46-57. https://doi.org/10.1016/j.neucom.2019.01.037  
+[67] apache mesos. 2020. recordio data format. https://mesos.apache.org/ documentation/latest/recordio/.  
+[68] supun nakandala, yuhao zhang, and arun kumar. 2020. cerebro: a data system for optimized deep learning model selection. proc. vldb endow. 13, 11 (2020), 2159-2173. http://www.vldb.org/pvldb/vol13/p2159-nakandala.pdf  
+[69] deepak narayanan, aaron harlap, amar phanishayee, vivek seshadri, nikhil r devanur, gregory r ganger, phillip b gibbons, and matei zaharia. 2019. pipedream: generalized pipeline parallelism for dnn training. in proceedings of the 27th acm symposium on operating systems principles. acm, 1-15.  
+[70] deepak narayanan, keshav santhanam, amar phanishayee, and matei zaharia. 2018. accelerating deep learning workloads through efficient multi-model execution. in nips workshop on systems for machine learning (december 2018).  
+[71] andrew ng. 2020. data and dnns. https://www.wired.com/brandlab/2015/05/ andrew-ng-deep-learning-mandate-humans-not-just-machines/.  
+[72] eriko nurvitadhi, ganesh venkatesh, jaewoong sim, debbie marr, randy huang, jason ong gee hock, yeong tat liew, krishnan srivatsan, duncan moss, suchit subhaschandra, et al. 2017. can fpgas beat gpus in accelerating next-generation deep neural networks? in proceedings of the 2017 acm/sigda international symposium on field-programmable gate arrays. acm, 5-14.  
+[73] kalin ovtcharov, olatunji ruwase, joo-young kim, jeremy fowers, karin strauss, and eric s chung. 2015. accelerating deep convolutional neural networks using specialized hardware. microsoft research whitepaper 2, 11 (2015), 1-4.  
+[74] luis perez and jason wang. 2017. the effectiveness of data augmentation in image classification using deep learning. arxiv preprint arxiv:1712.04621 (2017).  
+[75] philipp probst, anne-laure boulesteix, and bernd bischl. 2019. tunability: importance of hyperparameters of machine learning algorithms. j. mach. learn. res. 20 (2019), 53:1-53:32. http://jmlr.org/papers/v20/18-444.html  
+[76] andrew putnam, adrian caulfield, eric chung, derek chiou, kypros constantinides, john demme, hadi esmaeilzadeh, jeremy fowers, jan gray, michael haselman, scott hauck, stephen heil, amir hormati, joo-young kim, sitaram lanka, eric peterson, aaron smith, jason thong, phillip yi xiao, doug burger, jim larus, gopi prashanth gopal, and simon pope. 2014. a reconfigurable fabric for accelerating large-scale datacenter services. in proceeding of the 41st annual international symposium on computer architecture (isca) (isca 2014). 13-24.  
+[77] minsoo rhu, natalia gimelshein, jason clemons, arslan zulfiqar, and stephen w. keckler. 2016. vdnn: virtualized deep neural networks for scalable, memory-efficient neural network design. in the 49th annual ieee/acm international symposium on microarchitecture (taipei, taiwan) (micro-49). piscataway, nj, usa, 18:1-18:13.  
+[78] olga russakovsky, jia deng, hao su, jonathan krause, sanjeev satheesh, sean ma, zhiheng huang, andrey karpathy, aditya khosla, michael bernstein, et al. 2015. imagenet large scale visual recognition challenge. international journal of computer vision 115, 3 (2015), 211-252.  
+[79] olga russakovsky, jia deng, hao su, jonathan krause, sanjeev satheesh, sean ma, zhiheng huang, andrei karpathy, aditya khosla, michael bernstein, et al. 2015. imagenet large scale visual recognition challenge. international journal of computer vision 115, 3 (2015), 211-252.  
+[80] mark sandler, andrew howard, menglong zhu, andrey zhmoginov, and liang-chieh chen. 2018. mobilenetv2: inverted residuals and linear bottlenecks. in proceedings of the ieee conference on computer vision and pattern recognition.
+
+4510-4520.  
+[81] supheakmungkol sarin, knot pipatsrisawat, khiem pham, anurag batra, and luis valente. 2019. **crowdsource by google: a platform for collecting inclusive and representative machine learning data.**  
+[82] kaz sato. 2020. google's first tensor processing unit. https://cloud.google.com/blog/products/gcp/an-in-depth-look-at-google-first-tensor-processing-unit-tpu.  
+[83] karen simonyan and andrew zisserman. 2014. very deep convolutional networks for large-scale image recognition. arxiv preprint arxiv:1409.1556 (2014).  
+[84] michael stonebraker. 1981. operating system support for database management. commun. acm 24, 7 (1981), 412-418. https://doi.org/10.1145/358699.358703  
+[85] mustafa suleyman. 2020. using ai to give doctors a 48-hour head start on life-threatening illness. https://deepmind.com/blog/article/predicting-patient-deterioration.  
+[86] andrew tomkins, r hugo patterson, and garth gibson. 1997. informed multiprocess prefetching and caching. in acm sigmetrics performance evaluation review, vol. 25. acm, 100-114.  
+[87] nicolas vasilache, oleksandr zinenko, theodoros theodoridis, priya goyal, zachary devito, william s moses, sven verdoolaege, andrew adams, and albert cohen. 2018. tensor comprehensions: framework-agnostic high-performance machine learning abstractions. arxiv preprint arxiv:1802.04730 (2018).  
+[88] subhashini venugopalan, marcus rohrbach, jeffrey donahue, raymond mooney, trevor darrell, and kate saenko. 2015. sequence to sequence-video to text. in proceedings of the ieee international conference on computer vision. 4534-4542.  
+[89] guanhua wang, amar phanishayee, shivaram venkataraman, and ion stoica. 2020. blink: a fast nvlink-based collective communication library. in proceedings of the 3rd conference on machine learning and systems, mlsys '20. austin, tx, usa.  
+[90] yonghui wu, mike schuster, zhifeng chen, quoc v le, mohammad norouzi, wolfgang macherey, maxim krikun, yuan cao, qin gao, klaus macherey, et al. 2016. google's neural machine translation system: bridging the gap between human and machine translation. arxiv preprint arxiv:1609.08144 (2016).  
+[91] wencong xiao, romil bhardwaj, ramachandran ramjee, muthian sivathanu, nipun kwatra, zhenhua han, pratyush patel, xuan peng, hanyu zhao, quanlu zhang, fan yang, and lidong zhou. 2018. gandiva: introspective cluster scheduling for deep learning. in 13th usenix symposium on operating systems design and implementation, osdi 2018, carlsbad, ca, usa, october 8-10, 2018. usenix association, 595-610. https://www.usenix.org/conference/osdi18/presentation/xiao  
+[92] hao zhang, zeyu zheng, shizhen xu, wei dai, qirong ho, xiaodan liang, zhiting hu, jinliang wei, pengtao xie, and eric p. xing. 2017. poseidon: an efficient communication architecture for distributed deep learning on gpu clusters. in 2017 usenix annual technical conference (usenix atc 17). usenix association, santa clara, ca, 181-193.  
+[93] xiangyu zhang, xinyu zhou, mengxiao lin, and jian sun. 2018. shufflenet: an extremely efficient convolutional neural network for mobile devices. in proceedings of the ieee conference on computer vision and pattern recognition. 6848-6856.  
+[94] hongyu zhu, amar phanishayee, and gennady pekhimenko. 2020. daydream: accurately estimating the efficacy of optimizations for dnn training. in 2020 usenix annual technical conference, usenix atc 2020, july 15-17, 2020. usenix association, 337-352.  
+[95] yue zhu, fahim chowdhury, huansong fu, adam moody, kathryn mohrro, kento sato, and weikuan yu. 2018. entropy-aware i/o pipelining for large-scale deep learning on hpc systems. in 2018 ieee 26th international symposium on modeling, analysis, and simulation of computer and telecommunication systems (mascots). ieee, 145-156.  
+[96] yukun zhu, ryan kiros, rich zemel, ruslan salakhutdinov, raquel urtasun, antonio torralba, and sanja fidler. 2015. aligning books and movies: towards story-like visual explanations by watching movies and reading books. in proceedings of the ieee international conference on computer vision. 19-27.
+
+# appendix
+
+this document contains supplementary material, describing experiments that were omitted in the paper for brevity.
+
+# a analysis of data stalls
+
+our paper shows the analysis of data stalls in dnn training across various models, datasets, and hardware configurations. here, we provide additional analysis of prep stalls such as increasing the number of cpu cores per gpu beyond 3, and the data pipeline rates for different models, datasets and number of gpus.
+
+# a.1 data pipeline rates
+
+using ds-analyzer, we measure the rate of different components in the data pipeline as shown in figure 17.  $g$  indicates the gpu rate,  $p_g$  represents the pre-processing rate when using the gpu-mode of dali,  $p_c$  is the prep rate for the cpu-mode of dali, and  $f$  is the effective fetch rate. we show these quantities on config-ssd-v100 for 7 different models and varying gpu count for the openimages dataset in figure 18, imagenet-22k in figure 19 and imagenet-1k in figure 20. the configurations and cache size for each dataset is shown in table 4 when the gpu count is reduced, all other resources (cpu, and memory) are also proportionately reduced to maintain the sku.
+
+$p = \max (p_q,p_c)$  , the best of cpu or gpu-based prep
+
+the speed of the data pipeline is given by:  $\min(p, f)$
+
+data stall exists in a given configuration if  $g > \min(p, f)$ .
+
+we see that across several models and configurations, data stalls are prominent. the fetch rate shown here, assumes an efficient in-memory cache like minio that provides x hits per epoch if the cache has x items. if we rely on os page cache, fetch rates observed are  $20\%$  lower, resulting in higher fetch stalls.
+
+as we decrease the number of gpus, the ingestion rate at the gpu  $g$  decreases, as they process data slower due to decrease in parallelism. in all configurations, the bandwidth of the storage device remains constant; therefore as we reduce the number of gpus,  $f$ , catches up with  $g$ , and the bottleneck in the training pipeline shifts to pre-processing.
+
+there following are the key takeaways from the rate graphs.
+
+- several models experience data stalls due to fetch or prep across a range of gpu configurations and datasets.  
+- rich datasets like openimages (higher per-image size) result in higher data stalls as shown in figure 18  
+- even computationally expensive models like resnet50 and vgg experience data stalls due to the costly pre-processing, despite using state-of-the-art data pipelines.  
+- gpu based pre-processing hurts the performance of some models like resnet50 and vgg due to interference with gpu computation.
+
+# a.2 training on servers with high cpu count
+
+typically, servers optimized for ml training (for e.g., nvidia dgx-2) have 3 cpu cores per gpu [14]. however, some cloud providers like aws have servers with 8 gpus and 32 cpu cores (64 vcpus), that results in 4 cores (or 8 vcpus) per gpu. we analyze prep stalls in one such server with 8 v100 gpus, 64 vcpus, and 500gib dram.
+
+![](images/25c6b8376dc19f5b1ec432cc0c9ff506c1ca909d169b7d193c2695b1fa4c15e1.jpg)  
+figure 17: data pipeline in dnn training. this figure shows the different hardware components involved in dnn training and the throughput of each component.
+
+table 4: the table shows the number of gpus, cpus, and the percentage of dataset cached in memory for different configurations on config-ssd-v100.  
+
+<table><tr><td rowspan="2">num gpu</td><td rowspan="2">num cpu</td><td rowspan="2">mem (gb)</td><td rowspan="2">openimages</td><td colspan="2">% dataset cached</td></tr><tr><td>imagenet-22k</td><td>imagenet-1k</td></tr><tr><td>8</td><td>24</td><td>500</td><td>65%</td><td>35%</td><td>100%</td></tr><tr><td>4</td><td>12</td><td>250</td><td>32%</td><td>17%</td><td>100%</td></tr><tr><td>2</td><td>6</td><td>125</td><td>16%</td><td>9%</td><td>70%</td></tr><tr><td>1</td><td>3</td><td>62.5</td><td>8%</td><td>5%</td><td>35%</td></tr></table>
+
+figure 21 shows the training speed for a resnet18 training job as we vary the number of vcpus per gpu for both cpu-based and gpu-based prep pipeline with dali. note that the dataset is fully cached in memory and there are no fetch stalls in this experiment.
+
+resnet18 has  $50\%$  prep stall for 3 cpu cores per gpu, when gpu-based prep is used (shown by the gpu ingestion rate in figure 21). with 8 vcpus per gpu, prep stalls reduced to  $37\%$ , but did not vanish. note that, pre-processing with cpu scales linearly up to the number of cores (here 4 per gpu), beyond that, hyperthreading does not result in linear gain in performance. increasing the number of pre-processing threads in the server from 32 to 64 increased pre-processing speed only by  $30\%$ . in this experiment, we did not increase pre-processing threads per gpu beyond 5 in the gpu-prep mode of dali, as it resulted in higher gpu memory consumption for prep and hence oom. all the experiments presented in our main submission used 3 physical cpu cores per gpu (with gpu-prep of dali where beneficial). this is only  $25\%$  slower than using 8 vcpus per gpu (as shown in figure 21). additionally, the prep stall shown here is for imagenet-1k; with richer datasets like openimages (higher per-image size), prep stalls increase further.
+
+# a.3 comparing pytorch dl with dali
+
+pytorch has two different native modes for data parallel training; dataparallel (dp) and distributeddataparallel (ddp). dp is usually slower than ddp even on a single server due to the global interpreter lock (gil) contention across threads, and additional overhead introduced by scattering inputs and gathering outputs across gpus [20]. figure 22 shows the epoch time for 7 different image classification models using the imagenet-1k dataset(fully cached
+
+![](images/24c294c3a03a54dd381ca3a51039d7e71091f454921b2440e4b6c3daf96228bf.jpg)
+
+![](images/914424e45d30913d092f34eb3b06fb5496781b6ebc60ef1ae4ce7f119859b36b.jpg)
+
+![](images/9d60b23f5379142f4b06b44cb017f556041d5801b97685d9d1713d63807acbc3.jpg)
+
+![](images/3dcd13e49712d89cdd12b30108db543cd8008a6f3072b577e5004d0df607716a.jpg)  
+(a) 8 gpu
+
+![](images/7961e366707b041c96a6410d44b8cd4f8856179385f3d79354ef6b70c83a7b23.jpg)
+
+![](images/1d4eccd409f4196dede90d8ed3d256e9261c3fd83a5dee1b66cc157db433a16d.jpg)
+
+![](images/b8406b98702ab3be5ab3dd5137fae663522748f18dda730ae106a672af83efe3.jpg)
+
+![](images/7cc2bc6e235736bc28f07faf819b57c688c9a5581a9f1cc916e3309c49e5e13e.jpg)
+
+![](images/7e3e7c6b8f029ed51af2a4d3b4e41134dd27c1e29a5f78b1ab89b2982fe7ef9b.jpg)
+
+![](images/febc7dd179ab1053f12076a6354094d278ad605eae1f3b8cda87c1d9518c9e1d.jpg)
+
+![](images/9b1a9def3186ccbb52699835e5692a18eb7e21d9e2c1d4e437bbf6c24663fe0b.jpg)  
+(b) 4 gpu
+
+![](images/08e3053ac1026c94be3d1d116cf8d333936827206bbf46a95504273fdc03a275.jpg)
+
+![](images/416982b753cbfddad3cb8f95a596228622d3f4c717a92c2b0276811b3a54ad66.jpg)
+
+![](images/f786ff4e25e9cdf999843d86c46952824a484e756282763dbde4a9896ab984f9.jpg)
+
+![](images/5ca20d2638620c908237e7be9d3ed555e6c44a5e8e44fcf023bbdf807c671006.jpg)
+
+![](images/308767c6590dcaf75f5dae175fa4daec52ce1e33114ff4f7b6e325353c038be5.jpg)
+
+![](images/e0375681527abd32f506f6ef69212f6069240ea7f4f9e3b3be2481505ca6fb90.jpg)
+
+![](images/6cca9e4615c419eda39b76d22e69b8e1c4e2cb6d93d17ccb0c0cf8d19d48bb91.jpg)  
+(c) 2 gpu
+
+![](images/05b9df74156c0cacde81c6e55ed055776d7b383826d12dd01b747b284ff124d5.jpg)
+
+![](images/9d97c3e745eed5f6df9d4917027fbb68b86b998c96e92b00b1998b020c06994c.jpg)
+
+![](images/089cc6a240260b0781223242f36fa2e6a28f169b8e3a9baff8d241076cec8a89.jpg)
+
+![](images/d40347dc4bb8a1f09f73121e4c2c78c0d99115a876a1cb9d38e0038757cbdbd3.jpg)  
+figure 18: data pipeline rates with openimages. this graph shows that several models across various configurations have data stalls; i.e., the black bar  $(g)$  is greater than the minimum of blue  $(p)$  and red  $(f)$  bars.
+
+![](images/5ef7abb54265de5595978337b028717651190152b4edac2fda0102728d7ff0a2.jpg)
+
+![](images/4d90292fb889454fc401748e6e18d6eadab4c68d5cf4fb80c471b7cdea42ec62.jpg)
+
+![](images/c7c0c83ed559e0dded0fc04ad824d985e84bca4bf4187d83031859354a8f0cb2.jpg)  
+(d) 1 gpu
+
+![](images/b4191b4269e8efd8da795dc3fb8232637c7eda57e9cfcecd99a645428e5fc5dd.jpg)
+
+![](images/ad6d28c438f64ee3cb731d734d2fb7241720ae6d3764ae55c6fc95f3fa2e8c8f.jpg)
+
+![](images/0f68eb97c46c9d0247800377136ab217e6fa505314783581d4d286b796d8173e.jpg)
+
+![](images/6b39c46a06752dc86b9d310bbccc52072dda5f402acbfc6cfe9339e658ae1457.jpg)
+
+![](images/bf4440dc36033ba2b366de29c3f83e35a5b011d818ecb612330738e8740c8490.jpg)
+
+![](images/08f2a306420f22e6a4bb957bf6af07aaaf41eb7fc44e6f38e5fda1e85bebcde9.jpg)
+
+![](images/cb6eb756ec9c31e5e0e56da6da5638438e5d13b3c1bf3e0ce45a7d118ceeb3c5.jpg)  
+(a) 8 gpu
+
+![](images/a410e5a47ee5c155479926f85a4eb2bc8f59288b7055e1a524d196eb587d3593.jpg)
+
+![](images/0c988b5ed2733870abab54d4ddde4e383dc4520a09893f3990885948634bbf76.jpg)
+
+![](images/c33e14d9896aaa732e6b587bc0ad3b0e299dd66dc5fb06795d91b90191a49204.jpg)
+
+![](images/6d8a6597431b73b8a82364aa19b8852a8fdd802ecdc3077f3ff74be3a28d3b56.jpg)
+
+![](images/075c80a94bfaa343babe249104b9c6ac1b6a48d8acf76f492f456ea6967f56f9.jpg)
+
+![](images/714df389e7969b3973c1e08d09365c427082d4a9363f9970ab5688407c1fc9d8.jpg)
+
+![](images/d21c56bab9fc5270d28aa903dfa1a0438e2cf2bcc391582885bd432b360decc6.jpg)  
+(b) 4 gpu
+
+![](images/f0991051ee1e6844d5c734bf0e6f9d12ccac3cc5d331d9d269892d1d4d384db2.jpg)
+
+![](images/610f9ffa7685bd8e113eda2fc04c732ada8a4269d3f19d945cb4b5a9c4804e99.jpg)
+
+![](images/c473ef9224c8640dfc233be0c02d8d4c4fcb7d6015e29be049610dc8d1052e0d.jpg)
+
+![](images/195ee62f9dc9aea79299e576994fd738d9ee7446315348396631aa68fb491a95.jpg)
+
+![](images/a702e7c465b65535a1008a9847d76a5d909e698fffa81f597333d121e420211b.jpg)
+
+![](images/7ac026fc1fde2cfc5248406ea267c1f8e094f35f0aa57b940fd92c42286a8d2f.jpg)
+
+![](images/8fedd6674f599ebfc4ae962048359714bfb1ef1eea875dd566081880cc09e4d4.jpg)  
+(c) 2 gpu
+
+![](images/08e7609c56f909c7bde8ad72a98e4781116acd7da4282f3585592d4f741df498.jpg)
+
+![](images/28845da7afcb90a717257b898db4e8991d8ec12100cec7d894dec038056aeb56.jpg)
+
+![](images/98f071beed69f4e2f52b4c9c37e9c9ef3d5d1c2243b034bc57d81d9ff5898e55.jpg)
+
+![](images/0146f4d7ef51edd5032095c667665aef0caf0f570a70533474d3ce56f5a76044.jpg)  
+figure 19: data pipeline rates with imagenet-22k. this graph shows that several models across various configurations have data stalls due to fetch and prep; i.e., the black bar  $(g)$  is greater than the minimum of blue  $(p)$  and red  $(f)$  bars.
+
+![](images/6d67fe93e4659e970d2fb17356ff72d3a533d766d998e0f53d78c46459d6b717.jpg)
+
+![](images/1d3984472a0e0f3e1459c16e5fc698ffba6e26da98446e232664b733b2aa5959.jpg)
+
+![](images/f12916af874cfc9c8fc1fc906f2d15fc0ea1abb63ed5929a99ddd8a95ecf7092.jpg)  
+(d) 1 gpu
+
+![](images/f67c5161177181a0166bf128e8720982ad0efa71e7b0c79793969a645e9c2804.jpg)
+
+![](images/59dbb2fc2645f551fd3d8d975c440805121223e7b8ce102238b0e2643eed1fb9.jpg)
+
+![](images/fa209651a0bcde88fb51c069788d66354ce890a45e75337700dbfab3efaf6277.jpg)
+
+![](images/2106c8f54b72ddf6ef78d3e29beaded2ac4e849943b810e1e32d208bae8953c2.jpg)
+
+![](images/71e3ad4545bfc2c008fa07994832da672062aa2088515ee009327ba4ef067f12.jpg)
+
+![](images/d4419e326cafb91123abc819e247ebf42de6f9fe8447e67faa63161dc14c4fa6.jpg)
+
+![](images/76c76101af7a781d240a80cbcc0dc541d26637392845ae6d6d76a81374442054.jpg)  
+(a) 8 gpu
+
+![](images/a61fbb31b149473fad5f79ed89c3409ebd8b256a6bf35b3c3312b7ad4b78a3a1.jpg)
+
+![](images/ee00d03cc78142d26f5c183abdd6b730d6522550621c6bdc78f02d0ad5feff66.jpg)
+
+![](images/b290f374b3481c196864b60a86e6bb63ca63a5a08d61f1315fc38a82b586a022.jpg)
+
+![](images/e6ac0f660a580935ab55609616e840e31ce03e9df25d73403bfe4825dcc4a690.jpg)
+
+![](images/bf5d32ee6b618bfed95f907e1c9e84ecbc91e9739d6c571917981223a82f63dd.jpg)
+
+![](images/c20032074e8b515f7347f2f43eea421bd482c53800e50cbe4ab1c04bcc4f0268.jpg)
+
+![](images/9305996feb4d58c557828df304be977b2854614a1bce0e63c4f95d6384b4409b.jpg)  
+(b) 4 gpu
+
+![](images/df5ee43be49e380d075e01a92f3eec5568b4338d13895e8e78fe4c3e672bffd1.jpg)
+
+![](images/871fe5f168abfff8b0c1859d86e4b2e79bc3140cafef3a231cae3c431bd4d326.jpg)
+
+![](images/e8cfb4e01256d2b1144039564c7bbd7bb1c428093ea0a8117babde6517275316.jpg)
+
+![](images/6df25956fae706b2b8cd699d96d1ff4b07a787b1abe306fe559586c5723267f6.jpg)
+
+![](images/0fdc542d235d5c6d7df866da4473bd47706cc509daeb7ff3803a9a4283811a8d.jpg)
+
+![](images/584c7635eb496eb8da6734a3fe07fbe3101d365434b95db6891cfd639885f694.jpg)
+
+![](images/bc92f4d55c6ca07591a4028b0892fea32ede1701b6690c3c8ee116f0df1286ed.jpg)  
+(c) 2 gpu
+
+![](images/0c9243c15b3fe9929a6ad4065bf77d63b17a4fe4a2cf845bd2b4486d2fec10fc.jpg)
+
+![](images/29aa72b8c71580725a794e1b5b6b477a26f50368eefa1cbd01505667e60b4c7b.jpg)
+
+![](images/b00415e562c6a7f77324c5fc64eff52bc5f412e88e02ff441410c4dd5e816818.jpg)
+
+![](images/9cf1e9fc95d1ac77a43dcff1dde482183e27d7324c4d4e93a55a997ef77519aa.jpg)  
+figure 20: data pipeline rates with imagenet-1k. this graph shows that several models across various configurations have prep stalls; i.e., the black bar  $(g)$  is greater than the blue  $(p)$  bars. since the dataset fits in memory in most configurations,  $f$  is high.
+
+![](images/a80cc35bbfb02281878d873271ce3023b98279f2f82c5bacf92d6f1068c58713.jpg)
+
+![](images/59d226898d115d68c92b384a0a6de06b5f4283d41eba75976db16ba5e04b6e6c.jpg)
+
+![](images/3eceaf69db9f3eec2acd0114250add848f0f9522fd121a47a986f210f0462535.jpg)  
+(d) 1 gpu
+
+![](images/7c689b9f4eefe5d9e78757156da43a028fd9d667b795924a8814dc611a071b28.jpg)
+
+![](images/e071856cc2da9e9db32054bc4fc196e650dc4faa720a6d253e119708852029a4.jpg)
+
+![](images/cdea9d87de61eaf162b5bb3f54d56ef4a424a8577fdcc2b4c60ea938cc9be640.jpg)
+
+![](images/0a00cb2c78e802e9a485dfb12b7e2bbf70059f279bda57fd0fc8bcb29633cad0.jpg)  
+figure 21: impact of cpu on prep. this graph plots the epoch time for resnet18 on config-ssd-v100 as we vary the number of vcpus per gpu. although epoch time decreases with higher vcpus, at 8vcpus per gpu, resnet18 has  $37\%$  prep stalls. with the gpu-prep of dali, we do not increase threads beyond 5 per gpu as it results in gpu oom.
+
+in memory) using native pytorch dl with the faster ddp mode and dali. pytorch dl uses the pillow library [32] and torchvision [22] for image decoding and pre-processing while dali uses the optimized nvjpeg library [15], therefore resulting in faster preprocessing even when using only cpu. when the gpu based dali pipeline is used, training time further drops due to reduction in prep stalls. however, note that there are two downsides to using dali's gpu based prep. first, it takes up 2-5gb of additional gpu
+
+memory for pre-processing, the luxury of which may not be available for all models and gpus, as gpu memory is limited. second, scheduling pre-processing on the gpu hurts models like resnet50, as they are already heavy on gpu computation. in all our analysis and evaluation presented in the paper, we run with both gpu and cpu based dali pipeline and present the best of the two results (cpu-based prep was faster on resnet-50 and vgg11).
+
+# b evaluation of coordl against dali
+
+our paper evaluates coordl against dali in various training scenarios. this document provides a more detailed evaluation of some aspects of coordl.
+
+# b.1 evaluation with imagenet22k
+
+imagenet-22k is the extended version of the popular imagenet-1k dataset, and contains about 14 million images that belong to 21841 different categories [36]. the average size of an image in this dataset is about 90kb, much smaller than the average image size in openimages dataset (300kb), as well as imagenet-1k (150kb).
+
+when we train the image classification models with imagenet-22k on config-ssd-v100, minio results in  $20\%$  higher cache hits than dali-shuffle that resulted in  $1.5 \times$  faster training on shufflenet, and  $1.4 \times$  faster on alexnet and resnet18.
+
+next, when we perform distributed training on these models on config-ssd-v100 with 2 servers, alexnet trained  $1.3 \times$  faster, shufflenet trained  $1.33 \times$  faster and resnet18 achieved  $1.12 \times$  speedup. the fetch stalls with imagenet-22k was lower than a more complex dataset like openimages because of the low per-image size that
+
+![](images/e1847a961d930ce17ee4330e3f3a98367e1faac38c7bc1bfb28a2cd629e46117.jpg)  
+figure 22: epoch time with pytorch and dali. this graph plots the epoch time for various image classification models with native pytorch dl and dali (cpu-prep and gpu-prep) on config-ssd-v100. dali provides significant speedup over pytorch even in its cpu mode due to the optimized nvjpeg decoding library. for compute heavy models like resnet50, gpu based pipeline hurts performance because there is no idle time at the gpu that can be used for pre-processing, and thus interferes with gpu computation.
+
+![](images/989d956c156b0c4b1ee82dd0937839a1a660d6f552c11dc9863e7d4211c9de99.jpg)  
+figure 23: hp search with imagenet-22k dataset. this plot shows the normalized training speed wrt dali, when training 8 concurrent hp search jobs on config-ssd-v100.
+
+table 5: impact on fetch misses and disk io. when training resnet18 on openimages (645gb), coordl reduces cache misses from  $66\%$  to  $35\%$ . config-ssd-v100 caches  $65\%$  of the dataset, so this is the minimum miss rate.  
+
+<table><tr><td></td><td>dali-seq</td><td>dali-shuffle</td><td>coordl</td></tr><tr><td>cache miss</td><td>66%</td><td>53%</td><td>35%</td></tr><tr><td>disk io (gb)</td><td>422</td><td>340</td><td>225</td></tr></table>
+
+increased the number of samples the storage can deliver per second.
+
+finally, we perform hp search with eight concurrent jobs on config-ssd-v100 on the seven image classification models. as shown in figure 23, coordl results in upto  $2.5 \times$  speedup.
+
+# b.2 cache misses with coordl
+
+coordl's minio cache is designed to minimize the amount of storage i/o per epoch, by efficiently utilizing the all the items in cache. table 5 enumerates the fetch misses and total disk i/o for dali-seq, dali-shuffle and coordl when training shufflenetv2 on openimages dataset on config-ssd-v100. this server can cache  $65\%$  of the dataset. coordl is able to reduce disk i/o by  $47\%$  compared to dali-seq and  $33\%$  compared to dali-shuffle, by reducing thrashing by  $47\%$  and  $33\%$  respectively. minio cache is able to reduce the cache misses down to capacity misses.
+
+# b.3 scalability of partitioned caching
+
+our paper shows that when training is distributed across just enough servers that can cache the entire dataset in memory, partitioned caching can speed up training jobs by upto  $15 \times$ . however, when we distribute training to more servers, such that their aggregate memory is higher than the total dataset size, coordl continues to outperform dali as shown in figure 24a. in this experiment, we train resnet50 on openimages on config-hdd-1080ti, where each server can cache  $65\%$  of the dataset. when training extends to 24 gpus(3servers), or 32 gpus(4 servers), the throughput with coordl increases because, training is not bottlenecked on i/o and more gpus for training naturally results in faster training due to increase in gpu parallelism. with dali, although the throughput increases, it is still i/o bound; the increase in throughput is due to the reduced disk i/o per server when training is distributed as shown in table 24b. although the i/o per server decreases with dali as we distribute training across more servers, note that the gpu parallelism is also proportionately increasing; the gpu compute rate  $(g)$  and prefetch rate  $(f)$ , are proportionately increasing, leaving the performance gap the same.
+
+![](images/127d4f9861880d851750895117a05e68a59d577b8edaca2db48fd1817fadca30.jpg)  
+(a) distributed training  
+figure 24: distributed training with coordl. the plot compares dali with coordl when training resnet50 across up to 4 nodes. even when each node can cache  $65\%$  of the dataset, dali results in i/o bound training due to disk fetch, while coordl results in zero disk accesses beyond first epoch.
+
+<table><tr><td>nodes</td><td>disk io(gb)</td></tr><tr><td>1</td><td>342</td></tr><tr><td>2</td><td>119</td></tr><tr><td>3</td><td>70</td></tr><tr><td>4</td><td>50</td></tr></table>
+
+(b) disk io
+
+table 6: on config-ssd-v100, when training with the small imagenet-1k dataset that fits in memory, coordl provides upto  $1.87 \times$  speedup by eliminating redundant prep  
+
+<table><tr><td rowspan="2">model</td><td colspan="2">per job speed (samples/s)</td></tr><tr><td>dali</td><td>coordl</td></tr><tr><td>shufflenet</td><td>1441</td><td>1.81×</td></tr><tr><td>alexnet</td><td>1399</td><td>1.87×</td></tr><tr><td>resnet18</td><td>1056</td><td>1.53×</td></tr><tr><td>squeezenet</td><td>835</td><td>1.50×</td></tr><tr><td>mobilenet</td><td>752</td><td>1.35×</td></tr><tr><td>resnet50</td><td>569</td><td>1.21×</td></tr><tr><td>vgg11</td><td>552</td><td>1.22×</td></tr></table>
+
+![](images/ee998e20e80a149febd38ffca01af74d47403b0c0a0a5ca79b67c0d422e0fb9a.jpg)
+
+![](images/4d44a6e347cb2d8f2bc21d71a82971b31bb43ef7de08f32e8d0f1eaeb7962b03.jpg)  
+figure 25: this plot shows the cpu utilization over time for dali and coordl when training resnet18 on openimages. coordl uses cache effectively to reduce disk i/o, therefore utilizing cpu on useful pre-processing rather than waiting on i/o
+
+![](images/d90379bc0b80f4e36b655b70749b60b24e92dcade43a929dc32f8da7ecba0573.jpg)  
+figure 26: this plot shows the memory utilization for two epochs of hp search using alexnet on openimages, with 8 concurrent jobs. coordl uses 5gb of extra process memory; resulting in 5gb lower cache space.
+
+# b.4 hp search with fully cached dataset
+
+the core of coordl's ability to speed up hp search jobs comes from coordinating pre-processing to overcome the imbalance in the ratio of cpu cores to gpu. we perform hp search with 8 jobs on config-ssd-v100 with imagenet-1k dataset that fits entirely in memory. as shown in table 6, coordl sped up hp search by  $1.9 \times$  on alexnet and and  $1.2 \times$  on resnet50 by eliminating redundant pre-processing operations.
+
+# b.5 resource utilization with coordl
+
+cpu utilization with coordl. the paper showed how minio reduces the amount of data fetched from storage in each epoch and regularizes the data access pattern. profiling the cpu during training of resnet18 on openimages shows that the pre-processing threads in dali are often stalled waiting for i/o as in figure 25. since minio reduces the total disk i/o, coordl is able to better utilize the cpu threads for pre-processing. the combination of lower disk i/o and better cpu utilization leads to shorter training times when using coordl.
+
+low memory overhead of co-ordinated prep. by design, co-ordinated prep has the same memory requirements as dali. to experimentally validate this, we track the memory utilization of running hyperparameter search on alexnet on openimages on a config-ssd-v100 server using eight concurrent jobs. figure 26 plots the memory utilization over time for both the process working memory, and the cache. coordl uses 5 gb of extra process memory to store prepared mini-batches in memory until all hyperparameter jobs consume it. we reduce the cache space given to coordl by 5 gb (keeping the total memory consumption same for coordl and dali). despite the lower cache space, coordl still accelerated training by  $2.9 \times$ .
+
+# c building py-coordl in native pytorch
+
+as a proof of concept, we implemented two of the techniques behind coordl, minio and coordinated prep as a pluggable module to the native pytorch dl (without dali). this section briefly describes the implementation and presents the evaluation of py-coordl against the native pytorch dl.
+
+# c.1 implementation
+
+py-coordl is implemented as a pluggable dataloader module for pytorch with minimal changes to its current dataloader api. py-coordl is implemented in 650 lines of python code. py-coordl is implemented using python's shared memory abstraction because pytorch spawns multiple processes instead of threads to parallelize data fetch and prep (due to python's global interpreter lock limiting concurrency of threads).
+
+# c.2 evaluation
+
+we evaluate py-coordl on a server with 8 v100 gpus, each with 16gb of gpu dram. our server is 2 socket, 14-core intel xeon e5-2690@2.6ghz, with 500gb dram, and 2 different storage devices (ssd and hdd). we evaluate py-coordl on five image classification models; alexnet [57], resnet18 [44], shufflenetv2 [93],
+
+![](images/abce58cd0935bb2270929b98e91569721c37177429a552c00fcf493bcb5df6db.jpg)  
+(a) hdd
+
+![](images/cdfa9f9bbcb212dda8b01b8f294bca7e4e3cff8366455447abe0763f1e450cce.jpg)  
+(b) ssd
+
+![](images/8ac6eee3c9483451a9c862e6b4735d607c202314e2e0509c790a2e51b35e9bc9.jpg)  
+figure 27: evaluation of minio caching policy. the graphs compare the native pytorch dataloader with py-coordl's minio caching policy, and shows the speedup due to the two components in minio; sequential access in shared memory(shm), and increased cache hits(minio). on hdds the sequential access of image files in shm provides significant speedup. on ssd, benefits with minio are marginal because training is bottlenecked on cpu prep.  
+figure 28: evaluation of coordinated prep. this graph compares pytorch against py-coordl's coordinated prep when training 6 or 8 hp search jobs on a server. coordinated prep is able to reduce prep stalls significantly as compared to pytorch
+
+squeezenet [46] and mobilenetv2 [80]. we set the batch size to the maximum that fits the gpu (512 for alexnet, shufflenet and resnet18, 256 for the others). we train the model for 5 epochs and report the average epoch time excluding the first warmup epoch. we use the imagenet 1k dataset of size 146gib [79] and pytorch 1.1. to evaluate the benefits of py-coordl, we run our jobs in a docker container with restricted memory to mimic the scenario where the dataset does not entirely fit in dram. this is equivalent to running the full imagenet dataset (22k classes - 1.3tb) on our server.
+
+c.2.1 multi-gpu training in a server. we now evaluate the benefit of using py-coordl to perform multi-gpu training in a single server.
+
+hard drives. figure 27a plots the stabilized per epoch time as a function of cache size for resnet18. in this experiment, dataparallel training is performed on 8 gpus, each with a batch size of 512 and a total of 24 data workers pre-processing in parallel. py-coordl brings down the per-epoch training time by  $2.1 \times -3.3 \times$ . this is due to two reasons. first, py-coordl increases the sequentiality of reading data items from the disk by indexing the entire data item instead of individual pages. each data item in the imagenet dataset is on average 150kb, which spans about 28 pages on disk. the native pytorch dl fetches the pages of data items on demand, whenever the
+
+cpu thread requires to decode the item. as multiple data workers decode images in parallel, the pages from different images were requested randomly. py-coordl reduces this randomness by reading the entire data item into memory, before decoding it. second, minio caching policy results in  $20\%$  lower cache misses as compared to the page cache's lru scheme. given the low throughput of disks (15mbps), this translates to a high savings in training time.
+
+solid state drives. figure 27b shows the variation in training time for different cache sizes, when the dataset is accessed from a fast solid state drive (ssd). the throughput of the ssd is 500mbps. reduction in cache trashing does not reduce the training time significantly because we are bottlenecked on pre-processing at the cpu (pre-processing throughput is around 327mbps). therefore, the  $20\%$  reduction in store misses translates to a mere  $7\%$  lower training time. note that when an optimized library like dali is used for pre-processing, the cpu prep rate increases, making storage the bottleneck; this makes minio's savings more significant with dali.
+
+c.2.2 hp search. to evaluate the benefits of coordinated prep, we construct a microbenchmark where each job trains the resnet18 model on a single gpu in a server, when the entire dataset is cached in memory. we evaluate two scenarios; 4 jobs, each using 6 data workers for pre-processing (4 gpu and 24 cpu), and 8 jobs with 3 data workers each (8 gpu and 24 cpu). the per-epoch time for these scenarios is shown in figure 28. as the number of concurrent jobs increase, the data stall time increases because each job gets fewer cpu cores for pre-processing. py-coordl reduces the data stall time close to 0 in both cases. it does so by launching a unified data loading process that pre-processes the dataset exactly once per epoch using all 24 cpus, and shares the prepared batches across all the jobs. this technique results in  $1.8 \times$  lower training time when 8 jobs are run concurrently on a single server.  
+c.2.3 end-to-end benefit of py-coordl. we now evaluate the end-to-end benefit of coordl using a macrobenchmark; hp search using ray tune [61] when dataset does not fit entirely in memory.
+
+ray tune. ray tune [61] is a hp optimization framework that provides the flexibility of using various search algorithms such as population based training (pbt), median stopping rule, and hyperband. ray tune uses one of these algorithms to pick a unique
+
+![](images/6e67ff85c932d09681bd1717c30225d25d87adf50fe72b3c0111478b56131419.jpg)  
+(a) end-to-end workload on hdd
+
+![](images/2e185442d7569cf56fe6703063ba4cbe66ec8337eed03dfb91740c74d6e7f4d7.jpg)  
+(b) end-to-end workload on ssd  
+figure 29: end-to-end evaluation. the graphs compare the total search time for hp optimization on ray tune using the baseline pytorch dl and py-coordl on hard disks and solid state drives. it also shows the contribution of individual components; when just coordinated prep is used without minio (indicated as coordinated prep) and when both techniques are used (shown as py-coordl). on ssds, minio does not help accelerate training as much as it does on hdds, because the fetch rate is higher than the cpu prep rate on ssd.
+
+value for the hp, and launches a training job on one of the available gpus. we modified ray tune's job executor to use py-coordl and launch training jobs one on each available gpu in a server. we used the hyperband search algorithm to sample 16 values of (learning rate, momentum) pairs and set the stopping criteria to be the completion of one epoch for brevity. the trends remain the same if the stopping criteria is set to a target accuracy.
+
+experiment setting. we run this macrobenchmark on a machine with 8 gpus (8 samples are trained in parallel). for the pytorch dl, we set the number of data workers to 3 for each job and to evaluate py-coordl, we set data workers to 24. note the total number of data workers in the system is the same in both cases. we set the cache size set to  $110\mathrm{gb}$  ( $\approx 75\%$  of the dataset). we record the total reduction in search time compared to the baseline, and the contribution of each of our techniques, coordinated prep alone, and when coordinated prep is combined with minio caching. we evaluate the benefits of py-coordl in two scenarios; when the dataset resides on a slower storage media like hard drive and when it is on a relatively faster media like solid state drive.
+
+dataset resides on hard drive. as shown in figure 29a, coordinated prep alone results in up to  $2.5 \times$  speedup in total search time by reducing the total disk accesses by  $2.5 \times$ . the savings in time comes directly from the reduced disk accesses because the dataloader in this case is bottlenecked on i/o rather than pre-processing. when minio caching policy is enabled, the effective speedup is close to  $5.5 \times$  due to reduced storage miss and reduction in random accesses.
+
+dataset resides on solid state drive. when the dataset is on a faster medium like ssd, whose throughput is higher than that of pre-processing, the bottleneck in the dataloader shifts to cpu. in this scenario, as shown in figure 29b, coordinated prep reduces the overhead of pre-processing and speeds up search time by reusing prepared minibatches across jobs. with the addition of minio policy, the search does not speed up significantly due to cheap io.
+
+# c.3 summary
+
+py-coordl speeds up dnn training jobs by  $2 \times -5.7 \times$  by enabling efficient reuse of both raw data items and pre-processed batches. although py-coordl has marginal gains when dataset resides on ssd, the reason was the slow pre-processing rate of data transformation operations used by pytorch dl. if prep rate goes up, fetch stalls become prominent, and minio comes to the rescue, which is the case when using dali for pre-processing [8].

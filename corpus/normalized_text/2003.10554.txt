@@ -1,0 +1,608 @@
+# elle: inferring isolation anomalies from experimental observations
+
+kyle kingsbury jepsen
+
+aphyr@jepsen.io
+
+peter alvaro
+
+uc santa cruz
+
+palvaro@ucsc.edu
+
+# abstract
+
+users who care about their data store it in databases, which (at least in principle) guarantee some form of transactional isolation. however, experience shows [26, 24] that many databases do not provide the isolation guarantees they claim. with the recent proliferation of new distributed databases, demand has grown for checkers that can, by generating client workloads and injecting faults, produce anomalies that witness a violation of a stated guarantee. an ideal checker would be sound (no false positives), efficient (polynomial in history length and concurrency), effective (finding violations in real databases), general (analyzing many patterns of transactions), and informative (justifying the presence of an anomaly with understandable counterexamples). sadly, we are aware of no checkers that satisfy these goals.
+
+we present elle: a novel checker which infers an adja-style dependency graph between client-observed transactions. it does so by carefully selecting database objects and operations when generating histories, so as to ensure that the results of database reads reveal information about their version history. elle can detect every anomaly in adya et al's formalism [2] (except for predicates), discriminate between them, and provide concise explanations of each.
+
+this paper makes the following contributions: we present elle, demonstrate its soundness, measure its efficiency against the current state of the art, and give evidence of its effectiveness via a case study of four real databases.
+
+# 1. introduction
+
+database systems often offer multi-object transactions at varying isolation levels, such as serializable or read committed. however, design flaws or bugs in those databases may result in weaker isolation levels than claimed. in order to verify whether a given database actually provides claimed safety properties, we can execute transactions against the database, record a concurrent history of how those transactions completed, and analyze that history to identify invariant violations. this property-based approach to verification
+
+is especially powerful when combined with fault injection techniques. [29]
+
+many checkers use a particular pattern of transactions, and check that under the expected isolation level, some hand-proved invariant(s) hold. for instance, one could check for long fork (an anomaly present in parallel snapshot isolation) by inserting two records  $x$  and  $y$  in separate transactions, and in two more transactions, reading both records. if one read observes  $x$  but not  $y$ , and the other observes  $y$  but not  $x$ , then we have an example of a long fork, and can conclude that the system does not provide snapshot isolation—or any stronger isolation level.
+
+these checkers are generally efficient (i.e. completing in polynomial time), and do identify bugs in real systems, but they have several drawbacks. they find a small number of anomalies in a specific pattern of transactions, and tell us nothing about the behavior of other patterns. they require hand-proven invariants: one must show that for chosen transactions under a given consistency model, those invariants hold. they also do not compose: transactions we execute for one checker are, in general, incompatible with another checker. each property may require a separate test.
+
+some researchers have designed more general checkers which can analyze broader sets of possible transactions. for instance, knossos [22] and porcupine [3] can verify whether an arbitrary history of operations over a user-defined datatype is linearizable, using techniques from wing & gong [37] and lowe [28]. since strict-1sr is equivalent to linearizability (where operations are transactions, and the linearizable object is a map), these checkers can be applied to strict serializable databases as well. while this approach does find anomalies in real databases, its use is limited by the np-complete nature of linearizability checking, and the combinatorial explosion of states in a concurrent multi-register system.
+
+serializability checking is also (in general) np-complete [30] and unlike linearizability, one cannot use real-time constraints to reduce the search space. following the abstract execution formalism of cerone, bernardi, and gotsman [12], kingsbury attempted to verify serializability by identifying write-read dependencies between transactions, translating those dependencies to an integer constraint problem on transaction orders [23], and applying off-the-shelf constraint solvers like gecode [35] to solve for a particular order. this approach works, but, like knossos, is limited by the np-complete nature of constraint solving. histories of more than a hundred-odd transactions quickly become intractable. moreover, constraint solvers give us limited in
+
+sight into why a particular transaction order was unsolvable. they can only tell us whether a history is serializable or not, without insight into specific transactions that may have gone wrong. finally, this approach cannot distinguish between weaker isolation levels, such as snapshot isolation or read committed.
+
+what would an ideal checker for transaction isolation look like? such a checker would accept many patterns of transactions, rather than specific, hand-coded examples. it would distinguish between different types of anomalies, allowing us to verify stronger (e.g. strict-1sr) and weaker (e.g. read uncommitted) isolation levels. it ought to localize the faults it finds to specific subsets of transactions. of course, it should do all of this efficiently.
+
+in this paper, we present elle: an isolation checker for black-box databases. instead of solving for a transaction order, elle uses its knowledge of the transactions issued by the client, the objects written, and the values returned by reads to reason about the possible dependency graphs of the opaque database in the language of adya's formalism. [2] while elle can make limited inferences from read-write registers, it shines with richer datatypes, like append-only lists.
+
+all history checkers depend on the system which generated their transactions. elle's most powerful analysis requires that we generate histories in which reads of an object correspond return its entire version history, and where a unique mapping exists between versions and transactions. however, we show that generating histories which allow these inferences is straightforward, that the required datatypes are broadly supported, and that these choices do not prevent elle from identifying bugs in real-world database systems.
+
+# 2. the adya formalism
+
+in their 2000 paper "generalized isolation level definitions", adya, liskov, and o'neil formalized a variety of transactional isolation levels in terms of proscribed behaviors in an abstract history  $h$ . adya et al.'s histories (hereafter: "adya histories") comprise of a set of transactions, an event order which encodes the order of operations in those transactions, and a version order  $\ll$ : a total order over installed versions of each object. two anomalies, g1a (aborted reads) and g1b (intermediate reads), are defined as transactions which read versions written by aborted transactions, or which read versions from the middle of some other transaction, respectively. the remainder are defined in terms of cycles over a direct serialization graph (dsg), which captures the dependencies between transactions. setting aside predicates, adya et al.'s dependencies are:
+
+- directly write-dependents.  $t_{i}$  installs  $x_{i}$ , and  $t_{j}$  installs  $x$ 's next version  
+- directly read-dependents.  $t_{i}$  installs  $x_{i}$ ,  $t_{j}$  reads  $x_{i}$  
+- directly anti-dependents.  $t_{i}$  reads  $x_{i}$ , and  $t_{j}$  installs  $x$ 's next version
+
+the direct serialization graph  $dsg(h)$  is a graph over transactions in some history  $h$ , whose edges are given by these dependencies. a g0 anomaly is a cycle in the dsg comprised entirely of write dependencies. g1c anomalies include read dependencies. instances of g2 involve at least one anti-dependency (those with exactly one are g-single).
+
+this is a tantalizing model for several reasons. its definitions are relatively straightforward. its anomalies are local, in the sense that they involve a specific set of transactions. we can point to those transactions and say, "things went wrong here!"—which aids debugging. moreover, we can check these properties in linear time: intermediate and aborted reads are straightforward to detect, and once we've constructed the dependency graph, cycle detection is solvable in  $\mathrm{o}(\text{vertices} + \text{edges})$  time, thanks to tarjan's algorithm for strongly connected components [34].
+
+however, there is one significant obstacle to working with an adya history: we don't have it. in fact, one may not even exist. the database system may not have any concept of a version order, or it might not expose that ordering information to clients.
+
+as an example, consider adya et al.'s history  $h_{\text{serial}}$ , as it would be observed by clients. is this history serializable?
+
+$$
+t _ {1} \colon w (z _ {1}), w (x _ {1}), w (y _ {1}), c
+$$
+
+$$
+t _ {2}: r (x _ {1}), w (y _ {2}), c
+$$
+
+$$
+t _ {3}: w (x _ {3}), r (y _ {2}), w (z _ {3}), c
+$$
+
+$t_{2}$  read  $x_{1}$ , so it must read-depend on  $t_{1}$ , and likewise,  $t_{3}$  must read-depend on  $t_{2}$ . what about  $t_{1}$  and  $t_{2}$ 's writes to  $y$ ? which overwrote the other? as crooks et al observe [17], we cannot tell, because we lack a key component in adya's formalism: the version order.  $h_{serial}$  includes additional information ( $x_{1} \ll x_{3}, y_{1} \ll y_{2}, z_{1} \ll z_{3}$ ) which is invisible to clients. we might consider deducing the version order from the real-time order in which writes or commits take place, but adya et al explicitly rule this out, since optimistic and multi-version implementations might require the freedom to commit earlier versions later in time. moreover, network latency may make it impossible to precisely determine concurrency windows.
+
+we would like to be able to infer an adya history based purely on the information available to clients of the system, which we call an observation. when a client submits an operation to a database, it generally knows what kind of operation it performed (e.g. a read, a write, etc.), the object that operation applies to, and the arguments it provided. for instance, a client might write the value 5 to object  $x$ . if the database returns a response for an operation, we may also know a return value; for instance, that a read of  $x$  returned the number 5.
+
+clients know the order of operations within every transaction. they may also know whether a transaction was definitely aborted, definitely committed, or could be either, based on whether a commit request was sent, and how (or if) the database acknowledged that request. clients can also record their own per-client and real-time orders of events.
+
+this is not, in general, enough information to go on. consider a pair of transactions which set  $x$  to 1 and 2, respectively. in the version order, does 1 or 2 come first? we can't say! or consider an indeterminate transaction whose effects are not observed. did it commit? we have no way to tell.
+
+this implies there might be many possible histories which are compatible with a given observation. are there conditions under which only one history is possible? or, if more than one is possible, can we infer something about the structure of all of them which allows us to identify anomalies?
+
+we argue that yes: one can infer properties of every history compatible with a given observation, by taking advantage of datatypes which allow us to trace the sequence of versions which gave rise to a particular version of an object, and which let us recover the particular writes which gave rise to those versions. next, we provide an intuition for how this can be accomplished.
+
+# 3. deducing dependencies
+
+consider a set of observed transactions interacting with some read-write register  $x$ . one transaction  $t_{j}$  read  $x$  and observed some version  $x_{i}$ . another transaction  $t_{i}$  wrote  $x_{i}$  to  $x$ . in general, we cannot tell whether  $t_{i}$  was the transaction which produced  $x_{i}$ , because some other transaction might have written  $x_{i}$  as well. however, if we know that no other transaction wrote  $x_{i}$ , then we can recover the particular transaction which wrote  $x_{i}$ :  $t_{i}$ . this allows us to infer a direct write-read dependency:  $t_{i} < _{wr}t_{j}$ .
+
+if every value written to a given register is unique $^1$ , then we can recover the transaction which gave rise to any observed version. we call this property recoverability: every version we observe can be mapped to a specific write in some observed transaction.
+
+recoverability allows us to infer read dependencies. however, inferring write- and anti-dependencies takes more than recoverability: we need the version order  $\ll$ . read-write registers make inferring  $\ll$  impossible in general: if two transactions set  $x$  to  $x_{i}$  and  $x_{j}$  respectively, we can't tell which came first.
+
+in a sense, blind writes to a register "destroy history". if we used a compare-and-set operation, we could tell something about the preceding version, but a blind write can succeed regardless of what value was present before. moreover, the version resulting from a blind write carries no information about the previous version. let us therefore consider richer datatypes, whose writes do preserve some information about previous versions.
+
+for instance, we could take increment operations on counters, starting at 0. if every write is an increment, then the version history of a register should be something like  $(0,1,2,\ldots)$ . given two transactions  $t_{i}$  and  $t_{j}$ , both of which read object  $x$ , we can construct a read-read dependency  $t_{i} < _{rr}t_{j}$  if  $t_{i}$ 's observed value of  $x$  is smaller than  $t_{j}$ 's. however, any non-trivial increment history is non-recoverable, because we can't tell which increment produced a particular version. this keeps us from inferring write-write, write-read, and read-write dependencies. we could return the resulting version from our writes, but this works only when the client receives acknowledgement of its request(s).
+
+what if we let our objects be sets of elements, and had each write add a unique element to a given set? like counters, this lets us recover read-read dependencies whenever one version is a proper superset of another. moreover, we can recover some (but not all) write-write, write-read, and read-write dependencies. consider these observed transactions:
+
+$$
+t _ {0}: \operatorname {r e a d} (x, \{0 \})
+$$
+
+$$
+t _ {1}: \operatorname {a d d} (x, 1)
+$$
+
+$t_{2}$  : add(x,2)
+
+$t_{3}$  : read  $(x,\{0,1,2\})$
+
+since  $\{0,1,2\}$  is a proper superset of  $\{0\}$ , we know that  $t_{3}$  read a higher version of  $x$  than  $t_{0}$ , and can infer  $t_{0} < _{rr}t_{3}$ . in addition, we can infer that  $t_{1} < _{wr}t_{3}$  and  $t_{2} < _{wr}t_{3}$ , since their respective elements 1 and 2 were both visible to  $t_{3}$ . conversely, since  $t_{0}$ 's read of 0 did not include 1 or 2, we can infer that  $t_{0} < _{rw}t_{1}$  and  $t_{0} < _{rw}t_{2}$ : anti-dependency relations! we cannot, however, identify the write-write dependency between  $t_{1}$  and  $t_{2}$ : the database could have executed  $t_{1}$  and  $t_{2}$  in either order with equivalent effects, because sets are order-free. only a read of  $\{0,1\}$  or  $\{0,2\}$  could resolve this ambiguity.
+
+so, let's add order to our values. let each version be an ordered list, and a write to  $x$  append a unique value to  $x$ . then any read of  $x_i$  tells us the order of all versions written prior:  $x_i = [1,2,3]$  implies that  $x$  took on the versions [, [1], [1,2], and [1,2,3] in exactly that order. we call this property traceability. since appends add a unique element to the end of  $x$ , we can also infer the exact write which gave rise to any observed version: these versions are recoverable as well.
+
+as with counters and sets, we can use traceability to reconstruct read-read, write-read, and read-write dependencies but because we have the full version history, we can precisely identify read-write and write-write dependencies for every transaction whose writes were observed by some read. we know, for instance, that the transaction which added 2 to  $x$  must write-depend on the transaction which added 1 to  $x$ , because we have a read of  $x$  wherein 1 immediately precedes 2. there may be some writes near the end of a history which are never observed, but so long as histories are long and include reads every so often, the unknown fraction of a version order can be made relatively small.
+
+recoverability and traceability are the key to inferring dependencies between observed transactions, but we have glossed over the mapping between observed dependencies and adya histories, as well as the challenges arising from aborted and indeterminate transactions. in the following section, we discuss these issues more rigorously.
+
+# 4. formal model
+
+in this section we present our abstract model of databases and transactional isolation. we establish the notions of traceability and recoverability, which we prove to be sufficient to reason directly from external observations to internal histories. we show that this approach is sound: that is, any anomalies identified in an observation must be present in any adya history consistent with that observation.
+
+due to space considerations, we do not present the formal definitions of traceability and recoverability or their accompanying proofs here; instead, we summarize these results.
+
+# 4.1 preliminaries
+
+we begin our formalism by defining a model of a database, transactions, and histories, closely adapted from adya et al. we omit predicates for simplicity, and generalize adya's read-write registers to objects supporting arbitrary transformations as writes, resulting in a version graph. we constrain adya's version order  $\ll$  to be compatible with this version graph. this generalization introduces a new class of anomaly, dirty updates, which we define in section 4.3.1.
+
+<table><tr><td>object</td><td>versions</td><td>xinit</td><td>writes</td></tr><tr><td>register</td><td>any</td><td>nil</td><td>w(xi,a) → (a,nil)</td></tr><tr><td>counter</td><td>integers</td><td>0</td><td>w(xi,a) → (xi+a,nil)</td></tr><tr><td>set add</td><td>sets</td><td>{}</td><td>w(xi,a) → (xi∪{a},nil)</td></tr><tr><td>list append</td><td>lists</td><td>[]</td><td>w([e1,...,en],a) → ([e1,...,en,a],nil)</td></tr></table>
+
+figure 1: example objects.
+
+# 4.1.1 objects, operations, databases
+
+an object  $x$  is a mutable datatype, consisting of a set of versions $^2$ , written  $x_i$ ,  $x_j$ , etc., an initial version, labeled  $x_{init}$ , and a set of object operations.
+
+an object operation represents a state transition between two versions  $x_{i}$  and  $x_{j}$  of some object  $x$ . object operations take an argument  $a$  and produce a return value  $r$ . we write this as  $f(x, x_{i}, a) \to (x_{j}, r)$ . where the object, argument, return value, or return tuple can be inferred from context or are unimportant, we may omit them:  $f(x_{i}, a) \to (x_{j})$ ,  $f(x_{i}) \to (x_{j})$ ,  $f(x_{i})$ , etc.
+
+like adya, we consider two types of operations: reads  $(r)$  and writes  $(w)$ . a read takes no argument, leaves the version of the object unchanged, and returns that version:  $r(x_i, nil) \rightarrow (x_i, x_i)$ .
+
+as we show in figure 1, a write operation  $w$  changes a version somehow. write semantics are object-dependent. adya's model (like much work on transactional databases) assumes objects are registers, and that writes blindly replace the current value. our other three objects incorporate increasingly specific dependencies on previous versions. in this section we are primarily concerned with objects like list append, but we provide definitions for the first three objects as illustrative examples.
+
+the versions and write operations on an object  $x$  together yield a version graph  $v_{x}$ : a directed graph whose vertices are versions, and whose edges are write operations.
+
+a database is a set of objects  $x$ ,  $y$ , etc.
+
+# 4.1.2 transactions
+
+a transaction is a list (a totally ordered set) of object operations, followed by at most one commit or abort operation. transactions also include a unique identifier for disambiguation.
+
+we say a transaction is committed if it ends in a commit, and aborted if it ends in an abort. we call the version resulting from a transaction's last write to object  $x$  its final version of  $x$ ; any other writes of  $x$  result in intermediate versions. if a transaction commits, we say it installs all final versions; we call these installed versions. unlike adya, we use committed versions to refer to versions written by committed transactions, including intermediate versions. versions from transactions which did not commit are called uncommitted versions.
+
+the initial version of every object is considered committed.
+
+# 4.1.3 histories
+
+per adya et al, a history  $h$  comprises a set of transactions  $t$  on objects in a database  $d$ , a partial order  $e$  over
+
+operations in  $t$ , and a version order  $\ll$  over versions of the objects in  $d$ .
+
+the event order  $e$  has the following constraints:
+
+- it preserves the order of all operations within a transaction, including commit or abort events.  
+- one cannot read from the future: if a read  $r(x_i)$  is in  $e$ , then there must exist a write  $w \to (x_i)$  which precedes it.  
+- transactions observe their own writes: if a transaction  $t$  contains  $w(x_{i})$  followed by  $r(x_{j})$ , and there exists no  $w(x_{k})$  between the write and read of  $x_{i}$  in  $t$ ,  $x_{i} = x_{j}$ .  
+- the history must be complete: if  $e$  contains a read or write operation for a transaction  $t_i$ ,  $e$  must contain a commit or abort event for  $t_i$ .
+
+the version order  $\ll$  has two constraints, per adya et al
+
+- it is a total order over installed versions of each individual object; there is no ordering of objects written by uncommitted, aborted, or intermediate transactions.  
+- the version order for each object  $x$  (which we write  $\ll_{x}$ ) begins with the initial version  $x_{init}$ .
+
+driven by the intuition that the version order should be consistent with the order of operations on an object, that  $x_{i} \ll x_{j}$  means  $x_{j}$  overwrote  $x_{i}$ , and that cycles in  $\ll$  are meant to capture anomalies like circular information flow, we introduce an additional constraint that was not necessary in adya et al.'s formalism: the version order  $\ll$  should be consistent with the version graphs  $v_{x}, v_{y}, \ldots$ .
+
+specifically, if  $x_{i} \ll x_{j}$ , there exists a path from  $x_{i}$  to  $x_{j}$  in  $v_{x}$ . it would be odd if one appended 3 to the list [1, 2], obtaining [1, 2, 3], and yet the database believed [1, 2, 3] << [1, 2].
+
+# 4.1.4 dependency graphs
+
+we define write-write, read-write, and write-read dependencies between transactions, adapted directly from adya's formalism.
+
+finally, we (re-)define the direct serialization graph using those dependencies. the anomalies we wish to find are expressed in terms of that serialization graph.
+
+- direct write-write dependency. a transaction  $t_{j}$  directly  $ww$ -depends on  $t_{i}$  if  $t_{i}$  installs a version  $x_{i}$  of  $x$ , and  $t_{j}$  installs  $x$ 's next version  $x_{j}$ , by  $\ll$ .  
+- direct write-read dependency. a transaction  $t_{j}$  directly  $wr$ -depends on  $t_{i}$  if  $t_{i}$  installs some version  $x_{i}$  and  $t_{j}$  reads  $x_{i}$ .<sup>3</sup>  
+- direct read-write dependency. a transaction  $t_{j}$  directly  $rw$ -depends on  $t_{i}$  if  $t_{i}$  reads version  $x_{i}$  of  $x$ , and  $t_{j}$  installs  $x$ 's next version in  $\ll$ .
+
+a direct serialization graph, or  $dsg$ , is a graph of dependencies between transactions. the dsg for a history  $h$  is denoted  $dsg(h)$ . if  $t_{j}$  ww-dependends on  $t_{i}$ , there exists an edge labeled  $ww$  from  $t_{i}$  to  $t_{j}$  in  $dsg(h)$ , and similarly for wr- and rw-dependencies.
+
+# 4.1.5 dirty updates
+
+adya defines  $g1a$ : aborted read as a committed transaction  $t_{2}$  containing a read of some value  $x_{i}$  which was written by an aborted transaction  $t_{1}$ . however, our abstract datatypes allow a transaction to commit a write which incorporates aborted state.
+
+we therefore define a complementary phenomenon to g1a, intended to cover scenarios in which information "leaks" from uncommitted versions to committed ones via writes. a history exhibits dirty update if it contains an uncommitted transaction  $t_{1}$  which writes  $x_{i}$ , and a committed transaction  $t_{2}$  which contains a write acting on  $x_{i}$ .
+
+# 4.1.6 traceable objects, version orders and version graphs
+
+we now define a class of traceable objects, which permit recovery of the version graph and object operations resulting in any particular version.
+
+recall that for an object  $x$ , the version graph  $v_{x}$  is comprised of versions connected by object operations. we call a path in  $v_{x}$  from  $x_{init}$  to some version  $x_{i}$  a trace of  $x_{i}$ . intuitively, a trace captures the version history of an object.
+
+we say an object  $x$  is traceable if every version  $x_{i}$  has exactly one trace; i.e.  $v_{x}$  is a tree.
+
+given a history with version order  $\ll$ , we call the largest version of  $x$  (by  $\ll_{x}$ )  $x_{max}$ . because  $\ll$  is a total order over installed versions, and because a path in the version graph exists between any two elements ordered by  $\ll$ , it follows that every committed version of  $x$  is in the trace of  $x_{max}$ . moreover, for any installed version  $x_{i}$  of  $x$ , we can recover the prefix of  $\ll_{x}$  up to and including  $x_{i}$  simply by removing intermediate and aborted versions from the trace of  $x_{i}$ .
+
+restricting our histories to traceable objects (e.g., lists) will allow us to directly reason about the version order  $\ll$  using the results of individual read operations.
+
+# 4.2 a theory of mind for externally-observed histories
+
+when we interact with a database system, the history may not be accessible from outside the database—or perhaps no "real" history exists at all. we construct a formal "theory of mind" which allows us to reason about potential adya histories purely from client observations.
+
+we define an observation of a system as a set of experimentally-accessible transactions where versions, return values, and committed states may be unknown, and consider the interpretations of that observation—the set of all histories which could have resulted in that particular observation.
+
+to be certain that an external observation constitutes an irrefutable proof of an internal isolation anomaly requires that observations have a unique mapping between versions and observed transactions, a notion we call recoverability.
+
+we provide practical, sufficient conditions to produce recoverable histories.
+
+# 4.2.1 observations
+
+imagine a set of single-threaded logical processes which interact with a database system as clients. each process submits transactions for execution, and may receive information about the return values of the operations in those transactions. what can we tell from the perspective of those client processes?
+
+recall that an object operation has five components:  $f(x, x_i, a) \rightarrow (x_j, r)$  denotes an operation on object  $x$  which takes version  $x_i$  and combines it with argument  $a$  to yield version  $x_j$ , returning  $r$ . when a client makes a write, it knows the object  $x$  and argument  $a$ , but (likely) not the versions  $x_i$  or  $x_j$ . if the transaction commits, the client may know the return value  $r$ , but might not if, for example, a response message is lost by the network.
+
+we define an observed object operation as an operation whose versions and return value may be unknown. we write observed operations with a hat:  $\hat{w}(x, \neg, 3) \rightarrow (\neg, nil)$  denotes an observed write of 3 to object  $x$ , returning nil; the versions involved are unknown. an observed operation is either an observed object operation, a commit, or an abort.
+
+an observed transaction, written  $\hat{t}_i$ , is a transaction composed of observed operations. if a client attempts to abort, or does not attempt to commit, a transaction, the observed transaction ends in an abort. if a transaction is known to have committed, it ends in a commit operation. however, when a client attempts to commit a transaction, but the result is unknown, e.g. due to a timeout or database crash, we leave the transaction with neither a commit nor abort operation.
+
+an observation  $o$  represents the experimentally-accessible information about a database system's behavior. observations have a set of observed transactions  $\hat{t}$ . we assume observations include every transaction executed by a database system. we say that  $o$  is determinate if every transaction in  $\hat{t}$  is either committed or aborted; e.g. there are no indeterminate transactions. otherwise,  $o$  is indeterminate.
+
+consider the set  $x_{c}$  of versions of a traceable object  $x$  read by committed transactions in some observation  $o$ . we denote a single version with a trace longer than any other  $x_{longest}$  if there are multiple longest traces, any will do. we say  $o$  is consistent if for all  $x$  in  $o$ , every  $x_{i} \in x_{c}$  appears in the trace of  $x_{longest}$ . otherwise,  $o$  is inconsistent. we will find  $x_{longest}$  helpful in inferring as much of  $\ll$  as possible.
+
+# 4.2.2 interpretations
+
+intuitively, an observed operation  $\hat{o}$  could be a witness to an "abstract" operation  $o$  if the two execute the same type of operation on the same key with the same argument, and their return values and versions don't conflict. we capture this correspondence in the notion of compatibility.
+
+consider an operation  $o = f(x_{i},a)\to (x_{j},r)$  and an observed operation  $\hat{o} = \hat{f} (\hat{x}_i,\hat{a})\rightarrow (\hat{x}_j,\hat{r})$ . we say that  $o$  is compatible with  $\hat{o}$  iff:
+
+$\hat{f} = f$  
+-  $\hat{a} = a$  
+-  $\hat{r}$  is either unknown or equal to  $r$  
+-  $\hat{x}_i$  is either unknown or equal to  $x_i$
+
+-  $\hat{x}_j$  is either unknown or equal to  $x_j$
+
+we may now define a notion of compatibility among transactions that builds upon object compatibility. consider an abstract transaction  $t_{i}$  and an observed transaction  $\hat{t}_i$ . we say that  $t_{i}$  is compatible with  $\hat{t}_i$  iff:
+
+- they have the same number of object operations.  
+- every object operation in  $t_{i}$  is compatible with its corresponding object operation in  $\hat{t}_i$ .  
+- if  $t_{i}$  committed,  $\hat{t}_{i}$  is not aborted, and if  $\hat{t}_{i}$  committed,  $t_{i}$  committed too.  
+- if  $t_i$  is not committed, and if  $\hat{t}_i$  is aborted,  $t_i$  is aborted too.
+
+finally, we generalize the notion of compatibility to entire histories and observations. consider a history  $h$  and an observation  $o$ , with transaction sets  $t$  and  $\hat{t}$  respectively. we say that  $h$  is compatible with  $o$  iff there exists a one-to-one mapping  $r$  from  $\hat{t}$  to  $t$  such that  $\forall (\hat{t}_i, t_i) \in r, t_i$  is compatible with  $\hat{t}_i$ . we call any  $(h, r)$  which satisfies this constraint an interpretation of  $o$ . given an interpretation, we say that  $t_i = r\hat{t}_i$  is the corresponding transaction to  $\hat{t}_i$ , and vice versa.
+
+there may be many histories compatible with a given observation. for instance, an indeterminate observed transaction may either commit or abort in a compatible history. given two increment transactions  $t_{1}$  and  $t_{2}$  with identical operations, there are two choices of  $r$  for any history  $h$ , corresponding to the two possible orders of  $t_{1}$  and  $t_{2}$ . there may also be many observations compatible with a given history: for instance, we could observe transaction  $t_{1}$ 's commit, or fail to observe it and label  $t_{1}$  indeterminate.
+
+in each interpretation of an observation, every observed transaction corresponds to a distinct abstract transaction in that interpretation's history, taking into account that we may not know exactly what versions or return values were involved, or whether or not observed transactions actually committed. these definitions of compatible formalize an intuitive "theory of mind" for a database: what we think could be going on behind the scenes.
+
+# 4.2.3 recoverability
+
+traceability allows us to derive version dependencies, but in order to infer transaction dependencies, we need a way to map between versions and observed transactions. we also need a way to identify aborted and intermediate versions, which means proving which particular write in a transaction yielded some version(s). to do this, we exploit the definition of reads, and a property relating versions to observed writes, which we call recoverability.
+
+the definition of a read requires that the pre-version, postversion, and return value are all equal. this means for an observed committed read, we know exactly what version it observed—and conversely, given a version, we know which reads definitely observed it.<sup>4</sup> we say an observed transaction  $\hat{t}_i$  read  $x_i$  when  $x_i$  is returned in one of  $\hat{t}_i$ 's reads. by compatibility, every corresponding transaction  $t_i$  must also have read  $x_i$ .
+
+writes are more difficult, because in general multiple writes could have resulted in a given version. for example, consider
+
+4indeterminate reads, of course, may have read different values in different interpretations.
+
+two observed increment operations  $\hat{w}_1 = w(x, \neg, 1) \rightarrow (\neg, nil)$  and  $\hat{w}_2 = w(x, \neg, 1) \rightarrow (\neg, nil)$ . which of these writes resulted in, say, the version 2? it could be either  $\hat{w}_1$  or  $\hat{w}_2$ . we cannot construct a single transaction dependency graph for this observation. we could construct a (potentially exponentially large) set of dependency graphs, and check each one for cycles, but this seems expensive. to keep our analysis computationally tractable, we restrict ourselves to those cases where we can infer a single write, as follows.
+
+given an observation  $o$  and an object  $x$  with some version  $x_i$ , we say that  $x_i$  is recoverable iff there is exactly one write  $\hat{w}_i$  in  $o$  which is compatible with any write leading to  $x_i$  in the version graph  $v_x$ . we call  $\hat{w}_i$  recoverable as well, and say that  $x_i$  must have been written by  $\hat{w}_i$ . since there is only one  $\hat{w}_i$ , there is exactly one transaction  $\hat{t}_i$  in  $o$  which performed  $\hat{w}_i$ .
+
+thanks to compatibility, any interpretation of  $o$  has exactly one  $w_{i}$  compatible with  $\hat{w}_{i}$ , again performed by a unique transaction  $t_{i}$ . when a version is recoverable, we know which single transaction performed it in every interpretation.
+
+we say a version  $x_{i}$  is known-aborted if it is recoverable to an aborted transaction, known-committed if it is recoverable to a committed transaction, and known-intermediate if it is recovered to a non-final write. by compatibility, these properties apply not just to an observation  $o$ , but to every interpretation of  $o$ .
+
+we say an observation  $o$  is completely recoverable if every write in  $o$  is recoverable.  $o$  is intermediate-recoverable if every intermediate write in  $o$  is recoverable.  $o$  is trace-recoverable if, for every  $x$  in  $o$ ,  $x$  is traceable, and every non-initial version in the trace of every committed read of  $x$  is recoverable.
+
+we can obtain complete recoverability for a register by choosing unique arguments for writes. counters and sets are difficult to recover in general: a set like  $\{1,2\}$  could have resulted either from a write of 1 or 2. however, restricting observations to a single write per object makes recovery trivial.
+
+for traceable objects, we can guarantee an observation  $o$  is trace-recoverable when  $o$  satisfies three criteria:
+
+1. every argument in the observed writes to some object is distinct.  
+2. given a committed read of  $x_{i}$ , every argument to every write in the trace of  $x_{i}$  is distinct.  
+3. given a committed read of  $x_{i}$ , every write in the trace of  $x_{i}$  has a compatible write in  $o$ .
+
+we can ensure the first criterion by picking unique values when we write to the database. we can easily detect violations of the remaining two criteria, and each points to pathological database behavior: if arguments in traces are not distinct, it implies some write was somehow applied twice; and if a trace's write has no compatible write in  $o$ , then it must have manifested from nowhere.
+
+similar conditions suffice for intermediate-recoverability.
+
+with a model for client observations, interpretations of those observations, and ways to map between versions and
+
+observed operations, we are ready to infer the presence of anomalies.
+
+# 4.3 soundness of elle
+
+we would like our checker to be sound: if it reports an anomaly in an observation, that anomaly should exist in every interpretation of that observation. we would also like it to be complete: if an anomaly occurred in an history, we should be able to find it in any observation of that history. in this section, we establish the soundness of elle formally, and show how our approach comes close to guaranteeing completeness.
+
+the anomalies identified by adya et al. can be broadly split into two classes. some anomalies involve transactions operating on versions that they should not have observed, either because an aborted transaction wrote them or because they were not the final write of some committed transaction. our soundness proof must show that if one of these anomalies is detected in an observation, it surely occurred in every interpretation of that observation. others involve a cycle in the dependency graph between transactions; we show that given an observation, we can can construct a dependency graph which is a subgraph of every possible history compatible with that observation. if we witness a cycle in the subgraph, it surely exists in any compatible history.
+
+we begin with the first class: non-cycle anomalies.
+
+# 4.3.1 non-cycle anomalies
+
+we can use the definition of compatibility, along with properties of traceable objects and recoverability, to infer whether or not an observation implies that every interpretation of that observation contains aborted reads, intermediate reads, or dirty updates.
+
+direct observation consider an observation  $o$  with a known-aborted version  $x_{i}$ . if  $x_{i}$  is read by an observed committed transaction  $\hat{t}_i$ , that read must correspond to a committed read of an aborted version in every interpretation of  $o$ : an aborted read. a similar argument holds for intermediate reads.
+
+inconsistent observations for traceable objects, we can go further. if an observation  $o$  is inconsistent, it contains a committed read of some version  $x_{i}$  which does not appear in the trace of  $x_{\text{longest}}$ . as previously discussed, all committed versions of  $x$  must be in the trace of  $x_{\text{max}}$ . at most one of  $x_{\text{longest}}$  or  $x_{i}$  may be in this trace, so at least one of them must be aborted.
+
+via traces consider a committed read of some value  $x_{c}$  whose trace contains a known-aborted version  $x_{a}$ . either  $x_{c}$  is aborted (an aborted read), or a dirty update exists between  $x_{a}$  and  $x_{c}$ . an similar argument allows us to identify dirty updates when  $x_{c}$  is the product of a known-committed write. the closer  $x_{a}$  and  $x_{c}$  are in the version graph, the better we can localize the anomaly.
+
+completeness the more recoverable a history is, and the fewer indeterminate transactions it holds, the more noncycle anomalies we can catch. if an observation is determinate and trace-recoverable, we know exactly which reads committed in every interpretation, and exactly which writes aborted, allowing us to identify every case of aborted read. finding every dirty update requires complete recoverability.
+
+for an intermediate-recoverable observation  $o$ , we can identify every intermediate read. we can do the same if  $o$  is trace-recoverable. let  $x_{i}$  be a version read by a committed
+
+read in  $o$ . trace-recoverability ensures  $x_{i}$  is recoverable to a particular write, and we know from that write's position in its observed transaction whether it was intermediate or not. compatibility ensures all interpretations agree.
+
+in practice, observations are rarely complete, but as we show in section 7, we typically observe enough of a history to detect the presence of non-cycle anomalies.
+
+# 4.3.2 dependency cycles
+
+the remainder of the anomalies identified by adya et al. are defined in terms of cycles in the dependency graph between transactions. given an observation  $o$ , we begin by inferring constraints on the version order  $\ll$ , then use properties of reads and recoverability to map dependencies on versions into dependencies on transactions.
+
+inferred version orders consider a intermediate-recoverable observation  $o$  of a database composed of traceable objects, and an interpretation  $(h,r)$  of  $o$ . we wish to show that we can derive part of  $h$ 's version order  $\ll$  from  $o$  alone, with minimal constraints on  $h$  and  $r$ . traceability allows us to recover a prefix of  $\ll_{x}$  from any installed  $x_{i}$  in  $h$ , assuming we know which transactions in the trace of  $x_{i}$  committed, and which aborted. let us assume  $h$  does not contain aborted reads, intermediate reads, or dirty updates. we call such a history clean.
+
+given  $o$ , which version of  $x$  should we use to recover  $\ll_{x}$ ? ideally, we would have  $x_{max}$ . however, there could be multiple interpretations of  $o$  with distinct  $x_{max}$ . instead, we take a version  $x_{f}$  read by a transaction  $\hat{t}_{f}$  such that:
+
+-  $\hat{t}_f$  is committed.  
+-  $\hat{t}_f$  read  $x_{f}$  before performing any writes to  $x$  
+- no other version of  $x$  satisfying the above properties has a longer trace than  $x_{f}$ .
+
+we use  $x_{f}$  to obtain an inferred version order  $<_{x}$  that is consistent with  $\ll_{x}$ , as follows. first, we know that  $x_{f}$  corresponds to an installed version of  $x$  in  $h$  because  $h$  contains no intermediate or aborted reads. by a similar argument, we also know that every version of  $x$  in the trace of  $x_{f}$  was written by a committed transaction. therefore, if we remove the intermediate versions in the trace of  $x_{f}$  (which we know, thanks to intermediate-recoverability), we are left with a total order over committed versions that corresponds directly to the prefix of  $\ll_{x}$  up to and including  $x_{f}$ .
+
+we define  $<$  as the union of  $<_{x}$  for all objects  $x$ .
+
+inferred serialization graphs given an intermediate-recoverable observation  $o$  of a database of traceable objects, we can infer a chain of versions  $<_{x}$  which is a prefix of  $\ll_{x}$ , for every object  $x$  in  $o$ . if  $o$  is trace-recoverable, we can map every version in  $<$  to a particular write in  $o$  which produced it, such that the corresponding write in every interpretation of  $o$  produced that same version. using these relationships, we define inferred dependencies between pairs of transactions  $\hat{t}_i$  and  $\hat{t}_j$  in  $o$  as follows:
+
+- direct inferred write-write dependency. a transaction  $\hat{t}_j$  directly inferred-ww-dependends on  $\hat{t}_i$  if  $\hat{t}_i$  performs a final write of a version  $x_i$  of  $x$ , and  $\hat{t}_j$  performs a final write resulting in  $x$ 's next version  $x_j$ , by  $<$ .
+
+- direct inferred write-read dependency. a transaction  $\hat{t}_j$  directly inferred-wr-dependends on  $\hat{t}_i$  if  $\hat{t}_i$  performs a final write of a version  $x_i$  in  $<$ , and  $\hat{t}_j$  reads  $x_i$ .  
+- direct inferred read-write dependency. a transaction  $\hat{t}_j$  directly inferred-rw-dependends on  $\hat{t}_i$  if  $\hat{t}_i$  reads version  $x_i$  of  $x$ , and  $\hat{t}_j$  performs a final write of  $x$ 's next version in  $<$ .
+
+unlike adya et al's definitions, we don't require that a transaction install some  $x_{i}$ , because an indeterminate transaction in  $o$  might be committed in interpretations of  $o$ , and have corresponding dependency edges there. instead, we rely on the fact that  $<$  only relates installed versions (in clean interpretations).
+
+an inferred direct serialization graph, or idsg, is a graph of dependencies between observed transactions. the idsg for an observation  $o$  is denoted  $\mathrm{idsg}(o)$ . if  $\hat{t}_j$  inferred-ww-dependends on  $\hat{t}_i$ , there exists an edge labeled  $ww$  from  $\hat{t}_i$  to  $\hat{t}_j$  in  $\mathrm{idsg}(o)$ , and similarly for inferred-wr and inferred-rw-dependencies.
+
+all that remains is to show that for every clean interpretation  $(h,r)$  of an observation,  $\mathrm{idsg}(o)$  is (in some sense) a subgraph of  $\mathrm{dsg}(h)$ . however, the idsg and dsg are graphs over different types of transactions; we need the bijection  $r$  to translate between them. given a relation  $r$  and a graph  $g$ , we write  $r\diamond g$  to denote  $g$  with each vertex  $v$  replaced by  $rv$ .
+
+the soundness proof for elle first establishes that for every clean interpretation  $(h,r)$  of a trace-recoverable observation  $o$ ,  $r \diamond idsg(o)$  is a subgraph of  $dsg(h)$ . the proof proceeds by cases showing that for each class of dependency, if a given edge exists in the idsg, it surely exists in every compatible dsg. we omit these details, which are straightforward, in this paper.
+
+for every anomaly defined in terms of cycles on a dsg (e.g. g0, g1c, g-single, g2, ...) we can now define a corresponding anomaly on an idsg. if we detect that anomaly in  $\mathrm{idsg}(o)$ , its corresponding anomaly must be present in every clean interpretation of  $o$  as well!
+
+we present a soundness theorem for elle below:
+
+theorem 1. given a trace-recoverable observation  $o$ , if elle infers aborted reads, dirty updates, or intermediate reads, then every interpretation of  $o$  exhibits corresponding phenomena. if elle infers a cycle anomaly, then every clean interpretation of  $o$  exhibits corresponding phenomena.
+
+unclean interpretations what of unclean interpretations, like those with aborted reads or dirty updates? if those occurred, the trace of a version read by a committed transaction could cause us to infer a version order  $<_{x}$  which includes uncommitted versions, and is not a prefix of  $\ll_{x}$ . a clean interpretation could have cycles absent from an unclean interpretation, and vice versa.
+
+phenomena like aborted reads and dirty updates are, in an informal sense, "worse" than dependency cycles like g1c and g2. if every interpretation of an observation must exhibit aborted reads, the question of whether it also exhibits anti-dependency cycles is not as pressing! and if some interpretations exist which don't contain aborted reads, but all of those exhibit anti-dependency cycles, we can choose to give the system the benefit of the doubt, and say that it definitely exhibits g2, but may not exhibit aborted reads.
+
+completeness the more determinate transactions an observation contains, the more likely we are to definitively detect anomalies. in special cases (e.g. when  $o$  is determinate, completely-recoverable, etc.), we can prove completeness. in practice, we typically fail to observe the results of some transactions, and must fall back on probabilistic arguments. in section 7 we offer experimental evidence that elle is complete enough to detect anomalies in real databases.
+
+# 5. inferring additional dependencies
+
+we have argued that elle can infer transaction dependencies based on traceability and recoverability. in this section, we suggest additional techniques for inferring the relationships between transactions and versions.
+
+# 5.1 transaction dependencies
+
+in addition to dependencies on values, we can infer additional dependencies purely from the concurrency structure of a history. for instance, if process a performs  $t_{1}$  then  $t_{2}$ , we can infer that  $t_{1} < _{p}t_{2}$ . these dependencies encode a constraint akin to sequential consistency: each process should (independently) observe a logically monotonic view of the database. we can use these dependencies to strengthen any consistency model testable via cycle detection. for instance, berenson et al's definition of snapshot isolation [4] does not require that transaction start timestamps proceed in any particular order, which means that a single process could observe, then un-observe, a write. if we augment the dependency graph with per-process orders, we can identify these anomalies, distinguishing between si and strong session si [16].
+
+similarly, serializability makes no reference to real-time constraints: it is legal, under adya's formalism, for every read-only transaction to return an initial, empty state of the database, or to discard every write-only transaction by ordering it after all reads. strict serializability [19] enforces a real-time order: if transaction  $t_{1}$  completes before  $t_{2}$  begins,  $t_{2}$  must appear to take effect after  $t_{1}$ . we can compute a transitive reduction of the realtime precedence order in  $o(n \cdot p)$  time, where  $n$  is the number of operations in the history, and  $p$  is the number of concurrent processes, and use it to detect additional cycles.
+
+some snapshot-isolated databases expose transaction start and commit timestamps to clients. where this information is available, we can use it to infer the time-preccedes order used in adya's formalization of snapshot isolation [1], and construct a start-ordered serialization graph.
+
+# 5.2 version dependencies
+
+traceability on  $x$  allows us to infer a prefix of the version order  $<_{x}$  but this does not mean that non-traceable objects are useless! if we relax  $<_{x}$  to be a partial order, rather than total, and make some small, independent assumptions about the behavior of individual objects, we can recover enough version ordering information to detect cyclic anomalies on less-informative datatypes, such as registers or sets.
+
+for instance, if we assume that the initial version  $x_{init}$  is never reachable via any write, we can infer  $x_{init} < _x x_i$  for every  $x_i$  other than  $x_{init}$ . with registers, for example, we
+
+know that 1, 2, 3, etc. must all follow  $nil$ . when the number of versions per object is small (or when databases have a habit of incorrectly returning  $nil$ ), this trivial inference can be sufficient to find real-world anomalies.
+
+if we assume that writes follow reads within a single transaction, we can link versions together whenever a transaction reads, then writes, the same key, and that write is recoverable. for instance,  $t_{1} = r(x_{i}), w(x_{j})$  allows us to infer  $x_{i} <_{x} x_{j}$ .
+
+many databases claim that each record is independently linearizable, or sequentially consistent. after computing the process or real-time precedence orders, we can use those transaction relationships to infer version dependencies. if a transaction finishes writing or reading a linearizable object  $x$  at  $x_{i}$ , then another transaction precedes to write or read  $x_{j}$ , we can infer (on the basis of per-key linearizability) that  $x_{i} <_{x} x_{j}$ .
+
+where databases expose version metadata to clients, we can use that metadata to construct version dependency graphs directly, rather than inferring the version order from values.
+
+since we can use transaction dependencies to infer version dependencies, and version dependencies to infer transaction dependencies, we can iterate these procedures to infer increasingly complete dependency graphs, up to some fixed point. we can then use the resulting transaction graph to identify anomalies.
+
+# 6. finding counterexamples
+
+these techniques allow us to identify several types of dependencies between transactions: write-read, write-write, and read-write relationships on successive versions of a single object, process and real-time orders derived from the concurrency structure of the history, and version and snapshot metadata orders where databases offer them. we take the union of these dependency graphs, with each edge labeled with its dependency relationship(s), and search for cycles with particular properties.
+
+- g0: a cycle comprised entirely of write-write edges.  
+- g1c: a cycle comprised of write-write or write-read edges.  
+g-single: a cycle with exactly one read-write edge.  
+g2: a cycle with one or more read-write edges.
+
+optionally, we may expand these definitions to allow process, realtime, version, and/or timestamp dependencies to count towards a cycle.
+
+to find a cycle, we apply tarjan's algorithm to identify strongly connected components [34]. within each graph component, we apply breadth-first search to identify a short cycle.
+
+to find g0 anomalies, we restrict the graph to only write-write edges, which ensures that any cycle we find is purely comprised of write dependencies. for g1c, we select only write-write and write-read edges. g-single is trickier, because it requires exactly one read-write edge. we partition the dependency graph into two subgraphs: one with, and one without read-write edges. we find strongly connected components in the full graph, but for finding a cycle, we begin with a node in the read-write subgraph, follow exactly one read-write edge, then attempt to complete the cycle using only write-write and write-read edges. this allows us to
+
+identify cycles with exactly one read-write edge, should one exist.
+
+these cycles can be presented to the user as a witness of an anomaly. we examine the graph edges between each pair of transactions, and use those relationships to construct a human-readable explanation for the cycle, and why it implies a contradiction.
+
+# 6.1 additional anomalies
+
+as described in section 4.3.1, we can exploit recoverability and traceability to directly detect aborted read, intermediate read, and dirty update. in addition, there are phenomena which adya et al.'s formalism does not admit, but which we believe (having observed them in real databases) warrant special verification:
+
+- garbage reads: a read observes a value which was never written.  
+- duplicate writes: the trace of a committed read version contains a write of the same argument multiple times.  
+- internal inconsistency: a transaction reads some value of an object which is incompatible with its own prior reads and writes.
+
+garbage reads may arise due to client, network, or database corruption, errors in serialization or deserialization, etc. duplicate writes can occur when a client or database retries an append operation; with registers, duplicate writes can manifest as g1c or g2 anomalies. internal inconsistencies can be caused by improper isolation, or by optimistic concurrency control which fails to apply a transaction's writes to its local snapshot.
+
+# 7. implementation and case study
+
+we have implemented elle as a checker in the open-source distributed systems testing framework jepsen [25] and applied it to four distributed systems, including sql, document, and graph databases. elle revealed anomalies in every system we tested, including g2, g-single, g1a, lost updates, cyclic version dependencies, and internal inconsistency. almost all of these anomalies were previously unknown. we have also demonstrated, as a part of elle's test suite, that elle can identify g0, g1b, and g1c anomalies, as well as anomalies involving real-time and process orders.
+
+elle is straightforward to run against real-world databases. most transactional databases offer some kind of list with append. the sql standard's concat function and the text datatype are a natural choice for encoding lists, e.g. as comma-separated strings. some sql databases, like postgres, offer json collection types. document stores typically offer native support for ordered collections. even systems which only offer registers can emulate lists by performing a read followed by a write.
+
+while list-append gives us the most precise inference of anomalies, we can use the inference rules discussed in section 5 to analyze systems without support for lists. wide rows in cassandra and predicates in sql are a natural fit for sets. many systems have a notion of an object version number or counter datatype: we can detect cycles in both using elle. even systems which offer only read-write registers
+
+let:
+
+```txt
+t1 = {:value [[:append 250 10] [r 253 [1 3 4]] [r 255 [2 3 4 5]] [:append 256 3]], ...}  
+t2 = {:value [[:append 255 8] [r 253 [1 3 4]]], ...}  
+t3 = {:value [[:append 256 4] [r 255 [2 3 4 5 8]] [r 256 [1 2 4]] [r 253 [1 3 4]]], ...}
+```
+
+then:
+
+- t1 < t2, because t1 did not observe t2's append of 8 to 255.  
+- t2 < t3, because t3 observed t2's append of 8 to key 255.  
+- however, t3 < t1, because t1 appended 3 after t3 appended 4 to 256: a contradiction!
+
+![](images/b59fab2aca69c602c6c694cd35ac4b956423cfb12a39a11c9fae056d413dc0de.jpg)  
+figure 2: a textual explanation of an experimentally obtained real-time g-single cycle, as presented by our checker.  
+figure 3: the same cycle, as plotted by our checker. arrows show dependencies between transactions: wr denotes a read dependency, rw denotes an anti-dependency, and rt denotes a real-time ordering.
+
+allow us to infer write-read dependencies directly, and version orders can be (partially) inferred by write-follows-read, process, and real-time orders.
+
+in all our tests, we generated transactions of varying length (typically 1-10 operations) comprised of random reads and writes over a handful of objects. we performed anywhere from one to 1024 writes per object; fewer writes per object stresses codepaths involved in the creation of fresh database objects, and more writes per object allows the detection of anomalies over longer time periods.
+
+we ran 10-30 client threads across 5 to 9 nodes, depending on the particular database under test. when a client thread times out while committing a transaction (as is typical for fault-injection tests) jepsen spawns a new logical process for that thread to execute. this causes the logical concurrency of tests to rise over time. tens of thousands of logically concurrent transactions are not uncommon.
+
+our implementation takes an expected consistency model (e.g. strict-serializable) and automatically detects and reports anomalies as data structures, visualizations, and human- verifiable explanations of each cycle. for example, consider the g-single anomaly in figures 2 and 3.
+
+# 7.1 tidb
+
+tidb [32] is an sql database which claims to provide snapshot isolation, based on google's percolator [31]. we tested list append with sql concat over text fields, and found that versions 2.1.7 through 3.0.0-beta.1 exhibited frequent anomalies—even in the absence of faults. for example, we observed the following trio of transactions:
+
+$t_{1}$  : r(34, [2, 1]), append(36, 5), append(34, 4)
+
+$t_{2}$  : append(34, 5)
+
+$t_{3}$  :  $\mathbf{r}(34, [2, 1, 5, 4])$
+
+$t_{1}$  did not observe  $t_{2}$ 's append of 5 to key 34, so  $t_{2}$  must rw-depend on  $t_{1}$ . however,  $t_{3}$ 's read implies  $t_{1}$ 's append of 4 to key 34 followed  $t_{2}$ 's append of 5, so  $t_{1}$  ww-depend on  $t_{2}$ . this cycle contains exactly one anti-dependency edge, so it is a case of g-single: read skew. we also found numerous cases of inconsistent observations (implying aborted reads) as well as lost updates.
+
+these cases stemmed from an automated transaction retry mechanism: when one transaction conflicted with another, tidb simply re-applied the transaction's writes again, ignoring the conflict. this feature was enabled by default. turning it off revealed the existence of a second, undocumented retry mechanism, also enabled by default. version 3.0.0-rc2 resolved these issues by disabling both retry mechanisms by default.
+
+furthermore, tidb's engineers claimed that select ... for update prevented write skew. elle demonstrated that g2 anomalies including write skew were still possible, even when all reads used select ... for update. tidb's locking mechanism could not express a lock on an object which hadn't been created yet, which meant that freshly inserted rows were not subject to concurrency control. tidb has documented this limitation.
+
+# 7.2 yugabyte db
+
+yugabyte db [21] is a serializable sql database based on google's spanner [14]. we evaluated version 1.3.1 using concat over text fields, identified either by primary or secondary keys, both with and without indices. we found that when master nodes crashed, paused, or otherwise became unavailable to tablet servers, those tablet servers could exhibit a handful of g2-item anomalies. for instance, this cycle (condensed for clarity), shows two transactions which fail to observe each other's appends:
+
+$t_{1}$  .. append(3, 837) ... r(4, [... 874, 877, 883])
+
+$t_{1}$  .. append(4, 885) ... r(3, [... 831, 833, 836])
+
+every cycle we found involved multiple anti-dependencies; we observed no cases of g-single, g1, or g0. yugabyte db's engineers traced this behavior to a race condition: after a leader election, a fresh master server briefly advertised an empty capabilities set to tablet servers. when a tablet
+
+server observed that empty capabilities set, it caused every subsequent rpc call to include a read timestamp. yugabyte db should have ignored those read timestamps for serializable transactions, but did not, allowing transactions to read from inappropriate logical times. this issue was fixed in 1.3.1.2-b1.
+
+# 7.3 faunadb
+
+faunadb [20] is a deterministic, strict-serializable document database based on calvin [36]. it offers native list datatypes, but the client we used had no list-add function—we used strings with concat instead. while faunadb claimed to provide (up to) strict serializability, we detected internal inconsistencies in version 2.6.0, where a single transaction failed to observe its own prior writes:
+
+$t_{1}$  : append(0, 6), r(0, nil)
+
+these internal inconsistencies also caused elle to infer g2 anomalies. internal anomalies occurred frequently, under low contention, in clusters without any faults. however, they were limited to index reads. fauna believes this could be a bug in which coordinators fail to apply tentative writes to a transaction's view of an index.
+
+# 7.4 dgraph
+
+dgraph [27] is a graph database with a homegrown transaction protocol influenced by shacham, ohad et al. [33]. dgraph's data model is a set of entity-attribute-value triples, and it has no native list datatype. however, it does lend itself naturally to registers, which we analyzed with elle. we evaluated dgraph version 1.1.1, which claimed to offer snapshot isolation, plus per-key linearizability.
+
+like faunadb, dgraph transactions failed to provide internal consistency under normal operation: reads would fail to observe previously read (or written!) values. this transaction, for instance, set key 10 to 2, then read an earlier value of 1.
+
+$t_{1}$  w(10,2)，r(10，1)
+
+to find cycles over registers, we allowed elle to infer partial version orders from the initial state, from writes-follow-reads within individual transactions, and (since dgraph claims linearizable keys) from the real-time order of operations. these inferred dependencies were often cyclic—here, transaction  $t_{1}$  finished writing key 540 a full three seconds before  $t_{2}$  began, but  $t_{2}$  failed to observe that write:
+
+$t_{1}$  : r(541, nil), w(540, 2)
+
+$t_{2}$  ：r(540，nil)，w(544，1)
+
+elle automatically reports and discards these inconsistent version orders, to avoid generating trivial cycles, but it went on to identify numerous instances of read skew, both with and without real-time edges:
+
+$t_{1}$  : r(2432, 10), r(2434, nil)
+
+$t_{2}$  : w(2434, 10)
+
+$t_{3}$  w(2432，10)，r(2434，10)
+
+these cycles stemmed from a family of bugs in dgraph related to shard migration: transactions could read from freshly-migrated shards without any data in them, returning nil. dgraph labs is investigating these issues.
+
+# 7.5 performance
+
+elle's performance on real-world workloads was excellent; where knossos (jepsen's main linearizability checker) often timed out or ran out of memory after a few hundred transactions, elle was able to check histories of hundreds of thousands of transactions in tens of seconds. to confirm this behavior experimentally, we designed a history generator which simulates clients interacting with an in-memory serializable-snapshot-isolated database, and analyzed those histories with both elle and knossos.
+
+our histories were composed of randomly generated transactions performing one to five operations each, interacting with any of 100 possible objects at any point in time. we performed 100 appends per object. we generated histories of different lengths, and with varying numbers of concurrent processes, and measured both elle and knossos' runtime. since many knossos runs involved search spaces on the order of  $10^{24}$ , we capped runtimes at 100 seconds. all tests were performed on a 24-core xeon with 128 gb of ram.
+
+as figure 4 shows, knossos' runtime rises dramatically with concurrency: given  $c$  concurrent transactions, the number of permutations to evaluate is  $c!$ . symmetries and pruning reduce the state space somewhat, but the problem remains fundamentally np-complete. with  $40+$  concurrent processes, even histories of 5000 transactions were (generally) uncheckable in reasonable time frames. of course, runtime rises with history length as well.
+
+elle does not exhibit knossos' exponential runtimes: it is primarily linear in the length of a history. building indices, checking for consistent orders, looking for internal and aborted reads, constructing the inferred serialization graph, and detecting cycles are all linear-time operations. unlike knossos, concurrency does not have a strong impact on elle. with only one process, every transaction commits. as concurrency rises, some transactions abort due to conflicts, which mildly reduces the number of transactions we have to analyze. at high concurrency, more transactions interact with the same versions, and we infer more dependencies.
+
+# 8. related work
+
+as we discuss in section 1, there has been a significant amount of work on history checkers in the concurrent programming community. as early as 1993, wing & gong [37] simulated executions of linearizable objects to record concurrent histories, and described a checker algorithm which could search for bugs in those histories. line-up [9], knosos [22], and lowe's linearizability checker [28] follow similar strategies. gibbons & korach showed [18] that sequential consistency checking was np-complete via reduction to sat.
+
+generating random operations, applying them to some implementation of a datatype, and checking that the resulting history obeys certain invariants is a key concept in generative, or property-based testing. perhaps the most well-known implementation of this technique is quickcheck [13], and jepsen applies a similar approach to distributed systems [24]. majumdar & niksic argued probabilistically for the effectiveness of this randomized testing approach [29], which helps explain why our technique finds bugs.
+
+brutschy et al. propose both a static [8] and a trace-based dynamic [7] analysis to find serializability violations in
+
+![](images/65ce4f0f32639a4026a46876bc82baaa395d3074f1ef3acf4fcdbb829e2d4edf.jpg)  
+figure 4: performance of elle vs knossos.
+
+![](images/9ca54e22f783ea21e8bbf4818e37276d2bdc6a4351de0cbc84e1e72c3d3aec68.jpg)
+
+programs run atop weakly-consistent stores. quite recently, biswas & enea provided polynomial-time checkers for read committed, read atomic, and causal consistency, as well as exponential-time checkers for prefix consistency, snapshot isolation, and serializability. [6]
+
+using graphs to model dependencies among transactions has a long history in the database literature. the dependency graph model was first proposed by bernstein [5, 4] and later refined by adya [2, 1]. dependency graphs have been applied to the problem of safely running transactions at a mix of isolation levels [17] and to the problem of runtime concurrency control[11, 38], in addition to reasoning formally about isolation levels and anomalous histories.
+
+as attractive as dependency graphs may be as a foundation for database testing, they model orderings among object versions and operations that are not necessarily visible to external clients. instead of defining isolation levels in terms of internal operations, some declarative definitions of isolation levels [12, 10] are based upon a pair of compatible dependency relations: a visibility relation capturing the order in which writes are visible to transactions and an arbitration relation capturing the order in which writes are committed.
+
+the client-centric formalism of crooks et al. [15] goes a step further, redefining consistency levels strictly in terms of client-observable states. while both approaches, like ours, enable reasoning about existing isolation levels from the outside of the database implementation, our goal is somewhat different. we wish instead to provide a faithful mapping between externally-observable events and adya's data-centric definitions, which have become a lingua franca in the database community. in so doing, we hope to build a bridge between two decades of scholarship on dependency graphs and emerging techniques for black-box database testing.
+
+# 9. future work & conclusions
+
+future work there are some well-known anomalies, like long fork, which elle detects but tags as g2. we believe it should be possible to provide more specific hints to users
+
+about what anomalies are present. ideally, we would like to tell a user exactly which isolation levels a given history does and does not satisfy.
+
+our approach ignores predicates and deals only in individual objects; we cannot distinguish between repeatable read and serializability. nor can we detect anomalies like predicate-many-preceders. we would like to extend our model to represent predicates, and prove how to infer dependencies on them. one could imagine a system which somehow generates a random predicate  $p$ , in such a way that any version of an object can be classified as in  $p$  or not, and then using that knowledge to generate dependency edges for predicate-based reads.
+
+conclusions we present elle: a novel theory and tool for experimental verification of transactional isolation. by using datatypes and generating histories which couple the version history of the database to client-observable reads and writes, we can extract rich dependency graphs between transactions. we can identify cycles in this graph, categorize them as various anomalies, and present users with concise, human-readable explanations as to why a particular set of transactions implies an anomaly has occurred.
+
+elle is sound. it identifies g0, g1a, g1b, g1c, g-single, and g2 anomalies, as well as inferring cycles involving perprocess and real-time dependencies. in addition, it can identify dirty updates, garbage reads, duplicated writes, and internal consistency violations. when elle identifies an anomaly in an observation of database, it must be present in every interpretation of that observation.
+
+elle is efficient. it is linear in the length of a history and effectively constant with respect to concurrency. it can quickly analyze real-world histories of hundreds of thousands of transactions, even when processes crash leading to high logical concurrency. we see no reason why it cannot handle more. it is dramatically faster than linearizability checkers [22] and constraint-solver serializability checkers [23].
+
+elle is effective. it has found anomalies in every database we've checked, ranging from internal inconsistency and aborted reads to anti-dependency cycles.
+
+elle is general. unlike checkers which hard-code a particular example of an anomaly (e.g. long fork), elle works with arbitrary patterns of writes and reads over different types of objects, so long as those objects and transactions satisfy some simple properties: traceability and recoverability. generating random histories with these properties is straightforward; list append is broadly supported in transactional databases. elle can also make limited inferences from less informative datatypes, such as registers, counters, and sets.
+
+elle is informative. unlike solver-based checkers, elle's cycle-detection approach produces short witnesses of specific transactions. moreover, it provides a human-readable explanation of why each witness must be an instance of the claimed anomaly.
+
+we are aware of no other checker which combines these properties. using elle, testers can write a small test which verifies a wealth of properties against almost any database. the anomalies elle reports can rule out (or tentatively support) that database's claims for various isolation levels. moreover, each witness points to particular transactions at particular times, which helps engineers investigate and fix bugs. we believe elle will make the database industry safer.
+
+# 9.1 acknowledgements
+
+the authors wish to thank asha karim for discussions leading to elle, and kit patella for her assistance in building the elle checker.
+
+# 10. references
+
+[1] a. adya. weak consistency: a generalized theory and optimistic implementations for distributed transactions. technical report, mit, 1999.  
+[2] a. adya, b. liskov, and p. e. o'neil. generalized isolation level definitions. icde'00, 2000.  
+[3] a. athalye. porcupine. https://github.com/anishathalye/porcupine, 2017-2018.  
+[4] p. a. bernstein, p. a. bernstein, and n. goodman. concurrency control in distributed database systems. acm computing survey, 13(2), 1981.  
+[5] p. a. bernstein, d. w. shipman, and w. s. wong. formal aspects of serializability in database concurrency control. ieee transactions on software engineering, 5(3), 1979.  
+[6] r. biswas and c. enea. on the complexity of checking transactional consistency. proceedings of the acm on programming languages, 3(oopsla), 2019.  
+[7] l. brutschy, d. dimitrov, p. müller, and m. vechev. serializability for eventual consistency: criterion, analysis, and applications. popl 2017, 2017.  
+[8] l. brutschy, d. dimitrov, p. müller, and m. vechev. static serializability analysis for causal consistency. pldi 2018, 2018.  
+[9] s. burckhardt, c. dern, m. musuvathi, and r. tan. line-up: a complete and automatic linearizability checker. pldi '10, 2010.  
+[10] s. burckhardt, d. leijen, m. fähndrich, and m. sagiv. eventually consistent transactions. in *esop* 2012, 2012.  
+[11] m. j. cahill, u. röhm, and a. d. fekete. serializable isolation for snapshot databases. acm transactions on database systems, 34(4), 2009.  
+[12] a. cerone, g. bernardi, and a. gotsman. a framework for transactional consistency models with atomic visibility. in 26th international conference on concurrence theory (concur 2015), 2015.  
+[13] k. claessen and j. hughes. quickcheck: a lightweight tool for random testing of haskell programs. icfp '00, 2000.  
+[14] j. c. corbett, j. dean, m. epstein, a. fikes, c. frost, j. furman, s. ghemawat, a. gubarev, c. heiser, p. hochschild, et al. spanner: google's globally-distributed database. in proceedings of osdi, volume 1, 2012.  
+[15] n. crooks, y. pu, l. alvisi, and a. clement. seeing is believing: a client-centric specification of database isolation. podc '17, 2017.  
+[16] k. daudjee and k. salem. lazy database replication with snapshot isolation. vldb '06, 2006.  
+[17] a. fekete. allocating isolation levels to transactions. pods '05, 2005.  
+[18] p. b. gibbons and e. korach. testing shared memories. siam journal on computing, 26(4), 1997.  
+[19] m. p. herlihy and j. m. wing. linearizability: a correctness condition for concurrent objects. acm transactions on programming languages and systems, 12(3), 1990.  
+[20] f. inc. faunadb. https://fauna.com, 2019.  
+[21] y. inc. yugabyte db. https://yugabyte.com, 2019.
+
+[22] k. kingsbury. knossos. https://github.com/jepsen-io/knossos, 2013-2019.  
+[23] k. kingsbury. gretchen. https://github.com/aphyr/gretchen, 2016.  
+[24] k. kingsbury and k. patella. jepsen (reports). http://jepsen.io/analyses, 2013-2019.  
+[25] k. kingsbury and k. patella. jepsen (software library). https://github.com/jepsen-io/jepsen, 2013-2019.  
+[26] m. kleppmann. hermitage: testing transaction isolation levels. https://github.com/ept/hermitage, 2014-2019.  
+[27] d. labs. dgraph. https://dgraph.io, 2020.  
+[28] g. lowe. testing and verifying concurrent objects. concurrency and computation: practice and experience, 29(4), 2017.  
+[29] r. majumdar and f. niksik. why is random testing effective for partition tolerance bugs. popl 2018, 2018.  
+[30] c. h. papadimitriou. the serializability of concurrent database updates. journal of the association for computing machinery, 26(4), 1979.  
+[31] d. peng and f. dabek. large-scale incremental processing using distributed transactions and notifications. in osdi, 2010.  
+[32] pingcap. tidb. https://pingcap.com/en, 2019.  
+[33] o. shacham, f. perez-sorrosal, e. bortnikov, e. hillel, i. keidar, i. kelly, m. morel, and s. paranjpye. omid, reloaded: scalable and highly available transaction processing. usenix conference on file and store technologies, 2017.  
+[34] r. tarjan. depth-first search and linear graph algorithms. swat '71, 1971.  
+[35] g. team. gencode: generic constraint development environment. https://www.gencode.org/, 2005.  
+[36] a. thomson, t. diamond, s.-c. weng, k. ren, p. shao, and d. j. abadi. calvin: fast distributed transactions for partitioned database systems. sigmod '12, 2012.  
+[37] j. m. wing and c. gong. testing and verifying concurrent objects. journal of parallel and distributed computing, 17(1-2), 1993.  
+[38] c. yao, d. agrawal, p. chang, g. chen, b. c. ooi, w. wong, and m. zhang. dgcc: a new dependency graph based concurrency control protocol for multicore database systems. corr, abs/1503.03642, 2015.

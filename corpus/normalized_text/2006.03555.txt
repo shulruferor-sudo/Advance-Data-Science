@@ -1,0 +1,502 @@
+# masked language modeling for proteins via linearly scalable long-context transformers
+
+krzysztof choromanski\*1, valerii likhosherstov\*2, david dohan\*1, xingyou song\*1
+
+andreea gane\*1, tamas sarlos\*1, peter hawkins\*1, jared davis\*3
+
+david belanger<sup>1</sup>, lucy colwell<sup>1,2</sup>, adrian weller<sup>2,4</sup>
+
+<sup>1</sup>google <sup>2</sup>university of cambridge <sup>3</sup>deepmind <sup>4</sup>alan turing institute
+
+# abstract
+
+transformer models have achieved state-of-the-art results across a diverse range of domains. however, concern over the cost of training the attention mechanism to learn complex dependencies between distant inputs continues to grow. in response, solutions that exploit the structure and sparsity of the learned attention matrix have blossomed. however, real-world applications that involve long sequences, such as biological sequence analysis, may fall short of meeting these assumptions, precluding exploration of these models. to address this challenge, we present a new transformer architecture, performer, based on fast attention via orthogonal random features (favor). our mechanism scales linearly rather than quadratically in the number of tokens in the sequence, is characterized by sub-quadratic space complexity and does not incorporate any sparsity pattern priors. furthermore, it provides strong theoretical guarantees: unbiased estimation of the attention matrix and uniform convergence. it is also backwards-compatible with pre-trained regular transformers. we demonstrate its effectiveness on the challenging task of protein sequence modeling and provide detailed theoretical analysis.
+
+# 1 introduction and related work
+
+transformers [46, 18] are powerful neural network architectures that have become sota in several areas of machine learning including natural language processing (nlp) (e.g. speech recognition [33]), neural machine translation (nmt) [7], document generation/summarization, time series prediction, generative modeling (e.g. image generation [37]), music generation [27], and analysis of biological sequences [40, 34, 28, 21, 20]. transformers rely on a trainable attention mechanism that identifies complex dependencies between the elements of each input sequence (e.g. amino acids within a protein). unfortunately, a standard transformer scales quadratically with the number of tokens  $l$  in the input sequence, which is prohibitively expensive for large  $l$ . several solutions have been proposed to address this issue [2, 24, 4, 8, 1]. most approaches restrict the attention mechanism to attend to local neighborhoods [37] or incorporate structural priors on attention such as sparsity [8], pooling-based compression [38] clustering/binning/convolution techniques (e.g. [42] which applies  $k$ -means clustering to learn dynamic sparse attention regions, or [29], where locality sensitive hashing is used to group together tokens of similar embeddings), sliding windows [2], or truncated targeting [5]. thus these approaches do not aim to approximate regular attention, but rather propose simpler and more tractable attention mechanisms, often by incorporating additional constraints (e.g. identical query and key sets as in [29]), or by trading regular attention with sparse attention using more layers [8]. unfortunately, there is a lack of rigorous guarantees for the representation power produced by such methods, and sometimes the validity of sparsity patterns can only be verified empirically through trial and error by constructing special gpu operations (e.g. either writing c++ cuda kernels [8] or using tvms [2]). other techniques which aim to improve the time complexity of transformers
+
+include reversible residual layers allowing for one-time activation storage in training [29] and shared attention weights [53]. these constraints may impede application to problems that involve long sequences, where approximations of the attention mechanism are not sufficient. approximations based on truncated back-propagation [17] are also unable to capture long-distance correlations since the gradients are only propagated inside a localized window.
+
+recent work has demonstrated that transformers fit to the amino acid sequences of single proteins learn to accurately predict information about protein structure and function, and can generate new sequences with specific properties [40, 21, 34]. approaches that encode 3d protein structural data via transformer-based models demonstrate improved performance, despite the restriction of attention to the local structural neighborhoods of each node [20, 28]. these models provide initial promise for protein design applications, but their applicability beyond the design of single proteins is limited because they truncate sequences to 512 or 1024 amino acids. the ability to scale to longer sequences without imposing sparsity constraints would enable the use of transformers to jointly model multiple concatenated protein sequences and the interactions between them. this follows recent works employing simpler statistical models that predict protein quaternary structure, protein-protein interactions and protein interaction networks from evolutionary sequence data [52, 26, 36, 3, 14].
+
+in response, we present a new transformer architecture, performer, based on fast attention via orthogonal random features (favor). our proposed mechanism has several advantageous properties: it scales linearly rather than quadratically in the number of tokens in the sequence (important for analysis involving multiple protein molecules), it is characterized by sub-quadratic space complexity, and it does not incorporate any sparsity pattern priors. furthermore, it provides strong theoretical guarantees: unbiased estimation of the regular attention matrix and uniform convergence. favor is designed for long input sequences where the number of tokens  $l$  satisfies  $l \gg d$ , for embedding dimensionality  $d$ . in contrast to previous approaches, instead of simplifying regular attention via various structural priors (which can lead to different, potentially incompatible architectures), we show that it can be effectively approximated as it is, without any "liftings". this leads to our method being flexible: combined with small amounts of fine-tuning, the performer is backwards-compatible with pretrained regular transformers and can be also used beyond the transformer scope as a more scalable replacement for regular attention, which itself has a wide variety of uses in computer vision [23], reinforcement learning [57], and even combinatorial optimization [51]. we demonstrate its effectiveness on challenging tasks that include protein sequence modeling and imagenet64.
+
+we show that regular attention can be considered a special case of a much larger class of kernel-driven attention mechanisms, generalized attention (ga), and that all our results for regular attention can be directly translated also to this extended class. this observation enables us to explore a much larger class of attention models (sec. 2.2). interestingly, this is often enabled by the favor mechanism, even if linear scaling is not required (sec. 4). we highlight the following contributions:
+
+- we present fast attention via orthogonal random features (favor) (sec. 2) which can be used as a replacement for regular attention. favor is characterized by  $o(ld\log(d))$  space complexity and  $o(ld^2\log(d))$  time complexity, as compared to  $o(l^2)$  space complexity and  $o(l^2d)$  time complexity for the regular algorithm (sec. 2.6, sec. 3).  
+- we present a general class of kernel-based attention mechanisms, generalized attention (ga), which can be handled by favor. standard attention is a special case. (sec. 2.2).  
+- we provide strong theoretical guarantees regarding favor: unbiasedness of our estimator of the attention matrix (sec. 2.3) and uniform convergence (sec. 3)  
+- we empirically compare the performance of favor via performers at protein sequence modeling tasks, demonstrating in practice all the aforementioned advantages (sec. 4).  
+- we show that our mechanism, implemented in jax [22], is api-compatible with the regular transformer, whose standard dot-product attention can be replaced by favor with all other components of the architecture intact.
+
+all proofs are given in full in the appendix.
+
+# 2 generalized attention via favor mechanism
+
+below we describe in detail our favor mechanism which is the backbone of our performer's architecture. we also present a general class of kernel-based attentions, called generalized attention (ga) (which includes regular attention as a special case), where favor can be applied.
+
+# 2.1 preliminaries - standard attention mechanism
+
+let  $l$  be the size of an input sequence of tokens. then regular dot-product attention [46] is a mapping which accepts matrices  $\mathbf{q}, \mathbf{k}, \mathbf{v} \in \mathbb{r}^{l \times d}$  as input where  $d$  is the hidden dimension (dimension of the latent representation). matrices  $\mathbf{q}, \mathbf{k}, \mathbf{v}$  are intermediate representations of the input and their rows can be interpreted as queries, keys and values of the continuous dictionary data structure respectively. bidirectional (or non-directional [19]) dot-product attention has the following form:
+
+$$
+\operatorname {a t t} _ {\leftrightarrow} (\mathbf {q}, \mathbf {k}, \mathbf {v}) = \mathbf {d} ^ {- 1} \mathbf {a v}, \quad \mathbf {a} = \exp (\mathbf {q} \mathbf {k} ^ {\top} / \sqrt {d}), \quad \mathbf {d} = \operatorname {d i a g} (\mathbf {a} \mathbf {1} _ {l}), \tag {1}
+$$
+
+where  $\exp (\cdot)$  is applied elementwise,  $\mathbf{1}_l$  is the all-ones vector of length  $l$ , and  $\mathrm{diag}(\cdot)$  is a diagonal matrix with the input vector as the diagonal. the runtime complexity of computing (1) is  $o(l^2 d)$  because the attention matrix  $\mathbf{a}\in \mathbb{r}^{l\times l}$  has to be computed and stored explicitly. hence, in principle, dot-product attention of type (1) is incompatible with end-to-end processing of long sequences.
+
+another important type of attention is unidirectional dot-product attention which has the form:
+
+$$
+\operatorname {a t t} _ {\rightarrow} (\mathbf {q}, \mathbf {k}, \mathbf {v}) = \widetilde {\mathbf {d}} ^ {- 1} \widetilde {\mathbf {a}} \mathbf {v}, \quad \widetilde {\mathbf {a}} = \operatorname {t r i l} (\mathbf {a}), \quad \widetilde {\mathbf {d}} = \operatorname {d i a g} (\widetilde {\mathbf {a}} \mathbf {1} _ {l}), \tag {2}
+$$
+
+where  $\mathrm{tril}(\cdot)$  returns the lower-triangular part of the argument matrix including diagonal. as discussed in [46], unidirectional attention is used for autoregressive generative modelling with transformers when the output sequence  $o_1, \ldots, o_l$  is modelled as:
+
+$$
+p \left(o _ {1}, \dots , o _ {l}\right) = p \left(o _ {1}\right) p \left(o _ {2} \mid o _ {1}\right) \dots p \left(o _ {l} \mid o _ {1}, \dots , o _ {l - 1}\right).
+$$
+
+therefore, the probability distribution over  $o_i$  can only depend on embeddings of tokens  $o_1, \ldots, o_{i-1}$ . unidirectional attention is used as self-attention in generative transformers as well as the decoder part of seq2seq transformers [46], while bidirectional attention is used in encoder self-attention and encoder-decoder attention in seq2seq architectures.
+
+a line of work relies on sparse approximation of the matrix  $\mathbf{a}$  - either through restricting the sparsity pattern of  $a$  [8] or learning it using locality-sensitive hashing (lsh) techniques [29]. the latter results in  $o(ld^{2}\log l)$  runtime complexity. we will show that, without any structural assumptions, the matrix  $\mathbf{a}$  can be approximated up to any precision in time  $o(ld^{2}\log (d))$ .
+
+# 2.2 generalized attention (ga)
+
+the idea of the attention mechanism is simple. new representations of tokens are obtained from previous ones by taking convex combinations of different value vectors with coefficients of the convex combinations interpreted as renormalized (i.e. all coefficients sum up to one) similarity measures between different tokens. high similarities imply strong attendance to the corresponding tokens. these similarity measures  $\mathrm{sim}:\mathbb{r}^d\times \mathbb{r}^d\to \mathbb{r}$  are simple ad-hoc "soft-max style" functions of a dot-product between query  $\mathbf{q}_i$  of token  $i$  and key  $\mathbf{k}_j$  of token  $j$ , namely:
+
+$$
+\sin \left(o _ {i}, o _ {j}\right) = \exp \left(\frac {\mathbf {q} _ {i} \mathbf {k} _ {j} ^ {\top}}{\sqrt {d}}\right), \tag {3}
+$$
+
+where:  $\mathbf{q}_i^\top, \mathbf{k}_j^\top \in \mathbb{r}^d$ . note that sim is not a commutative operation here, and the  $\sqrt{d}$ -renormalizer is a technical modification to stabilize the range of sim and avoid very small/large values.
+
+however, what if we use kernels instead of arbitrary similarity measures? specifically,  $\mathbf{q}_i$  and  $\mathbf{k}_j$  are entangled through a valid kernel function, by defining the attention matrix  $\mathbf{a}$  as:
+
+$$
+\mathbf {a} = \mathbf {a} _ {k} ^ {g, h} = \left[ g \left(\mathbf {q} _ {i} ^ {\top}\right) k \left(\mathbf {q} _ {i} ^ {\top}, \mathbf {k} _ {j} ^ {\top}\right) h \left(\mathbf {k} _ {j} ^ {\top}\right) \right] _ {i, j \in \{1, \dots , l \}}, \tag {4}
+$$
+
+where  $k:\mathbb{r}^d\times \mathbb{r}^d\to \mathbb{r}$  is an arbitrary kernel function and  $g,h:\mathbb{r}^d\to \mathbb{r}$ . we call this attention mechanism defined above generalized attention (ga) parameterized by  $k,g,h$
+
+next we show that not only can favor approximate regular attention governed by eq. 3, but it can be applied to gas as long as the corresponding kernels can be effectively estimated via a random feature map mechanism [39], which is the case for most kernels used in practice. we will in fact show that regular attention is a special case of ga for a specific choice of  $g, h$ , and gaussian kernel  $k$ .
+
+# 2.3 towards favor: approximating attention with random features (rfs)
+
+instead of computing and storing the attention matrix  $\mathbf{a} \in \mathbb{r}^{l \times l}$  explicitly, we derive its unbiased stochastic approximation, which benefits from low-rank structure. we take our inspiration from a randomized scheme to train kernel support vector machines with large training data [39].
+
+let  $\mathbf{q}_i$  and  $\mathbf{k}_i$  denote the  $i$ -th rows of matrices  $\mathbf{q}$  and  $\mathbf{k}$  respectively. for regular attention, the  $i,j$ -th element of  $\mathbf{a}$  can be expressed as:
+
+$$
+\mathbf {a} _ {i, j} = \exp (\mathbf {q} _ {i} \mathbf {k} _ {j} ^ {\top} / \sqrt {d}) = \exp (\| \mathbf {q} _ {i} \| _ {2} ^ {2} / 2 \sqrt {d}) \cdot \exp (- \| \mathbf {q} _ {i} - \mathbf {k} _ {j} \| _ {2} ^ {2} / 2 \sqrt {d}) \cdot \exp (\| \mathbf {k} _ {j} \| _ {2} ^ {2} / 2 \sqrt {d}).
+$$
+
+in other words, for  $r = 2\sqrt{d}$ , the attention matrix  $\mathbf{a}$  can be decomposed as:
+
+$$
+\mathbf {a} = \mathbf {d} _ {\mathbf {q}} \mathbf {b} \mathbf {d} _ {\mathbf {k}}, \quad \mathbf {b} \in \mathbb {r} ^ {l \times l}, \forall i, j: \mathbf {b} _ {i, j} = \exp (- \| \mathbf {q} _ {i} - \mathbf {k} _ {j} \| _ {2} ^ {2} / r), \tag {5}
+$$
+
+$$
+\mathbf {d} _ {\mathbf {t}} = \operatorname {d i a g} \left(\exp \left(\| \mathbf {t} _ {1} \| _ {2} ^ {2} / r\right), \dots , \exp \left(\| \mathbf {t} _ {l} \| _ {2} ^ {2} / r\right)\right), \tag {6}
+$$
+
+for  $\mathbf{t} = \mathbf{q},\mathbf{k}$ . both  $\mathbf{d}_{\mathbf{q}}$  and  $\mathbf{d}_{\mathbf{k}}$  can be computed in  $o(ld)$  time. note that the  $i,j$ -th element of matrix  $\mathbf{b}$  is the value of the gaussian kernel with  $\sigma = d^{\frac{1}{4}}$ :
+
+$$
+\mathbf {b} _ {i, j} = k _ {\mathrm {g a u s s}} ^ {\sigma} \left(\mathbf {q} _ {i} ^ {\top}, \mathbf {k} _ {j} ^ {\top}\right) \stackrel {\mathrm {d e f}} {=} \exp \left(- \frac {\| \mathbf {q} _ {i} - \mathbf {k} _ {j} \| ^ {2}}{2 \sigma^ {2}}\right). \tag {7}
+$$
+
+for ga, our analysis is similar. this time  $\mathbf{d}_{\mathbf{q}}, \mathbf{d}_{\mathbf{k}}$  have nonzero entries of the form  $g(\mathbf{q}_i^\top)$  and  $h(\mathbf{k}_i^\top)$  (for regular attention we have:  $g(\mathbf{x}) = h(\mathbf{x}) = \exp \left(\frac{\|\mathbf{x}\|_2^2}{r}\right)$ ) respectively and furthermore the gaussian kernel is replaced by a general kernel  $k$ , namely:  $\mathbf{b}_{i,j} = k(\mathbf{q}_i^\top, \mathbf{k}_j^\top)$ , as in equation 4.
+
+in the reminder of this section we will derive an unbiased stochastic approximation of matrix  $\mathbf{b}$  based on low-rank decomposition of  $\mathbf{b}$  with the use of random feature maps [39].
+
+for a given kernel  $k:\mathbb{r}^d\times \mathbb{r}^d\to \mathbb{r}$ , the random feature [rf] map  $\phi_k:\mathbb{r}^d\to \mathbb{r}^m$  corresponding to  $k$  is a probabilistic embedding satisfying
+
+$$
+k (\mathbf {x}, \mathbf {y}) = \mathbb {e} \left[ \phi^ {\top} (\mathbf {x}) \phi (\mathbf {y}) \right], \tag {8}
+$$
+
+where the expectation is with respect to the randomness of  $\phi$ , and  $m$  denotes the number of random features (if  $\mathbb{e}[\phi^{\top}(\mathbf{x})\phi(\mathbf{y})]$  only approximates  $k(\mathbf{x},\mathbf{y})$  then we refer to the mechanism as an approximate random feature map). this mechanism covers also as a very special case an instance, where  $\phi$  is deterministic (and then expectation is not needed). efficient-to-compute random feature maps exist for virtually all classes of kernels used in machine learning, e.g. shift-invariant kernels [39], the pointwise nonlinear gaussian kernel related to neural networks [25], and more, though the techniques used to derive these random mappings vary from class to class [13]. even more interestingly, for most of these kernels, corresponding random feature maps have a similar structure, namely:
+
+$$
+\phi (\mathbf {x}) \stackrel {\text {d e f}} {=} \frac {c}{\sqrt {m}} \left(f \left(\omega_ {1} ^ {\top} \mathbf {x} + b _ {1}\right), \dots , f \left(\omega_ {m} ^ {\top} \mathbf {x} + b _ {m}\right)\right) ^ {\top} = \frac {c}{\sqrt {m}} f \left(\mathbf {w x} + \mathbf {b}\right) ^ {\top}, \tag {9}
+$$
+
+for some  $f:\mathbb{r}\to \mathbb{r},\omega_1,\ldots ,\omega_m\stackrel {\mathrm{iid}}{\sim}\omega ,b_1,\ldots ,b_m\stackrel {\mathrm{iid}}{\sim}\mathcal{b}$ , distributions:  $\omega \in \mathcal{p}(\mathbb{r}^d)$ ,  $\mathcal{b}\in \mathcal{p}(\mathbb{r})$  and constant  $c > 0$ . here  $\mathbf{w}\in \mathbb{r}^{m\times d}$  has rows  $\mathbf{w}_i = \boldsymbol{\omega}_i^\top$  and  $\mathbf{b}\stackrel {\mathrm{def}}{=}(b_1,\dots,b_m)^\top$ .
+
+in particular, for the gaussian kernel, we have  $c = \sqrt{2}$  and:
+
+$$
+\phi (\mathbf {x}) \stackrel {\text {d e f}} {=} \sqrt {\frac {2}{m}} \left(\cos \left(\omega_ {1} ^ {\top} \mathbf {x} + b _ {1}\right), \dots , \cos \left(\omega_ {m} ^ {\top} \mathbf {x} + b _ {m}\right)\right) ^ {\top}, \tag {10}
+$$
+
+where  $\omega_{1},\ldots ,\omega_{m}\stackrel {\mathrm{iid}}{\sim}\mathcal{n}(0,\sigma^{2}\mathbf{i}_{d})$  and  $b_{1},\dots,b_{m}\stackrel {\mathrm{iid}}{\sim}\mathrm{unif}(0,2\pi)$ . this particular form of  $\phi$  is a consequence of the celebrated bochner's theorem [39]. we now define  $\widehat{\mathbf{q}}$  and  $\widehat{\mathbf{k}}\in \mathbb{r}^{l\times m}$  as:
+
+$$
+\widehat {\mathbf {q}} = \frac {c}{\sqrt {m}} f \left(\mathbf {w} \mathbf {q} ^ {\top} + \mathbf {b}\right) ^ {\top}, \quad \widehat {\mathbf {k}} = \frac {c}{\sqrt {m}} f \left(\mathbf {w} \mathbf {k} ^ {\top} + \mathbf {b}\right) ^ {\top}. \tag {11}
+$$
+
+note that we have:  $\widehat{\mathbf{q}}_i = \phi (\mathbf{q}_i^\top)^\top$  and  $\widehat{\mathbf{k}}_i = \phi (\mathbf{k}_i^\top)^\top$ , where  $\widehat{\mathbf{q}}_i$  and  $\widehat{\mathbf{k}}_i$  stand for the  $i$ th row of  $\widehat{\mathbf{q}}$  and  $\widehat{\mathbf{k}}$  respectively. then according to equation 8, we have:  $\mathbf{b} = \mathbb{e}[\widehat{\mathbf{q}}\widehat{\mathbf{k}}^\top]$ . thus with  $\mathbf{q}'$ ,  $\mathbf{k}'$  given as:  $\mathbf{q}' = \mathbf{d}_{\mathbf{q}}\widehat{\mathbf{q}}, \mathbf{k}' = \mathbf{d}_{\mathbf{k}}\widehat{\mathbf{k}}$ , we obtain:
+
+$$
+\mathbf {a} = \mathbb {e} \left[ \mathbf {q} ^ {\prime} \left(\mathbf {k} ^ {\prime}\right) ^ {\top} \right]. \tag {12}
+$$
+
+we conclude that the attention matrix  $\mathbf{a}$  can be approximated without bias as:  $\widehat{\mathbf{a}} = \mathbf{q}'(\mathbf{k}')^\top$ . we will leverage this unbiased approximate low-rank (if  $m \ll l$ ) decomposition of  $\mathbf{a}$  in our algorithm, even though we will not explicitly compute  $\widehat{\mathbf{a}}$ .
+
+algorithm 1: favor (bidirectional or unidirectional).  
+input:  $\mathbf{q},\mathbf{k},\mathbf{v}\in \mathbb{r}^{l\times d}$  , isbidirectional - binary flag.   
+result:  $\widehat{\mathrm{att}}_{\leftrightarrow}(\mathbf{q},\mathbf{k},\mathbf{v})\in \mathbb{r}^{l\times l}$  if isbidirectional,  $\widehat{\mathrm{att}}_{\rightarrow}(\mathbf{q},\mathbf{k},\mathbf{v})\in \mathbb{r}^{l\times l}$  otherwise.   
+compute  $\mathbf{d}_{\mathbf{q}},\mathbf{d}_{\mathbf{k}}$  as explained in sec. 2.3;   
+compute  $\widehat{\mathbf{q}},\widehat{\mathbf{k}}$  according to (11) and take  $\mathbf{q}'\coloneqq \mathbf{d}_{\mathbf{q}}\widehat{\mathbf{q}}$ $\mathbf{k}'\coloneqq \mathbf{d}_{\mathbf{k}}\widehat{\mathbf{k}}$ $\mathbf{c}\coloneqq [\mathbf{v}\quad \mathbf{1}_l]$    
+if isbidirectional then   
+ $\begin{array}{rl}&{\mathrm{buf}_{1}:=(\mathbf{k}^{\prime})^{\top}\mathbf{c}\in\mathbb{r}^{m\times(d+1)},\quad\mathrm{buf}_{2}:=\mathbf{q}^{\prime}\mathrm{buf}_{1}\in\mathbb{r}^{l\times(d+1)};\end{array}$    
+else   
+ $\begin{array}{rl}&{\mathrm{compute~g~and~its~prefix-sum~tensor~g^{ps}~according~to~(14);}}\\&{\mathrm{buf}_{2}:=\left[\mathbf{g}_{1,:,:}^{\mathrm{ps}}\mathbf{q}_{1}^{\prime}\quad...\quad\mathbf{g}_{l,:,:}^{\mathrm{ps}}\mathbf{q}_{l}^{\prime}\right]^{\top}\in\mathbb{r}^{l\times(d+1)};}\\&{\mathrm{end}}\\&{\mathrm{[buf}_{3}\quad\mathrm{buf}_{4}]:=buf_{2},\quad\mathrm{buf}_{3}\in\mathbb{r}^{l\times d},\quad\mathrm{buf}_{4}\in\mathbb{r}^{l};}\\&{\mathrm{return~diag}(\mathrm{buf}_{4})^{-1}\mathrm{buf}_{3};}\end{array}$
+
+note that one can also define a valid kernel as:  $k(\mathbf{x},\mathbf{y}) = \mathbb{e}[\phi (\mathbf{x})^\top \phi (\mathbf{y})]$  for  $\phi$  as in eq. 9 and an arbitrary  $f:\mathbb{r}\to \mathbb{r}$ . such kernels cover in particular the family of pointwise nonlinear gaussian kernels [13] (intrinsically related to nonlinear neural networks) such as arc-cosine kernels (e.g. angular kernels). most of these kernels do not have closed-forms so computing exact gas for them would not be possible, but of course computation is feasible with the presented mechanism.
+
+# 2.4 towards favor: refinements via orthogonal random features
+
+for isotropic  $\omega$  (true for most practical applications, including regular attention), instead of sampling  $\omega_{i}$  independently, we can use orthogonal random features (orf) [56, 13, 12]: these maintain (exactly or approximately) the marginal distributions of samples  $\omega_{i}$  while enforcing that different samples are orthogonal. if we need  $m > d$ , orfs still can be used locally within each  $d\times d$  block of  $\mathbf{w}$  [56].
+
+orfs were introduced to reduce the variance of monte carlo estimators [56, 13, 12, 10, 41, 9, 11] and we show in secs. 3 and 4 that they do indeed lead to more accurate approximations and substantially better downstream results. below we briefly review the most efficient orf mechanisms (based on their strengths and costs) that we will use in sec. 2.6 in the analysis of favor.
+
+(1) regular orfs [r-orfs]: applies gaussian orthogonal matrices [56]. encodes matrix  $\mathbf{w}$  in  $o(md)$  space. provides algorithm for computing  $\mathbf{wx}$  in  $o(md)$  time for any  $\mathbf{x} \in \mathbb{r}^d$ . gives unbiased estimation. requires one-time  $o(md^2)$  preprocessing (gram-schmidt orthogonalization).  
+(2) hadamard/givens orfs [h/g-orfs]: applies random hadamard [13]/givens matrices [11]. encodes matrix  $\mathbf{w}$  in  $o(m) / o(m\log (d))$  space. provides algorithm for computing  $\mathbf{wx}$  in  $o(m\log (d))$  time for any  $\mathbf{x}\in \mathbb{r}^d$ . gives small bias (going to 0 with  $d\to \infty$ ).
+
+# 2.5 favor: fast attention via orthogonal random features
+
+we are ready to present the full favor algorithm. in the bidirectional case, our approximate attention computed by favor is given as:
+
+$$
+\widehat {\operatorname {a t t}} _ {\leftrightarrow} (\mathbf {q}, \mathbf {k}, \mathbf {v}) = \widehat {\mathbf {d}} ^ {- 1} \widehat {\mathbf {a}} \mathbf {v} = \widehat {\mathbf {d}} ^ {- 1} \left(\mathbf {q} ^ {\prime} \left(\left(\mathbf {k} ^ {\prime}\right) ^ {\top} \mathbf {v}\right)\right), \tag {13}
+$$
+
+where  $\widehat{\mathbf{d}} = \mathrm{diag}(\mathbf{q}'((\mathbf{k}')^\top \mathbf{1}_l))$ . the placement of brackets determines the order in which computations are conducted. note that we never explicitly compute  $\widehat{\mathbf{a}}$  and consequently, avoid  $\theta(l^2)$  time complexity and storing the  $l \times l$  approximate attention matrix (see: sec. 2.6 for rigorous analysis).
+
+# 2.5.1 prefix-sums for unidirectional favor
+
+for the unidirectional case, our analysis is similar but this time our goal is to compute  $\mathrm{tril}(\mathbf{q}'(\mathbf{k}')^\top) \mathbf{c}$  without constructing and storing the  $l \times l$ -sized matrix  $\mathrm{tril}(\mathbf{q}'(\mathbf{k}')^\top)$  explicitly, where  $c = [v \quad \mathbf{1}_l] \in \mathbb{r}^{l \times (d + 1)}$ . in order to do so, observe that  $\forall 1 \leq i \leq l$ :
+
+$$
+\left[ \operatorname {t r i l} \left(\mathbf {q} ^ {\prime} \left(\mathbf {k} ^ {\prime}\right) ^ {\top}\right) \mathbf {c} \right] _ {i} = \mathbf {g} _ {i,:,:} ^ {\mathrm {p s}} \times \mathbf {q} _ {i} ^ {\prime}, \quad \mathbf {g} _ {i,:,:} ^ {\mathrm {p s}} = \sum_ {j = 1} ^ {i} \mathbf {g} _ {j,:,:}, \quad \mathbf {g} _ {j,:,:} = \mathbf {k} _ {j} ^ {\prime} \mathbf {c} _ {j} ^ {\top} \in \mathbb {r} ^ {m \times (d + 1)} \tag {14}
+$$
+
+where  $\mathbf{g},\mathbf{g}^{\mathrm{ps}}\in \mathbb{r}^{l\times m\times (d + 1)}$  are 3d-tensors. each slice  $\mathbf{g}_{:,l,p}^{\mathrm{ps}}$  is therefore a result of a prefix-sum (or cumulative-sum) operation applied to  $\mathbf{g}_{:,l,p}$ :  $\mathbf{g}_{i,l,p}^{\mathrm{ps}} = \sum_{j = 1}^{i}\mathbf{g}_{i,l,p}$ . an efficient algorithm to compute the prefix-sum of  $l$  elements takes  $o(l)$  total steps and  $o(\log l)$  time when computed in parallel [31, 16]. see algorithm 1 for the whole approach.
+
+# 2.6 time and space complexity analysis
+
+we see that a variant of bidirectional favor using regular rfs (based on iid samples) or r-orfs has  $o(md + ld + ml)$  space complexity as opposed to  $\theta(l^2 + ld)$  space complexity of the baseline. unidirectional favor using fast prefix-sum precomputation in parallel [31, 16] has  $o(mld)$  space complexity to store  $\mathbf{g}^{\mathrm{ps}}$  which can be reduced to  $o(md + ld + ml)$  by running a simple (though non-parallel in  $l$ ) aggregation of  $\mathbf{g}_{i,\dots}^{\mathrm{ps}}$  without storing the whole tensor  $\mathbf{g}^{ps}$  in memory. from sec. 2.4, we know that if instead we use g-orfs, then space complexity is reduced to  $o(m\log(d) + ld + ml)$  and if the h-orfs mechanism is used, then space is further reduced to  $o(m + ld + ml) = o(ld + ml)$ . thus for  $m, d \ll l$  all our variants provide substantial space complexity improvements since they do not need to store the attention matrix explicitly.
+
+the time complexity of algorithm 1 is  $o(lmd)$  (note that constructing  $\widehat{\mathbf{q}}$  and  $\widehat{\mathbf{k}}$  can be done in time  $o(lmd)$  via eq. 11 if samples from  $\omega$  and  $\mathcal{b}$  can be obtained in time  $o(d)$  and  $o(1)$  respectively (which is the case for all practical applications). note that the time complexity of our method is much lower than  $o(l^2 d)$  of the baseline for  $l \gg m$ .
+
+as explained in sec. 2.4, the r-orf mechanism incurs an extra one-time  $o(md^2)$  cost (negligible compared to the  $o(lmd)$  term for  $l \gg d$ ). h-orfs or g-orfs do not have this cost, and when favor uses them, computing  $\mathbf{q}'$  and  $\mathbf{k}'$  can be conducted in time  $o(l\log(m)d)$  as opposed to  $o(lmd)$  (see: sec. 2.4). thus even though h/g-orfs do not change the asymptotic time complexity, they improve the constant factor from the leading term. this plays an important role for training very large models.
+
+the number of random features  $m$  allows a trade-off between computational complexity and the level of approximation: bigger  $m$  results in higher computation costs, but also in a lower variance of the estimate of  $\mathbf{a}$ . in the next section we will show that in practice we can take  $m = \theta(d\log(d))$ .
+
+observe that the algorithm obtained is highly-parallelizable, and benefits from fast matrix multiplication and broadcasted operations on gpus or tpus.
+
+# 3 theoretical convergence analysis
+
+in contrast to other methods approximating the attention matrix  $\mathbf{a}$ , our algorithm provides provable strong uniform convergence theoretical guarantees for compact domains. we show that  $m_{\mathrm{opt}}$ , the optimal number of random features, does not depend on  $l$  but only on  $d$ . in fact, we prove that if we take  $m_{\mathrm{opt}} = \theta(d\log(d))$ , then with  $o(ld^2\log(d))$ -time, we can approximate  $\mathbf{a}$  up to any precision, regardless of the number of tokens  $l$ . in order to provide those guarantees for favor, we leverage recent research on the theory of negative dependence for orfs [32]. the following is true:
+
+theorem 1 (uniform convergence of favor). take the generalized attention mechanism defined by  $g, h: \mathbb{r}^d \to \mathbb{r}$  (see: sec. 2.2) and a radial basis function (rbf) kernel [12]  $k$  with corresponding spectral distribution  $\omega$  (e.g. gaussian kernel for which  $\omega = \mathcal{n}(0, \mathbf{i}_d)$ ). assume that the rows of matrices  $\mathbf{q}$  and  $\mathbf{k}$  are taken from a ball  $b(r)$  of radius  $r$ , centered at 0 (i.e. norms of queries and keys are upper-bounded by  $r$ ). define  $l = rd^{-\frac{1}{4}}$  and take  $g^* = \max_{\mathbf{x} \in b(l)} |g(\mathbf{x})|$ ,  $h^* = \max_{\mathbf{x} \in b(l)} |h(\mathbf{x})|$ . then for any  $\epsilon > 0$ ,  $\delta = \frac{\epsilon}{g^* h^*}$  and the number of random features  $m = \omega\left(\frac{d}{\delta^2} \log\left(\frac{4\sigma r}{\delta d^{\frac{1}{4}}}\right)\right)$  for  $\sigma = \mathbb{e}_{\omega \sim \omega}[\omega^\top \omega]$  the following holds:  $\| \widehat{\mathbf{a}} - \mathbf{a} \|_1 \leq \epsilon$  with any constant probability, where  $\widehat{\mathbf{a}}$  approximates generalized attention matrix via favor with r-orfs.
+
+the result holds in particular for regular attention using gaussian kernels (see: sec. 2.2) for which  $m_{\mathrm{opt}} = \omega \left( \frac{d}{\delta^2} \log \left( \frac{4d^{\frac{3}{4}}r}{\delta} \right) \right)$  since  $\sigma = d$ .
+
+# 4 experiments
+
+we implement our setup on top of pre-existing transformer training code in jax [22] optimized with just-in-time (jax.jit) compilation, and complement our theory with empirical evidence to demonstrate favor's practicality in the protein setting. unless explicitly stated, a performer replaces
+
+only the attention component with favor, while all other components are exactly the same as for the regular transformer. furthermore, since we use the cross-entropy loss in our generative training experiments, we use the standard accuracy metric as defined from supervised learning.
+
+# 4.1 computation costs
+
+between the transformer and the performer, we compared speed-wise the backward pass, as it is one of the main computational bottlenecks during training, when using the regular default size  $(n_{\text{heads}}, n_{\text{layers}}, d_{ff}, d) = (8, 6, 2048, 512)$ , where  $d_{ff}$  denotes the width of the mlp layers. we observed (fig. 1) that in terms of  $l$ , the performer reaches nearly linear time complexity as opposed to the transformer's quadratic time complexity. the performer's memory consumption is also subquadratic (as it does not store the explicit  $o(l^2)$ -sized attention matrix), allowing higher batch sizes and longer sequence lengths. in fact, the performer achieves nearly optimal speedup and memory efficiency possible, depicted by the "x"-line when attention is replaced a "identity function" by simply returning the v-vector. the combination of both memory and backward pass efficiencies for large  $l$  has profound implications for training speed, as it allows respectively, large batch training and lower wall clock time per gradient step, contributing to total train time reduction. extensive additional results are demonstrated in appendix e by varying layers, raw attention, and architecture sizes.
+
+![](images/ca5dc0a1b95924c9326b626cd952c0b5bc240bd2568db259dce748464fe35fa7.jpg)  
+figure 1: comparison of transformer and performer in terms of forward and backward pass speed and maximum  $l$  allowed. "x" (opt) denotes the maximum possible speedup achievable, when attention simply returns the v-vector. plots shown up to when a model produces an out of memory error on a v100 gpu with 16gb. best in color.
+
+# 4.2 approximation error and compatibility with regular transformer
+
+we further examined the approximation error of the attention matrix implicitly defined in favor in fig. 2 (and in fig. 11 in appendix d), which thus directly affects the accuracy of favor's output. we demonstrate that orthogonal features generally produce lower error than unstructured features.
+
+![](images/7529332725b58d59d467017f0e0b679eacd1d3e73618e49e958bf936e543b0ba.jpg)  
+figure 2: approximation errors for both the attention matrix and output of the mechanism itself. we took  $l = 4096$ ,  $d = 16$ , and varied the number of random features  $m$ . standard deviations shown across 10 samples.
+
+![](images/3f0fa6dffc3a109240b5b9316dbc7d6acb277a51f1c768028b2543a8e8643140.jpg)
+
+![](images/4abbdd43cd0541330171f8ff388b91e5171f3f5826ed48861533d2c526f49c95.jpg)  
+figure 3: we transferred the original pretrained transformer's weights into the performer, which produces an initial non-zero 0.07 accuracy (dotted orange line). once fine-tuned however, the performer quickly recovers accuracy in a small fraction of the original number of gradient steps.
+
+notice that the accuracy can be further boosted by applying a resampling strategy that reconstructs samples periodically. we set this option as a hyperparameter of our overall algorithm.
+
+the approximation error can propagate when applying the other components (mlps, multiple heads, multiple layers, etc.) of a transformer, which we demonstrate in fig. 11 (appendix). this implies we cannot immediately directly transfer the weights from a pretrained transformer onto the performer. however, this can be resolved by finetuning the performer on the trained task. we demonstrate this technique for a pretrained bert model [19] on the lm1b dataset [6] in fig. 3.
+
+# 4.3 multiple layer training
+
+we further benchmark the performer on both unidirectional (u) and bidirectional (b) cases by training a 36-layer model using protein sequences from the jan. 2019 release of trembl [15], similar to [34]. as a baseline for sparse attention, we also used the reformer [29]. in fig. 4, the reformer significantly drops in accuracy on the protein dataset. this suggests that sparse attention may be insufficient for protein tasks, which require modelling of global interactions. furthermore, the usefulness of generalized attention is evidenced by performer-relu (taking  $f = \mathrm{relu}$  in equation 8) achieving the highest accuracy in both (u) and (b) cases. our proposed softmax approximation is also shown to be tight, achieving the same accuracies as the exact-softmax transformer. extended results including dataset statistics, out of distribution evaluations, and visualizations, can be found in appendix c.
+
+![](images/5b9872979c54288be652dd44b0bafad2588c9aa7850df3d53b2137e5c267fbc1.jpg)  
+figure 4: train = dashed, validation = solid, unidirectional = (u), bidirectional = (b). for trembl, we used the exact same model parameters ( $n_{\text{heads}}$ ,  $n_{\text{layers}}$ ,  $d_{ff}$ ,  $d$ ) = (8, 36, 1024, 512) from [34] for all runs. for fairness, all trembl experiments used 16x16 tpu-v2's. batch sizes were maximized for each separate run given the corresponding compute constraints. hyperparameters can be found in appendix b.
+
+![](images/da38fc9a75ae11b34993d6b6afdcf6e0a3eca5eb18ca8d41af98a686a33bcde1.jpg)
+
+# 4.4 large length training
+
+on the standard (u) imagenet64 benchmark ( $l = 12288$ ) from [37], we see that the performer matches the reformer, when both use 8x8 tpu-v2's. depending on hardware (tpu or gpu), we also found that the performer can be 2x faster than the reformer via jax optimizations for the (u) setting. for a proof of principle study, we also create an initial protein benchmark for predicting interactions among groups of proteins by concatenating protein sequences to length  $l = 8192$  from trembl, long enough to model protein interaction networks without the large sequence alignments required by existing methods [14]. in this setting, a baseline transformer overloads memory even at a batch size of 1 per chip, by a wide margin. thus as a baseline we were forced to use a significantly smaller variant, reducing to  $(n_{\text{heads}}, n_{\text{layers}}, d_{ff}, d) = (8, \{1, 2, 3\}, 256, 256)$ . meanwhile, the performer trains efficiently at a batch size of 8 per chip using the standard (8, 6, 2048, 512) architecture. we see in fig. 5 that the smaller transformer  $(n_{\text{layer}} = 3)$  is quickly bounded at  $\approx 19\%$ , while the performer is able to train continuously to  $\approx 24\%$ .
+
+![](images/024fa653dfcb0f8739eba6d742478b562423a1995c0599f34c36459409b70e87.jpg)  
+figure 5: for imagenet64, we took 6-layer variants of both the performer and the reformer, evaluated both at 50k steps, and also plotted the 3.77 bpd baseline (img-t) from [37], which uses 12-layers but with cropped lengths on a regular transformer. for concatenated trembl, we varied  $n_{layers} \in \{1,2,3\}$  for the smaller transformer. hyperparameters found in appendix b.
+
+![](images/76f41d6e9783a5c7b132cbdb601057a795c47ff1359047f079d618b428fc0f23.jpg)
+
+# 5 conclusion
+
+we presented performer, a new type of transformer, relying on our fast attention via orthogonal random features (favor) mechanism to significantly improve space and time complexity of regular transformers. our mechanism is to our knowledge the first unbiased estimation of the original algorithm with linear space and time complexity with respect to  $l$ . furthermore, favor could be applied to other tasks of approximate attention, including hierarchical attention networks [54], graph attention networks [47], image processing [23], and reinforcement learning/robotics [44].
+
+# 6 broader impact
+
+we believe that the presented algorithm can be impactful in various ways:
+
+biology and medicine: our method has the potential to directly impact research on biological sequence analysis by enabling the transformer to be applied to much longer sequences without constraints on the structure of the attention matrix. the initial application that we consider is the prediction of interactions between proteins on the proteome scale. recently published approaches require large evolutionary sequence alignments, a bottleneck for applications to mammalian genomes [14]. the potentially broad translational impact of applying these approaches to biological sequences was one of the main motivations of this work. we believe that modern bioinformatics can immensely benefit from new machine learning techniques with transformers being among the most promising. scaling up these methods to train faster more accurate language models opens the door to the ability to design sets of molecules with pre-specified interaction properties. these approaches could be used to augment existing physics-based design strategies that are of critical importance for example in the development of new nanoparticle vaccines [35].
+
+environment: as we have shown, performers with favor are characterized by much lower compute costs and substantially lower space complexity which can be directly translated to  $\mathrm{co}_{2}$  emission reduction [43] and lower energy consumption [55], as regular transformers require very large computational resources.
+
+research on transformers: we believe that our results can shape research on efficient transformers architectures, guiding the field towards methods with strong mathematical foundations. our research may also hopefully extend transformers also beyond their standard scope (e.g. by considering the generalized attention mechanism and connections with kernels). exploring scalable transformer architectures that can handle  $l$  of the order of magnitude few thousands and more, preserving accuracy of the baseline at the same time, is a gateway to new breakthroughs in bio-informatics, e.g. language modeling for proteins, as we explained in the paper. our presented method can be potentially a first step.
+
+backward compatibility: our performer can be used on the top of a regular pre-trained transformer as opposed to other transformer variants. even if up-training is not required, favor can be still used for fast inference with no loss of accuracy. we think about this backward compatibility as a very important additional feature of the presented techniques that might be particularly attractive for practitioners.
+
+attention beyond transformers: finally, favor can be applied to approximate exact attention also outside the scope of transformers. this opens a large volume of new potential applications including: hierarchical attention networks (hans) [54], graph attention networks [47], image processing [23], and reinforcement learning/robotics [44].
+
+# 7 acknowledgements
+
+we thank afroz mohiuddin, wojciech gajewski, nikita kitaev, and lukasz kaiser for multiple discussions on the transformer. we further thank joshua meier, aurko roy, and john platt for many fruitful discussions on biological data and useful comments on this draft.
+
+lucy colwell acknowledges support from the simons foundation. adrian weller acknowledges support from the david mackay newton research fellowship at darwin college, the alan turing institute under epsrc grant ep/n510129/1 and u/b/000074, and the leverhulme trust via cfi.
+
+# references
+
+[1] i. bello, b. zoph, a. vaswani, j. shlens, and q. v. le. attention augmented convolutional networks. corr, abs/1904.09925, 2019.  
+[2] i. beltagy, m. e. peters, and a. cohan. longformer: the long-document transformer. corr, abs/2004.05150, 2020.  
+[3] a.-f. bitbol, r. s. dwyer, l. j. colwell, and n. s. wingreen. inferring interaction partners from protein sequences. proceedings of the national academy of sciences, 113(43):12180-12185, 2016.  
+[4] w. chan, c. sahara, g. e. hinton, m. norouzi, and n. jaitly. imputer: sequence modelling via imputation and dynamic programming. corr, abs/2002.08926, 2020.  
+[5] c. chelba, m. x. chen, a. bapna, and n. shazeer. faster transformer decoding: n-gram masked self-attention. corr, abs/2001.04589, 2020.  
+[6] c. chelba, t. mikolov, m. schuster, q. ge, t. brants, p. koehn, and t. robinson. one billion word benchmark for measuring progress in statistical language modeling. in *interspeech* 2014, 15th annual conference of the international speech communication association, singapore, september 14-18, 2014, pages 2635-2639, 2014.  
+[7] m. x. chen, o. first, a. bapna, m. johnson, w. macherey, g. f. foster, l. jones, m. schuster, n. shazeer, n. parmar, a. vaswani, j. uszkoreit, l. kaiser, z. chen, y. wu, and m. hughes. the best of both worlds: combining recent advances in neural machine translation. in i. gurevych and y. miyao, editors, proceedings of the 56th annual meeting of the association for computational linguistics, acl 2018, melbourne, australia, july 15-20, 2018, volume 1: long papers, pages 76-86. association for computational linguistics, 2018.  
+[8] r. child, s. gray, a. radford, and i. sutskever. generating long sequences with sparse transformers. corr, abs/1904.10509, 2019.  
+[9] k. choromanski, c. downey, and b. boots. initialization matters: orthogonal predictive state recurrent neural networks. in 6th international conference on learning representations, iclr 2018, vancouver, bc, canada, april 30 - may 3, 2018, conference track proceedings. openreview.net, 2018.  
+[10] k. choromanski, a. pacchiano, j. pennington, and y. tang. kama-nns: low-dimensional rotation based neural networks. in k. chaudhuri and m. sugiyama, editors, the 22nd international conference on artificial intelligence and statistics, aistats 2019, 16-18 april 2019, naha, okinawa, japan, volume 89 of proceedings of machine learning research, pages 236-245. pmlr, 2019.  
+[11] k. choromanski, m. rowland, w. chen, and a. weller. unifying orthogonal monte carlo methods. in k. chaudhuri and r. salakhutdinov, editors, proceedings of the 36th international conference on machine learning, icml 2019, 9-15 june 2019, long beach, california, usa, volume 97 of proceedings of machine learning research, pages 1203-1212. pmlr, 2019.  
+[12] k. choromanski, m. rowland, t. sarlós, v. sindhwani, r. e. turner, and a. weller. the geometry of random features. in a. j. storkey and f. pérez-cruz, editors, international conference on artificial intelligence and statistics, aistats 2018, 9-11 april 2018, playa blanca, lanzarote, canary islands, spain, volume 84 of proceedings of machine learning research, pages 1-9. pmlr, 2018.  
+[13] k. m. choromanski, m. rowland, and a. weller. the unreasonable effectiveness of structured random orthogonal embeddings. in i. guyon, u. von luxburg, s. bengio, h. m. wallach, r. fergus, s. v. n. vishwanathan, and r. garnett, editors, advances in neural information processing systems 30: annual conference on neural information processing systems 2017, 4-9 december 2017, long beach, ca, usa, pages 219-228, 2017.  
+[14] q. cong, i. anishchenko, s. ovchinnikov, and d. baker. protein interaction networks revealed by proteome coevolution. science, 365(6449):185-189, 2019.  
+[15] u. consortium. uniprot: a worldwide hub of protein knowledge. *nucleic acids research*, 47(d1):d506–d515, 2019.  
+[16] t. h. cormen, c. e. leiserson, r. l. rivest, and c. stein. introduction to algorithms, 3rd edition. mit press, 2009.
+
+[17] z. dai*, z. yang*, y. yang, w. w. cohen, j. carbonell, q. v. le, and r. salakhutdinov. transformer-xl: language modeling with longer-term dependency, 2019.  
+[18] m. dehghani, s. gouws, o. vinyals, j. uszkoreit, and l. kaiser. universal transformers. in 7th international conference on learning representations, iclr 2019, new orleans, la, usa, may 6-9, 2019. openreview.net, 2019.  
+[19] j. devlin, m. chang, k. lee, and k. toutanova. bert: pre-training of deep bidirectional transformers for language understanding. corr, abs/1810.04805, 2018.  
+[20] y. du, j. meier, j. ma, r. fergus, and a. rives. energy-based models for atomic-resolution protein conformations. arxiv preprint arxiv:2004.13167, 2020.  
+[21] a. elnaggar, m. heinzinger, c. dallago, and b. rost. end-to-end multitask learning, from protein language to protein features without alignments. biorxiv, page 864405, 2019.  
+[22] r. frostig, m. johnson, and c. leary. compiling machine learning programs via high-level tracing. in conference on machine learning and systems 2018, 2018.  
+[23] j. fu, j. liu, h. tian, y. li, y. bao, z. fang, and h. lu. dual attention network for scene segmentation. in ieee conference on computer vision and pattern recognition, cvpr 2019, long beach, ca, usa, june 16-20, 2019, pages 3146-3154, 2019.  
+[24] a. gulati, j. qin, c.-c. chiu, n. parmar, y. zhang, j. yu, w. han, s. wang, z. zhang, y. wu, and r. pang. conformer: convolution-augmented transformer for speech recognition, 2020.  
+[25] i. gulrajani, f. ahmed, m. arjovsky, v. dumoulin, and a. c. courville. improved training of wasserstein gans. in i. guyon, u. von luxburg, s. bengio, h. m. wallach, r. fergus, s. v. n. vishwanathan, and r. garnett, editors, advances in neural information processing systems 30: annual conference on neural information processing systems 2017, 4-9 december 2017, long beach, ca, usa, pages 5767-5777, 2017.  
+[26] t. a. hopf, l. j. colwell, r. sheridan, b. rost, c. sander, and d. s. marks. three-dimensional structures of membrane proteins from genomic sequencing. cell, 149(7):1607-1621, 2012.  
+[27] c. a. huang, a. vaswani, j. uszkoreit, i. simon, c. hawthorne, n. shazeer, a. m. dai, m. d. hoffman, m. dinculescu, and d. eck. music transformer: generating music with long-term structure. in 7th international conference on learning representations, iclr 2019, new orleans, la, usa, may 6-9, 2019. openreview.net, 2019.  
+[28] j. ingraham, v. garg, r. barzilay, and t. jaakkola. generative models for graph-based protein design. in advances in neural information processing systems, pages 15794-15805, 2019.  
+[29] n. kitaev, l. kaiser, and a. levskaya. reformer: the efficient transformer. in 8th international conference on learning representations, iclr 2020, addis ababa, ethiopia, april 26-30, 2020. openreview.net, 2020.  
+[30] o. kovaleva, a. romanov, a. rogers, and a. rumshisky. revealing the dark secrets of bert. arxiv preprint arxiv:1908.08593, 2019.  
+[31] r. e. ladner and m. j. fischer. parallel prefix computation. j. acm, 27(4):831-838, oct. 1980.  
+[32] h. lin, h. chen, t. zhang, c. laroche, and k. choromanski. demystifying orthogonal monte carlo and beyond. corr, abs/2005.13590, 2020.  
+[33] h. luo, s. zhang, m. lei, and l. xie. simplified self-attention for transformer-based end-to-end speech recognition. corr, abs/2005.10463, 2020.  
+[34] a. madani, b. mccann, n. naik, n. s. keskar, n. anand, r. r. eguchi, p. huang, and r. socher. progen: language modeling for protein generation. corr, abs/2004.03497, 2020.  
+[35] j. marcandalli, b. fiala, s. ols, m. perotti, w. de van der schueren, j. snijder, e. hodge, m. benhaim, r. ravichandran, l. carter, et al. induction of potent neutralizing antibody responses by a designed protein nanoparticle vaccine for respiratory syncytial virus. cell, 176(6):1420-1431, 2019.  
+[36] s. ovchinnikov, h. kamisetty, and d. baker. robust and accurate prediction of residue-residue interactions across protein interfaces using evolutionary information. *elife*, 3:e02030, 2014.  
+[37] n. parmar, a. vaswani, j. uszkoreit, l. kaiser, n. shazeer, a. ku, and d. tran. image transformer. in j. g. dy and a. krause, editors, proceedings of the 35th international conference on machine learning, icml 2018, stockholm, sweden, july 10-15, 2018, volume 80 of proceedings of machine learning research, pages 4052-4061. pmlr, 2018.
+
+[38] j. w. rae, a. potapenko, s. m. jayakumar, c. hillier, and t. p. lillicrap. compressive transformers for long-range sequence modelling. in international conference on learning representations, 2020.  
+[39] a. rahimi and b. recht. random features for large-scale kernel machines. in j. c. platt, d. koller, y. singer, and s. t. roweis, editors, advances in neural information processing systems 20, proceedings of the twenty-first annual conference on neural information processing systems, vancouver, british columbia, canada, december 3-6, 2007, pages 1177-1184. curran associates, inc., 2007.  
+[40] a. rives, s. goyal, j. meier, d. guo, m. ott, c. zitnick, j. ma, and r. fergus. biological structure and function emerge from scaling unsupervised learning to 250 million protein sequences. *bioarxiv*, 04 2019.  
+[41] m. rowland, j. hron, y. tang, k. choromanski, t. sarlós, and a. weller. orthogonal estimation of wasserstein distances. in k. chaudhuri and m. sugiyama, editors, the 22nd international conference on artificial intelligence and statistics, aistats 2019, 16-18 april 2019, naha, okinawa, japan, volume 89 of proceedings of machine learning research, pages 186-195. pmlr, 2019.  
+[42] a. roy, m. saffar, a. vaswani, and d. grangier. efficient content-based sparse attention with routing transformers. corr, abs/2003.05997, 2020.  
+[43] e. strubell, a. ganesh, and a. mccallum. energy and policy considerations for deep learning in nlp. corr, abs/1906.02243, 2019.  
+[44] y. tang, d. nguyen, and d. ha. neuroevolution of self-interpretable agents. corr, abs/2003.08165, 2020.  
+[45] y.-h. h. tsai, s. bai, m. yamada, l.-p. morency, and r. salakhutdinov. transformer dissection: an unified understanding for transformer's attention via the lens of kernel. in proceedings of the 2019 conference on empirical methods in natural language processing and the 9th international joint conference on natural language processing (emnlp-ijcnlp), pages 4335-4344, 2019.  
+[46] a. vaswani, n. shazeer, n. parmar, j. uszkoreit, l. jones, a. n. gomez, l. u. kaiser, and i. polosukhin. attention is all you need. in i. guyon, u. v. luxburg, s. bengio, h. wallach, r. fergus, s. vishwanathan, and r. garnett, editors, advances in neural information processing systems 30, pages 5998-6008. curran associates, inc., 2017.  
+[47] p. velickovic, g. cucurull, a. casanova, a. romero, p. lio, and y. bengio. graph attention networks. in 6th international conference on learning representations, iclr 2018, vancouver, bc, canada, april 30 - may 3, 2018, conference track proceedings. openreview.net, 2018.  
+[48] j. vig. a multiscale visualization of attention in the transformer model. arxiv preprint arxiv:1906.05714, 2019.  
+[49] j. vig and y. belinkov. analyzing the structure of attention in a transformer language model. corr, abs/1906.04284, 2019.  
+[50] j. vig, a. madani, l. r. varshney, c. xiong, r. socher, and n. f. rajani. bertology meets biology: interpreting attention in protein language models. corr, abs/2006.15222, 2020.  
+[51] o. vinyals, m. fortunato, and n. jaitly. pointer networks. in advances in neural information processing systems 28: annual conference on neural information processing systems 2015, december 7-12, 2015, montreal, quebec, canada, pages 2692-2700, 2015.  
+[52] m. weigt, r. a. white, h. szurmant, j. a. hoch, and t. hwa. identification of direct residue contacts in protein-protein interaction by message passing. proceedings of the national academy of sciences, 106(1):67-72, 2009.  
+[53] t. xiao, y. li, j. zhu, z. yu, and t. liu. sharing attention weights for fast transformer. in s. kraus, editor, proceedings of the twenty-eighth international joint conference on artificial intelligence, ijcai 2019, macao, china, august 10-16, 2019, pages 5292-5298. ijcai.org, 2019.  
+[54] z. yang, d. yang, c. dyer, x. he, a. j. smola, and e. h. hovy. hierarchical attention networks for document classification. in k. knight, a. nenkova, and o. rambow, editors, *naacl hlt* 2016, the 2016 conference of the north american chapter of the association for computational linguistics: human language technologies, san diego california, usa, june 12-17, 2016, pages 1480-1489. the association for computational linguistics, 2016.
+
+[55] h. you, c. li, p. xu, y. fu, y. wang, x. chen, r. g. baraniuk, z. wang, and y. lin. drawing early-bird tickets: toward more efficient training of deep networks. in international conference on learning representations, 2020.  
+[56] f. x. yu, a. t. suresh, k. m. choromanski, d. n. holtmann-rice, and s. kumar. orthogonal random features. in d. d. lee, m. sugiyama, u. von luxburg, i. guyon, and r. garnett, editors, advances in neural information processing systems 29: annual conference on neural information processing systems 2016, december 5-10, 2016, barcelona, spain, pages 1975-1983, 2016.  
+[57] v. f. zambaldi, d. raposo, a. santoro, v. bapst, y. li, i. babuschkin, k. tuyls, d. p. reichert, t. p. lillicrap, e. lockhart, m. shanahan, v. langston, r. pascanu, m. botvinick, o. vinyals, and p. w. battaglia. deep reinforcement learning with relational inductive biases. in 7th international conference on learning representations, iclr 2019, new orleans, la, usa, may 6-9, 2019, 2019.
+
+# appendix: masked language modeling for proteins via linearly scalable long-context transformers
+
+# a theoretical results
+
+we provide here the proof of theorem 1 from the main body.
+
+proof. we consider first the case of the default favor setting with r-orf mechanism turned on. we rely on theorem 3 from [32]. note that we can apply it in our case, since for rbf kernels the corresponding function  $f$  is cos (thus in particular it is bounded). also, it is not hard to observe (see for instance analysis in claim 1 from [39]) that  $l_{f} = 1$ . using theorem 3 from [32], we conclude that:
+
+$$
+\left\| \widehat {\mathbf {b}} - \mathbf {b} \right\| _ {1} \leq \delta \tag {15}
+$$
+
+with any constant probability as long as  $m = \omega\left(\frac{d}{\delta^2}\right) \log \left(\frac{\sigma \cdot \mathrm{diam}(\mathcal{m})}{\delta}\right)$ , where  $\sigma = \mathbb{e}[\omega^\top \omega]$  and  $\mathcal{m}$  is the diameter of the smallest ball  $\mathcal{m}$  containing all vectors of the form  $\mathbf{z} = \frac{\mathbf{q}_i}{d^{\frac{1}{4}}} - \frac{\mathbf{k}_j}{d^{\frac{1}{4}}}$ . since  $\| \mathbf{q}_i \|_2, \| \mathbf{k}_j \|_2 \leq r$ , we conclude that  $\| \mathbf{z} \|_2 \leq \frac{2r}{d^{\frac{1}{4}}}$  and thus one can take  $\mathrm{diam}(\mathcal{m}) = \frac{4r}{d^{\frac{1}{4}}}$ . we have:
+
+$$
+\left\| \widehat {\mathbf {a}} - \mathbf {a} \right\| _ {1} = \left\| \mathbf {d} _ {\mathbf {q}} (\widehat {\mathbf {b}} - \mathbf {b}) \mathbf {d} _ {\mathbf {k}} \right\| _ {1} \leq \left\| \mathbf {d} _ {\mathbf {q}} \right\| _ {1} \left\| \widehat {\mathbf {b}} - \mathbf {b} \right\| _ {1} \left\| \mathbf {d} _ {\mathbf {k}} \right\| _ {1} \leq \delta g ^ {*} h ^ {*} \tag {16}
+$$
+
+taking  $\delta = \frac{\epsilon}{g^{*}h^{*}}$  completes the proof.
+
+![](images/873220b98edb56206a6badecde680e5c510583836898c70be42f3e3f46cc6b57.jpg)
+
+# b hyperparameters
+
+this optimal setting (including comparisons to approximate softmax) we use for the performer is specified in the generalized attention (subsection b.3), and unless specifically mentioned (e.g. using name "performer-softmax"), "performer" refers to using this generalized attention setting.
+
+# b.1 training hyperparameters
+
+all performer + transformer runs used 0.5 grad clip, 0.1 weight decay, 0.1 dropout,  $10^{-3}$  fixed learning rate with adam hyperparameters  $(\beta_{1} = 0.9, \beta_{2} = 0.98, \epsilon = 10^{-9})$ , with batch size maximized (until tpu memory overload) for a specific model. for the reformer, we used the same hyperparameters as mentioned for protein experiments, without gradient clipping, while using the defaults<sup>1</sup> (which instead use learning rate decay) for imagenet-64. in both cases, the reformer used the same default lsh attention parameters.
+
+all 36-layer protein experiments used the same amount of compute (i.e. 16x16 tpu-v2, 8gb per chip). for concatenated experiments, 16x16 tpu-v2's were also used for the performer, while 8x8's were used for the 1-3 layer ( $d = 256$ ) transformer models (using 16x16 did not make a difference in accuracy).
+
+# b.2 approximate softmax attention default values
+
+the optimal values, set to default parameters $^2$ , are: renormalizeattention = true, numerical stabilizer  $= 10^{-6}$ , number of features  $= 256$ , ortho_features = true, ortho_scaling = 0.0.
+
+# b.3 generalized attention default values
+
+the optimal values, set to default parameters $^3$ , are: renormalizeattention = true, numerical stabilizer  $= 0.0$ , number of features  $= 256$ , kernel = relu, kernel_epsilon =  $10^{-3}$ .
+
+# c experimental details for protein modeling tasks
+
+# c.1 trembl dataset
+
+<table><tr><td rowspan="2">dataset</td><td rowspan="2">set name</td><td rowspan="2">count</td><td colspan="5">length statistics</td></tr><tr><td>min</td><td>max</td><td>mean</td><td>std</td><td>median</td></tr><tr><td rowspan="4">trembl</td><td>train</td><td>104,863,744</td><td>2</td><td>74,488</td><td>353.09</td><td>311.16</td><td>289.00</td></tr><tr><td>valid</td><td>102,400</td><td>7</td><td>11,274</td><td>353.62</td><td>307.42</td><td>289.00</td></tr><tr><td>test</td><td>1,033,216</td><td>8</td><td>32,278</td><td>353.96</td><td>312.23</td><td>289.00</td></tr><tr><td>ood</td><td>29,696</td><td>24</td><td>4,208</td><td>330.96</td><td>269.86</td><td>200.00</td></tr><tr><td rowspan="2">trembl (concat)</td><td>train</td><td>4,532,224</td><td>8,192</td><td>8,192</td><td>8,192</td><td>0</td><td>8,192</td></tr><tr><td>valid</td><td>4,096</td><td></td><td></td><td></td><td></td><td></td></tr></table>
+
+table 1: statistics for the trembl single sequence and the long sequence task.
+
+we used the trembl dataset<sup>4</sup>, which contains 139,394,261 sequences of which 106,030,080 are unique. while the training dataset appears smaller than the one used in madani et al. [34], we argue that it includes most of the relevant sequences. specifically, the trembl dataset consists of the subset of uniprotkb sequences that have been computationally analyzed but not manually curated, and accounts for  $\approx 99.5\%$  of the total number of sequences in the uniprotkb dataset<sup>5</sup>.
+
+following the methodology described in madani et al. [34], we used both an ood-test set, where a selected subset of pfam families are held-out for valuation, and an iid split, where the remaining protein sequences are split randomly into train, valid, and test tests. we held-out the following protein families (pf18369, pf04680, pf17988, pf12325, pf03272, pf03938, pf17724, pf10696, pf11968, pf04153, pf06173, pf12378, pf04420, pf10841, pf06917, pf03492, pf06905, pf15340, pf17055, pf05318), which resulted in 29,696 ood sequences. we note that, due to dedduplication and potential trembl version mismatch, our ood-test set does not match exactly the one in madani et al. [34]. we also note that this ood-test selection methodology does not guarantee that the evaluation sequences are within a minimum distance from the sequences used during training. in future work, we will include rigorous distance based splits.
+
+the statistics for the resulting dataset splits are reported in table 1. in the standard sequence modeling task, given the length statistics that are reported in the table, we clip single sequences to maximum length  $l = 1024$ , which results in few sequences being truncated significantly.
+
+in the long sequence task, the training and validation sets are obtained by concatenating the sequences, separated by an end-of-sequence token, and grouping the resulting chain into non-overlapping sequences of length  $l = 8192$ .
+
+# c.2 empirical baseline
+
+![](images/9a6d615ecdddeec995e63260346dfed63c80b42d89758fc3f59a019f9b22cd6a.jpg)  
+figure 6: visualization of the estimated empirical distribution for the 20 standard amino acids, colored by their class. note the consistency with the statistics on the trembl web page.
+
+a random baseline, with uniform probability across all the vocabulary tokens at every position, has accuracy  $5\%$  (when including only the 20 standard amino acids) and  $4\%$  (when also including the 5 anomalous amino acids [15]). however, the empirical frequencies of the various amino acids in our
+
+dataset may be far from uniform, so we also consider an empirical baseline where the amino acid probabilities are proportional to their empirical frequencies in the training set.
+
+figure 6 shows the estimated empirical distribution. we use both the standard and anomalous amino acids, and we crop sequences to length 1024 to match the data processing performed for the transformer models. the figure shows only the 20 standard amino acids, colored by their class, for comparison with the visualization on the trembl web page<sup>6</sup>.
+
+# c.3 tabular results
+
+table 2 contains the results on the single protein sequence modeling task ( $l = 1024$ ). we report the following evaluation metrics:
+
+1. accuracy: for unidirectional models, we measure the accuracy on next-token prediction, averaged across all sequence positions in the dataset. for bidirectional models, we mask each token with  $15\%$  probability and measure accuracy across the masked positions.  
+2. perplexity: for unidirectional models, we measure perplexity across all sequence positions in the dataset. for bidirectional models, similar to the accuracy case, we measure perplexity across the masked positions.
+
+<table><tr><td>model type</td><td>set name</td><td>model</td><td>accuracy</td><td>perplexity</td></tr><tr><td rowspan="6">uni</td><td rowspan="3">test</td><td>empirical baseline</td><td>9.92</td><td>17.80</td></tr><tr><td>transformer</td><td>30.80</td><td>9.37</td></tr><tr><td>performer (generalized)</td><td>31.58</td><td>9.17</td></tr><tr><td rowspan="3">ood</td><td>empirical baseline</td><td>9.07</td><td>17.93</td></tr><tr><td>transformer</td><td>19.70</td><td>13.20</td></tr><tr><td>performer (generalized)</td><td>18.44</td><td>13.63</td></tr><tr><td rowspan="6">bid</td><td rowspan="3">test</td><td>transformer</td><td>33.32</td><td>9.22</td></tr><tr><td>performer (generalized)</td><td>36.09</td><td>8.36</td></tr><tr><td>performer (softmax)</td><td>33.00</td><td>9.24</td></tr><tr><td rowspan="3">ood</td><td>transformer</td><td>25.07</td><td>12.09</td></tr><tr><td>performer (generalized)</td><td>24.10</td><td>12.26</td></tr><tr><td>performer (softmax)</td><td>23.48</td><td>12.41</td></tr></table>
+
+table 2: results on single protein sequence modeling ( $l = 1024$ ). we note that the empirical baseline results are applicable to both the unidirectional (uni) and bidirectional (bid) models.
+
+# c.4 attention matrix illustration
+
+in this section we illustrate the attention matrices produced by a performer model. we focus on the bidirectional case and choose one performer model trained on the standard single-sequence trembl task for over 500k steps. the same analysis can be applied to unidirectional performers as well.
+
+we note that while the transformer model instantiates the attention matrix in order to compute the attention output that incorporates the (queries  $q$ , keys  $k$ , values  $v$ ) triplet (see eq. 1 in the main paper), the favor mechanism returns the attention output directly (see algorithm 1). to account for this discrepancy, we extract the attention matrices by applying each attention mechanism twice: once on each original  $(q, k, v)$  triple to obtain the attention output, and once on a modified  $(q, k, v^{\circ})$  triple, where  $v^{\circ}$  contains one-hot indicators for each position index, to obtain the attention matrix. the choice of  $v^{\circ}$  ensures that the dimension of the attention output is equal to the sequence length, and that a non-zero output on a dimension  $i$  can only arise from a non-zero attention weight to the  $i^{th}$  sequence position. indeed, in the transformer case, when comparing the output of this procedure with the instantiated attention matrix, the outputs match.
+
+attention matrix example. we start by visualizing the attention matrix for an individual protein sequence. we use the bpt1_bovin protein sequence<sup>7</sup>, one of the most extensively studied globular proteins, which contains 100 amino acids. in figure 7, we show the attention matrices for the first 4 layers. note that many heads show a diagonal pattern, where each node attends to its neighbors, and some heads show a vertical pattern, where each head attends to the same fixed positions. these patterns are consistent with the patterns found in transformer models trained on natural language [30]. in figure 9 we highlight these attention patterns by focusing on the first 25 tokens, and in figure 8, we illustrate in more detail two attention heads.
+
+amino acid similarity. furthermore, we analyze the amino-acid similarity matrix estimated from the attention matrices produced by the performer model, as described in vig et al. [50]. we aggregate the attention matrix across 800 sequences. the resulting similarity matrix is illustrated in figure 10. note that the performer recognises highly similar amino acid pairs such as (d, e) and (f, y).
+
+![](images/326535b39e1a1820b3d3344a75641a6fb981aeba7a3a09f83c43f5a0d4866092.jpg)  
+figure 7: we show the attention matrices for the first 4 layers and all 8 heads (each row is a layer, each column is head index, each cell contains the attention matrix across the entire bpt1_bovin protein sequence). note that many heads show a diagonal pattern, where each node attends to its neighbors, and some heads show a vertical pattern, where each head attends to the same fixed positions.
+
+![](images/8ec9d11d0c4b9cbfe82c431e7aeda5b887da85cd97fa3fa05de40d54db164f6b.jpg)  
+figure 8: we illustrate in more detail two attention heads. the sub-figures correspond respectively to: (1) head 1-2 (second layer, third head), (2) head 4-1 (fifth layer, second head). note the block attention in head 1-2 and the vertical attention (to the start token ('m') and the 85th token ('c')) in head 4-1.
+
+![](images/c4ae0b3582608621e83c69232a597e5035faf9a3e93e80000ebe322bb7a291f7.jpg)  
+figure 9: we highlight the attention patterns by restricting our attention to the first 25 tokens (note that we do not renormalize the attention to these tokens). the illustration is based on vig et al. [48, 49]. note that, similar to prior work on protein transformers [34], the attention matrices include both local and global patterns.
+
+![](images/356cefabfa46281e76b713d017e9f5a6b63a4db546d964f0311c23b5102f03f5.jpg)  
+figure 10: amino acid similarity matrix estimated from attention matrices aggregated across a small subset of sequences, as described in vig et al. [50]. the sub-figures correspond respectively to: (1) the normalized blosum matrix, (2) the amino acid similarity estimated via a trained performer model. note that the performer recognises highly similar amino acid pairs such as (d, e) and (f, y).
+
+![](images/01a69433b84dea09d5f28a5020d2d83d5496b667704c11b33d0ffc231c9e4036.jpg)
+
+# d extended approximation results
+
+# d.1 backwards compatibility
+
+although mentioned previously (sec. 4.2) that the performer with additional finetuning is backwards compatible with the transformer, we demonstrate below in fig. 11 that error propagation due to nonattention components of the transformer is one of the primary reasons that pretrained transformer weights cannot be immediately used for inference on the corresponding performer.
+
+# d.2 generalized attention
+
+we investigated generalized attention mechanisms (mentioned in sec. 2.2) on trembl when  $l = 512$  for various kernel functions. this is similar to [45] which also experiments with various attention kernels for natural language. using hyperparameter sweeps across multiple variables in favor, we compared several kernels and also renormalization on/off (fig. 12 and fig. 13), where renormalize corresponds to applying  $\mathbf{d}^{-1}$  operator in attention, as for the standard mechanism, though we noticed that disabling it does not necessarily hurt accuracy) to produce the best training configuration for the performer. we note that the effective batch size slightly affects the rankings
+
+![](images/71c0352b5f3bc417025e52ca7fdfe30ba0410e725fa9d0ddf0c3bc2d6b1fda49.jpg)  
+performer approx. error  
+figure 11: output approximation errors between a vanilla transformer and a performer (with orthogonal features) for varying numbers of layers.
+
+(as shown by the difference between 2x2 and 4x4 tpu runs) - we by default use the generalized relu kernel with other default hyperparameters shown in appendix b, as we observed that they are empirically optimal for large batch size runs (i.e. 8x8 or 16x16 tpu's).
+
+![](images/26fcebc5d383b2876f886b4f5aa06f23a6d1bbd8c63c5c9de46468cdff68f6f4.jpg)  
+figure 12: to emphasize the highest accuracy runs but also show the nan issues with certain kernels which caused runs to stop early, we set both x and y axes to be log-scale. we tested kernels defined by different functions  $f$  (see: sec. 2.2): sigmoid, exponential, relu, absolute, gelu, cosine (original softmax approximation), tanh, and identity. all training runs were performed on 2x2 tpu-v2's, 128 batch size per device.
+
+![](images/3ec601fc93ab6f7dd530ec17a519ef4bb2b183656bcb544053e70dc4d5a85cb8.jpg)  
+figure 13: we also performed a similar setup as fig. 12 for 4x4 tpu-v2's.
+
+# e extended computation costs
+
+in this subsection, we empirically measure computational costs in terms of wall clock time on forward and backward passes for three scenarios in fig. 14, 15:
+
+1. performer, with varying number of layers. we show that our method can scale up to (but not necessarily limited to) even 20 layers.  
+2. attention time complexities when comparing standard attention (from transformer) and favor (from performer). note that the maximum memory size here is not reflective of the maximum memory size in an actual model (shown below), as this benchmark requires computing explicit tensors (causing memory increases) in jax, while a model does not.  
+3. time complexities when comparing the transformer and performer models. "x" (opt) denotes the maximum possible speedup achievable, when attention simply returns the v-vector, showing that the performer is nearly optimal. we see that the maximum possible power of 2 length allowed on a v100 gpu (16gb) is  $2^{15} = 32768$  using regular dimensions.
+
+since some of the computational bottleneck in the transformer may originate from the extra feedforward layers [29], we also benchmark the "small" version, i.e.  $(n_{\text{heads}}, n_{\text{layers}}, d_{ff}, d) = (1, 6, 64, 64)$  as well, when the attention component is the dominant source of computation and memory. we remind the reader that the "regular" version consists of  $(n_{\text{heads}}, n_{\text{layers}}, d_{ff}, d) = (8, 6, 2048, 512)$ .
+
+![](images/e1cb67956c97c12cf38df3525ff348cd0883e6764083f4a489eb3b5a36591f8e.jpg)
+
+![](images/40264b5eb0511df14b67182ae8363c1588f9e03c9104e623500fef8729518753.jpg)
+
+![](images/533ece5adf9644e3c001b347e0dc4b13895e97c9fe7f1c24f10e4ef3d094842a.jpg)
+
+![](images/50cdfadac9e489fe8d651582e86d16a05ff86bd9bcfde2972e3ea0236cc41ea0.jpg)
+
+![](images/c975bbc5db50c36af8f5b990a86d2ae9277666f91cf7f3abc21404d0feab5562.jpg)
+
+![](images/d55fb7670cc095733faf1b5031476d2de784fa81cec842bf06d6e72d4f26a64e.jpg)
+
+![](images/74e0f11b8b277d9a6d15031a05009b3cafeed4d91edd3f8f3d99ebaf311f56be.jpg)  
+figure 14: captions (1), (2) for each  $2 \times 2$  subfigure mentioned above.
+
+![](images/43d04a19eaee63c2f5befcb2cb6336b57c2273b95d98235d6501a30fe4d34f84.jpg)
+
+![](images/d04bdaff602cc4eecdb0322039c88995bf12aaa6b25404b63dca8597c63d5332.jpg)
+
+![](images/9b1bc91f5babef2652bb2c5885b60bbc70b678fa6e4035bb1b48c389554c6a37.jpg)
+
+![](images/1c63979e798c798534a437e6be7f1236efdfb3fa983017f582d003c7cbd93a43.jpg)
+
+![](images/db21dbea1446a903447c133229ad5368a8699581609a4c061513283b90d7d274.jpg)  
+figure 15: caption (3) for this  $2 \times 2$  subfigure mentioned above.

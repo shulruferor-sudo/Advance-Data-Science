@@ -1,0 +1,508 @@
+# tsunami: a learned multi-dimensional index for correlated data and skewed workloads
+
+jialin ding, vikram nathan, mohammad alizadeh, tim kraska
+
+massachusetts institute of technology
+
+# abstract
+
+filtering data based on predicates is one of the most fundamental operations for any modern data warehouse. techniques to accelerate the execution of filter expressions include clustered indexes, specialized sort orders (e.g., z-order), multi-dimensional indexes, and, for high selectivity queries, secondary indexes. however, these schemes are hard to tune and their performance is inconsistent. recent work on learned multi-dimensional indexes has introduced the idea of automatically optimizing an index for a particular dataset and workload. however, the performance of that work suffers in the presence of correlated data and skewed query workloads, both of which are common in real applications. in this paper, we introduce tsunami, which addresses these limitations to achieve up to  $6 \times$  faster query performance and up to  $8 \times$  smaller index size than existing learned multi-dimensional indexes, in addition to up to  $11 \times$  faster query performance and  $170 \times$  smaller index size than optimally-tuned traditional indexes.
+
+# 1 introduction
+
+filtering through data is the foundation of any analytical database engine, and several advances over the past several years specifically target database filter performance. for example, column stores [11] delay or entirely avoid accessing columns (i.e., dimensions) which are not relevant to a query, and they often sort the data by a single dimension in order to skip over records that do not match a query filter over that dimension.
+
+if data has to be filtered by more than one dimension, secondary indexes can be used. unfortunately, their large storage overhead and the latency incurred by chasing pointers make them viable only when the predicate on the indexed dimension has a very high selectivity. an alternative approach is to use (clustered) multi-dimensional indexes; these may be tree-based data structures (e.g., k-d trees, r-trees, or octrees) or a specialized sort order over multiple dimensions (e.g., a space-filling curve like z-ordering or hand-picked hierarchical sort). many state-of-the-art analytical database systems use multidimensional indexes or sort orders to improve the scan performance of queries with predicates over several columns [1, 8, 16].
+
+however, multi-dimensional indexes have significant drawbacks. first, these techniques are hard to tune and require an admin to carefully pick which dimensions to index, if any at all, and the order in which they are indexed. this decision must be revisited every time the data or workload changes, requiring extensive manual labor to maintain performance. second, there is no single approach (even if tuned correctly) that dominates all others [30].
+
+to address the shortcomings of traditional indexes, recent work has proposed the idea of learned multi-dimensional indexes [9, 25, 30, 44, 46]. in particular, flood [30] is a in-memory multi-dimensional index that automatically optimizes its structure to achieve high performance on a particular dataset and workload. in contrast to
+
+traditional multi-dimensional indexes, such as the k-d tree, which are created entirely based on the data (see fig. 1a), flood divides each dimension into some number of partitions based on the observed data and workload (see fig. 1b, explained in detail in §2). the cartesian product of the partitions in each dimension form a grid. furthermore, to reduce the index size, flood uses models of the cdf of each dimension to locate the data.
+
+however, flood faces a number of limitations in real-world scenarios. first, flood's grid cannot efficiently adapt to skewed query workloads in which query frequencies and filter selectivities vary across the data space. second, if dimensions are correlated, then flood cannot maintain uniformly sized grid cells, which degrades performance and memory usage.
+
+to address these limitations, we propose tsunami, an in-memory read-optimized learned multi-dimensional index that extends the ideas of flood with new data structures and optimization techniques. first, tsunami achieves high performance on skewed query workloads by using a lightweight decision tree, called a grid tree, to partition space into non-overlapping regions in a way that reduces query skew. second, tsunami achieves high performance on correlated datasets by indexing each region using an augmented grid, which uses two techniques—functional mappings and conditional cdfs—to efficiently capture information about correlations.
+
+while recent work explored how correlation can be exploited to reduce the size of secondary indexes [20, 45], our work goes much further. we demonstrate not only how to leverage correlation to achieve faster and more compact multi-dimensional indexes (in which the data is organized based on the index) rather than secondary indexes, but also how to integrate the optimization for query skew and data correlation into a full end-to-end solution. tsunami automatically optimizes the data storage organization as well as the multi-dimensional index structure based on the data and workload.
+
+like flood [30], tsunami is a clustered in-memory read-optimized index over an in-memory column store. in-memory stores are increasingly popular due to lower ram prices [19] and our focus on reads reflects the current trend towards avoiding in-place updates in favor of incremental merges (e.g., rocksdb [37]). we envision that tsunami could serve as the building block for a multi-dimensional in-memory key-value store or be integrated into commercial in-memory (offline) analytics accelerators like oracle's database inmemory (dbim) [35].
+
+in summary, we make the following contributions:
+
+(1) we design and implement tsunami, an in-memory read-optimized learned multi-dimensional index that self-optimizes to achieve high performance and robustness to correlated datasets and skewed workloads.  
+(2) we introduce two data structures, the grid tree and the augmented grid, along with new optimization procedures that enable tsunami to tailor its index structure and data organization strategy to handle data correlation and query skew.
+
+![](images/62d00fe49090d6e77598a374661e99e608a604432a3001fce12cd57fc8815d00.jpg)  
+figure 1: indexes must identify the points that fall in the green query rectangle. to do so, they scan the points in red. (a) k-d tree guarantees equally-sized regions but is not optimized for the workload. (b) flood is optimized using the workload but its structure is not expressive enough to handle query skew, and cells are unequally sized on correlated data. (c) tsunami is optimized using the workload, is adaptive to query skew, and maintains equally-sized cells within each region.
+
+![](images/b7ee9a6056d5af73b9da8fc7e5f97117fbc472ee32266749cb52ebcab3770dc3.jpg)
+
+![](images/e2de6c54bf7131d163401f16ecd7f03f8cec829afafe38509dca5b48af9fc634.jpg)
+
+(3) we evaluate tsunami against flood, the original in-memory learned multi-dimensional index, as well as a number of traditional non-learned indexes, on a variety of workloads over real datasets. we show that tsunami is up to  $6 \times$  and  $11 \times$  faster than flood and the fastest optimally-tuned non-learned index, respectively. tsunami is also adaptable to workload shift, and scales across data size, query selectivity, and dimensionality.
+
+in the remainder of this paper, we give background ( $\s 2$ ), present an overview of tsunami ( $\s 3$ ), introduce its two core components—grid tree ( $\s 4$ ) and augmented grid ( $\s 5$ ), present experimental results ( $\s 6$ ), review related work ( $\s 7$ ), propose future work ( $\s 8$ ), and conclude ( $\s 9$ ).
+
+# 2 background
+
+tsunami is an in-memory clustered multi-dimensional index for a single table. tsunami aims to increase the throughput performance of analytics queries by decreasing the time needed to filter records based on range predicates. tsunami supports queries such as:
+
+select sum(r.x)
+
+from mytable
+
+where  $(a\leq r,y\leq b)$  and  $(c\leq r,z\leq d)$
+
+where  $\mathrm{sum}(\mathsf{r},\mathsf{x})$  can be replaced by any aggregation. records in a  $d$ -dimensional table can be represented as points in  $d$ -dimensional data space. for the rest of this paper, we use the terms record and point interchangeably. to place tsunami in context, we first describe the k-d tree as an example of a traditional non-learned multi-dimensional index, and flood, which originally proposed the idea of learned in-memory multi-dimensional indexing.
+
+# 2.1 k-d tree: a traditional non-learned index
+
+the k-d tree [4] is a binary space-partitioning tree that recursively splits  $d$ -dimensional space based on the median value along each dimension, until the number of points in each leaf region falls below a threshold, called the page size. fig. 1a shows a k-d tree over 2-dimensional data that has 8 leaf regions. the points within each region are stored contiguously in physical storage (e.g., a column store). by construction, the leaf regions have a roughly equal number of points. to process a query (i.e., identify all points that match the query's filter predicates), the k-d tree traverses the tree to find all leaf regions that intersect the query's filter, then scans all points within those regions to identify points that match the filter predicates.
+
+the k-d tree structure is constructed based on the data distribution but independently of the query workload. that is, regardless of whether a region of the space is never queried or whether queries are more selective in some dimensions than others, the k-d tree would still build an index over all data points with the same page size and index overhead. while other traditional multi-dimensional indexes split space in different ways [3, 27, 31, 47], they all share the property that the index is constructed independent of the query workload.
+
+# 2.2 flood: a learned index
+
+in contrast, flood [30] does optimize its layout based on the workload (see fig. 1b). we first introduce how flood works, then explain its two key advantages over traditional indexes, then discuss two key limitations it has.
+
+given a  $d$ -dimensional dataset, flood first constructs compact models of the cdf of each dimension. the choice of modeling technique is orthogonal; flood uses an rmi [23], but one could also use a histogram or linear regression. flood uses these models to divide the domain of each dimension into equally-sized partitions: let  $p_i$  be the number of partitions in each dimension  $i \in [0,d)$ . then a point whose value in dimension  $i$  is  $x$  is placed into the  $\lfloor cdf_i(x) \cdot p_i \rfloor$ -th partition of dimension  $i$ , and similarly for all other dimensions. this guarantees that each partition in a given dimension has an equal number of points. when combined, the partitions of each dimension form a  $d$ -dimensional grid with  $\prod_{i \in [0,d]} p_i$  cells, which are ordered. the points within each cell are stored contiguously in physical storage.
+
+flood's query processing workflow has three steps, shown in fig. 1b: (1) using the per-dimension cdf models, identify the range of intersecting partitions in each dimension, and take the cartesian product to identify the set of intersecting cells. (2) for each intersecting cell, identify the corresponding range in physical storage using a lookup table. (3) scan all the points within those physical storage ranges, and identify the points that match all query filters.
+
+2.2.1 flood's strengths. flood has two key advantages over traditional indexes such as the k-d tree<sup>1</sup>. first, flood can automatically tune its grid structure for a given query workload by adjusting the number of partitions in each dimension to maximize query performance. for example, in fig. 1b, there are many queries in the upper-right region of the data space that have high selectivity over dimension y. therefore, flood's optimization technique will place more partitions in dimension y than dimension x, in order to reduce the number of points those queries need to scan. in other words, flood learns which dimensions to prioritize over others and adjusts the number of partitions accordingly, whereas non-learned approaches do not take the workload into account and treat all dimensions equally.
+
+flood's second key advantage is its cdf models. the advantage of indexing using compact cdf models, as opposed to a tree-based structure such as a k-d tree, is lower overhead in both space and time: storing  $d$  cdf models takes much less space than storing pointers and boundary keys for all internal tree nodes. it is also much faster to identify intersecting grid cells by invoking  $d$  cdf models than by pointer chasing to traverse down a tree index.
+
+the combination of these two key advantages allows flood to outperform non-learned indexes by up to three orders of magnitude while using up to  $50 \times$  smaller index size [30], despite the simplicity of the grid structure.
+
+2.2.2 flood's limitations. however, flood has two key limitations. first, flood only optimizes for the average query, which results in degraded performance when queries are not uniform. for example, in fig. 1b there are a few queries in the lower-left region of the data space that, unlike the many queries in the upper-right region, have high selectivity over dimension x. since these queries are a small fraction of the total workload, flood's optimization will not prioritize their performance. as a result, flood will need to scan a large number of points to create the query result (red points in fig. 1b). flood's uniform grid structure can only optimize for the average selectivity in each dimension and is not expressive enough to optimize for both the upper-right queries and lower-left queries independently. the
+
+workload in fig. 1 is an example of a skewed workload. query skew is common in real workloads: for example, queries often hit recent data more frequently than stale data, and operations monitoring systems only query for health metrics that are exceedingly low or high.
+
+second, flood's model-based indexing technique can result in unequally-sized cells when data is correlated. in fig. 1b, even though the cdf models guarantee that the three partitions over dimension x have an equal number of points, as do the six partitions over dimension y, the 18 grid cells are unequally sized. this degrades performance and space usage (§5.1). correlations are common in real data: for example, the price and distance of a taxi ride are correlated, as are the dates on which a package is shipped and received.
+
+the goal of our work, tsunami, is to maintain the two advantages of flood—optimization based on the query workload and a compact/fast model-based index structure—while also addressing flood's limitations in the presence of data correlations and query skew.
+
+# 3 tsunami design overview
+
+tsunami is a learned multi-dimensional index that is robust to data correlation and query skew. we first introduce the index structure and how it is used to process a query. we then provide an overview of the offline procedures we use to automatically optimize tsunami's structure.
+
+tsunami structure. tsunami is a composition of two independent data structures: the grid tree (§4) and the augmented grid (§5). the grid tree is a space-partitioning decision tree that divides  $d$ -dimensional data space into some number of non-overlapping regions. in fig. 1c, the grid tree divides data space into three regions by splitting on dimension x.
+
+within each region, there is an augmented grid. each augmented grid indexes the points that fall in its region. in fig. 1c, regions 1 and 3 each have their own augmented grid. region 2 is not given an augmented grid because no queries intersect its region. an augmented grid is essentially a generalization of flood's index structure that uses additional techniques to capture correlations. in fig. 1c, the augmented grids use  $f: y \to x$  and  $cdf(y|x)$  instead of flood's  $cdf(y)$  (explained in §5.2).
+
+tsunami query workflow. tsunami processes a query in three steps: (1) traverse the grid tree to find all regions that intersect the query's filter. (2) in each region, identify the set of intersecting augmented grid cells (\$5), then identify the corresponding range in physical storage using a lookup table. (3) scan all the points within those physical storage ranges, and identify the points that match all query filters.
+
+tsunami optimization. tsunami's offline optimization procedure has two steps: (1) optimize the grid tree using the full dataset and sample query workload ( $\s 4.3$ ). (2) in each region of the optimized grid tree, construct an augmented grid that is optimized over only the points and queries that intersect its region ( $\s 5.3$ ).
+
+intuitively, tsunami separates the two concerns of query skew and data correlations into its two component structures, grid tree and augmented grid, respectively. each structure is optimized in a way that addresses its corresponding concern. we now describe each structure in detail.
+
+![](images/d18cc1156dec9ac3c12f8152df466f53d80c2980ad044596987c56404ea5a653.jpg)  
+figure 2: a single grid cannot efficiently index a skewed query workload, but a combination of non-overlapping grids can. we use this workload as a running example.
+
+![](images/5d51cf46fb318e279a0952e83c3a79b2d8222ff4b6efc6fc2419963aeecf26a2.jpg)
+
+# 4 grid tree
+
+in this section, we first discuss the performance challenges posed by skewed workloads. we then formally define query skew, and we describe tsunami's solution for mitigating query skew: the grid tree.
+
+# 4.1 challenges of query skew
+
+a query workload is skewed if the characteristics of queries (e.g., frequency or selectivity) vary in different parts of the data space. fig. 2a shows an example of sales data from 2016 to 2020. points are uniformly distributed in time. the query workload is composed of two distinct query "types": the red queries  $q_{r}$  filter uniformly over one-year spans, whereas the green queries  $q_{g}$  filter over one-month spans only over the last year. if we were to impose a grid over the data space, we intuitively would want many partitions over the past year in order to obtain finer granularity for  $q_{g}$ , whereas partitions prior to 2019 should be more widely spaced, because  $q_{r}$  does not require much granularity in time. however, with a single grid it is not possible accommodate both while maintaining an equal number of points in each partition (fig. 2a).
+
+instead, we can split the data space into two regions: before 2019 and after 2019 (fig. 2b). each region has its own grid, and the two grids are independent. the right region can therefore tailor its grid for  $q_{g}$  by creating many partitions over time. on the other hand, the left region does not need to worry about  $q_{g}$  at all and places few partitions over time, and can instead add more partitions over the sales dimension. this intuition drives our solution for tackling query skew.
+
+# 4.2 reducing query skew with a grid tree
+
+we first formally define query skew. we then describe at a high level how grid tree tackles query skew and how to process queries using the grid tree. we then describe how to find the optimal grid tree for a given dataset and query workload. we use the terminology in tab. 1.
+
+4.2.1 definition of query skew. the skew of a set of queries  $q$  with respect to a range  $[a, b)$  in dimension  $i$  is
+
+$$
+s k e w _ {i} (q, a, b) = e m d (u n i _ {i} (a, b), p d f _ {i} (q, a, b))
+$$
+
+where  $uni_{i}(a,b)$  is a uniform distribution over  $[a,b)$  and  $pdf_{i}(q,a,b)$  is the empirical pdf of queries in  $q$  over  $[a,b)$ . each query contributes
+
+table 1: terms used to describe the grid tree  
+
+<table><tr><td>term</td><td>description</td></tr><tr><td>d</td><td>dimensionality of the dataset</td></tr><tr><td>s</td><td>d-dimensional data space: [0, x0) ×··· × [0,xd-1)</td></tr><tr><td>q</td><td>set of queries</td></tr><tr><td>uni i(a,b)</td><td>uniform distribution over [a,b) in dimension i ∈ [0,d)</td></tr><tr><td>pdfi(q,a,b)</td><td>empirical pdf of queries q over [a,b) in dimension i</td></tr><tr><td>hist i(q,a,b,n)</td><td>approximate pdf of queries q over range [a,b) in dimension i using a histogram with n bins</td></tr><tr><td>emd(p1,p2)</td><td>earth mover&#x27;s distance between distributions p1, p2</td></tr><tr><td>skew i(q,a,b)</td><td>skew of query set q over range [a,b) in dimension i</td></tr></table>
+
+![](images/581b417df75fca80155f34a10bfb8ac21ee41b08d9a9351bd2baa40cabfcd6e1.jpg)  
+figure 3: query skew is computed independently for each query type  $(q_{g}$  and  $q_{r})$  and is defined as the statistical distance between the empirical pdf of the queries and the uniform distribution.
+
+a unit mass to the pdf, spread over its filter range in dimension  $i$ . emd is the earth mover's distance, which is a measure of the distance between two probability distributions.
+
+fig. 3a shows the same data and workload as in fig. 2. fig. 3b-c show the pdf of  $q_{g}$  and  $q_{r}$ , respectively. the skew is intuitively visualized (though not technically equal to) the shaded area between the pdf and the uniform distribution. although  $q_{g}$  is highly skewed over the time dimension, fig. 3d shows that by splitting the time domain at 2019, we can reduce the skew of  $q_{g}$  because skewyear(qg,2016,2019) and skewyear(qg,2019,2020) are low.
+
+in concept,  $pdf_{i}(q,a,b)$  is a continuous probability distribution. however, in practice we approximate  $pdf_{i}(q,a,b)$  using a histogram: we discretize the range  $[a,b)$  into  $n$  bins. if a query  $q$ 's filter range intersects with  $m$  contiguous bins, then it contributes  $1/m$  mass to
+
+each of the bins. therefore, the total histogram mass will be  $|q|$ . we call this histogram  $hist_{i}(q,a,b,n)$ .
+
+in this context, a probability distribution over a range of histogram bins  $[x,y)$ , where  $0 \leq x < y \leq n$ , is a  $(y - x)$ -dimensional vector. we can concretely compute skew over the bins  $[x,y)$ :
+
+$$
+u n i _ {i} (q, x, y) [ j ] = \frac {\sum_ {x \leq k <   y} h i s t _ {i} (q , a , b , n) [ k ]}{y - x} \quad \text {f o r} x \leq j <   y
+$$
+
+$$
+p d f _ {i} (q, x, y) [ j ] = \operatorname {h i s t} _ {i} (q, a, b, n) [ j ] \quad \text {f o r} x \leq j <   y
+$$
+
+$$
+s k e w _ {i} (q, x, y) = e m d (u n i _ {i} (q, x, y), p d f _ {i} (q, x, y))
+$$
+
+we store the bin boundaries of the histogram, so there is a simple mapping function from a value  $a$  to its bin  $x$ . therefore, throughout this section, we will use  $\text{skew}_i(q,a,b)$  and  $\text{skew}_i(q,x,y)$  interchangeably.
+
+4.2.2 grid tree design. given a query workload that is skewed over a data space, the aim of the grid tree is to divide the data space into a number of non-overlapping regions so that within each region, there is little query skew.
+
+the grid tree is a space-partitioning decision tree, similar to a k-d tree. each internal node of the grid tree divides space based on the values in a particular dimension, called the split dimension  $d_{s}$ . unlike a k-d tree, which is a binary tree, internal nodes of the grid tree can split on more than one value. if an internal node splits on values  $v = \{v_{1},\dots,v_{k}\}$ , then the node has  $k + 1$  children. to process a query, we traverse the grid tree to find all regions that intersect with the query's filter predicates. if there is an index over the points in that region (e.g., an augmented grid), then we delegate the query to that index and aggregate the returned results. if there is no index for the region, we simply scan all points in the region.
+
+note that the grid tree is not meant to be an end-to-end index. instead, the grid tree's purpose is to efficiently reduce query skew, while using low memory. this way, the user is free to use any indexing scheme within each region, without worrying about intra-region query skew.
+
+# 4.3 optimizing the grid tree
+
+given a dataset and sample query workload, our optimization goal is to reduce query skew as much as possible while maintaining a small and lightweight grid tree. we present the high-level optimization algorithm, then dive into details. our procedure is as follows: (1) group queries in the sample workload into some number of clusters, which we call query types ( $\s 4.3.1$ ). (2) build the grid tree in a greedy fashion. start with a root node that is responsible for the entire data space  $s$ . recursively, for each node  $n$  responsible for data space  $s_n$ , pick the split dimension  $d_s \in [0,d)$  and the set of split values  $v = \{v_1,\dots,v_k\}$  that most reduce query skew ( $\s 4.3.2$ ).  $d_s$  and  $v$  define  $k + 1$  non-overlapping sub-spaces of  $s_n$ . assign a child node to each of the  $k + 1$  sub-spaces and recurse for each child node. if a node  $n$  has low query skew ( $\s 4.3.2$ ), or has below a minimum threshold number of intersecting points or queries, then it stops recursing and becomes a leaf node, representing a region.
+
+4.3.1 clustering query types. it is not enough to consider the query skew of the entire query set  $q$  as a whole, because queries within this set have different characteristics and therefore are best indexed in different ways. for example, we showed in fig. 2 that  $q_{g}$  and  $q_{r}$  are best indexed with different partitioning schemes. considering
+
+all queries as a whole can mask the effects of skew because the skews of different query types can cancel each other out.
+
+therefore, we cluster queries into types that have similar selectivity characteristics. first, queries that filter over different sets of dimensions are automatically placed in different types. for each group of queries that filter over the same set of  $d'$  dimensions, we transform each query into a  $d'$ -dimensional embedding in which each value is set to the filter selectivity of the query over a particular dimension. we run dbscan over the  $d'$ -dimensional embeddings with eps set to 0.2 (this worked well for all our experiments and we never tuned it). dbscan automatically determines the number of clusters. the choice of clustering algorithm is orthogonal to the grid tree design.
+
+real query workloads have patterns and can usually be divided into types. for example, many analytic workloads are composed of query templates, for which the dimensions filtered and rough selectivity remains constant, but the specific predicate values vary. however, even if there are no patterns in the workload, the grid tree is still useful because there can still be query skew over a single query type (i.e., query frequency varies in different parts of data space).
+
+from now on, we assume that if the query set  $q$  is composed of  $t$  query types, then we can divide  $q$  into  $t$  subsets  $q_{1},\ldots ,q_{t}$ . for example, in fig. 3 there are 2 types,  $q_{r}$  and  $q_{g}$ . note that each query can only belong to one query type, but queries in different types are allowed to overlap in data space. we now redefine skew:
+
+$$
+\operatorname {s k e w} _ {i} (q, a, b) = \sum_ {1 \leq i \leq t} \operatorname {s k e w} _ {i} \left(q _ {t}, a, b\right)
+$$
+
+4.3.2 selecting the split dimension and values. given a grid tree node  $n$  over a data space  $s_n$  and a set of queries  $q$  that intersects with  $s_n$ , our goal is to find the split dimension  $d_s$  and split values over that dimension  $v = \{v_1, \dots, v_k\}$  that achieve the largest reduction in query skew. for a dimension  $i \in [0,d)$  and split values  $v$ , the reduction in query skew is defined as
+
+$$
+\begin{array}{l} r _ {i} (q, 0, x _ {d}, v) = \operatorname {s k e w} _ {i} (q, 0, x _ {d}) - \left[ \operatorname {s k e w} _ {i} (q, 0, v _ {1}) \right. \\ \left. + \operatorname {s k e w} _ {i} (q, v _ {k}, x _ {d}) + \sum_ {1 \leq i <   k} \operatorname {s k e w} _ {i} (q, v _ {i}, v _ {i + 1}) \right] \\ \end{array}
+$$
+
+note that skew reduction is defined per dimension, not over all  $d$  dimensions simultaneously. therefore, we independently find the largest skew reduction  $rmax_{i} = \max_{v}(r_{i})$  for each dimension  $i\in [0,d)$  (explained next), then pick the split dimension  $d_{s} = \operatorname{argmax}_{i}(rmax_{i})$ .
+
+for example, in fig. 3, skewsales is already low because both query types are distributed relatively uniformly over sales, so  $rmax_{sales}$  is low. on the other hand, skewyear is high. we can achieve very large  $rmax_{year}$  using  $v = \{2019\}$ . therefore, we select  $d_s =$  year and  $v = \{2019\}$ .
+
+if  $\max_i(r\max_i)$  is below some minimum threshold (by default  $5\%$  of  $|q|$ ) or if  $s_n$  intersects below a minimum threshold of points or queries (by default  $1\%$  of the total points or queries in the entire data space), then  $d_s$  is rejected and  $n$  becomes a leaf grid tree node.
+
+we now explain how to find the split values  $v$  that maximize  $r_{ds}$  for each candidate split dimension  $d_s \in [0,d)$ . we introduce a data structure called the skew tree, which is simply a tool to help find the optimal  $v$ ; it is never used when running queries. the skew tree is a balanced binary tree (fig. 4). each node represents a range over
+
+![](images/c4ed4c0287ecff7001fe021cbd036e692e6f400ac4aa72441913f2a925d08da3.jpg)  
+figure 4: skew tree over the range [0, 1000) with eight leaf nodes. the covering set that achieves lowest combined skew is shaded green. based on the boundaries of the covering set, we extract the split values  $v = \{250,375,500\}$ .
+
+the domain of dimension  $d_{s}$ . the root node represents the entire range  $[0, x_{d_{s}})$ , and every node represents the combined ranges of the nodes in its subtree. a skew tree node whose range is  $[a, b)$  will store the value  $skew_{d_{s}}(q, a, b)$ . in other words, each skew tree node stores the query skew over the range it represents.
+
+creating the skew tree requires  $hist_{d_s}(q,0,x_{d_s})$ . by default, we instantiate the histogram with 128 bins. note that we are unable to compute a meaningful skew over a single histogram bin:  $skew_{d_s}(q,x,x + 1)$  is always zero, because a single bin has no way to differentiate the uniform distribution from the query pdf. therefore, the skew tree will only have 64 leaf nodes. however, if there are fewer than 128 unique values in dimension  $d_s$ , we create a bin for each unique value. in this case, there is truly no skew within each histogram bin, so the skew tree has as many leaf nodes as unique values in  $d_s$ , and the skew at each leaf node is 0.
+
+a set of skew tree nodes is called covering if their represented ranges do not intersect and the union of their represented ranges is  $[0, x_{d_s})$ . we want to solve for the covering set with minimum combined query skew. this is simple to do via dynamic programming in two passes over the skew tree nodes: in the first pass, we start from the leaf nodes and work towards the root node, and at each node we annotate the minimum combined query skew achievable over the node's subtree. in the second pass, we start from the root and work towards the leaves, and check if a node's skew is equal to the annotated skew: if so, the node is part of the optimal covering set. the boundaries between the ranges of nodes in the optimal covering set form  $v$ .
+
+as a final step, we do a single ordered pass over all the nodes in the covering set, in order of the range they represent, and merge nodes if the query skew of the combined node is not more than a constant factor (by default,  $10\%$ ) larger than the sum of the individual query skews. for example, in fig. 4 if  $s_{kewa}(q,0,375) < 15 \cdot 1.1$ , then the first two nodes of the covering set would be merged, and 250 would be removed as a split value. this step counteracts the fact that the binary tree may split at superfluous points, and it also acts as a regularizer that prevents too many splits.
+
+# 5 augmented grid
+
+in this section, we describe the challenges posed by data correlations, and we introduce our solution to address those challenges: the augmented grid. note that the grid tree (§4) optimizes only for query skew reduction, and the points within each region might still display correlation.
+
+<table><tr><td>ex. skeleton</td><td colspan="3">[x,y|x,z] (i.e., cdf(x), cdf(y|x), and cdf(z))</td></tr><tr><td>one hop away</td><td>[x,y,z]</td><td>[x,y|z,z]</td><td>[x,y→x,z]</td></tr><tr><td></td><td>[x,y→z,z]</td><td>[x,y|x,z|x]</td><td>[x,y|x,z→x]</td></tr></table>
+
+table 2: example skeleton over dimensions  $x, y, z$ , and all skeletons one "hop" away. restrictions are explained in §5.2.1 and §5.2.2 (e.g.,  $[x \to z, y|x, z]$  is not allowed).
+
+# 5.1 challenges of data correlation
+
+we broadly define a pair of dimensions  $x$  and  $y$  to be correlated if they are not independent, i.e., if  $cdf(x) \neq cdf(x|y)$  and vice versa. in the presence of correlated dimensions, it is not possible to impose a grid that has equally-sized cells by partitioning each dimension independently (see fig. 1b). as a result, points will be clustered into a relatively few number of cells, so any query that hits one of those cells will likely scan many more points than necessary.
+
+one way to mitigate this issue is by increasing the number of partitions in each dimension, to form more fine-grained cells. however, increasing the number of cells would counteract the two advantages of grids over trees: (1) space overhead increases rapidly (e.g., doubling the number of partitions in each dimension increases index size by  $2^{d}$ ). (2) time overhead also increases, because each cell incurs a lookup table lookup. therefore, simply making finer-grained grids is not a scalable solution to data correlations.
+
+# 5.2 a correlation-aware grid
+
+tsunami handles data correlations while maintaining the time and space advantage of grids by augmenting the basic grid structure with new partitioning strategies that allow it to partition dimensions dependently instead of independently. we first provide a high level description of the augmented grid, then dive into details.
+
+an augmented grid is a grid in which each dimension  $x \in [0,d)$  is divided into  $p_x$  partitions and uses one of three possible strategies for creating its partitions: (1) we can partition  $x$  independently of other dimensions, uniformly in  $cdf(x)$ . this is what flood does for every dimension. (2) we can remove  $x$  from the grid and transform query filters over  $x$  into filters over some other dimension  $y \in [0,d)$  using a functional mapping  $f: x \to y$  (§5.2.1). (3) we can partition  $x$  dependent on another dimension  $y \in [0,d)$ , uniformly in  $cdf(x|y)$  (§5.2.2).
+
+a specific instantiation of partitioning strategies for all dimensions is called a skeleton. tab. 2 shows an example. we "flesh out" the skeleton by setting the number of partitions in each dimension to create a concrete instantiation of an augmented grid. therefore, an augmented grid is uniquely defined by the combination of its skeleton  $s$  and number of partitions in each dimension  $p$ .
+
+5.2.1 functional mappings. a pair of dimensions  $x$  and  $y$  is monotonically correlated if as values in  $x$  increase, values in  $y$  only move in one direction. linear correlations are one subclass of monotonic correlations. for monotonically correlated  $x$  and  $y$ , we conceptually define a mapping function as a function  $f: \mathbb{r}^2 \to \mathbb{r}^2$  that takes a range  $[y_{min}, y_{max}]$  over dimension  $y$  and maps it to a range  $[x_{min}, x_{max}]$  over dimension  $x$  with the guarantee that any point whose value in dimension  $y$  is in  $[y_{min}, y_{max}]$  will have a value in dimension  $x$  in  $[x_{min}, x_{max}]$ . in this case, we call  $y$  the mapped dimension and we call  $x$  the target dimension. for simplicity, we place a restriction: a
+
+![](images/1f910194028b22b282fbf1e2614a36ddf9d3a9605b03d74f4da4b9410701ffcc.jpg)  
+(a) grid w/o fm
+
+![](images/09ff69ac5d1d6ce8333dc9f41a79e47d581a0b565861549951315ae99f02832b.jpg)  
+(b) grid w/ fm  
+figure 5: functional mapping creates equally-sized cells and reduces scanned points for tight monotonic correlations. the query is in green, scanned points are red, and the mapping function is purple, with error bounds drawn as dashed lines.
+
+target dimension cannot itself be a mapped dimension. similar ideas were proposed in [20, 45].
+
+concretely, we implement the mapping function as a simple linear regression  $lr$  trained to predict  $x$  from  $y$ , with lower and upper error bounds  $e_l$  and  $e_u$ . therefore, a functional mapping is encoded in four floating point numbers and has negligible storage overhead. given a range  $[y_{min}, y_{max}]$ , the mapping function produces  $x_{min} = y_{min} - e_l$  and  $x_{max} = y_{max} + e_u$ . note that the idea of functional mappings can generalize to all monotonic correlations, as in [45]. however, in our experience the vast majority of monotonic correlations in real data are linear, so we use linear regressions for simplicity.
+
+given a functional mapping, any range filter predicate  $(y_0 \leq y \leq y_1)$  over dimension  $y$  can be transformed into a semantically equivalent predicate  $(x_0 \leq x \leq x_1)$  over dimension  $x$ , where  $(x_0, x_1) = f(y_0, y_1)$ . this gives us the opportunity to completely remove the mapped dimension from the  $d$ -dimensional grid, to obtain equally-sized cells. fig. 5 demonstrates the benefits of functional mapping. the grid without functional mapping has unequally-sized cells, which results in many points scanned. on the other hand, the grid with functional mapping has equally-sized cells and is furthermore able to "shrink" the size of the query to a semantically equivalent query by inducing a narrower filter over dimension  $x$  using the mapping function. this results in fewer points scanned.
+
+5.2.2 conditional cdfs. functional mappings are only useful for tight monotonic correlations. otherwise, the error bounds would be too large for the mapping to be useful. for loose monotonic correlations or generic correlations, we instead use conditional cdfs. for a pair of generically correlated dimensions  $x$  and  $y$ , we partition  $x$  uniformly in  $cdf(x)$  and we partition  $y$  uniformly in  $cdf(y|x)$ , resulting in equally-sized cells. in this case, we call  $x$  the base dimension and  $y$  the dependent dimension. for simplicity, we place restrictions: a base dimension cannot itself be a mapped dimension or a dependent dimension.
+
+concretely, if there are  $p_x$  and  $p_y$  partitions over  $x$  and  $y$  respectively, we implement  $cdf(y|x)$  by storing  $p_x$  histograms over  $y$ , one for each partition in  $x$ . when a query filters over  $y$ , we first find all intersecting partitions in  $x$ , then for each  $x$  partition independently invoke  $cdf(y|x)$  to find the intersecting partitions in  $y$ . the storage overhead is proportional to  $p_xp_y$ , which is minimal
+
+![](images/28eb14832a05501ce27ea26d460aac278d0c9e6d1309e3aa5a48e87e025a20b4.jpg)  
+(a) grid w/o ccdf  
+figure 6: conditional cdfs create equally-sized cells and reduce scanned points for generic correlations. the query is in green, and scanned points are in red.
+
+![](images/1df8ea1a1deca23f2d7c17bc526b86ca0463cb1ec6e4601828bcb313f91d2fe9.jpg)  
+(b) grid w/ ccdf
+
+compared to the existing overhead of the grid's lookup table, which is proportional to  $\prod_{i\in [0,d]}p_i$
+
+fig. 6 shows an example of using conditional cdfs. both grids have  $p_{x} = p_{y} = 4$ . by partitioning  $y$  using  $cdf(y|x)$ , the grid on the right has staggered partition boundaries, which create equally-sized cells and results in fewer points scanned. additionally, the regions outside the cells (shaded in gray) are guaranteed to have no points, which allows the query to avoid scanning the first and last partitions of  $x$ , even though they intersect the query.
+
+# 5.3 optimizing the augmented grid
+
+given a dataset and sample query workload, our optimization goal is to find the best augmented grid, i.e., the settings of the parameters  $(s,p)$  that achieves lowest average query time over the sample workload, where  $s$  is the skeleton and  $p$  is the number of partitions in each dimension.
+
+this optimization problem is challenging in two ways: (1) for a specific setting of  $(s,p)$ , we cannot know the average query time without actually running the queries, which can be very time-intensive. therefore, we create a cost model to predict average query time, and we optimize for lowest average predicted query time (§5.3.1). (2) the search space over skeletons is exponentially large. for each dimension, there are  $o(d)$  possible partitioning strategies, since there are up to  $d - 1$  choices for the other dimension in a functional mapping or conditional cdf. therefore, the search space of skeletons has size  $o(d^{d})$ . to efficiently navigate the joint search space of  $(s,p)$ , we use adaptive gradient descent (§5.3.2).
+
+5.3.1 cost model. we use a simple analytic linear cost model to predict the runtime of a query  $q$  on dataset  $d$  and an instantiation of the augmented grid with parameters  $(s, p)$ :
+
+time  $= w_{0}(\#$  cell ranges)  $+w_{1}(\#$  scanned points)(# filtered dims)
+
+we now explain each term of this model. a set of adjacent cells in physical storage is called a cell range. instead of doing a lookup on the lookup table for every intersecting cell, we only look up the first and last cell of a cell range. furthermore, skipping to each new cell range in physical storage likely incurs a cache miss.  $w_0$  represents the time to do a lookup and the cache miss of accessing the range in physical storage.
+
+the  $w_{1}$  term models the time to scan points (e.g., all red points in previous figures). since data is stored in a column store, only the dimensions filtered by the query need to be accessed.  $w_{1}$  represents the time to scan a single dimension of a single point.
+
+importantly, the features of this cost model can be efficiently computed or estimated: the number of cell ranges is easily computed from  $q$  and  $(s,p)$ . the number of filtered dimensions is obvious from  $q$ . the number of scanned points is estimated using  $q$ ,  $(s,p)$ , and a sample of  $d$ .
+
+note that we do not model the time to actually perform the aggregation after finding the points that intersect the query rectangle. this is because aggregation is a fixed cost that must be incurred regardless of index choice, so we ignore it when optimizing.
+
+5.3.2 adaptive gradient descent. we find the  $(s,p)$  that minimizes average query time, as predicted by the cost model, using adaptive gradient descent (agd). we first enumerate agd's high level steps, then provide details for each step. agd is an iterative algorithm that jointly optimizes  $s$  and  $p$ :
+
+(1) using heuristics, initialize  $(s_0,p_0)$ .  
+(2) from  $(s_0, p_0)$ , take a gradient descent step over  $p_0$  using the cost model as the objective function, which gives us  $(s_0, p_1)$ .  
+(3) from  $(s_0, p_1)$ , perform a local search over skeletons to find the skeleton  $s'$  that minimizes query time for  $(s', p_1)$ . set  $s_1 = s'$ . it may be that  $s' = s_0$ , that is, the skeleton does not change in this step.  
+(4) repeat steps 2 and 3 starting from  $(s_1, p_1)$  until we reach a minimum average query time.
+
+in step 1, we first initialize  $s$ , then  $p$ . we make a best guess at the optimal skeleton using heuristics: for each dimension  $x$ , use a functional mapping to dimension  $y$  if the error bound is below  $10\%$  of  $y$ 's domain. else, partition using  $cdf(x|y)$  if not doing so would result in more than  $25\%$  of cells in the  $xy$  grid hyperplane being empty. else, partition  $x$  independently using  $cdf(x)$ . given the initial  $s$ , we initialize  $p$  proportionally to the average query filter selectivity in each grid dimension (i.e., excluding mapped dimensions).
+
+in step 2, we take advantage of the insight that the cost model is relatively smooth in  $p$ : changing the number of partitions in a dimension usually smoothly increases or decreases the cost. therefore, we take the numerical gradient over  $p$  at  $(s,p)$  and take a step in the gradient direction.
+
+in step 3, we take advantage of the insight that an incremental change in  $p$  is unlikely to cause the skeleton  $s'$  to differ greatly from  $s$ . therefore, step 3 will only search over  $s'$  that can be created by changing the partitioning strategy for a single dimension in  $s$  (e.g., skeletons one "hop" away in tab. 2).
+
+while we could conceivably use black box optimization methods such as simulated annealing to optimize  $(s,p)$ , agd takes advantage of the aforementioned insights into the behavior of the optimization and is therefore able to find lower-cost augmented grids, which we confirm in §6.6.
+
+# 6 evaluation
+
+we first describe the experimental setup and then present the results of an in-depth experimental study that compares tsunami with flood and several other indexing methods on a variety of datasets and workloads. overall, this evaluation shows that:
+
+(1) tsunami is consistently the fastest index across tested datasets and workloads. it achieves up to  $6 \times$  higher query throughput than flood and up to  $11 \times$  higher query throughput than the fastest optimally-tuned non-learned index. furthermore, tsunami has up to  $8 \times$  smaller index size than flood and up to  $170 \times$  smaller index size than the fastest non-learned index (§6.3).  
+(2) tsunami can optimize its index layout and reorganize the records quickly for a new query distribution, typically in under 4 minutes for a 300 million record dataset (§6.4).  
+(3) tsunami's performance advantage over other indexes scales with dataset size, selectivity, and dimensionality (§6.5).
+
+# 6.1 implementation and setup
+
+we implement tsunami in  $\mathrm{c + + }$  and perform optimization in python. we perform our query performance evaluation via single-threaded experiments on an ubuntu linux machine with intel core i9-9900k 3.6ghz cpu and 64gb ram. optimization and data sorting for index creation are performed in parallel for tsunami and all baselines.
+
+all experiments use 64-bit integer-valued attributes. any string values are dictionary encoded prior to evaluation. floating point values are typically limited to a fixed number of decimal points (e.g., 2 for price values). we scale all values by the smallest power of 10 that converts them to integers.
+
+evaluation is performed on data stored in a custom column store with one scan-time optimization: if the range of data being scanned is exact, i.e., we are guaranteed ahead of time that all elements within the range match the query filter, we skip checking each value against the query filter. for common aggregations, e.g. count, this removes unnecessary accesses to the underlying data.
+
+we compare tsunami to other solutions implemented on the same column store, with the same optimizations, if applicable:
+
+(1) clustered single-dimensional index: points are sorted by the most selective dimension in the query workload. if a query filter contains this dimension, we locate the endpoints using binary search. otherwise, we perform a full scan.  
+(2) the  $z$ -order index is a multidimensional index that orders points by their  $z$ -value [14]; contiguous chunks are grouped into pages. given a query, the index finds the smallest and largest  $z$ -value contained in the query rectangle and iterates through each page with  $z$ -values in this range. pages maintain min/max metadata per dimension, which allows queries to skip over irrelevant pages.  
+(3) the hyperoctree [27] recursively subdivides space equally into hyperoctants (the  $d$ -dimensional analog to 2-dimensional quadrants), until the number of points in each leaf is below a predefined but tunable page size.  
+(4) the  $k$ -d tree [4] recursively partitions space using the median value along each dimension, until the number of points in each leaf falls below the page size. the dimensions are selected in a round robin fashion, in order of selectivity.  
+(5) flood, introduced in §2.2. we use the implementation of [30] with two changes: we use tsunami's cost model instead of flood's original random-forest-based cost model, and we perform refinement using binary search instead of learned per-cell models (see [30] for details). we verified that these changes did not meaningfully impact performance. furthermore, removing per-cell
+
+<table><tr><td></td><td>tpc-h.</td><td>taxi</td><td>perfmon</td><td>stocks</td></tr><tr><td>records</td><td>300m</td><td>184m</td><td>236m</td><td>210m</td></tr><tr><td>query types</td><td>5</td><td>6</td><td>5</td><td>5</td></tr><tr><td>dimensions</td><td>8</td><td>9</td><td>7</td><td>7</td></tr><tr><td>size (gb)</td><td>19.2</td><td>13.2</td><td>13.2</td><td>11.8</td></tr></table>
+
+models dramatically reduces flood's index size (on average by  $20 \times [30]$ ), and this allows us to more directly evaluate the impact of design differences between flood and tsunami without any confounding effects from implementation differences.
+
+there are a number of other multi-dimensional indexing techniques, such as grid files [31], ub-tree [36], and  $\mathbf{r}^*$ -tree [3]. we decided not to evaluate against these because flood already showed consistent superiority over them [30]. we also do not evaluate against other learned multi-dimensional indexes because they are either optimized for disk [25, 46] or optimize only based on the data distribution, not the query workload [9, 44] (see §7).
+
+# 6.2 datasets and workloads
+
+we evaluate indexes on three real-world and one synthetic dataset, summarized in tab. 3. queries are synthesized for each dataset, and include a mix of range filters and equality filters. the queries for each dataset comes from a certain number of query types (§4.3.1), each of which answers a different analytics question, with 100 queries of each type. all queries perform a count aggregation. since all indexes must pay the same fixed cost of aggregation, performing different aggregations would not change the relative ordering of indexes in terms of query performance.
+
+the taxi dataset comes from records of yellow taxi trips in new york city in 2018 and 2019 [32]. it includes fields capturing pickup and drop-off dates/times, pick-up and drop-off locations, trip distances, itemized fares, and driver-reported passenger counts. our queries answer questions such as "how common were single-passenger trips between two particular parts of manhattan?" and "what month of the past year saw the most short-distance trips?". queries display skew over time (more queries over recent data), passenger count (different query types about very low and very high passenger counts), and trip distance (more queries about very short trip distances). query selectivity varies from  $0.25\%$  to  $3.9\%$ , with an average of  $1.3\%$ .
+
+the performance monitoring dataset perfmon contains logs of all machines managed by a major us university over the course of a year. it includes fields capturing log time, machine name, cpu usages, and system load averages. our queries answer questions such as "when in the last month did a certain set of machines experience high load?" queries display skew over time (more queries over recent data) and cpu usage (more queries over high usage). query selectivity varies from  $0.50\%$  to  $4.9\%$ , with an average of  $0.79\%$ . the original dataset has 23.6m records, but we use a scaled dataset with 236m records.
+
+the stocks dataset consists of daily historical stock prices of over 6000 stocks from 1970 to 2018 [12]. it includes fields capturing daily prices (open, close, adjusted close, low, and high), trading volume, and the date. our queries answer questions such as "which stocks
+
+table 3: dataset and query characteristics.  
+
+<table><tr><td></td><td>tpc-h</td><td>taxi</td><td>perfmon</td><td>stocks</td></tr><tr><td colspan="5">tsunami</td></tr><tr><td>num grid tree nodes</td><td>39</td><td>35</td><td>42</td><td>54</td></tr><tr><td>grid tree depth</td><td>4</td><td>2</td><td>4</td><td>4</td></tr><tr><td>num leaf regions</td><td>27</td><td>31</td><td>36</td><td>39</td></tr><tr><td>min points per region</td><td>3.5m</td><td>1.9m</td><td>2.6m</td><td>2.4m</td></tr><tr><td>median points per region</td><td>5.9m</td><td>3.3m</td><td>3.7m</td><td>3.2m</td></tr><tr><td>max points per region</td><td>10m</td><td>6.7m</td><td>26m</td><td>41m</td></tr><tr><td>avg fms per region</td><td>0.67</td><td>0.55</td><td>0</td><td>1.1</td></tr><tr><td>avg ccdfs per region</td><td>1.3</td><td>1.9</td><td>1.75</td><td>1.8</td></tr><tr><td>total num grid cells</td><td>1.5m</td><td>99k</td><td>80k</td><td>220k</td></tr><tr><td colspan="5">flood</td></tr><tr><td>num grid cells</td><td>920k</td><td>840k</td><td>530k</td><td>250k</td></tr></table>
+
+table 4: index statistics after optimization.
+
+saw the lowest intra-day price change while trading at high volume?" and "what one-year span in the past decade saw the most stocks close in a certain price range?". queries display skew over time (more queries over recent data) and volume (different query types about very low and very high volume). query selectivity is tightly concentrated around  $0.5\% \pm 0.04\%$ . the original dataset has 21m records, but we use a scaled dataset with 210m records.
+
+our last dataset is tpc-h [42]. for our evaluation, we use only the fact table, line item, with 300m records (scale factor 50) and create queries by using filters commonly found in the tpc-h query workload. our queries include filters over quantity, extended price, discount, tax, ship mode, ship date, commit date, and receipt date. they answer questions such as "how many high-priced orders in the past year used a significant discount?" and "how many shipments by air had below ten items?" query selectivity varies from  $0.40\%$  to  $0.64\%$ , with an average of  $0.54\%$ .
+
+# 6.3 overall results
+
+fig. 7 compares tsunami to flood and the non-learned baselines. tsunami and flood are automatically optimized for each dataset/workload. for the non-learned baselines, we tuned the page size to achieve best performance on each dataset/workload. tsunami is consistently the fastest of all the indexes across datasets and workloads, and achieves up to  $6 \times$  faster queries than flood and up to  $11 \times$  faster queries than the fastest non-learned index.
+
+tab. 4 shows statistics of the optimized tsunami index structure. the grid tree depth and the number of leaf regions are relatively low, which confirms that the grid tree is lightweight, as desired. because skew does not occur uniformly across data space, the number of points in each region can vary by over an order of magnitude.
+
+the grid tree typically has a low number of nodes (tab. 4), so the vast majority of tsunami's index size comes from the cell lookup tables for the augmented grids in each region. tsunami often has fewer total grid cells than flood (tab. 4) because partitioning space via the grid tree gives tsunami fine-grained control over the number of cells to allocate in each region, whereas flood must often over-provision partitions to deal with query skew (see §4.1). fig. 8 shows that as a result of having fewer cells, tsunami uses up to  $8 \times$  less memory than flood. furthermore, tsunami is between  $7 \times$  to  $170 \times$  smaller than the fastest optimally-tuned non-learned index across the four datasets.
+
+![](images/38c5644cbd4c1749f6d89fb90565e0b0aa4729a5c2955c05edbb2328135fa058.jpg)  
+figure 7: tsunami achieves up to  $6 \times$  faster queries than flood and up to  $11 \times$  faster queries than the fastest non-learned index.
+
+![](images/dbfc5ad50d7f794919ababa3001c221ab7f2ac721f57b33de9afd7dfe59a2a79.jpg)
+
+![](images/49157deccdd14d6ba2f8308fa7184731f6bcdd21a745aa469ed720cd1c80c99b.jpg)
+
+![](images/421c17c2b599d2bc373899894e81ce00e59736230ae0b2ce179795d2dd73caeb.jpg)
+
+![](images/057eb277b4f1595de3d0eea702eab886ea7146fdf09f03b17481e6fb9dbf1407.jpg)
+
+![](images/202346b7c4e9e5f6aac302e7836326d43a5773c20d7a84a1651a02537672f791.jpg)  
+figure 8: tsunami uses up to  $8 \times$  less memory than flood and  $7 - 170 \times$  less memory than the fastest tuned non-learned index.
+
+![](images/770dcb3505c00f263af90cf6720538d63759939e2ee3174c3a557516ec318b1c.jpg)
+
+![](images/715f168f61511031a8b805bce3ceadab44c61c5aee4e0c754643ce748cabb586.jpg)
+
+![](images/8fcbedbc77105a73dfb1571bd7ea88996454971cd37eb300365613a0c790372f.jpg)
+
+# 6.4 adaptibility
+
+tsunami is able to quickly adapt to changes in the query workload by re-optimizing its layout for the new query workload and re-organizing the data based on the new layout. in fig. 9a, we simulate a scenario in which the query workload over the tpc-h dataset changes at midnight: the original query workload is replaced by a new workload with queries drawn from five new query types. this causes performance on the learned indexes to degrade. tsunami (as well as flood) automatically detects the workload shift (see §8) and triggers a re-optimization of the index layout for the new query workload. tsunami's re-optimization and data re-organization over 300m rows finish within 4 minutes, and its high query performance is restored. this shows that tsunami is highly adaptive for scenarios in which the data or workload changes infrequently (e.g., every day). the non-learned indexes are not re-tuned after the workload shift, because in practical settings, it is unlikely that a database administrator will be able to manually tune the index for every workload change.
+
+fig. 9b shows the index creation time in greater detail for tsunami and the baselines. all indexes require time to sort the data based on the index layout, shown as solid bars. the learned approaches additionally require time to perform optimization based on the dataset and query workload, shown as the hatched bars. even for the largest datasets, the entire index creation time for tsunami remains below 4 minutes.
+
+# 6.5 scalability
+
+throughout this subsection, tsunami and flood are re-optimized for each dataset/workload configuration, while the non-learned indexes use the same page size and dimension ordering as they were tuned for the full tpc-h dataset/workload in §6.3.
+
+![](images/d6c2efe8f60018776c9ee0c8703102a763472163a386c06275589475428ef10f.jpg)  
+figure 9: (a) after the query workload changes at midnight, tsunami re-optimizes and re-organizes within 4 minutes to maintain high performance. (b) comparison of index creation times (solid bars = data sorting time, hatched bars = optimization time).
+
+number of dimensions. to show how tsunami scales with dimensions, and how correlation affects scalability, we create two groups of synthetic  $d$ -dimensional datasets with 100m records. within each group, datasets vary by number of dimensions ( $d \in \{4,8,12,16,20\}$ ). datasets in the first group show no correlation and points are sampled from i.i.d. uniform distributions. for datasets in the second group, half of the dimensions have uniformly sampled values, and dimensions in the other half are linearly correlated to dimensions in the first half, either strongly ( $\pm 1\%$  error) or loosely ( $\pm 10\%$  error). for each dataset, we create a query workload with four query types. earlier dimensions are filtered with exponentially higher selectivity than later dimensions, and queries are skewed over the first four dimensions.
+
+fig. 10 shows that in both cases, tsunami continues to outperform the other indexes at higher dimensions. in particular, the augmented grid is able to take advantage of correlations to effectively reduce the
+
+![](images/c3aa35cfe8e87f4d91ad75be23e407a1b91ba75929a98602a21fac6787319e5e.jpg)  
+figure 10: tsunami continues outperform other indexes at higher dimensions. in particular, augmented grid helps tsunami delay the curse of dimensionality on correlated data.
+
+![](images/bd38cffb18ba9792eac4b0b3372acdeccd932337f16c62e61b22e6597e9c8900.jpg)  
+figure 11: tsunami maintains high performance across dataset sizes and query selectivities.
+
+dimensionality of the dataset. this helps tsunami delay the curse of dimensionality: tsunami has around the same performance on each  $d$ -dimensional correlated dataset as it does on the  $(d - 4)$ -dimensional uncorrelated dataset.
+
+dataset size. to show how tsunami scales with dataset size, we sample records from the tpc-h dataset to create smaller datasets. we run the same query workload as on the full dataset. fig. 11a shows that across dataset sizes, tsunami maintains its performance advantage over flood and non-learned indexes.
+
+query selectivity. to show how tsunami performs at different query selectivities, we use the 8-dimensional synthetic dataset/workload with correlation (explained above) and scale filter ranges up and down equally in each dimension in order to achieve between  $0.001\%$  and  $10\%$  selectivity. fig. 11b shows that tsunami performs well at all selectivities. the relative performance benefit of tsunami is less apparent at  $10\%$  selectivity because aggregation time becomes a bottleneck.
+
+# 6.6 drill-down into components
+
+fig. 12a shows the relative performance of only using the augmented grid (i.e., one augmented grid over the entire data space) and of only using grid tree (i.e., with an instantiation of flood in each leaf region). grid tree contributes the most to tsunami's performance, but augmented grid also boosts performance significantly over flood. grid tree-only performs almost as well as tsunami because partitioning data space via the grid tree often already has the unintentional but useful side effect of mitigating data correlations.
+
+![](images/4b1c8fa4d13b5ee7cf59f06b9a8045051e4dc89e6b430ec4403642d953f2d40d.jpg)  
+figure 12: (a) augmented grid and grid tree both contribute to tsunami's performance. (b) comparison of optimization methods. bars show the predicted query time according to our cost model. error bars show the actual query time.
+
+we now evaluate augmented grid's optimization procedure, which can be broken into two independent parts: the accuracy of the cost model (§5.3.1) and the ability of adaptive gradient descent (§5.3.2) to minimize cost (i.e., average query time, predicted by the cost model). for each of our four datasets/workloads, we run adaptive gradient descent (agd) to find a low-cost augmented grid over the entire data space. we compare with three alternative optimization methods, all using the same cost model:
+
+(1) gradient descent (gd) uses the same initial  $(s_0, p_0)$  as agd, then performs gradient descent over  $p$ , without ever changing the skeleton.  
+(2) black box starts with the same initial  $(s_0, p_0)$  as agd, then optimizes  $s$  and  $p$  according to the basin hopping algorithm, implemented in scipy [38], for 50 iterations.  
+(3) adaptive gradient descent with naive initialization (agd-ni) sets the initial skeleton  $s_0$  to use  $cdf(x)$  for each dimension, then runs agd.
+
+fig. 12b shows the lowest cost achieved by each optimization method. there are several insights. first, black box performs worse than the gradient descent variants, which implies that using domain knowledge and heuristics to guide the search process provides an advantage. second, adaptive gradient descent usually achieves only marginally better predicted query time than gradient descent, which implies that for our tested datasets, our heuristics created a good initial skeleton  $s_0$ . third, adaptive gradient descent is able to find a low-cost grid even when starting from a naive skeleton, which implies that the local search over skeletons is able to effectively switch to better skeletons. for the taxi dataset, agd-ni is even able to find a lower-cost configuration than agd.
+
+fig. 12b additionally shows the error between the predicted query time using the cost model and the actual query time when running the queries of the workload. the average error of the model for all optimized configurations shown in fig. 12b is only  $15\%$ .
+
+# 7 related work
+
+traditional multi-dimensional indexes. there is a rich corpus of work dedicated to multi-dimensional indexes, and many commercial database systems have turned to multi-dimensional indexing schemes. for example, amazon redshift organizes points by z-order [29], which maps multi-dimensional points onto a single dimension for sorting [1, 34, 47]. with spatial dimensions, sql server allows z-ordering [28], and ibm informix uses an r-tree [16]. other
+
+multi-dimensional indexes include k-d trees, octrees,  $\mathbf{r}^*$  trees, ub trees (which also make use of the z-order), and grid files [31], among many others (see [33, 40] for a survey). there has also been work on automatic index selection [6, 26, 43]. however, these approaches mainly focus on creating secondary indexes, whereas tsunami co-optimizes the index and data storage.
+
+learned indexes. recent work by kraska et al. [23] proposed the idea of replacing traditional database indexes with learned models that predict the location of a key in a dataset. their learned index, called the recursive model index (rmi), and various improvements on the rmi [10, 13, 15, 22, 41], only handle one-dimensional keys.
+
+since then, there has been a corpus of work on extending the ideas of the learned index to spatial and multi-dimensional data. the most relevant work is flood [30], described in §2.2. learning has also been applied to the challenge of reducing i/o cost for disk-based multi-dimensional indexes. qd-tree [46] uses reinforcement learning to construct a partitioning strategy that minimizes the number of disk-based blocks accessed by a query. lisa [25] is a disk-based learned spatial index that achieves low storage consumption and i/o cost while supporting range queries, nearest neighbor queries, and insertions and deletions. tsunami and these works share the idea that a multi-dimensional index can be instance-optimized for a particular use case by learning from the dataset and query workload.
+
+past work has also aimed to improve traditional indexing techniques by learning the data distribution. the zm-index [44] combines the standard z-order space-filling curve [29] with the rmi from [23] by mapping multi-dimensional values into a single-dimensional space, which is then learnable using models. the ml-index [9] combines the ideas of idistance [18] and the rmi to support range and knn queries. unlike tsunami, these works only learn from the data distribution, not from the query workload.
+
+data correlations. there is a body of work on discovering and taking advantage of column correlations. bhunt [5], cords [17], and pyro [24] automatically discover algebraic constraints, soft functional dependencies, and approximate dependencies between columns, respectively. coradd [21] recommends materialized views and indexes based on correlations. correlation map [20] aims to reduce the size of  $\mathrm{b + }$  tree secondary indexes by creating a mapping between correlated dimensions. hermit [45] is a learned secondary index that achieves low space usage by capturing monotonic correlations and outliers between dimensions. although the functional mappings in the augmented grid are conceptually similar to correlation map and hermit, our work is more focused on how to incorporate correlation-aware techniques into a multi-dimensional index.
+
+query skew. the existence of query skew has been extensively reported in settings where data is accessed via single-dimensional keys (i.e., "hot keys") [2, 7, 48]. in particular, key-value store workloads at facebook display strong key-space locality: hot keys are closely located in the key space [48]. instead of relying on caches to reduce query time for frequently accessed keys, tsunami automatically partitions data space using the grid tree to account for query skew.
+
+# 8 future work
+
+complex correlations. although augmented grid introduces techniques to address data correlations, there are more opportunities
+
+on the table. first, functional mappings are not robust to outliers: one outlier can significantly increase the error bound of the mapping. we can address this by placing outliers in a separate buffer, similar to hermit [45]. second, augmented grid might not efficiently capture more complex correlation patterns, such as temporal/periodic patterns and correlations due to functional dependencies over more than two dimensions. to handle these correlations, we intend to introduce new correlation-aware partitioning strategies to the augmented grid.
+
+categorical dimensions. values of categorical dimensions typically have no semantically meaningful sort order, so they are sorted alphabetically by default. however, we can improve performance by imposing our own sort order. in the augmented grid, we can sort categorical values by co-access frequency: values that are commonly accessed together in the same query should ideally be placed in the same grid partition, so that a query that accesses them needs to scan fewer partitions and points.
+
+data and workload shift. tsunami can quickly adapt to workload changes but does not currently have a way to detect when the workload characteristics have changed sufficiently to merit re-optimization. to do this, tsunami could detect when an existing query type (§4.3.1) disappears, a new query type appears, or when the relative frequencies of query types change. tsunami could also detect when the query skew of a particular grid tree region has deviated from its skew after the initial optimization. additionally, tsunami is completely re-optimized for each new workload. however, tsunami could be incrementally adjusted, e.g. by only re-optimizing the augmented grids whose regions saw the most significant workload shift.
+
+tsunami currently only supports read-only workloads. to support insertions, each leaf node in the grid tree could maintain a sibling node that acts as a delta index [39] in which updates are buffered and periodically merged into the main node.
+
+persistence tsunami's techniques for reducing query skew and handling correlations are not restricted to in-memory scenarios and could be incorporated into a multi-dimensional index for data resident on disk or ssd, perhaps by combining ideas from qd-tree [46] or lisa [25].
+
+# 9 conclusion
+
+recent work has introduced the idea of learned multi-dimensional indexes, which outperform traditional multi-dimensional indexes by co-optimizing the index layout and data storage for a particular dataset and query workload. we design tsunami, a new in-memory learned multi-dimensional index that pushes the boundaries of performance by automatically adapting to data correlations and query skew. tsunami introduces two modular data structures—grid tree and augmented grid—that allow it to outperform existing learned multi-dimensional indexes by up to  $6 \times$  in query throughput and  $8 \times$  in space. our results take us one step closer towards a robust learned multi-dimensional index that can serve as a building block in larger in-memory database systems.
+
+acknowledgements. this research is supported by google, intel, and microsoft as part of the mit data systems and ai lab (dsail) at mit, nsf iis 1900933, darpa award 16-43-d3m-fp040, and the mit air force artificial intelligence innovation accelerator (aiia). research was sponsored by the united states air force research
+
+laboratory and was accomplished under cooperative agreement number fa8750-19-2-1000. the views and conclusions contained in this document are those of the authors and should not be interpreted as representing the official policies, either expressed or implied, of the united states air force or the u.s. government. the u.s. government is authorized to reproduce and distribute reprints for government purposes notwithstanding any copyright notation herein.
+
+# references
+
+[1] amazon aws. 2016. amazon redshift engineering's advanced table design playbook: compound and interleaved sort keys. https://aws.amazon.com/blogs/big-data/amazon-redshift-engineings-advanced-table-design-playbook-compound-and-interleaved-sortkeys/.  
+[2] berk atikoglu, yuehai xu, eitan frachtenberg, song jiang, and mike paleczny. 2012. workload analysis of a large-scale key-value store. in proceedings of the 12th acm sigmetrics/performance joint international conference on measurement and modeling of computer systems (london, england, uk) (sigmetrics '12). association for computing machinery, new york, ny, usa, 53–64. https://doi.org/10.1145/2254756.2254766  
+[3] norbert beckmann, hans-peter kriegel, ralf schneider, and bernhard seeger. 1990. the  $\mathbb{r}^*$ -tree: an efficient and robust access method for points and rectangles. sigmod rec. 19, 2 (may 1990), 322-331. https://doi.org/10.1145/93605.98741  
+[4] jon louis bentley. 1975. multidimensional binary search trees used for associative searching. commun. acm 18, 9 (sept. 1975), 509-517. https://doi.org/10.1145/361002.361007  
+[5] paul brown and peter j. haas. 2003. bhunt: automatic discovery of fuzzy algebraic constraints in relational data. in vldb.  
+[6] surajit chaudhuri and vivek narasayya. 1997. an efficient, cost-driven index selection tool for microsoft sql server. in proceedings of the vldb endowment. vldb endowment.  
+[7] brian f. cooper, adam silberstein, erwin tam, raghu ramakrishnan, and russell sears. 2010. benchmarking cloud serving systems with ycsb. in proceedings of the 1st acm symposium on cloud computing (indianapolis, indiana, usa) (socc '10). association for computing machinery, new york, ny, usa, 143-154. https://doi.org/10.1145/1807128.1807152  
+[8] databricks engineering blog. [n.d.]. processing petabytes of data in seconds with databricks delta. https://databricks.com/blog/2018/07/31/processing-petabytes-of-data-in-seconds-with-databricks-delta.html.  
+[9] angela davitkova, evica milchevski, and sebastian michel. 2020. the ml-index: a multidimensional, learned index for point, range, and nearest-neighbor queries. in 2020 conference on extending database technology (edbt).  
+[10] jialin ding, umar farooq minhas, jia yu, chi wang, jaeyoung do, yinan li, hantian zhang, badrish chandramouli, johannes gehrke, donald kossmann, david lomet, and tim kraska. 2020. alex: an updatable adaptive learned index. in proceedings of the 2020 international conference on management of data.  
+[11] mike stonebraker et al. 2005. c-store: a column-oriented dbms. in proceedings of the 31st vldb conference. vldb endowment.  
+[12] evan hallmark. 2020. daily historical stock prices (1970 - 2018). https://www.kaggle.com/ehallmar/daily-historical-stock-prices-1970-2018.  
+[13] paolo ferragina and giorgio vinciguerra. 2020. the pgm-index: a fully-dynamic compressed learned index with provable worst-case bounds. pvldb 13, 8 (2020), 1162-1175. https://doi.org/10.14778/3389133.3389135  
+[14] volker gaede and oliver günther. 1998. multidimensional access methods. acm computing surveys (csur) 30 (1998), 170-231. issue 2.  
+[15] alex galakatos, michael markovitch, carsten binnig, rodrigo fonseca, and tim kraska. 2019. fi ting-tree: a data-aware index structure. in proceedings of the 2019 international conference on management of data (amsterdam, netherlands) (sigmod '19). association for computing machinery, new york, ny, usa, 1189-1206. https://doi.org/10.1145/3299869.3319860  
+[16] ibm. [n.d]. the spatial index. https://www.ibm.com/support/knowledgecenter/ssgu8g_12.1.0/com.ibm.spatial.doc/ids_spat_024.htm.  
+[17] ihab f. ilyas, volker markl, peter haas, paul brown, and ashraf aboulnaga. 2004. cords: automatic discovery of correlations and soft functional dependencies. in proceedings of the 2004 acm sigmod international conference on management of data (paris, france) (sigmod '04). association for computing machinery, new york, ny, usa, 647-658. https://doi.org/10.1145/1007568.1007641  
+[18] h. v. jagadish, beng chin ooi, kian-lee tan, cui yu, and rui zhang. 2005. idistance: an adaptive b+-tree based indexing method for nearest neighbor search. acm trans. database syst. 30, 2 (june 2005), 364-397. https://doi.org/10.1145/1071610.1071612  
+[19] irfan khan. 2012. falling ram prices drive in-memory database surge. https://www.itworld.com/article/2718428/falling-ram-prices-drive-in-memory-database-surge.html.
+
+[20] hideaki kimura, george huo, alexander rasin, samuel madden, and stanley b. zdonik. 2009. correlation maps: a compressed access method for exploiting soft functional dependencies. proc. vldb endow. 2, 1 (aug. 2009), 1222-1233. https://doi.org/10.14778/1687627.1687765  
+[21] hideaki kimura, george huo, alexander rasin, samuel madden, and stanley b. zdonik. 2010. coradd: correlation aware database designer for materialized views and indexes. proc. vldb endow. 3, 1-2 (sept. 2010), 1103-1113. https://doi.org/10.14778/1920841.1920979  
+[22] andreas kipf, ryan marcus, alexander renen, mihail stoian, alfons kemper, tim kraska, and thomas neumann. 2020. radixspline: a single-pass learned index. in aidm 2020.  
+[23] tim kraska, alex beutel, ed h. chi, jeffrey dean, and neokliss polyzotis. 2018. the case for learned index structures. in proceedings of the 2018 international conference on management of data, sigmod conference 2018, houston, tx, usa, june 10-15, 2018. acm, 489-504. https://doi.org/10.1145/3183713.3196909  
+[24] sebastian kruse and felix naumann. 2018. efficient discovery of approximate dependencies. proc. vldb endow. 11, 7 (march 2018), 759-772. https://doi.org/10.14778/3192965.3192968  
+[25] pengfei li, hua lu, qian zheng, long yang, and gang pan. 2020. lisa: a learned index structure for spatial data. in proceedings of the 2020 international conference on management of data.  
+[26] lin ma, dana van aken, amed hefny, gustavo mezerhane, andrew pavlo, and geoffrey j. gordon. 2018. query-based workload forecasting for self-driving database management systems. in sigmod. acm.  
+[27] donald meagher. 1980. octree encoding: a new technique for the representation, manipulation and display of arbitrary 3-d objects by computer. technical report.  
+[28] microsoft sql server. 2016. spatial indexes overview. https://docs.microsoft.com/en-us/sql/relational-databases/spatial/spatial-indexes-overview?view  $\equiv$  sql-server-2017.  
+[29] g. m. morton. 1966. a computer oriented geodetic data base; and a new technique in file sequencing (pdf). technical report. ibm.  
+[30] vikram nathan, jialin ding, mohammad alizadeh, and tim kraska. 2020. learning multi-dimensional indexes. in proceedings of the 2020 international conference on management of data (portland, or, usa) (sigmod '20). association for computing machinery, new york, ny, usa. https://doi.org/10.1145/3318464.3380579  
+[31] j. nievevertg, hans hinterberger, and kenneth c. sevcik. 1984. the grid file: an adaptable, symmetric multikey file structure. acm trans. database syst. 9, 1 (march 1984), 38-71. https://doi.org/10.1145/348.318586  
+[32] nyc taxi & limousine commission. 2020. tlc trip record data. https://www1.nyc.gov/site/tlc/about/tlc-trip-record-data.page.  
+[33] beng chin ooi, ron sacks-davis, and jiawei han. 2019. indexing in spatial databases.  
+[34] oracle database data warehousing guide. 2017. attribute clustering. https://docs.oracle.com/database/121/dwhsg/attcluster.htm.  
+[35] oracle, inc. [n.d.]. oracle database in-memory. https://www.oracle.com/database/technologies/in-memory.html.  
+[36] frank ramsak1, volker markl, robert fenk, martin zirkel, klaus elhardt, and rudolf bayer. 2000. integrating the ub-tree into a database system kernel. in proceedings of the 26th international conference on very large databases. vldb endowment.  
+[37] rocksdb. 2020. rocksdb. https://rocksdb.org/.  
+[38] scipy.org. [n.d.]. scipy.optimize.basinhopping. https://docs.scipy.org/doc/scipy-0.18.1/reference/generated/scipy适合自己.html.  
+[39] dennis g. severance and guy m. lohman. 1976. differential files: their application to the maintenance of large databases. acm trans. database syst. 1, 3 (sept. 1976), 256-267. https://doi.org/10.1145/320473.320484  
+[40] hari singh and seema bawa. 2017. a survey of traditional and mapreduce based spatial query processing approaches. sigmod rec. 46, 2 (sept. 2017), 18-29. https://doi.org/10.1145/3137586.3137590  
+[41] chuzhe tang, youyun wang, zhiyuan dong, gansen hu, zhaoguo wang, minjie wang, and haibo chen. 2020. xindex: a scalable learned index for multicore data storage. in proceedings of the 25th acm sigplan symposium on principles and practice of parallel programming (san diego, california) (ppopp '20). association for computing machinery, new york, ny, usa, 308-320. https://doi.org/10.1145/3332466.3374547  
+[42] tpc. 2019. tpc-h. http://www(tpc.org,tpch/.  
+[43] gary valentin, michael zuliani, daniel c. zilio, guy lohman, and alan skelley. 2000. db2 advisor: an optimizer smart enough to recommend its own indexes. in proceedings of the 16th international conference on data engineering. ieee.  
+[44] h. wang, x. fu, j. xu, and h. lu. 2019. learned index for spatial queries. in 2019 20th ieee international conference on mobile data management (mdm). 569-574.  
+[45] yingjun wu, jia yu, yuanyuan tian, richard sidle, and ronald barber. 2019. designing succinct secondary indexing mechanism by exploiting column correlations. in proceedings of the 2019 international conference on management of data (amsterdam, netherlands) (sigmod '19). association for computing machinery, new york, ny, usa, 1223-1240. https://doi.org/10.1145/3299869.3319861
+
+[46] zongheng yang, badrish chandramouli, chi wang, johannes gehrke, yinan li, umar f. minhas, per-ake larson, donald kossmann, and rajeev acharya. 2020. qd-tree: learning data layouts for big data analytics. in proceedings of the 2020 international conference on management of data.  
+[47] zack slayton. 2017. z-order indexing for multifaceted queries in amazon dynamodb. https://aws.amazon.com/blogs/database/z-order-indexing-for
+
+multifaceted-queries-in-amazon-dynamodb-part-1/.  
+[48] zhichao cao, siying dong, sagar vemuri, and david h.c. du. 2020. characterizing, modeling, and benchmarking rocksdb key-value workloads at facebook. in 18th usenix conference on file and storage technologies (fast 20). usenix association, santa clara, ca, 209-223. https://www.usenix.org/conference/fast20/presentation/cao-zhichao

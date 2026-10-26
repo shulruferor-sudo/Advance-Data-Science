@@ -1,0 +1,662 @@
+# serving dnns like clockwork: performance predictability from the bottom up
+
+arpan gujarati*
+
+max planck institute for software systems
+
+safya alzayat
+
+max planck institute for software systems
+
+antoine kaufmann
+
+max planck institute for software systems
+
+reza karimi*
+
+emory university
+
+wei hao
+
+max planck institute for software systems
+
+ymir vigfusson
+
+emory university
+
+jonathan mace
+
+max planck institute for software systems
+
+# abstract
+
+machine learning inference is becoming a core building block for interactive web applications. as a result, the underlying model serving systems on which these applications depend must consistently meet low latency targets. existing model serving architectures use well-known reactive techniques to alleviate common-case sources of latency, but cannot effectively curtail tail latency caused by unpredictable execution times. yet the underlying execution times are not fundamentally unpredictable—on the contrary we observe that inference using deep neural network (dnn) models has deterministic performance.
+
+here, starting with the predictable execution times of individual dnn inferences, we adopt a principled design methodology to successively build a fully distributed model serving system that achieves predictable end-to-end performance. we evaluate our implementation, clockwork, using production trace workloads, and show that clockwork can support thousands of models while simultaneously meeting  $100\mathrm{ms}$  latency targets for  $99.9999\%$  of requests. we further demonstrate that clockwork exploits predictable execution times to achieve tight request-level service-level objectives (slos) as well as a high degree of request-level performance isolation.
+
+# 1 introduction
+
+with the proliferation of machine learning (ml), model inferences are now not only commonplace but increasingly on the critical path of web requests [29, 71]. inference requests are handled by underlying model serving services [16, 26, 51, 58] responsible for supporting scores of different pre-trained ml models (including personalized models and experimental a/b tests), ideally at low latency, high throughput, and low cost. these are demanding goals to meet at scale—facebook alone serves over 200 trillion inference requests each day [48]. furthermore, at least 100 companies are creating hardware chips for accelerated ml inference [48], which underscores the high stakes in this industry.
+
+yet significant software bottlenecks continue to hamper the efficient utilization of hardware accelerators, such as gpus, for high-performance model serving. consider an inference request passing through a model serving system. the request has an inherent deadline after which the answer ceases to be useful to the end-user, and so the system should seek to bound the latency of the request, or even provide service level objectives (slos) for consistently achieving low tail latency. the canonical approach for building such a low-latency system is to reduce potential wait times for resources through overprovisioning, since a larger pool of available resources makes it more likely to find a resource on which a pending request can be immediately scheduled. increased resource provisioning, however, comes at the expense of efficiency and utilization.
+
+existing systems fundamentally assume that the constituent system components have unpredictable latency performance [16, 58]. moreover, the best-effort techniques employed to tolerate such variability, such as fair queuing, further cascade the unpredictability to other system components and propagate tail latency to higher layers. while some performance volatility of a model serving system is due to external factors, such as a bursty or skewed workload, much variability in execution times stems from design decisions internal to the service, ranging from caching decisions over conditional branching behavior to concurrency from other processes, the os, and the hypervisor. the challenge, then, is to tame the internal unpredictability.
+
+in this paper, we present the design and implementation of clockwork, a distributed system for serving models with predictable performance. with an explicit focus on the ubiquitous deep neural network (dnns) architectures we first show that dnn inference is fundamentally a deterministic sequence of mathematical operations that has a predictable execution time on a gpu. to leverage this observation in designing a responsive model serving system, our approach is to preserve predictability wherever possible by consolidating choice: eschewing reactive and best-effort mechanisms and centralizing all resource consumption and scheduling decisions. clockwork will only execute an inference request if it is confident that the request can meet its latency slo. to
+
+support such proactive scheduling, clockwork is composed of workers that each handle one or more gpus, and a centralized controller that schedules requests. each clockwork worker, responsible for the exclusive model loading and inference execution on the gpus, achieves predictable performance. if a worker cannot execute a particular schedule, because of external factors, the request is immediately aborted and the worker resumes execution of the next request at the specified time. the clockwork controller manages the resources of each worker and maintains a minimal advance schedule for the worker's operations, including model placement and replication.
+
+we have implemented clockwork in  $\mathrm{c}++$  and evaluated it using a wide range of dnn models on production workload traces. in comparison to clipper [16] and infaas [58], two prior model serving systems, clockwork more effectively meets latency goals while providing comparable or better goodput. clockwork more effectively shares resources between different models, and scales to thousands of models per worker. for realistic workloads comprising unpredictable, bursty, and cold-start clients, clockwork consistently meets low-latency response times of under 100ms.
+
+the main contributions of this paper are as follows:
+
+- we demonstrate that predictability is a fundamental trait of dnn inference that can be exploited to build a predictable model serving system.  
+- we propose a system design approach, consolidating choice, to preserve predictable responsiveness in a larger system comprised of components with predictable performance.  
+- we present the design and implementation of clockwork, a distributed model serving system that mitigates tail latency of dnn inference from the bottom up.  
+- we report from an experimental evaluation on clockwork to show that the system supports thousands of models concurrently per gpu and substantially mitigates tail latency, even while supporting tight latency slos. clockwork achieves close to ideal goodput even under overload, with unpredictable and bursty workloads, and with many contending users.
+
+# 2 background and motivation
+
+the state of machine learning. the meteoric rise of applications driven by machine learning (ml), ranging from computer vision [28, 78] to ad-targeting [3, 17] to virtual assistants [13, 64], has prompted significant interest into making both ml training and inference faster. these efforts have targeted the underlying ml models, hardware accelerators, and software infrastructure. chief among the ml modeling approaches are deep neural networks (dnns), which are composed of multiple layers of artificial neurons tuned through non-linear convolution and pooling operations [25].
+
+a plethora of specialized hardware are being developed and deployed for ml training and inference [48], such as asic and fpga chips, google's tpus [41], and facebook's big
+
+![](images/d0f7bfdd635f2f19094dff737bc53f8dff78b61cb66c3e7e3d4d64d0c478e705.jpg)  
+fig. 1: model serving targets the narrow waist of the ml software stack (adapted from reddi et al. [48]). clockwork targets the shaded blocks on the left.
+
+basin [29] chips. the dominant machine learning hardware in data centers, however, is the gpu, representing a third of the global market in 2020 [5], and will be our focus here.
+
+interposed between the emerging dnn applications and hardware accelerators, an ecosystem of ml software frameworks is flourishing. fig. 1 displays several prominent projects in today's ml software stack. layered protocol stacks in complex systems and competitive environments tend to evolve into hourglass-shaped architectures [4]. we are witnessing the onnx and nnef graph exchange formats for dnns [49, 52] emerging as the "narrow waist" of the ml stack, acting as an interface between high-level ml model development and low-level software and hardware concerns.
+
+model serving. operators increasingly deploy machine learning on the critical path of nascent interactive applications [71]. this has elevated machine learning inference to separate, managed model serving services [16, 26, 58]. from the vantage point of an operator, the model serving users (customers or internal applications) upload their pre-trained dnn ahead of time (the natural format for which is onnx/nnef). their applications can then submit inference requests to an api. the model serving back-end manages the users' models and the hardware accelerator resources, and provides timely responses to inference requests. upon receiving an inference request, it loads the appropriate model into hardware if not already loaded, runs the dnn on the input, and returns the resulting output to the user. model serving has similar concerns to other datacenter services [2]: it multiplexes workloads of different users concurrently and load balances requests across multiple workers and gpu hardware accelerators.
+
+low-latency inference. model serving users require a timely response to their queries. most cloud and data center services have service-level objectives (slos) that codify the performance that clients can expect from the service [40]. the most common type is a latency slo, which specifies the service's acceptable request latencies, typically on the order of milliseconds [14, 32, 41]. for example, a latency slo might specify a 10ms average response time, or a 40ms  $99^{\text{th}}$  percentile response time, or both. if a service fails to meet its slos – for example, by being too slow for too many requests – the service provider may risk a penalty.
+
+model serving further operates under hard cost constraints. specialized ml hardware is necessary to achieve interactive
+
+latencies [41], but it is comparatively expensive to procure and operate, and must thus be used efficiently [60, 65]. existing model serving systems achieve efficient inferences for specific heavily used models by dedicating them entire gpus and using copious batching [41]. however, many use cases cannot justify dedicated hardware resources: applications with insufficient request volume; specialization (e.g. location-specific search or language-to-language translation); and experimentation (e.g. retrained models and a/b testing) [63]. efficiently serving models with low request rates requires a large number of models to share accelerators; no existing model serving system supports this.
+
+while it is already difficult for model serving operators to meet latency slos under these constraints, the bigger challenge lies in minimizing tail latency, the insidious bane of interactive performance. numerous sources of latency variability in complex individual [46] and distributed [18, 56] systems have been identified and studied, including out-of-order scheduling, interference from concurrency, power saving modes, and network queuing delays.
+
+the crux of tail latency lies in performance variability of both the constituent system/network components and the encompassing architecture. to tame it, the system designer can either seek to (quoting dean and barrosso [18]) "create a predictably responsive whole out of less-predictable parts", or to expend significant effort to systematically unshroud and mitigate the performance variability of these underlying components. to meet tight tail-latency slos under resource constraints, the latter approach is necessary.
+
+observation: dnn inference is predictable. we observe that dnn executions exhibit negligible latency variability, a result both intuitive in concept — dnn inferences involve no conditional branches — and demonstrable in practice. although we describe our observations in the context of gpu execution, they extend to other accelerators such as tpus, and also to cpu execution where appropriate.
+
+conceptually, a dnn inference is a fully deterministic execution. each dnn inference request carries a fixed-size input tensor argument; in practical terms this is a statically-sized array of bytes. a worker receives this input over the network into main memory. to execute on a gpu, the input is copied from main memory to gpu memory over the pcie interconnect. the dnn is then executed on the gpu. abstractly, a dnn is a pre-defined sequence of tensor multiplications and activation functions. concretely, the dnn code applies these operations to the input tensor one-at-a-time to transform the input into an output. dnn code lacks conditional branching; input choices such as batching size and rnn sequence length are specified ahead of time as parameters. the output is also a statically-sized array of bytes, and it is copied from gpu memory back to main memory over the pcie interconnect.
+
+we compiled resnet50v2 [78] with tvm 0.7 [15] and executed 11 million inferences in isolation on a state-of-the-art
+
+![](images/80c593e0be825874d21f98ea061da0775397085e5a48bb8f6cea306a9d945929.jpg)  
+(a) cdf of 1-thread latency
+
+![](images/a6f99098140f7e94572a4bba404ee3f33d69911b29824a84a4ee86417d59da19.jpg)  
+fig. 2: inference is predictable in isolation (left). running inferences concurrently gains up to  $25\%$  throughput (middle), at a cost of substantially increased latency variability (right) due to interleaved gpu and os executions.
+
+![](images/4fd348b29d01955bd40a285f8ca8ec796512dfa1c5f6619bb9b4e673777a68a4.jpg)  
+(b) inference throughput and latency. whiskers show min and max.
+
+nvidia tesla v100 gpu using random inputs and batch size 1. we measured the latencies of each inference and show the median and high-percentile latencies in fig. 2a. the  $99.99^{\text{th}}$  percentile latency was within  $0.03\%$  of the median latency.
+
+if dnn execution times can be measured and then accurately predicted for future inferences on that model, the next question is whether a distributed model serving system can preserve the predictable responsiveness of the core inference execution.
+
+# 3 predictable performance
+
+to build a responsive system through principled design, we further study the factors that can cause or amplify performance variability. importantly, components at any level of the modern system stack can contribute to variable request latency, whether at the application layer, in the operating system, or even in the hardware [46]. network effects and workload fluctuations add two more sources of unpredictability to distributed systems.
+
+the whole is more than the sum of its parts. the overall system performance variability is primarily governed by how the system is assembled from its constituent components. we can handle variable latency of a software component in several ways. first, we can ignore the problem and allow the volatility to propagate to later requests or percolate to other components of the system. even performance-conscious code that is optimized to improve throughput or average latency does not fix tail latency [19]. an example of this contagiousness of unpredictability, known as the "straggler" problem in data analytics frameworks [7, 56], is when a worker executes a request that takes unusually long and the other requests that were enqueued on the worker in the meantime then incur the extra delay from the unexpected wait-time. ignoring the variability can further compound the problem across the system, such as when the request handler itself has variable latency [69].
+
+second, we can mitigate the volatility by ensuring all requests match the worst-case latency, thus exchanging lower resource utilization for predictability—often a steep price when worst-case latency is significantly higher than the median.
+
+third, we can minimize variability by expending more resources, again in trade for lower utilization. some networked systems, for instance, are designed to submit the same job to mul
+
+tiple workers in parallel and then to cancel unneeded jobs upon successfully receiving a result from the fastest worker [18].
+
+fourth, upon detecting an unusual delay, we can notify a feedback mechanism to adjust the environment to lower the impact on future requests. such "best-effort" methods are typically reactive and aimed at longer-term effects, such as by temporarily adding more resources (auto-scaling [23]), throttling requests, or balancing load.
+
+consolidating choice. we take a fundamentally different approach: designing a predictable system from the bottom up. our strategy is to restrict the choices available to lower system layers as much as possible—a philosophy based on our observation that when executing an essentially predictable task, performance variability only arose when a lower layer in the system was given choices regarding how to execute its task. examples from all layers of the systems stack abound, including:
+
+- hardware level: when a gpu is passed multiple cuda kernels to execute in parallel, the gpu has the choice of how to allocate resources, including execution units and memory bandwidth, between kernels. the gpu makes these choices based on its internal state and undocumented, proprietary policies.  
+- os level: when we create multiple threads that the operating system can execute on the same core, the os has the choice of what threads to execute when, based on internal scheduling policies and state.  
+- application level: when the worker processes of a distributed application each manage their own cache independently, the workers have the choice of what to cache and for how long, leading to unpredictable hit rates and latency variability [38]; similarly, when worker processes implement their own thread pools and queuing policies, they have the choice of which requests to execute first, leading to unpredictable queuing times.
+
+fig. 2b illustrates this: a standard design for building a worker would use thread pools serving inference requests in parallel to saturate the gpu. while concurrent threads indeed increase inference throughput by up to  $25\%$ , the factors above cause tail latency to increase by  $100\times$ .
+
+our approach is to consolidate choices in the upper layers: once a layer implements choices for lower layers based on internal state, it forces the lower layer to follow a narrow path of possible executions, causing the performance of the resulting layer to be nearly deterministic. the upper layer can then sufficiently predict the performance of the lower layers and reason with foresight about resource utilization and the anticipated execution times for all requests. the price of this strategy, however, is a tighter coupling of components and a less modular architecture.
+
+imperfect predictability. notably, we can consolidate choice without requiring perfect predictability. real systems will retain some unpredictable components, such as managing cpu caches or workload shifts, even after consolidating choices in its upper layers. instead, the chief goal of concentrat-
+
+![](images/6ff944b825089f085085fe40e1764d0b6e1f9cd3a35711ba02577c03351bcd82.jpg)  
+fig. 3: clockwork comprises multiple workers and a centralized controller. models (★) reside on workers; inference requests are queued and scheduled centrally on clockwork's controller. see §4.1 for a detailed description.
+
+ing these choices is to make predictable executions the common case. this frees us from implementing best-effort mechanisms to tolerate the occasional, rare instance of unpredictability; instead unpredictability can be directly treated as an error.
+
+# 4 design
+
+by recursively restricting choice from lower layers, we converge on a design where the most performance-critical execution choices are made in the topmost layer. in the context of a model serving service, this process converges to an architecture, which we call clockwork, with a centralized controller and workers with predictable performance.
+
+# 4.1 overview
+
+architecture. fig. 3 illustrates clockwork's architecture. users submit inference requests (①) which are queued centrally on clockwork's controller. each worker has a set of dnn models ( $\star$ ) loaded into ram and maintains exclusive control over one or more gpus. the centralized scheduler has a global view of system state, including all workers, and decides when to execute each request (②). to execute a request, the scheduler explicitly decides when to load models into gpu memory (③) and when to execute requests on the gpu (④). at any time, the scheduler makes accurate, high-quality caching, scheduling, and load balancing decisions. the controller can perform these actions proactively because execution on workers is highly predictable. the controller transmits continual scheduling information to the workers that, by design, will execute schedules exactly as directed.
+
+illustrative example. to elucidate the clockwork architectural components with more detail, including the choices that were consigned to the controller, consider the key steps for serving the inference requests illustrated in fig. 4.
+
+① upon receiving an inference request  $r_1$  for model  $\star$ , the controller is aware that a target worker has yet to copy the model weights from ram into gpu memory. it estimates the time required to load the model weights (load), plus the time to subsequently execute the inference (infer), and concludes that the request will complete within its specified slo. the controller instructs the worker to copy the model weights to
+
+![](images/1df14cb0efe72f039497a68b9055cc19aa57f5c902529d801f35abffbaa5c721.jpg)  
+fig. 4: timeline of four illustrative inference requests.
+
+gpu memory via a load action. since the controller is aware of all timings, it does not yet need to submit the subsequent infer action until the load has completed.
+
+② while  $\star$  is loading, a request  $r_2$  for model  $\triangle$  arrives. the controller is aware that, unlike  $\star$ ,  $\triangle$  is already loaded into gpu memory. the controller can choose to either infer  $r_2$  immediately, or wait for  $\star$  to complete loading then infer  $r_1$ . since the worker would be otherwise idle, the controller instructs the worker to execute the inference for  $r_2$  immediately via an infer action.  
+③ clockwork workers only execute one infer action and one load action at a time, so the controller can wait until  $r_2$  has nearly completed before submitting an infer action for  $r_1$ . in the meantime, another request  $r_3$  for model  $\star$  arrives. this gives the controller a choice between infer for  $r_1$  by itself, or to batch  $r_1$  and  $r_3$ . batched execution is more efficient, but takes longer. in this case a batched infer action will still complete before  $r_1$ 's deadline, so the controller instructs the worker to batch the inferences for  $r_1$  and  $r_3$ .  
+$④$  while  $r_1$  and  $r_3$  execute, a request  $r_4$  for  $\triangle$  arrives with a tight slo. the controller is aware that  $r_4$  will miss its deadline, even if it executes immediately after the worker becomes free. the controller does not proceed to schedule an infer action, and cancels the request before performing any fruitless work.
+
+each step of the above execution is fast, e.g. for resnet50, load and infer take approximately 8 ms and 3 ms respectively. table 1 outlines representative measurements for 8 of the 61 models used for clockwork experiments.
+
+# 4.2 consolidating choice
+
+our design consolidates choice in three main ways. first, changes in the worker's state, for instance evicting a dnn from gpu memory, can influence the performance for future requests in a way that makes performance estimation complex. we therefore require that no worker operation should have implicit performance side-effects on any future operation. second, we must ensure that a predictable component either delegates scheduling decisions that may impact performance to the centralized controller, or otherwise makes schedules deterministic. third, when a predictable component is unable to execute a schedule as instructed, it is treated as an error to enable workers to get back on schedule. workers do not attempt best-effort remediation, so as to avoid a cascade of mispredictions.
+
+we enforce these three properties in clockwork through an action command abstraction between the controller and workers that, in lieu of traditional rpc calls, either communicates a change in a worker's state or a task for a worker to execute. each action the controller issues to a worker, such as load and infer, has predicted execution time and a designated execution window. these are derived using the known state of the worker, previously submitted actions, and known transitions in controller-maintained worker state.
+
+# 4.3 challenges for predictable inference
+
+to consolidate choice we must first identify where performance-critical choices arise in system components. we have established that dnn inference itself on a gpu has deterministic performance; we next study the challenges in extending this result to a full-fledged inference system.
+
+managed memory and caches can be unpredictable (c1). ram and gpu memory on a worker constitute state that impacts the performance of future requests. additionally, some memory allocators exhibit variable timing for allocation and deallocation requests due to internal trade-offs between memory fragmentation and amortized performance. memory that is used as a cache specifically introduces performance variability between cache hits and misses, with an internal cache replacement policy influencing performance of future items. to maintain predictability, we must instead consolidate choice by managing cache admission and eviction for each worker at the central controller. fortunately, caching of dnn weights is coarse-grained and per-model.
+
+hardware interactions can be unpredictable (c2). many system resources are implicitly administered by hardware schedulers that operate at very fine time-scales and produce different schedules under even minute shifts in the arrival times of other requests. the volatility of timing coupled with proprietary and un-documented scheduling policies make it onerous to accurately predict completion times for concurrent requests. the remedy for non-determinism is to strip away the ability for schedulers to reorder requests by forcing only a single request to be executed at a time, at the cost of spending
+
+<table><tr><td rowspan="2">model family</td><td rowspan="2">model</td><td colspan="2">io size (kb)</td><td colspan="2">weights</td><td colspan="5">gpu execution latency (ms)</td></tr><tr><td>input</td><td>output</td><td>size (mb)</td><td>transfer (ms)</td><td>b1</td><td>b2</td><td>b4</td><td>b8</td><td>b16</td></tr><tr><td>densenet [36]</td><td>densenet169</td><td>602</td><td>4</td><td>56.5</td><td>4.50</td><td>5.18</td><td>6.29</td><td>8.57</td><td>12.82</td><td>21.85</td></tr><tr><td>inception v3 [68]</td><td>inceptionv3</td><td>1073</td><td>4</td><td>95.3</td><td>7.77</td><td>4.46</td><td>6.85</td><td>10.99</td><td>16.45</td><td>26.17</td></tr><tr><td>mobile pose [72]</td><td>mobile_position_mobilenetv3</td><td>590</td><td>209</td><td>19.0</td><td>1.55</td><td>1.29</td><td>1.92</td><td>3.13</td><td>5.71</td><td>11.62</td></tr><tr><td rowspan="3">resnet [30]</td><td>resnet18</td><td>602</td><td>4</td><td>46.7</td><td>3.81</td><td>1.27</td><td>1.86</td><td>2.73</td><td>4.06</td><td>7.02</td></tr><tr><td>resnet50</td><td>602</td><td>4</td><td>102.3</td><td>8.33</td><td>2.61</td><td>3.78</td><td>5.61</td><td>9.13</td><td>15.67</td></tr><tr><td>resnet152</td><td>602</td><td>4</td><td>240.9</td><td>19.58</td><td>7.71</td><td>11.14</td><td>16.21</td><td>26.48</td><td>44.60</td></tr></table>
+
+greater effort on keeping the resource fully utilized. mercifully, one-at-a-time execution of dnn inferences on gpus has closely comparable throughput to concurrent execution (fig. 2b) and many classes of dnns (e.g. convolutional neural networks) can saturate gpus with small batch sizes.
+
+external factors can trigger performance variance (c3). even after systematically removing the key internal sources of unpredictability by consolidating choice, there will always remain external sources outside of the controller's purview. these include performance interference through shared network bottlenecks, thermal throttling of cpus and gpus, and others. the only option is to minimize their effects by building sufficient tolerance into the system.
+
+# 4.4 predictable dnn worker
+
+at a high-level, clockwork workers maintain dnns in memory and execute inference requests on one or more gpus. the workers interface with the controller to receive actions.
+
+memory management. model weights must be present in gpu memory to execute an inference. however, gpu memory capacity is small ( $\leq 32\mathrm{gb}$ ) relative to host memory ( $\leq 4\mathrm{tb}$ ), and host-to-gpu memory transfers ( $\approx 8.3\mathrm{ms}$  for resnet50) typically take longer than running the dnn inference on the gpu ( $\approx 2.9\mathrm{ms}$ ). consequently, clockwork treats gpu memory as a cache, letting commonly or recently used models avoid expensive loads. to overcome c1, workers explicitly expose load and unload actions to the controller for copying models to and removing models from worker's gpu memory with deterministic latency. these actions also update the state that the controller tracks for the worker.
+
+inference execution. the controller only sends an infer action when a model is present in gpu memory or a load action will momentarily complete. the worker internally divides infer actions into three steps. first, input transfers the input vector from host to gpu memory. next, exec performs the actual heavy-weight dnn gpu calculations, which dominate the total inference time. finally, output transfers the resulting output vector from the gpu back to host memory. these steps may coincide: the previous request's outputs can be copied at the same time as the current request's input is being transferred. however, multiple concurrent exec calls cause the gpu hardware scheduler to behave unpredictably (c2). fortunately,
+
+a dnn inference call by itself can efficiently utilize the gpu while also restricting the hardware scheduler to a single, predictable option (fig. 2b). clockwork workers therefore run a single exec at a time, a design choice that reduces performance variability by two orders of magnitude while only minimally decreasing inference throughput (fig. 2b).
+
+interface with the controller. clockwork workers receive load, unload, and infer actions from the controller with detailed timing expectations attached:
+
+table 1: measurements of a representative subset of the 61 models used for clockwork experiments. pre-trained models were sourced from the onnx model zoo [53] and the gluoncv model zoo [28], and optimized for nvidia tesla v100 gpus using tvm v0.7 [15].  
+
+<table><tr><td>type</td><td>infer, load, or unload</td></tr><tr><td>earliest</td><td>the time when this action may begin executing</td></tr><tr><td>latest</td><td>when this action will be rejected</td></tr></table>
+
+rather than executing actions in a work-conserving, best-effort manner, workers strictly follow the schedule of actions imposed by the controller. the controller communicates two timestamps with every action, earliest and latest, to designate a time interval during which the worker may begin executing the action. actions that cannot start within the prescribed window are cancelled and never executed. this allows workers to quickly get back on schedule after an individual action is delayed unexpectedly (c3) by skipping one or more actions, minimizing the impact of the delay on other actions. workers communicate the result of each action back to the controller, including whether the command was successful and the measured execution time.
+
+# 4.5 central controller
+
+all decision-making in clockwork occurs in the central controller. the controller receives inference requests from users and decides worker actions while striving to meet slos.
+
+modeling worker performance. the controller maintains a per-worker, per-model performance profile comprising processing time measurements of recent requests; profiles are updated continuously to tolerate shifts due to external factors (c3). the controller also tracks the outstanding actions and memory state at every worker. since actions have inherently deterministic latency by design, the controller can deduce the earliest time that a worker could begin executing a new action (queuing time).
+
+action scheduler. the clockwork controller proactively manages action schedules for workers. it utilizes a global view
+
+of system requests, up-to-date worker performance profiles, and accurate predictions for when outstanding actions will complete. the controller attempts to pack worker schedules tightly by making narrow, realistic estimates for the earliest and latest time interval. the interval width balances a trade-off between clockwork slo fulfillment and system goodput. on one hand, making the interval too narrow increases the risk of an action not being executed by a worker because it could not be completed in time (c3), potentially triggering an slo violation. on the other hand, underestimating the window length can create periods of inactivity and decrease worker utilization, thus affecting clockwork goodput.
+
+the scheduler lazily decides which worker should execute the inference. the controller only submits a minimal amount of work to keep workers utilized; it is in no hurry to commit because it can accurately predict action timings. delaying choices on the controller improves schedules by providing more options, permitting the clockwork controller to re-order and batch inference requests to the same model, significantly improving resource efficiency and throughput.
+
+in our design, any worker can process any request since they all store every model in host memory; however, workers have different sets of models loaded into their gpu memory. a worker that executes only cold inferences must transfer weights for each model from host memory to the gpu and may saturate the available pcie bandwidth, whereas a worker that executes only hot inferences may be bottlenecked by the gpu. the clockwork scheduler balances load by mixing and matching hot and cold inferences among all workers.
+
+# 5 implementation
+
+clockwork's implementation, comprising 26kloc of  $\mathrm{c}++$ , contains various decisions that enable clockwork to consolidate choice on its controller.
+
+# 5.1 models
+
+predictable model execution. prior model serving systems such as clipper [16] and infaas [58] act as orchestration layers atop existing model execution frameworks such as tensorflow [1] and tensorrt [50]. this decoupling makes it difficult to consolidate choice, since the model execution frameworks encapsulate scheduling and memory management decisions that we wish to make with clockwork. instead, clockwork implements its own model runtime, reusing key components of the tvm optimizing compiler [15]. clockwork's model runtime enables fine-grained control over each stage of a model's execution. for models provided to clockwork (e.g. in onnx form), we compile a binary representation using tvm and postprocess the model to produce the following:
+
+- weights: a model's weights are a binary blob (10s to 100s of mb (cf. table 1).  
+- kernels: the cuda kernels that execute a model (10s to 100s of kb). these are not provided by the user; they are derived from the abstract model definition, and kernels
+
+from different users can safely execute within the same process. clockwork uses the kernels compiled by tvm. clockwork compiles kernels for multiple configurable batch sizes; by default 1,2,4,8, and 16. kernels for different batch sizes can use the same weights without modification
+
+- memory metadata: at runtime, models do not directly allocate memory; instead, clockwork will pre-allocate and manage all gpu memory and pass pointers as arguments to function calls. the memory requirements for a model are static, and clockwork recalculates the required workspace memory and offsets required for each kernel.  
+- profiling data: clockwork runs a brief profiling step to produce a seed estimate for model execution times.
+
+model loading. models are stored in an efficient serialized form on disk. clockwork workers pre-load models from disk into main memory on worker startup. for the worker machines used in our evaluation, 768gb ram can support thousands of models (cf. §6.5). once a model is in main memory, clockwork extracts and links the cuda modules needed for its execution. to improve predictability, clockwork disables jit compilation and the caching of cuda kernels.
+
+# 5.2 dnn workers
+
+each machine runs one worker process that receives and executes actions from clockwork's controller. we do not run clockwork in a container or vm to avoid the performance interference such sharing can impose.
+
+managing model weights in memory. clockwork pre-allocates all gpu memory and divides it into three categories:
+
+- **workspace:** models require a variable amount of gpu memory for intermediate results. this memory is transient and only needed during execution; once an output has been produced, it is no longer needed. clockwork only executes models one-at-a-time, so it allocates 512mb workspace memory.  
+- iocache: although clockwork only executes models one-at-a-time, clockwork asynchronously copies inputs to the gpu prior to execution, and outputs to host memory after execution. clockwork allocates 512mb device memory for temporary storage of inputs and outputs before and after execution.  
+- pagecache: the remaining device memory is used for storing model weights, divided into 16mb pages. multiple tensors can occupy the same 16mb page and the mapping of tensors to pages is determined statically at model-compile time. at runtime, page pointers are passed as kernel arguments and tensors are read from pre-defined offsets.
+
+clockwork's pagecache has several advantages. first, avoiding repeated memory allocation calls leads to more predictable executions, since memory allocation can be an unpredictable source of overheads (c1). second, paging simplifies choice: external memory fragmentation issues are
+
+eliminated, and the controller need only track the number of total free pages to completely capture the worker's memory state. paging slightly increases memory utilization; however, model memory requirements are static and known ahead of time, and can be bucketed on to pages to reduce internal fragmentation. paging does not affect the latency of memory transfers.
+
+actions. to orchestrate workers, the controller uses the previously described action abstraction. actions contain a unique id and an action-dependent payload (e.g. infer inputs). each worker runs a dedicated executor for each action type and each worker-gpu. an executor runs a thread that dequeues actions chronologically by earliest timestamp, and waits until earliest is reached before proceeding with an action. executors reject actions whose latest timestamp has passed. to reduce interference between threads and other processes, each executor is pinned to a dedicated core and runs at real-time priority. both infer and load execute asynchronous work in their own cuda streams. each executor is bottlenecked by a different resource (e.g. gpu execution and pcie transfers) and can run concurrently with negligible interference.
+
+results. a network thread maintains a persistent connection with the controller for receiving actions and sending results. a result comprises the following:
+
+```txt
+status success or an error code timing start and end times, and on-device execution duration for any asynchronous work
+```
+
+load actions acquire pages from the pagecache, then copy weights to those pages. if no pages are available then load aborts. the controller explicitly frees pages with unload; this only updates in-memory metadata and always succeeds.
+
+infer actions comprise input, exec and output, each of which have dedicated executors. input executes immediately on receipt of infer; it acquires io memory from the iocache then copies inputs. exec inherits the infer action's earliest and latest timestamps; it checks weights and inputs are present then executes kernels on the gpu, using workspace for intermediate calculations. output immediately copies outputs back to main memory then releases the io memory. to simplify controller decision making, input and output are not exposed as actions since they are orders of magnitude faster than exec and load (10s of microseconds) for our workloads. clockwork's memory management allows for back-to-back infer actions for the same model.
+
+# 5.3 central controller
+
+on startup, clockwork's controller establishes persistent connections to all workers and exchanges metadata about the size of each worker's pagecache, the models present on each worker, and their initial pre-profiled execution times. the core duty of the controller is to satisfy requests received from clients by submitting actions to workers. this decision making is encapsulated in the scheduler interface:
+
+```txt
+onrequest client request received, specifying a model id, slo, and providing inference inputs onresult a result is received from a worker
+```
+
+a scheduler implements this interface, and can invoke sendaction to send an action to a worker, and sendresponse to respond to a client. a separate layer of the controller implements common tasks such as networking, forwarding inputs to workers, setting timestamps, and handling timeouts. this design concentrates all choice in a single place, and enables different scheduler implementations to be easily dropped in.
+
+managing worker state. the controller maintains an accurate representation of workers' execution state, which is threefold: memory state, in which the scheduler tracks what models are present in the worker pagecaches and when load will be required; action profiles, which are measurements of past 10 actions duration, stratified by model, worker, and batch size, to predict the duration of future action; and pending actions, which tracks submitted actions and estimates when each executor will next be available. taken together, these enable the scheduler to accurately predict when candidate actions will complete, and avoid submitting work that cannot complete before the request's deadline. worker state is not a significant scalability bottleneck; action profiles require only 40 bytes for each model, worker and batch size combination.
+
+scheduling infer. upon arrival, requests are enqueued into per-model request queues. for each infer executor, a new action must be scheduled whenever the executor has less than 5 ms of outstanding work. to schedule an infer action, a model and batch size must be selected. the batch size can differ action-to-action, though the scheduler prioritizes larger batch sizes for efficiency.
+
+at any point in time, a model will have zero or more queued requests. however, not every request is suitable for every batch size. higher batch sizes take longer to execute, so a request close to its deadline might only be satisfiable using a small batch size. to handle this, each model has a request queue per batch size (we term this a batch queue). new requests are enqueued into every batch queue. requests are dropped from batch queues when they cease to be satisfiable; e.g. a request in the batch size of 16 queue will be dropped sooner than it is dropped from the batch size of 8 queue.
+
+to decide which model and batch size to schedule, we use strategies. a strategy specifies a model, a latest timestamp, and a batch size. each infer executor has a separate strategy queue, ordered by latest, containing only strategies for models it has loaded. the scheduler dequeues strategies until it finds one that is valid: latest has not elapsed, and the batch queue for the specified batch size has sufficient requests. if a strategy is valid, the scheduler will also speculatively increase the batch size as long as extra requests are available.
+
+when a valid strategy is found, an infer action is created and requests are dequeued to fill the batch. old strategies for this model are removed from the strategy queue, and new
+
+![](images/57bb86b29ea1fdc6b3210afa86c18c49d4bb24c4c006282fe4e0d4cf0bdc5ffd.jpg)  
+fig. 5: goodput and latency measurements for clipper, infaas, and clockwork. we deploy 15 instances of resnet50 on 1 worker; each model submits 16 concurrent requests in a closed loop. (left) request goodput. goodput only counts requests that succeed within the slo. (right) request latency cdfs across all requests (including those rejected due to missed deadlines). latency cdfs are scaled to highlight tail latency.
+
+strategies are then created and enqueued. a strategy is created per batch queue; latest is calculated by subtracting the batch execution time from the deadline of the request at the head of the queue. empty batch queues are skipped.
+
+scheduling load. each load executor also schedules up to 5 ms of outstanding work. for a load executor, the scheduler selects a model by estimating each model's slo violations given the model's current state and outstanding requests. to do this efficiently, the scheduler maintains and incrementally updates load and demand statistics for models and gpus:
+
+-  $d_{m}$  the total demand for each model  $m$  
+-  $a_{m,g}$  the demand allocation of model  $m$  on gpu  $g$ .  
+-  $\ell_g = \sum_m a_{m,g}$  the total load on each gpu  $g$
+
+a model's total demand  $d_{m}$  is the total estimated execution time of  $m$ 's outstanding requests; we update  $d_{m}$  when requests for that model arrive and complete. the demand allocations  $a_{m,g}$  for  $m$  on gpu  $g$  are also updated when requests arrive and complete; they are calculated such that  $\sum_{g} a_{m,g} = d_{m}$ . demand allocations are 0 for gpus where the model is not loaded. on gpus where the model is loaded, demand allocations are inversely proportional to the gpu's load, since overloaded gpus will be able to execute proportionally less of the total demand. each gpu's total load  $\ell_{g}$  is the sum of its allocations across all models. with these estimates, each model's load priority is defined as
+
+$$
+p _ {m, g} = d _ {m} - \sum_ {g} a _ {m, g} \cdot \frac {\text {c a p a c i t y} _ {g}}{\ell_ {g}}.
+$$
+
+a model's load priority estimates its unfulfilled work. for example, a model that is not loaded on any gpus has priority equal to its outstanding work; a model loaded on a gpu that sits mostly idle has negative priority since the gpu can serve more work than the model demands.
+
+clockwork does not attempt to converge to a perfect demand allocation each time the system's state changes. rather, clockwork incrementally updates each model's demand allocation and load priority (i) when new requests arrive for that model; (ii) when an infer is initiated for that model; (iii) when load and unload affect a model; and (iv) when a request crosses the point where it can benefit from load before its deadline.
+
+the scheduler selects load actions by choosing the highest priority model that is not already loaded. notably, models with negative priority need not be loaded since their demands are already met. clockwork uses a least-recently-used (lru) eviction policy when selecting models to unload.
+
+# 6 evaluation
+
+we next assess clockwork's ability to reliably serve dnns under a variety of workload conditions. we begin our experimental evaluation with simple workloads in controlled settings, before expanding to heterogeneous models and diverse workloads. our evaluation shows that clockwork's assumptions about predictability hold, and result in a system that can effectively meet slos and drastically reduce tail latency.
+
+experimental setup. we deploy clockwork in a private cluster of 12 dell poweredge r740 servers. each server has 32 cores, 768 gb ram, and  $2 \times$  nvidia tesla v100 gpu with 32 gb memory. the servers are connected by  $2 \times 10$  gbps ethernet on a shared network. in all experiments, we run the controller, clients, and workers on separate machines.
+
+# 6.1 how does clockwork compare?
+
+we begin with a comparison to two prior model serving systems, clipper [16] and infaas [58]. for clipper and clockwork, we provision a single cluster machine to use 1 gpu to serve 15 separate copies of resnet50. resnet50 is the `defacto` model used for comparison previously by these systems; we chose 15 models as this reached the memory limit of `clipper¹`. to evaluate infaas, we deployed an m5.24xlarge and ap3.2xlarge ec2 instance as the master and the worker, respectively. these are not identical experiment conditions; however, infaas is tightly integrated with ec2, and could not be deployed on our cluster infrastructure. we include these results for qualitative comparison.
+
+offered load. for each model, we run 16 closed-loop clients<sup>2</sup>. the serving systems may batch requests for the same model instance, but requests to different instances cannot be
+
+![](images/5d7a4d5fe215b6da9cd7923167cfc5d2e7fc215035ec512186e1fbbb9aa01ec3.jpg)  
+fig. 6: clockwork can serve thousands of models from a single worker. from  $t = 0$ , the major workload adds an additional model per second, to a total of 3,600 models at  $t = 60$  (cf. §6.2.)
+
+batched. we run multiple experiments, varying the target slo from  $10\mathrm{ms}$  to  $500\mathrm{ms}$ .
+
+goodput. fig. 5 plots the goodput achieved by each system as the target slo varies from  $10\mathrm{ms}$  to  $500\mathrm{ms}$ . goodput is the number of successful requests that completed within the target slo; it excludes timed out requests and requests that responded after the slo.
+
+with a high slo of  $500\mathrm{ms}$ , clockwork and infaas meet their slos and have comparable goodput of approximately  $800~\mathrm{r / s}$ . clipper's goodput is substantially lower, as clipper only treats slos as an average latency target, not a strict threshold, and converges to this target over time without bounding latency variability. as slos tighten, goodput and tail latency deteriorate for both clipper and infaas, and their goodput collapses below a  $100\mathrm{ms}$  slo. like clipper, infaas uses the slo as a coarse-grained goal for reactive policies. consequently, only clockwork can continue serving slos below  $100\mathrm{ms}$ .
+
+fig. 5 also plots latency cdfs for clipper, infaas, and clockwork. we scale the cdfs to emphasize tail latency. the figure illustrates how both clipper and infaas allow latency higher than their slos. however, of note, with a  $500\mathrm{ms}$  slo, infaas successfully finds a configuration that can serve this slo, and meets its slo for  $99\%$  of its requests. by comparison, clockwork's tail latency remains very close to the slo in all cases. for the  $500\mathrm{ms}$  slo, clockwork's latency remains at  $\approx 300\mathrm{ms}$  because it schedules each model's entire batch of 16 requests at a time, round-robin across models. with 15 models and a  $20\mathrm{ms}$  batch-16 execution duration, clockwork does not exceed the optimal  $300\mathrm{ms}$  latency.
+
+# 6.2 can clockwork serve thousands?
+
+the previous experiment represented an idealized scenario, with only a small number of models, each with a steady sustained workload. we now examine the serving limits of a single worker. we deploy 3,601 copies of resnet50 to a worker, and set a  $100\mathrm{ms}$  slo. we submit two workloads: a major workload and a minor workload. the major workload
+
+comprises 3,600 model instances; we vary the number of instances that are active at any point in time, and evenly distribute a workload of  $1,000\mathrm{r / s}$  across all active models. the minor workload is a single model instance that maintains a fixed  $200\mathrm{r / s}$  request rate throughout the experiment.
+
+figure fig. 6 (a) plots the goodput achieved by the major and minor workloads. from  $t = -5$  to  $t = 0$  (we denote  $t$  in minutes) only the minor workload is present, achieving its full  $200\mathrm{r / s}$ . at  $t = 0$ , we activate one model instance of the major workload; the addition of  $1000\mathrm{r / s}$  fully saturates the gpu (e). after that, we activate an additional model of the major workload every 1 second. as more model instances become active, the major workload's goodput drops since each additional model forgoes batching opportunities. at  $t = 60$  all 3,600 models are active, each submitting approximately  $0.28\mathrm{r / s}$ .
+
+by  $t = 3.5$ , 201 models have been activated, reaching the capacity of gpu device memory. to continue serving requests, clockwork begins swapping models on and off gpu; fig. 6 (d) shows pcie utilization rapidly rises to  $100\%$ . as more models activate, an increasing number of requests in the major workload find that their model is not loaded; fig. 6 (c) plots the rise in cold-starts, reaching  $70\%$  by the end of the experiment. the minor workload, with its sustained request rate of  $200\mathrm{r / s}$ , does not experience any cold starts because its demand dwarfs every other model after the first 5 seconds. as the number of cold-starts increases, the demand on gpu execution decreases, enabling the minor workload's goodput to gradually grow back to  $200\mathrm{r / s}$ . at approximately  $t = 20$ , the bottleneck for the major workload shifts to pcie utilization, enabling the minor workload's latency to drop back to an average of  $20\mathrm{ms}$  (b).
+
+this experiment illustrates how bottlenecks in clockwork can shift as workload demand changes. clockwork can deal with shifting bottlenecks even while serving a large number of models. as illustrated in fig. 6 (b), the maximum request latency across the experiment did not exceed the  $100\mathrm{ms}$  slo.
+
+# 6.3 how low can clockwork go?
+
+clockwork's predictability and centralized decision-making enables it to satisfy low-latency slos. in this experiment, we use six clockwork workers and evaluate the lower limit on slos that clockwork can achieve by measuring the proportion of successful requests while varying the slo. we repeat the experiment for six different workloads, varying the number of resnet50 instances ( $n = 12$  or 48) and cumulative request rate ( $r = 600\mathrm{r / s}$ ,  $1200\mathrm{r / s}$ , or  $2400\mathrm{r / s}$ ). for each experiment run, we begin with an slo of  $2.9\mathrm{ms}$  ( $1\times$  the execution latency of batch-1 resnet50 inference). every 30 seconds, we extend the slo by  $50\%$ ; by the end of the experiment the slo reaches 74ms. we run a separate open-loop client for each model with a poisson inter-arrival time distribution, and as before, all models are independent (requests cannot be batched across models).
+
+workload satisfaction. fig. 7 plots the workload satisfaction for each experiment run. workload satisfaction is the ratio of goodput to offered load. a workload satisfaction of
+
+![](images/0ed3f57f4fe0845b6fa9392c164184d6cb2224679fc08d8dea19c8a3caf8b4a5.jpg)  
+fig. 7: workload satisfaction rates as we vary  $n$ , the number of clients, and  $r$ , the request rate.
+
+![](images/8796593e3b397e94c28ea4e2bbee472682efda0e9a728c98d669879513ff2243.jpg)  
+fig. 8: workload satisfaction rates for latency-sensitive clients (top) and workload goodput for batch clients (bottom).
+
+1 means all requests received a successful response within their slo. for a load of  $r = 600 \, \mathrm{r/s}$  and  $1200 \, \mathrm{r/s}$ , irrespective of the number of models, clockwork successfully satisfied tight slos 10 and 22 ms. even at  $r = 2400 \, \mathrm{r/s}$ , clockwork comfortably managed an slo of 74 ms.
+
+# 6.4 can clockwork isolate performance?
+
+clockwork can satisfy tight slos for latency-sensitive clients in isolation; we next consider when the system is shared with other users serving batch requests without latency slos. as before, we use six clockwork workers, and all clients use instances of resnet50. we provision six latency-sensitive clients, each submitting a  $200\mathrm{r / s}$  open-loop workload. we also provision several batch clients, which submit sustained closed-loop workloads and do not have latency slos. big-batch clients have a concurrency of 16, while small-batch clients have a concurrency of 4. varying the concurrency affects the maximum batch size clockwork can achieve for batch client requests. we considered three scenarios: (a) baseline without batch clients; (b) 12 big-batch clients; and (c) 48 small-batch clients.
+
+fig. 8 illustrates the workload satisfaction rates for latency-sensitive clients and the total goodput achieved for the batch clients. clockwork successfully prioritizes latency-sensitive requests over batch requests. through slo-aware scheduling, it ensures that the workload satisfaction rates are unaffected by the presence of other pending, less time-critical requests. at the same time, clockwork does not throttle batch requests entirely, but schedules them during idle times or expected idle times. however, when the slos are too tight (<15ms), many latency-sensitive requests are rejected in advance, allowing pending batch requests to pass through.
+
+# 6.5 are realistic workloads predictable?
+
+we now ask whether executions remain predictable under realistic workloads that comprise many concurrent users and models. we also investigate whether clockwork effectively
+
+<table><tr><td>model family</td><td>count</td><td>model variants</td></tr><tr><td>densenet [36]</td><td>4</td><td>121, 161, 198, 201</td></tr><tr><td>dla [75]</td><td>1</td><td>34</td></tr><tr><td>googlenet [67]</td><td>1</td><td></td></tr><tr><td>inception [68]</td><td>1</td><td>v3</td></tr><tr><td>xception [68]</td><td>1</td><td></td></tr><tr><td>mobilepose [33]</td><td>4</td><td>sprn18, mnv3, rn18, rn50</td></tr><tr><td>resnest [78]</td><td>4</td><td>14, 26, 40, 101</td></tr><tr><td>resnet [30]</td><td>22</td><td>18, 18b, 34, 34b, 50, 50b, 50c, 50d, 50s, 50-1.8x, 101, 101b, 101c, 101d, 101s, 101-1.9x, 101-2.2x, 152, 152b, 152c, 152d, 152s</td></tr><tr><td>resnet-v2 [31]</td><td>5</td><td>18, 34, 50, 101, 152</td></tr><tr><td>resnext [73]</td><td>3</td><td>50-32, 101-32, 101-64</td></tr><tr><td>senet [35]</td><td>2</td><td>50-32, 101-32</td></tr><tr><td>tsn [70]</td><td>7</td><td>iv1, iv3, r18, r34, r50, r101, r152</td></tr><tr><td>wide resnet [76]</td><td>3</td><td>16-10, 28-10, 40-8</td></tr><tr><td>winograd [45]</td><td>3</td><td>rn18, rn50, rn101</td></tr></table>
+
+table 2: list of models used in experiments.
+
+exploits this predictability.
+
+to answer these questions, we deploy clockwork on 12 workers and replay a workload trace of microsoft azure functions (maf) [61]. the trace records approximately 46,000 function workloads, counting the number of invocations of each function, every minute, for two weeks. it interleaves a wide range of workloads, including heavy sustained workloads, low utilization cold workloads, bursty workloads that fluctuate over time, and workloads with periodic spikes [61]. we believe this to be a representative workload for evaluation since serverless platforms enable a wide range of applications and supporting ml inference on serverless is an active area of research [10,39].
+
+in this experiment, we replay six hours of the maf trace in real-time. we use 61 different models (table 2) taken from the onnx model zoo [53] and the gluoncv model zoo [28]. we duplicate each model 66 times, resulting in a total of 4,026 instances and reaching the main-memory capacity of our worker machines. we replay ten or eleven function workloads for each model instance. we configure clockwork with a  $100\mathrm{ms}$  slo.
+
+clockwork with realistic workloads. the time series in fig. 9 (a) shows the offered load and goodput achieved across all models. for the 6 hour experiment, both the offered load and goodput averaged  $9,638\mathrm{r / s}$  – out of a total of 208 million requests, only 58 failed due to action timing mispredictions, and no requests timed out. all gpus were fully utilized throughout the experiment, yet no request exceeded the 100ms slo.
+
+fig. 9 (b) plots the median,  $99^{\text{th}}$  percentile, and maximum request latency over the course of the experiment. latency spikes occur every 5, 15, and 60 minutes, due to the presence of numerous periodic workloads within the trace [61]. workload spikes do not cause slo violations because of latency headroom; fig. 9 (c) shows the average batch size for the experiment, and with each workload spike, clockwork can schedule larger batches, with higher latency. to evaluate the cold-start behavior of this workload, we categorize a request as a cold-start if its model is not already loaded into gpu's memory before arrival. for each 1-minute interval, fig. 9 (d) counts the number of
+
+![](images/ec46d9c5b16686a69b8425a717aea96e256f706bb290bd344e01d8b0d10d64cb.jpg)  
+fig. 9: microsoft azure functions (maf) over clockwork; see §6.5 for a description.
+
+![](images/2a47c76dc027a855b8a62c4874d0b4beea91443f8c1c6437207a3df6e6da1f92.jpg)  
+fig. 10: clockwork prediction and completion errors for maf trace.
+
+unique models that have at least one cold-start, and at least one warm-start. on average, 987 unique models perform cold-starts each minute; or approximately  $25\%$  of all models. however, while many models perform cold-starts, they only represent a small fraction of all requests. fig. 9 (e) plots the throughput of cold-start requests, averaging  $126~\mathrm{r / s}$ , or  $1.3\%$  of all requests. these results show that clockwork can sustain significant load for varied, realistic workloads comprising thousands of models.
+
+predictable executions. clockwork's scheduler relies on accurate predictions of action latency, so to assess clockwork's underlying assumptions of predictability, we next evaluate the accuracy of clockwork's predictions. we measure the latency of infer and load actions on clockwork's workers and compare it to the time estimated by clockwork's controller to derive a prediction error. prediction errors comprise two types: overprediction, when the real execution latency is faster than predicted; and underprediction, when the real execution latency is slower than predicted. consistent overpredictions can lead to idle resources, while consistent underpredictions can cause slo violations. fig. 10 (top) plots the prediction errors for infer and load actions. for infer actions, the  $99^{\text{th}}$  percentile of overpredictions and underpredictions is  $144\mu s$  and  $55\mu s$ , respectively. thereafter, the tail latency grows
+
+![](images/ccc821d08829e38ad12b950430a6daf3b6b2aaff46acd1de1363e40a797ee89f.jpg)  
+fig. 11: (left) with 40 emulated workers, goodput is approximately equal to offered load; peak goodput is achieved at appx.  $40,000\mathrm{r / s}$ , when all workers are fully utilized. (right) peak goodput achieved with different numbers of emulated workers.
+
+to exceed  $10\mathrm{ms}$  in a few extremely rare cases. clockwork consistently overpredicts more than it underpredicts, as it uses a rolling  $99^{\mathrm{th}}$  percentile measurement to make its predictions. for load actions, the  $99^{\mathrm{th}}$  percentile of overpredictions and underpredictions is  $431~\mu \mathrm{s}$  and  $348~\mu \mathrm{s}$ , respectively.
+
+fig. 10 (bottom) plots the completion time error. clockwork must accurately predict when a given action will complete, taking into account any previously submitted actions (i.e. queuing time). individual prediction errors can compound, leading to increased completion time error. for infer actions, the error compounds  $4 \times$ , with a  $99^{\text{th}}$  percentile completion error of  $\approx 1$  ms. in extreme cases, clockwork's completion error also grows to more than  $10$  ms. however, the completion error does not substantially exceed the action duration error, implying that for clockwork, erroneous predictions of outliers are statistically independent.
+
+# 6.6 can clockwork scale?
+
+centralized scheduling presents a potential scalability bottleneck, though prior work has demonstrated that centralized schedulers can reach impressive scale [24, 57]. our final experiment examines the scalability of clockwork's controller.
+
+to venture beyond the capacity of our testbed, we leverage a specially-developed emulated worker that implements clockwork's action interface. the emulated worker behaves identically to a bona fide clockwork worker, except the load and infer actions perform no meaningful work; instead, they wait for a period of time according to the pre-profiled model measurements before returning a response. the emulated worker is indistinguishable from a real worker from the vantage point of clockwork's controller. to bypass the limited network capacity of our testbed, we modified our clients to send zero-length inputs (network is not a fundamental limitation; see §7 for discussion).
+
+we measure the peak goodput achieved as we vary  $n$ , the number of emulated workers. we run multiple experiments, each with a different value of  $n$ , from 10 to 150 in increments of 10. we use the same models as described in §6.5, and a similar workload. instead of replaying the trace at a fixed rate, we scale the trace and gradually offer more load in 60-second intervals. fig. 11 (left) illustrates one experiment run with  $n = 40$ . goodput follows the offered load almost perfectly up to about 40,000 r/s, at which point all workers are fully utilized and the goodput saturates.
+
+fig. 11 (right) reports the peak goodput achieved with different numbers of workers. we report the median values across three experiment repetitions. the figure shows a linear increase in the peak goodput as the number of workers increases. below  $n = 110$ , goodput is limited by workers reaching full utilization. at  $n = 110$ , we reach a maximum goodput of  $103,387 \, \text{r/s}$ . at this point worker utilization stops being the limiting factor; instead, the bottleneck shifts to clockwork's controller. beyond  $n = 110$  peak goodput declines.
+
+# 6.7 summary
+
+in comparison with prior model serving systems, clockwork achieves superior goodput, serves considerably more models concurrently, and violates substantially fewer slos. owing to a lack of performance variability, clockwork can achieve much tighter latency slos without sacrificing tail latency. clockwork's underlying assumptions about predictable executions bear out in reality: by consolidating choice, a predictable system that substantially curtails tail latency can be built.
+
+clockwork extends to a diverse range of workload conditions not supported by prior systems, including supporting thousands of models concurrently per gpu. slow cold starts can run alongside high-throughput workloads without interference. under all workload conditions, including cold starts and even under overload, clockwork meets most slos without degrading service, and maintains close to maximal possible goodput. finally, clockwork isolates users of different models, enabling low-latency workloads to share the same system with background batch workloads.
+
+# 7 discussion
+
+why consolidate choice? philosophically, the encapsulation, abstraction, and loose coupling of components are essential design practices while the building blocks and use cases of large systems are still in flux. over time, the true use cases for the system settle and the entire system may in turn be replaced by a simpler, refined system that avoids the over-engineering and generality of its constituent parts—components that transpired to either be unnecessary in practice or to impede the common use case of the system. the squashing of layers through such specialization, effectively transforming systems into abstract units, can counteract the infamous bloat of modern software stacks. we designed clockwork to be such an abstract unit for model serving systems.
+
+machine learning. clockwork focuses on dnn inference, and excludes data preprocessing and postprocessing steps that are user-defined and cpu-bound. safely and predictably executing these in clockwork is a current research topic.
+
+individual dnn inferences are the atomic unit of work for clockwork. increasingly, modern ml applications are composed of pipelines or cascades of dnns [34, 43, 62]. for these applications, performance predictability is strongly desired. we believe there are opportunities to leverage clockwork's
+
+properties and perform more sophisticated pipeline scheduling that provides end-to-end guarantees. similarly, performance predictability can influence system designs in other areas, such as large language embedding models [11] that may require dedicated or distributed accelerators. expanding clockwork into other ml paradigms, such as deep reinforcement learning and dnn training, raises philosophical questions about the nature and limits of predictability.
+
+inference accelerators. the clockwork approach generalizes readily beyond gpus to other inference-specific hardware accelerators [48], whose performance is arguably even more predictable. tpus [41], for instance, are explicitly built around the idea of delegating control to software, while also eschewing general purpose processing engines with flexible control logic and generic memory hierarchies in favor of high-level operations and explicit memory hierarchies.
+
+on the other extreme, inferences can also be executed in software on the cpu. while many models are heavily parallel in nature and execute orders of magnitude slower on cpus, there are other models where execution on cpu is acceptable. one such example are recurrent neural networks (rnns) which are fundamentally more sequential and often cannot effectively leverage the available parallelism on gpus or other accelerators.
+
+limitations of predictability. consolidating choice is only possible when you have control of, or guarantees about, the system's major bottleneck resources. for example, clockwork assumes workers have exclusive control over their machine, and dedicated gpus. clockwork does not assume exclusive control over the network, but does assume that the network has mostly-predictable latency between the controller and workers. in a shared setting, preserving predictability becomes more challenging – though not impossible – and this is an active area of research due to a general need to co-locate latency critical datacenter services [42, 47].
+
+network. clockwork does not explicitly consider the network in its scheduling decisions; the occasional network latency spikes of dozens of ms during our experiments had negligible impact on our results. our prototype routes all inputs and outputs through the central controller which will become a bottleneck at scale. we were able to reach the limits of our testbed network with 12 workers and a sustained, single-model workload; to test beyond this we disabled inputs as described in §6.6. this limitation is not fundamental; clockwork's controller only requires request metadata to schedule requests, and we are working to remove this limitation with a tier of load balancers.
+
+security. security is important for all multi-user systems, since there are no container or hypervisor boundaries separating the workloads of different users. clockwork does not explicitly address security; however, clockwork does not execute arbitrary user code. users must submit models in an abstract format that we then compile to binary code under the covers. clockwork's threat model resembles shared storage or database
+
+systems, where system correctness is the chief concern; we have not verified any safety properties of clockwork.
+
+fault tolerance. while clockwork is a distributed system, we do not address the challenges of tolerating failures when serving models at large scale. this will require implementing a fault-tolerant centralized scheduler; however, we note that clockwork's predictable worker design will make pernicious phenomena like grey failure [27, 37] far easier to detect.
+
+other benefits of predictability. concentrating choice makes it easier to implement other guarantees, such as slos related to burstiness or per-request cost. the azure trace in our evaluation, for instance, contained regular, periodic spikes; exploiting advanced knowledge is an appealing future avenue for clockwork. a further benefit of predictable system components is performance clarity [55]: performance bottlenecks and upcoming tasks in clockwork are easy to reason about. clockwork's controller also provides a central point for explanation, since the controller has complete visibility of the expected and actual request behavior.
+
+# 8 related work
+
+model serving. we directly compared clockwork to clipper [16] and infaas [58] in §6.1; here we provide additional comments. both clipper and infaas are designed as wrappers around existing model execution frameworks: clipper, in order to provide a unifying abstraction; infaas, in order to exploit heterogeneous execution strategies. being agnostic to the underlying execution engine sacrifices predictability and control over model execution. both systems treat latency slos as long-term, reactive targets; by contrast, clockwork is explicitly designed to consolidate choice, and exploit predictability by making proactive decisions. clipper and infaas propose several orthogonal concepts that are compatible with clockwork. clipper's model selection layer could be superimposed on clockwork. infaas's model variant concept could be integrated into clockwork; we found similar predictability properties held for dnns executing on dedicated cpu cores.
+
+several other projects investigate model serving in virtualized cloud environments and on serverless platforms, where predictability is in the hands of the cloud provider [10,44, 77]. like infaas, these model throughput, latency, and accuracy together for optimal model selection, but, unlike clockwork, they do not use the backend predictability and latency slos for making proactive scheduling decisions. in industry,  $\mathrm{tfs^2}$  [51] is a proprietary model hosting service at google, about which public information is not available. amazon sagemaker [59] and google ai platform [26] are public cloud dnn serving systems with a similar interface to clockwork: upload your model, then make inference requests. both use containers under the covers as an isolation mechanism, and users suffer the associated cold-start latency. beyond these details, further design information is not publicly known.
+
+real-time systems. performance predictability, especially temporal safety, is also an important concern for safety-critical real-time systems. however in general, real-time systems are designed for periodic or sporadic workloads [8] with known minimum inter-arrival times and worst-case execution times, or for scenarios where the set of all inference requests is known in advance [66]. soft-real-time systems [12] consider weaker notions of timeliness similar to the latency slos considered in this paper, but mainly target periodic or sporadic workloads. clockwork, in contrast, makes no a priori assumptions about its workloads. prior real-time systems work has also proposed mechanisms to tame the unpredictability inside gpus [6, 9, 20, 22, 54]. elliott and anderson [21], for example, proposed interrupt handling mechanisms to circumvent the proprietary gpu drivers that ignore scheduling priorities, while yang et al. [74] suggested avoiding synchronization anomalies through more careful use of cuda synchronization primitives. these mechanisms are designed to facilitate an a priori schedulability analysis—mathematically bounding the blocking delays due to contention. such bounds are orthogonal to clockwork, which does not require strict worst-case guarantees.
+
+# 9 conclusion
+
+as dnn inferences become increasingly central to interactive applications, the requirements for fast response tighten, the volume of requests expands, and the number of models grows. our model serving system, clockwork, meets these challenges. clockwork efficiently fulfills aggressive tail-latency slos while supporting thousands of dnn models with different workload characteristics concurrently on each gpu, and scaling out to additional worker machines for increased capacity. the system also successfully isolates models from performance interference caused by other models served on the same system. our results derive from our design methodology of recursively ensuring all internal architecture components have predictable performance by concentrating all choices in the centralized controller. notably, our approach required us to either circumvent canonical best-effort mechanisms or orchestrate them to become predictable, and illustrates how consolidating choice can be applied in practice to achieve predictable performance.
+
+# acknowledgements
+
+we thank our shepherd junfeng yang and the anonymous reviewers for their insightful feedback that helped improve our work. our work was partially supported by nsf career grant #1553579.
+
+# references
+
+[1] martin abadi, paul barham, jianmin chen, zhifeng chen, andy davis, jeffrey dean, matthieu devin, sanjay ghemawat, geoffrey irving, michael isard, kudlur manjunath, josh levenberg, rajat monga, sherry moore, derek g. murray, benoit steiner, paul tucker, vijay vasudevan, pete warden, martin wicke, yuan
+
+yu, and xiaoqiang zheng. tensorflow: a system for large-scale machine learning. in proceedings of the 12th usenix symposium on operating systems design and implementation (osdi), 2016.  
+[2] atul adya, daniel myers, jon howell, jeremy elson, colin meek, vishesh khemani, stefan fulger, pan gu, lakshminath bhuvanagiri, jason hunter, et al. slicer: auto-sharding for datacenter applications. in proceedings of the 12th usenix symposium on operating systems design and implementation (osdi), 2016.  
+[3] deepak agarwal, bo long, jonathan traupman, doris xin, and liang zhang. laser: a scalable response prediction platform for online advertising. in proceedings of the 7th acm international conference on web search and data mining (wsdm), 2014.  
+[4] saamer akhshabi and constantine dovrolis. the evolution of layered protocol stacks leads to an hourglass-shaped architecture. in proceedings of the 2011 conference of the acm special interest group on data communication (sigcomm), 2011.  
+[5] allied market research. global machine learning chip market to garner $37.85 billion by 2025, at 40.8% cagr. https://www.globenewswire.com/news-release/2020/02/18/1986370/0/en/global-machine-learning-chip-market-to-garner-37-85-billion-by-2025-at-40-8-cagr.html, february 2020.  
+[6] tanya amert, nathan otterness, ming yang, james h anderson, and f donelson smith. gpu scheduling on the nvidia tx2: hidden details revealed. in proceedings of the 38th ieee real-time systems symposium (rtss), 2017.  
+[7] ganesh ananthanarayanan, ali ghodsi, scott shenker, and ion stoica. effective straggler mitigation: attack of the clones. in proceedings of the 10th usenix symposium on networked systems design and implementation (nsdi), 2013.  
+[8] theodore p baker and sanjoy k baruah. schedulability analysis of multiprocessor sporadic task systems. handbook of real-time and embedded systems, pages 3-31, 2007.  
+[9] joshua bakita, nathan otterness, james h anderson, and f donelson smith. scaling up: the validation of empirically derived scheduling rules on nvidia gpus. in 14th workshop on operating systems platforms for embedded real-time applications (ospert), 2018.  
+[10] anirban bhattacharjee, ajay dev chhokra, zhuangwei kang, hongyang sun, aniruddha gokhale, and gabor
+
+karsai. barista: efficient and scalable serverless serving system for deep learning prediction services. in proceedings of the 7th ieee international conference on cloud engineering (ic2e), 2019.  
+[11] tom b brown, benjamin mann, nick ryder, melanie subbiah, jared kaplan, prafulla dhariwal, arvind neelakantan, pranav shyam, girish sastry, amanda askell, et al. language models are few-shot learners. arxiv preprint arxiv:2005.14165, 2020.  
+[12] giorgio buttazzo, giuseppe lipari, luca abeni, and marco caccamo. soft real-time systems: predictability vs. efficiency: predictability vs. efficiency. springer science & business media, 2005.  
+[13] giovanni campagna, rakesh ramesh, silei xu, michael fischer, and monica s lam. almond: the architecture of an open, crowdsourced, privacy-preserving, programmable virtual assistant. in proceedings of the 26th international world wide web conference (www), 2017.  
+[14] wai chee yau. how zendesk serves tensorflow models in production. https://medium.com/zendesk-engineering/how-zendesk-serves-tensorflow-models-in-production-751ee22f0f4b, february 2017.  
+[15] tianqi chen, thierry moreau, ziheng jiang, lianmin zheng, eddie yan, haichen shen, meghan cowan, leyuan wang, yuwei hu, luis ceze, et al. tvm: an automated end-to-end optimizing compiler for deep learning. in proceedings of the 13th usenix symposium on operating systems design and implementation (osdi), 2018.  
+[16] daniel crankshaw, xin wang, guilio zhou, michael j franklin, joseph e gonzalez, and ion stoica. clipper: a low-latency online prediction serving system. in proceedings of the 14th usenix symposium on networked systems design and implementation (nsdi), 2017.  
+[17] brian dalessandro, daizhuo chen, troy raeder, claudia perlich, melinda han williams, and foster provost. scalable hands-free transfer learning for online advertising. in proceedings of the 20th acm sigkdd international conference on knowledge discovery and data mining (kdd), 2014.  
+[18] jeffrey dean and luiz andré barroso. the tail at scale. communications of the acm, 56(2):74-80, 2013.  
+[19] christina delimitrou and christos kozyrakis. amdahl's law for tail latency. communications of the acm, 61(8):65-72, 2018.
+
+[20] glenn a elliott and james h anderson. real-world constraints of gpus in real-time systems. in proceedings of the 17th ieee international conference on embedded and real-time computing systems and applications (rtcsa), 2011.  
+[21] glenn a elliott and james h anderson. robust real-time multiprocessor interrupt handling motivated by gpus. in proceedings of the 24th euromicro conference on real-time systems (ecrts), 2012.  
+[22] glenn a elliott and james h anderson. an optimal k-exclusion real-time locking protocol motivated by multi-gpu systems. real-time systems, 49(2):140–170, 2013.  
+[23] anshul gandhi, mor harchol-balter, ram raghunathan, and michael a kozuch. autoscale: dynamic, robust capacity management for multi-tier data centers. acm transactions on computer systems, 30(4):1-26, 2012.  
+[24] ionel gog, malte schwarzkopf, adam gleave, robert nm watson, and steven hand. firmament: fast, centralized cluster scheduling at scale. in proceedings of the 12th usenix symposium on operating systems design and implementation (osdi), 2016.  
+[25] ian goodfellow, yoshua bengio, and aaron courville. deep learning. mit press, 2016. http://www.deeplearningbook.org.  
+[26] google ai platform. retrieved may 2020 from https://cloud.google.com/ai-platform/, 2020.  
+[27] haryadi s gunawi, riza o suminto, russell sears, casey golliher, swaminathan sundararaman, xing lin, tim emami, weiguang sheng, nematollah bidokhti, caitie mccaffrey, et al. fail-slow at scale: evidence of hardware performance faults in large production systems. acm transactions on storage, 14(3):1-26, 2018.  
+[28] jian guo, he he, tong he, leonard lausen, mu li, haibin lin, xingjian shi, chenguang wang, junyuan xie, sheng zha, et al. gluoncv and gluonnlp: deep learning in computer vision and natural language processing. journal of machine learning research, 21(23):1-7, 2020.  
+[29] kim hazelwood, sarah bird, david brooks, soumith chintala, utku diril, dmytro dzhulgakov, mohamed fawzy, bill jia, yangqing jia, aditya kalro, et al. applied machine learning at facebook: a datacenter infrastructure perspective. in proceedings of the 24th ieee international symposium on high-performance computer architecture (hpca), 2018.  
+[30] kaiming he, xiangyu zhang, shaoqing ren, and jian sun. deep residual learning for image recognition. in proceedings of the ieee 2016 conference on computer vision and pattern recognition (cvpr), 2016.
+
+[31] kaiming he, xiangyu zhang, shaoqing ren, and jian sun. identity mappings in deep residual networks. in proceedings of the 14th european conference on computer vision (eccv), 2016.  
+[32] jeremy hermann and mike del balso. meet michelangelo: uber's machine learning platform. https://eng.uber.com/michelangelo/, september 2017.  
+[33] andrew howard, mark sandler, grace chu, liang-chieh chen, bo chen, mingxing tan, weijun wang, yukun zhu, ruoming pang, vijay vasudevan, et al. searching for mobilenetv3. in proceedings of the ieee 2019 conference on computer vision (iccv), 2019.  
+[34] kevin hsieh, ganesh ananthanarayanan, peter bodik, shivaram venkataraman, paramvir bahl, matthai philippos, phillip b gibbons, and onur mutlu. focus: querying large video dataset with low latency and low cost. in proceedings of the 13th usenix symposium on operating systems design and implementation (osdi), 2018.  
+[35] jie hu, li shen, and gang sun. squeeze-and-excitation networks. in proceedings of the ieee 2018 conference on computer vision and pattern recognition (cvpr), 2018.  
+[36] gao huang, zhuang liu, laurens van der maaten, and kilian q weinberger. densely connected convolutional networks. in proceedings of the ieee 2017 conference on computer vision and pattern recognition (cvpr), 2017.  
+[37] peng huang, chuanxiong guo, lidong zhou, jacob r lorch, yingnong dang, murali chintalapati, and randolph yao. gray failure: the achilles' heel of cloud-scale systems. in proceedings of the 16th workshop on hot topics in operating systems (hotos), 2017.  
+[38] qi huang, ken birman, robbert van renesse, wyatt lloyd, sanjeev kumar, and harry c li. an analysis of facebook photo caching. in proceedings of the 24th acm symposium on operating systems principles (sosp), 2013.  
+[39] vatche ishakian, vinod muthusamy, and aleksander slominski. serving deep learning models in a serverless platform. in proceedings of the 6th ieee international conference on cloud engineering (ic2e), 2018.  
+[40] chris jones, john wilkes, niall murphy, and cody smith. site reliability engineering: how google runs production systems. o'reilly media, 2016. https://landing.google.com/sre/sre-book/chapters/service-level-objectives/.
+
+[41] norman p jouppi, cliff young, nishant patil, david patterson, gaurav agrawal, raminder bajwa, sarah bates, suresh bhatia, nan boden, al borchers, et al. in-datacenter performance analysis of a tensor processing unit. in proceedings of the 44th acm/ieee international symposium on computer architecture (isca), 2017.  
+[42] kostis kaffes, dragos sbirlea, yiyan lin, david lo, and christos kozyrakis. leveraging application classes to save power in highly-utilized data centers. in proceedings of the 11th acm symposium on cloud computing (socc), 2020.  
+[43] daniel kang, john emmons, firas abuzaid, peter bailis, and matei zaharia. noscope: optimizing neural network queries over video at scale. proceedings of the vldb endowment, 10(11), 2017.  
+[44] ram srivatsa kannan, lavanya subramanian, ashwin raju, jeongseob ahn, jason mars, and lingjia tang. grandslam: guaranteeing slas for jobs in microservices execution frameworks. in proceedings of the 14th european conference on computer systems (eurosys), 2019.  
+[45] andrew lavin and scott gray. fast algorithms for convolutional neural networks. in proceedings of the ieee 2016 conference on computer vision and pattern recognition (cvpr), 2016.  
+[46] jialin li, naveen kr sharma, dan rk ports, and steven d gribble. tales of the tail: hardware, os, and application-level sources of tail latency. in proceedings of the 5th acm symposium on cloud computing (socc), 2014.  
+[47] david lo, liquin cheng, rama govindaraju, parthasarathy ranganathan, and christos kozyrakis. heracles: improving resource efficiency at scale. in proceedings of the 42nd annual international symposium on computer architecture (isca), 2015.  
+[48] peter mattson, vijay janapa reddi, christine cheng, cody coleman, greg diamos, david kanter, paulius micikevicius, david patterson, guenther schmuelling, hanlin tang, et al. mlperf: an industry standard benchmark suite for machine learning performance. ieee micro, 40(2):8-16, 2020.  
+[49] neural network exchange format (nnef). retrieved may 2020 from https://www.khronos.org/nnef/, 2020.  
+[50] nvidia tensorrt. retrieved may 2020 from https://developer.nvidia.com/tensorrt,2020.  
+[51] christopher olston, noah fiedel, kiril gorovoy, jeremiah harmsen, li lao, fangwei li, vinu rajashekhar, sukriti ramesh, and jordan soyke. tensorflow-serving:
+
+flexible, high-performance ml serving. workshop on ml systems at neurips 2017, 2017.  
+[52] open neural network exchange format: the new open ecosystem for interchangeable ai models. retrieved may 2020 from https://onnx.ai/, 2020.  
+[53] the onnx model zoo. retrieved may 2020 from https://github.com/onnx/models, 2020.  
+[54] nathan otterness, ming yang, tanya amert, james anderson, and f donelson smith. inferring the scheduling policies of an embedded cudagpu. in 13th workshop on operating systems platforms for embedded real-time applications (ospert), 2017.  
+[55] kay ousterhout, christopher canel, sylvia ratnasamy, and scott shenker. monotasks: architecting for performance clarity in data analytics frameworks. in proceedings of the 26th acm symposium on operating systems principles (sosp), 2017.  
+[56] kay ousterhout, ryan rasti, sylvia ratnasamy, scott shenker, and byung-gon chun. making sense of performance in data analytics frameworks. in proceedings of the 12th usenix symposium on networked systems design and implementation (nsdi), 2015.  
+[57] jonathan perry, amy ousterhout, hari balakrishnan, devavrat shah, and hans fugal. fastpass: a centralized "zero-queue" datacenter network. in proceedings of the 2014 conference of the acm special interest group on data communication (sigcomm), 2014.  
+[58] francisco romero, qian li, neeraja j yadwadkar, and christos kozyrakis. infaas: a model-less inference serving system. arxiv preprint arxiv:1905.13348, 2019.  
+[59] deploying a model on amazon sagemaker hosting services. retrieved may 2020 from https://docsaws.amazon.com/sagemaker/latest/dg/how-it-works-hosting.html, 2020.  
+[60] roy schwartz, jesse dodge, noah a smith, and oren etzioni. green ai. arxiv preprint arxiv:1907.10597, 2019.  
+[61] mohammad shahrad, rodrigo fonseca, iñigo goiri, gohar chaudhry, paul batum, jason cooke, eduardo laureano, colby tresness, mark russinovich, and ricardo bianchini. serverless in the wild: characterizing and optimizing the serverless workload at a large cloud provider. in proceedings of the 2020 usenix annual technical conference (atc '20), 2020.  
+[62] haichen shen, lequn chen, yuchen jin, liangyu zhao, bingyu kong, matthai philipse, arvind krishnamurthy, and ravi sundaram. nexus: a gpu cluster engine for accelerating dnn-based video analysis. in
+
+proceedings of the 27th acm symposium on operating systems principles (sosp), 2019.  
+[63] julien simon. amazon elastic inference - gpu-powered deep learning inference acceleration. https://aws.amazon.com/blog/aws/amazon-elastic-inference-gpu-powered-deep-learning-inference-acceleration/, november 2018.  
+[64] kacper sokol and peter a flach. glass-box: explaining ai decisions with counterfactual statements through conversation with a voice-enabled virtual assistant. in proceedings of the 27th international joint conference on artificial intelligence (ijcai), 2018.  
+[65] emma strubell, ananya ganesh, and andrew mccallum. energy and policy considerations for deep learning in nlp. arxiv preprint arxiv:1906.02243, 2019.  
+[66] jinghao sun, jing li, zhishan guo, an zou, xuan zhang, kunal agrawal, and sanjoy baruah. real-time scheduling upon a host-centric acceleration architecture with data offloading. in proceedings of the 26th ieee real-time and embedded technology and applications symposium (rtas), 2020.  
+[67] christian szegedy, wei liu, yangqing jia, pierre sermanet, scott reed, dragomir anguelov, dumitru erhan, vincent vanhoucke, and andrew rabinovich. going deeper with convolutions. in proceedings of the ieee 2015 conference on computer vision and pattern recognition (cvpr), 2015.  
+[68] christian szegedy, vincent vanhoucke, sergey ioffe, jon shlens, and zbigniew wojna. rethinking the inception architecture for computer vision. in proceedings of the ieee 2016 conference on computer vision and pattern recognition (cvpr), 2016.  
+[69] ymir vigfusson, hussam abu-libdeh, mahesh balakrishnan, ken birman, robert burgess, gregory chockler, haoyuan li, and yoav tock. dr. multicast:  $rx$  for data center communication scalability. in proceedings of the 5th european conference on computer systems (eurosys), 2010.  
+[70] limin wang, yuanjun xiong, zhe wang, yu qiao, dahua lin, xiaou tang, and luc van gool. temporal segment networks: towards good practices for deep action recognition. in proceedings of the 14th european conference on computer vision (eccv), 2016.  
+[71] carole-jean wu, david brooks, kevin chen, douglas chen, sy choudhury, marat dukhan, kim hazelwood, eldad isaac, yangqing jia, bill jia, et al. machine learning at facebook: understanding inference at the edge. in proceedings of the 2019 ieee international symposium on high performance computer architecture (hpca), 2019.
+
+[72] bin xiao, haiping wu, and yichen wei. simple baselines for human pose estimation and tracking. in proceedings of the 16th european conference on computer vision (eccv), 2018.  
+[73] saining xie, ross girshick, piotr dolkar, zhuowen tu, and kaiming he. aggregated residual transformations for deep neural networks. in proceedings of the ieee 2017 conference on computer vision and pattern recognition (cvpr), 2017.  
+[74] ming yang, nathan otterness, tanya amert, joshua bakita, james h anderson, and f donelson smith. avoiding pitfalls when using nvidia gpus for real-time tasks in autonomous systems. in proceedings of the 30th euromicro conference on real-time systems (ecrts), 2018.  
+[75] fisher yu, dequan wang, evan shelhamer, and trevor darrell. deep layer aggregation. in proceedings of the ieee 2018 conference on computer vision and pattern recognition (cvpr), 2018.  
+[76] sergey zagoruyko and nikos komodakis. wide residual networks. arxiv preprint arxiv:1605.07146, 2016.  
+[77] chengliang zhang, minchen yu, wei wang, and feng yan. mark: exploiting cloud services for cost-effective, slo-aware machine learning inference serving. in proceedings of the 2019 usenix annual technical conference (atc), 2019.  
+[78] hang zhang, chongruo wu, zhongyue zhang, yi zhu, zhi zhang, haibin lin, yue sun, tong he, jonas mueller, r manmatha, et al. resnest: split-attention networks. arxiv preprint arxiv:2004.08955, 2020.
+
+# a artifact appendix
+
+# a.1 abstract
+
+the artifact consists of clockwork's prototype source code, instructions for building from source, and directions for preparing the environment. the instructions for launching a docker instance that has all dependencies pre-installed is provided as well. the artifact also contains scripts, descriptions, and instructions to run the experiments automatically or manually for reproducing the graphs and results presented in the paper.
+
+# a.2 artifact check-list
+
+- program: dnn-model-serving, multi-tenant  
+- compilation: cmake, g++  
+- binary: worker, controller, client  
+- model: distributed, multi-tenant  
+- data set: azure-functions-trace-2019, poisson-distribution  
+- run-time environment: linux, cuda, network  
+- hardware: nvidia, tesla-v100  
+- execution: automated, manual  
+- metrics: throughput, latency, slo-violation, tail-latency  
+output: telemetry-measurements, table, graph  
+- experiments: throughput-latency, scalability, predictability, slo, tail-latency  
+required disk space:
+
+clockwork: 210mb
+
+total including compiled models and dataset: 12gb
+
+expected experiment run time: about 17 hours in total  
+public link:
+
+https://gitlab.mpi-sws.org/cld/ml/clockwork
+
+code licenses:
+
+clockwork: apache license 2.0
+
+tvm: apache license 2.0
+
+cuda common library: apache license 2.0
+
+catch2: boost software license 1.0
+
+data licenses:
+
+azure functions trace 2019: cc-by attribution
+
+# a.3 description
+
+# a.3.1 how to access
+
+the artifact is publicly available at
+
+https://gitlab.mpi-sws.org/cld/ml/clockwork
+
+# a.3.2 hardware dependencies
+
+to reproduce the exact experiment results, worker machines must have 768gb ram or higher, 16 cpu cores or more, at least one 32gb tesla v100 gpu and 10gbps network. the large-scale experiment with azure functions (fig. 9) requires 12 worker machines. most other experiments require fewer worker machines; details on the number of machines for each experiment and environment customization guide is provided in each experiment's documentation.
+
+# a.3.3 software dependencies
+
+# clockwork:
+
+ubuntu 18.04 or later, cuda v9.0+, libtbb-dev, libasio-dev, libconfig++-dev, libboost-all-dev, g++-8, make, cmake, automake, autoconf, libtool, curl, unzip, clang, llvm, and protobuf.
+
+a dockerfile is provided to facilitate the build process.
+
+# data analysis and plotting scripts:
+
+python 3.x and the numpy, pandas, matplotlib, and seaborn libraries.
+
+# a.3.4 data sets
+
+publicly released azure functions 2019 trace [61] https://gitlab.mpi-sws.org/cld/trace-datasets/azure-functions
+
+# a.3.5 models
+
+the dnn models pre-compiled for nvidia volta v100 gpus are accessible at
+
+https://gitlab.mpi-sws.org/cld/ml/clockwork-modelzoo-volta
+
+# a.4 installation
+
+- installation pre-requisites:
+
+https://gitlab.mpi-sws.org/cld/ml/clockwork/
+
+-/blob/master/docs/prerequisites.md
+
+building clockwork:
+
+https://gitlab.mpi-sws.org/cld/ml/clockwork/
+
+-/blob/master/docs/building.md
+
+- setting-up the environment:
+
+https://gitlab.mpi-sws.org/cld/ml/clockwork/
+
+-/blob/master/docs/environment.md
+
+clockwork configuration:
+
+https://gitlab.mpi-sws.org/cld/ml/clockwork/
+
+-/blob/master/docs/configuration.md
+
+# a.5 experiment workflow
+
+experiments can be run using the scripts provided in the repository. we have also provided instructions to run the experiments manually. to get started with clockwork, we recommend getting the system running manually, in order to understand the pieces involved, and to ensure the system has been configured appropriately for your machines. afterwards, you might choose to run the experiments using the provided scripts or manually. the experiments repository is available at https://gitlab.mi-sws.org/cld/ml/clockwork-results
+
+<table><tr><td>experiment</td><td>related figure</td><td>execution time (hr)</td><td>documentation and scripts</td></tr><tr><td>how does clockwork compare?</td><td>fig. 5</td><td>3</td><td>https://gitlab.mpi-sws.org/cld/ml/clockwork-results/∼/tree/master/sec61效果图5</td></tr><tr><td>can clockwork serve thousands?</td><td>fig. 6</td><td>1.5</td><td>https://gitlab.mpi-sws.org/cld/ml/clockwork-results/∼/tree/master/sec62效果图6</td></tr><tr><td>how low can clockwork go?</td><td>fig. 7</td><td>1</td><td>https://gitlab.mpi-sws.org/cld/ml/clockwork-results/∼/tree/master/sec63效果图7</td></tr><tr><td>can clockwork isolate performance?</td><td>fig. 8</td><td>1</td><td>https://gitlab.mpi-sws.org/cld/ml/clockwork-results/∼/tree/master/sec64效果图8</td></tr><tr><td>are realistic workloads predictable?</td><td>fig. 10</td><td>8</td><td>https://gitlab.mpi-sws.org/cld/ml/clockwork-results/∼/tree/master/sec65效果图9效果图10</td></tr><tr><td>can clockwork scale?</td><td>fig. 11</td><td>2</td><td>https://gitlab.mpi-sws.org/cld/ml/clockwork-results/∼/tree/master/sec66效果图11</td></tr></table>
+
+table 3: the experiments reproducing the presented results in this paper, their related figures, execution time, and links to the extensive documentation and scripts for each experiment.
+
+# a.6 evaluation and expected results
+
+the experiments repository is structured based on §6. we have provided the experiment titles, their related figures on the paper, execution time of each experiment, and the links to directories containing the respective descriptions, scripts and instructions in table 3.
+
+# a.7 experiment customization
+
+the directions for running each experiment manually is provided in each experiment's documentation. instructions for customizing the experiment environment is provided at
+
+https://gitlab.mpi-sws.org/cld/ml/clockwork/-- blob/master/docs/customizing.md
+
+# a.8 ae methodology
+
+submission, reviewing and badging methodology:
+
+https://www.usenix.org/conference/osdi20/call-for-artifacts

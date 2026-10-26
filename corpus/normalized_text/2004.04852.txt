@@ -1,0 +1,1231 @@
+# predictable accelerator design with time-sensitive affine types
+
+rachit nigam sachille atapattu samuel thomas zhijing li
+
+theodore bauer yuwei ye apurva koti adrian sampson zhiru zhang cornell university usa
+
+# abstract
+
+field-programmable gate arrays (fpgas) provide an opportunity to co-design applications with hardware accelerators, yet they remain difficult to program. high-level synthesis (hls) tools promise to raise the level of abstraction by compiling c or  $\mathrm{c}^{++}$  to accelerator designs. repurposing legacy software languages, however, requires complex heuristics to map imperative code onto hardware structures. we find that the black-box heuristics in hls can be unpredictable: changing parameters in the program that should improve performance can counterintuitively yield slower and larger designs. this paper proposes a type system that restricts hls to programs that can predictably compile to hardware accelerators. the key idea is to model consumable hardware resources with a time-sensitive affine type system that prevents simultaneous uses of the same hardware structure. we implement the type system in dahlia, a language that compiles to hls  $\mathrm{c}^{++}$ , and show that it can reduce the size of hls parameter spaces while accepting pareto-optimal designs.
+
+ccs concepts: • software and its engineering  $\rightarrow$  constraints.
+
+keywords: affine type systems, high-level synthesis
+
+# acm reference format:
+
+rachit nigam, sachille atapattu, samuel thomas, zhijing li, theodore bauer, yuwei ye, apurva koti, adrian sampson, and zhiru zhang. 2020. predictable accelerator design with time-sensitive affine types. in proceedings of the 41st acm sigplan international conference on programming language design and implementation (pldi '20), june 15-20, 2020, london, uk. acm, new york, ny, usa, 23 pages. https://doi.org/10.1145/3385412.3385974
+
+permission to make digital or hard copies of all or part of this work for personal or classroom use is granted without fee provided that copies are not made or distributed for profit or commercial advantage and that copies bear this notice and the full citation on the first page. copyrights for components of this work owned by others than the author(s) must be honored. abstracting with credit is permitted. to copy otherwise, or republish, to post on servers or to redistribute to lists, requires prior specific permission and/or a fee. request permissions from permissions@acm.org. pldi '20, june 15-20, 2020, london, uk
+
+© 2020 copyright held by the owner/author(s). publication rights licensed to acm.
+
+acm isbn 978-1-4503-7613-6/20/06...$15.00
+
+https://doi.org/10.1145/3385412.3385974
+
+# 1 introduction
+
+while moore's law may not be dead yet, its stalled returns for traditional cpus have sparked renewed interest in specialized hardware accelerators [28], for domains from machine learning [31] to genomics [56]. reconfigurable hardware—namely, field-programmable gate arrays (fpgas)—offer some of the benefits of specialization without the cost of custom silicon. fpgas can accelerate code in domains from databases [11] to networking [2] and have driven vast efficiency improvements in microsoft's data centers [46, 19].
+
+however, fpgas are hard to program. the gold-standard programming model for fpgas is register transfer level (rtl) design in hardware description languages such as verilog, vhdl, bluespec, and chisel [40, 5]. rtl requires digital design expertise: akin to assembly languages for cpus, rtl is irreplaceable for manual performance tuning, but it is too explicit and verbose for rapid iteration [53].
+
+fpga vendors offer high-level synthesis (hls) or "c-to-gates" tools [58, 16, 42, 10] that translate annotated subsets of c and  $\mathrm{c}^{+ + }$  to rtl. repurposing a legacy software languages, however, has drawbacks: the resulting language subset is small and difficult to specify, and minor code edits can cause large swings in hardware efficiency. we find empirically that smoothly changing source-level hints can cause wild variations in accelerator performance. semantically, there is no hls programming language: there is only the subset of  $\mathrm{c}^{+ + }$  that a particular version of a particular compiler supports.
+
+this paper describes a type system that restricts hls to programs whose hardware implementation is clear. the goal is predictable architecture generation: the hardware implications are observable in the source code, and costly implementation decisions require explicit permission from the programmer. instead of silently generating bad hardware for difficult input programs, the type system yields errors that help guide the programmer toward a better design. the result is a language that can express a subset of the architectures that hls can—but it does so predictably.
+
+the central insight is that an affine type system [54] can model the restrictions of hardware implementation. components in a hardware design are finite and expendable: a subcircuit or a memory can only do one thing at a time, so a program needs to avoid conflicting uses. previous research has shown how to apply substructural type systems to model classic computational resources such as memory allocations
+
+![](images/8f7c5fc5d192662d2626319dabe0555cbcb7245184de05855a5c12d90865a0a6.jpg)  
+figure 1. overview of a traditional high-level synthesis toolchain and how dahlia layers type safety on top.  
+figure 2. dense matrix multiplication in hls-friendly c.
+
+and file handles [24, 7, 36, 54] and to enforce exclusion for safe shared-memory parallelism [23, 6, 13]. unlike those classic resources, however, the availability of hardware components changes with time. we extend affine types with time sensitivity to express that repeated uses of the same hardware is safe as long as they are temporally separated.
+
+we describe dahlia, a programming language for predictable accelerator design. dahlia differs from traditional hls in two ways: (1) dahlia makes the hardware implementation for each language construct manifest in the source code instead of leaving this decision up to the hls middle-end, and (2) dahlia uses its time-sensitive affine types to reason about the hardware constraints and reject programs that would require complex transformation to implement in hardware. we implement a compiler for dahlia that emits annotated  $\mathrm{c}^{++}$  for a commercial hls toolchain. we show that predictability pitfalls exist in both industrial and recent academic tools and that dahlia's reasoning can help alleviate these issues.
+
+the contributions of this paper are:
+
+- we identify predictability pitfalls in hls and measure their effects in an industrial tool in section 2.  
+- we design dahlia (section 3), a language that restricts hls to predictable design spaces by modeling hardware constraints using time-sensitive affine types.  
+- we formalize a time-sensitive affine type system and prove syntactic type soundness in section 4.  
+- we empirically demonstrate dahlia's effectiveness in rejecting unpredictable design points and its ability to make area-performance trade-offs in common accelerator designs in section 5.
+
+# 2 predictability pitfalls in traditional hls
+
+figure 1 depicts the design of a traditional high-level synthesis (hls) compiler. a typical hls tool adopts an existing open-source  $\mathrm{c} / \mathrm{c}++$  frontend and adds a set of transformation heuristics that attempt to map software constructs onto hardware elements along with a backend that generates rtl code [15, 10]. the transformation step typically relies on a constraint solver, such as an lp or sat solver, to satisfy resource, layout, and timing requirements [25, 17]. programmers can add #pragma hints to guide the transformation—for example, to duplicate loop bodies or to share functional units.
+
+```c
+1 int m1[512][512], m2[512][512], prod[512][512];  
+2 int sum;  
+3 for (int i = 0; i < 512; i++) {  
+4 for (int j = 0; j < 512; j++) {  
+5 sum = 0;  
+6 for (int k = 0; k < 512; k++) {  
+7 sum += m1[i][k] * m2[k][j];  
+8 }  
+9 prod[i][j] = sum; }
+```
+
+hls tools are best-effort compilers: they make a heuristic effort to translate any valid  $\mathrm{c} / \mathrm{c}^{++}$  program to rtl, regardless of the consequences for the generated accelerator architecture. sometimes, the mapping constraints are unsatisfiable, so the compiler selectively ignores some #pragma hints or issues an error. the generated accelerator's efficiency depends on the interaction between the code, the hints, and the transformation heuristics that use them.
+
+the standard approach prioritizes automation over predictability. small code changes can yield large shifts in the generated architecture. when performance is poor, the compiler provides little guidance about how to improve it. pruning such unpredictable points from the design space would let programmers explore smaller, smoother parameter spaces.
+
+# 2.1 an example in hls
+
+programming with hls centers on arrays and loops, which correspond to memory banks and logic blocks. figure 2 shows the c code for a matrix multiplication kernel. this section imagines the journey of a programmer attempting to use hls to generate a fast fpga-based accelerator from this code. we use xilinx's sdaccel [57] compiler (v2018.3.op) and target an ultrascale+ vu9p fgpa on an aws f1 instance [1] to perform the experiments in this section.
+
+initial accelerator. our imaginary programmer might first try compiling the code verbatim. the hls tool maps the arrays m1, m2, and prod onto on-chip memories. fpgas have sram arrays, called block rams (brams), that the compiler allocates for this purpose. the loop body becomes combinational logic consisting of a multiplier, an adder, and an accumulator register. figure 3a depicts this configuration.
+
+this design, while functional, does not harness any parallelism that an fpga can offer. the two key metrics for evaluating an accelerator design are performance and area, i.e., the amount of physical chip resources that the accelerator occupies. this initial configuration computes the matrix product in 841.1 ms and occupies 2,355 of the device's lookup tables (luts). however, the target fpga device has over 1 million luts, so the programmer's next job is to expend more of the fpga area to improve performance.
+
+loop unrolling. the standard tool that hls offers for expressing parallelism is an unroll annotation, which duplicates the logic for a loop body. a programmer might attempt
+
+![](images/9cf5e4c28b20d444d30a2fbd8098557a95d7ad8779c336020dbd738e91e2ba06.jpg)  
+(a) the original code.
+
+![](images/400442c9296d050298fa09d7c2387b2a217dfec09674160a0c2bbe3445f9752f.jpg)  
+(b) with unrolling.
+
+![](images/bc35956feef93dcb8136ebad1eb47018e37f246581b840e3952333d6c896e140.jpg)  
+(c) with unrolling and banking.
+
+![](images/b8a8e2429ebd03953e5102e0aa15422c2e723d1b094a64cec1327c80a4c702bf.jpg)  
+figure 3. three accelerator implementations of the matrix multiplication in figure 2.
+
+![](images/0ac55a1226a4190568ede5f74927a1195169f95a9dda2b21e63f12952e30bf92.jpg)  
+(a) unrolling without partitioning.
+
+![](images/163e224e5d5c1d53948da0521b63316d6c67ced8f4568b84f4355f2b06f9ed24.jpg)
+
+![](images/7dcc36320be40e36841a955f0b2cd220150c4e6b10050b53f9c7c8c2c704f15b.jpg)  
+(b) unrolling with 8-way partitioning.
+
+![](images/5e16d518123cea63668d534444edb560c6c93156987f08d5f761ae3f2cc3aa50.jpg)
+
+![](images/88df1f70b7c37b845b255a453de2a100f680c3d9d1e75527ef11a9c6fe859ccc.jpg)  
+(c) unrolling and banking in lockstep.  
+figure 4. look-up table count (top) and execution latency (bottom) for the kernel in figure 2 with varying parameters.
+
+to obtain a better accelerator design by adding this annotation to the innermost loop on lines 6-8 in figure 2:
+
+# pragma hls unroll factor=8
+
+this unrolling directive instructs the hls tool to create 8 copies of the multiplier and adder, called processing elements (pes), and attempt to run them in parallel. loop unrolling represents an area-performance trade-off: programmers can reasonably expect greater unrolling factors to consume more of the fpga chip but yield lower-latency execution.
+
+the unroll directive alone, however, fails to achieve this objective. figure 4a shows the effect of various unrolling factors on this code in area (lut count) and performance (latency). there is no clear trend: greater unrolling yields unpredictably better and worse designs. the problem is that the accelerator's memories now bottleneck the parallelism provided by the pes. the brams in an fpga have a fixed, small number of ports, so they can only service one or two reads or writes at a time. so while the hls tool obeys the programmer's unroll request to duplicate pes, its scheduling must serialize their execution. figure 3b shows how the hls tool must insert additional multiplexing hardware to connect the multipliers to the single-ported memories. the additional hardware and the lack of parallelism yields the unpredictable performance and area for different pe counts.
+
+memory banking to match parallelism. to achieve expected speedups from parallelism, accelerators need to use multiple memories. hls tools provide annotations to partition arrays, allocating multiple brams and increasing the access throughput. the programmer can insert these partitioning annotations to allocate 8 brams per input memory:
+
+pragma hls array_partition variable=m1 factor=8 #pragma hls array_partition variable=m2 factor=8
+
+banking uses several physical memories, each of which stores a subset of the array's data. the compiler partitions the array using a "round-robin" policy to enable parallel access. in this example, elements 0 and 8 go in bank 0, elements 1 and 9 go in bank 1, etc.:
+
+$$
+\begin{array}{c c c c c c c c c c c c c c c} \hline 0 & 1 & 2 & 3 & 4 & 5 & 6 & 7 & 8 & 9 & 1 0 & 1 1 & 1 2 & 1 3 & 1 4 & 1 5 \\ \hline \end{array}
+$$
+
+(each shade represents a different memory bank.) figure 3c shows the resulting architecture, which requires no multiplexing and allows memory parallel access.
+
+combining banking and unrolling, however, unearths another source of unpredictable performance. while the hls tool produces a good result when both the banking factors and the loop unrolling factor are 8, other design choices perform worse. figure 4b shows the effect of varying the unrolling factor while keeping the arrays partitioned with factor 8. again, the area and performance varies unpredictably
+
+with the unrolling factor. reducing the unrolling factor from 9 to 8 can counter-intuitively improve both performance and area. in our experiments, some unrolling factors yield hardware that produces incorrect results. (we show the area but omit the running time for these configurations.)
+
+the problem is that some partitioning/unrolling combinations yield much simpler hardware than others. when both the unrolling and the banking factors are 8, each parallel pe need only access a single bank, as in figure 3c. the first pe needs to access elements 0, 8, 16, and so on—and because the array elements are “striped” across the banks, all of these values live in the first bank. with unrolling factor 9, however, the first pe needs to access values from every bank, which requires complicated memory indirection hardware. with unrolling factor 4, the indirection cost is smaller—the first pe needs to access only bank 0 and bank 4.
+
+from the programmer's perspective, the hls compiler silently enforces an unwritten rule: when the unrolling factor divides the banking factor, the area is good and parallelism predictably improves performance. otherwise, all bets are off. figure 4b labels the points where the unrolling factor divides the banking factor as predictable points. the hls compiler emits no errors or warnings for any parameter setting.
+
+banking vs. array size. even if we imagine that a programmer carefully ensures that banking factors exactly match unrolling factors, another pitfall awaits them when choosing the amount of parallelism. figure 4c shows the effects of varying the banking and unrolling factor in our kernel together. the lut count again varies wildly.
+
+the problem is that, when the banking and unrolling factors do not evenly divide the sizes of the arrays involved, the accelerator needs extra hardware to cope with the "leftover" elements. the memory banks are unevenly sized, and the pes need extra hardware to selectively disable themselves on the final iteration to avoid out-of-bounds memory accesses.
+
+again, there is a predictable subset of design points when the programmer obeys the unwritten rule: an array's banking factor should divide the array size. figure 4c highlights the predictable points that follow this rule. among this subset, the performance reliably improves with increasing parallelism and the area cost scales proportionally.
+
+# 2.2 enforcing the unwritten rules
+
+the underlying problem in each of these sources of unpredictability is that the traditional hls tool prioritizes automation over programmer control. while automation can seem convenient, mapping heuristics give rise to implicit rules that, when violated, silently produce bad hardware instead of reporting a useful error.
+
+this paper instead prioritizes the predictability of hardware generation and making architectural decisions obvious
+
+in the source code. hls tools already contain such a predictable subset hidden within their unrestricted input language. by modeling resource constraints, we can separate out this well-behaved fragment. figure 1 shows how our checker augments a traditional hls toolchain by lifting hidden compiler reasoning into the source code and rejecting potentially unpredictable programs.
+
+the challenge, however, is that the "unwritten rules" of hls are never explicitly encoded anywhere—they arise implicitly from non-local interactions between program structure, hints, and heuristics. a naïve syntactic enforcement strategy would be too conservative—it would struggle to allow flexible, fine-grained sharing of hardware resources.
+
+we design a type system that models the constraints of hardware implementation to enforce these constraints in a composable, formal way. our type system addresses target-independent issues—it prevents problems that would occur even on an arbitrarily large fpga. we do not attempt to rule out resource exhaustion problems because they would tie programs to specific target devices. we see that kind of quantitative resource reasoning as important future work.
+
+# 3 the dahlia language
+
+dahlia's type system enforces a safety property: that the number of simultaneous reads and writes to a given memory bank may not exceed the number of ports. while traditional hls tools enforce this requirement with scheduling heuristics, dahlia enforces it at the source level using types.
+
+the key ideas in dahlia are (1) using substructural typing to reason about consumable hardware resources and (2) expressing time ordering in the language to reason about when resources are available. this section describes these two core features (sections 3.1 and 3.2) and then shows how dahlia builds on them to yield a language that is flexible enough to express real programs (sections 3.3-3.6).
+
+# 3.1 affine memory types
+
+the foundation of dahlia's type system is its reasoning about memories. the problem in section 2.1's example is conflicting simultaneous accesses to the design's memories. the number of reads and writes supported by a memory per cycle is limited by the number of ports in the memory. hls tools automatically detect potential read/write conflicts and schedule accesses across clock cycles to avoid errors. dahlia instead makes this reasoning about conflicts explicit by enforcing an affine restriction on memories.
+
+memories are defined by giving their type and size:
+
+let a: float[10];
+
+the type of a is mem float[10], denoting a single-ported memory that holds 10 floating-point values. each dahlia memory corresponds to an on-chip bram in the fpga. memories resemble c or java arrays: programs read and mutate the contents via subscripting, as in a[5] := 4.2.
+
+because they represent static physical resources in the generated hardware, memory types differ from plain value types like float by preventing duplication and aliasing:
+
+```txt
+let  $x = a[0]$  // ok: x is a float.  
+let b = a; // error: cannot copy memories.
+```
+
+the affine restriction on memories disallows reads and writes to a memory that might occur at the same time:
+
+```verilog
+let x = a[0]; // ok  
+a[1] := 1; // error: previous read consumed a.
+```
+
+while type-checking a, the dahlia compiler removes a from the typing context. subsequent uses of a are errors, with one exception: identical reads to the same memory location are allowed. this program is valid, for example:
+
+```txt
+let  $x = a[0]$    
+let  $\mathbf{y} = \mathbf{a}[0]$  //ok:reading the same address.
+```
+
+the type system uses access capabilities to check reads and writes [18, 22]. a read expression such as  $\mathsf{a}[\theta]$  acquires a non-affine read capability for index 0 in the current scope, which permits unlimited reads to the same location but prevents the acquisition of other capabilities for a. the generated hardware reads once from a and distributes the result to both variables  $x$  and  $y$ , as in this equivalent code:
+
+```txt
+let tmp = a[0]; let x = tmp; let y = tmp;
+```
+
+however, memory writes use affine write capabilities, which are use-once resources: multiple simultaneous writes to the same memory location remain illegal.
+
+# 3.2 ordered and unordered composition
+
+a key hls optimization is parallelizing execution of independent code. this optimization lets hls compilers parallelize and reorder dependency-free statements connected by; when the hardware constraints allow it—critically, when they do not need to access the same memory banks.
+
+dahlia makes these parallelism opportunities explicit by distinguishing between ordered and unordered composition. the c-style; connector is unordered: the compiler is free to reorder and parallelize the statements on either side while respecting their data dependencies. a second connector, ---, is ordered: in a --- b, statement a must execute before b.
+
+dahlia prevents resource conflicts in unordered composition but allows two statements in ordered composition to use the same resources. for example, dahlia accepts this program that would be illegal when joined by the ; connector:
+
+```latex
+let  $\texttt{x} = \texttt{a} [0]$    
+---  
+ $\mathrm{a}[1] := 1$
+```
+
+in the type checker, ordered composition restores the affine resources that were consumed in the first command before checking the second command. the capabilities for all memories are discarded, and the program can acquire fresh capabilities to read and write any memory.
+
+together, ordered and unordered composition can express complex concurrent designs:
+
+```txt
+let a: float[10]; let b: float[10];  
+{ let x = a[0] + 1 -- b[1] := a[1] + x // ok }; let y = b[0]; // error: b already consumed.
+```
+
+the statements composed with --- are ordered with each other but unordered with the last line. the read therefore must not conflict with either of the first two statements.
+
+logical time. from the programmer's perspective, a chain of ordered computations executes over a series of logical time steps. logical time in dahlia does not directly reflect physical time (i.e., clock cycles). instead, the hls backend is responsible for allocating cycles to logical time steps in a way that preserves the ordering of memory accesses. for example, a long logical time step containing an integer division might require multiple clock cycles to complete, and the compiler may optimize away unneeded time steps that do not separate memory accesses. regardless of optimizations, however, a well-typed dahlia program requires at least enough ordered composition to ensure that memory accesses do not conflict.
+
+local variables as wires & registers. local variables, defined using the let construct, do not share the affine restrictions of memories. programs can freely read and write to local variables without restriction, and unordered composition respects the dependencies induced by local variables:
+
+```txt
+let  $x = 0$  .  $\texttt{x} := \texttt{x} +1$  . let  $\mathbf{y} = \mathbf{x}$  // all ok
+```
+
+in hardware, local variables manifest as wires or registers. the choice depends on the allocation of physical clock cycles: values that persist across clock cycles require registers. consider this example consisting of two logical time steps:
+
+```txt
+let  $\mathbf{x} = \mathbf{a}[0] + 1 - - - \mathbf{b}[0] := \mathbf{a}[1] + \mathbf{x}$
+```
+
+the compiler must implement the two logical time steps in different clock cycles, so it must use a register to hold  $\times$ . in the absence of optimizations, registers appear whenever a variable's live range crosses a logical time step boundary. therefore, programmers can minimize the use of registers by reducing the live ranges of variables or by reducing the amount of sequential composition.
+
+# 3.3 memory banking
+
+as section 2.1 details, hls tools can bank memories into disjoint components to allow parallel access. dahlia memory declarations support bank annotations:
+
+```txt
+let a: float[8 bank 4];
+```
+
+in a memory type mem  $t[n$  bank  $m]$ , the banking factor  $m$  must evenly divide the size  $n$  to yield equally-sized banks.
+
+hls tools, in contrast, allow uneven banking and silently insert additional hardware to account for it (see section 2.1).
+
+affine restrictions for banks. dahlia tracks an affine resource for each memory bank. to physically address a bank, the syntax  $m\{b\} [i]$  denotes the  $i$ th element of  $m$ 's  $b$ th bank. this program is legal, for example:
+
+```txt
+let a: float[10 bank 2];  
+a{0}[0] := 1;  
+a{1}[0] := 2; // ok: accessing a different bank.
+```
+
+dahlia also supports logical indexing into banked arrays using the syntax  $m[n]$  for literals  $n$ . for example, a[1] is equivalent to a{1} [0] above. because the index is static, the type checker can automatically deduce the bank and offset.
+
+multi-ported memories. dahlia also supports reasoning about multi-ported memories. this syntax declares a memory where each bank has two read/write ports:
+
+```javascript
+let a: float{2}[10];
+```
+
+a memory provides  $k$  affine resources per bank where  $k$  is the number of ports in a memory. this rule lets multi-ported memories provide multiple read/write capabilities in each logical time step. for example, dahlia accepts this program:
+
+```txt
+let a: float{2}[10];  
+let x = a[0];  
+a[1] := x + 1;
+```
+
+dahlia does not guarantee data-race freedom in the presence of multi-ported memories. programs are free to write to and read from the same memory location in the same logical time step and should expect the semantics of the underlying memory technology. extensions to rule out data races would resemble race detection for parallel software [44, 38].
+
+multi-dimensional banking. banking generalizes to multidimensional arrays. every dimension can have an independent banking factor. this two-dimensional memory has two banks in each dimension, a total of  $2 \times 2 = 4$  banks:
+
+let m: float[4 bank 2][4 bank 2];
+
+![](images/8759036ed3619b2cd2fe97fbb08c4b3f5bddbd59de18287a6bb8c4693e929ccf.jpg)
+
+the physical and logical memory access syntax similarly generalizes to multiple dimensions. for example,  $\mathsf{m}\{3\} [0]$  represents the element logically located at  $\mathsf{m}[1][1]$ .
+
+# 3.4 loops and unrolling
+
+fine-grained parallelism is an essential optimization in hardware accelerator design. accelerator designers duplicate a block of logic to trade off area for performance:  $n$  copies of the same logic consume  $n$  times as much area while offering a theoretical  $n$ -way speedup. dahlia syntactically separates parallelizable doall for loops, which must not have any cross-iteration dependencies, from sequential while loops, which
+
+may have dependencies but are not parallelizable. programmers can mark for loops with an unroll factor to duplicate the loop body logic and run it in parallel:
+
+```txt
+for (let i = 0..10) unroll 2 { f(i)}
+```
+
+this loop is equivalent to a sequential one that iterates half as many times and composes two copies of the body in parallel:
+
+```javascript
+for (let i = 0..5) { f(2* i + 0); f(2* i + 1) }
+```
+
+the doall restriction is important because it allows the compiler to run the two copies of the loop body in parallel using unordered composition. in traditional hls tools, a loop unrolling annotation such as #pragma hls unroll is always allowed—even when the loop body makes parallelization difficult or impossible. the toolchain will replicate the loop body and rely on complex analysis and resource scheduling to optimize the unrolled loop body as well as it can.
+
+resource conflicts in unrolled loops are errors. for example, this loop accesses an unbanked array in parallel:
+
+```txt
+let a: float[10];
+for (let i = 0..10) unroll 2 {
+a[i] := compute(i) // error: insufficient banks.
+}
+```
+
+unrolled memory accesses. dahlia uses special index types for loop iterators to type-check memory accesses within unrolled loops. index types generalize integers to encode information about loop unrolling. in this example:
+
+```txt
+for (let i = 0..8) unroll 4 { a[i]}
+```
+
+the iterator i gets the type idx{0..4}, indicating that accessing an array at i will consume banks 0, 1, 2, and 3. type-checking a memory access with i consumes all banks indicated by its index type.
+
+unrolling and ordered composition. loop unrolling has a subtle interaction with ordered composition. in a loop body containing ---, like this:
+
+```txt
+let a: float[10 bank 2];  
+for (let i = 0..10) unroll 2 {  
+    let x = a[i]  
+    --  
+    f(x, a[0])}
+```
+
+a naive interpretation would use parallel composition to join the loop bodies at the top level:
+
+```txt
+for（let  $\mathrm{i} = 0..5$  ）{ let  $\mathrm{x0} = \mathrm{a}[2\star \mathrm{i}]$  --  $f(x0,a[0])$  1; {let  $\mathrm{x1} = \mathrm{a}[2\star \mathrm{i} + 1]$  --  $f(x1,a[0])$  }
+```
+
+however, this interpretation is too restrictive. it requires all time steps in each loop body to avoid conflicts with all other time steps. this example would be illegal because the access to a[i] in the first time step may conflict with the access to a[0] in the second time step. instead, dahlia reasons about
+
+unrolled loops in lockstep by parallelizing within each logical time step. the loop above is equivalent to:
+
+```txt
+for（let  $\textsf{i} = 0..5)$  { let  $\times 0 = a[2\star i]$  ;let  $x1 = a[2\star i + 1]$  } -- {f(x0,a[0]); f(x1,a[0])}
+```
+
+the lockstep semantics permits this unrolling because conflicts need only be avoided between unrolled copies of the same logical time step. hls tools must enforce a similar restriction but leave the choice to black-box heuristics.
+
+nested unrolling. in nested loops, unrolled iterators can separately access dimensions of a multi-dimensional array. nested loops also interact with dahlia's read and write capabilities. in this program:
+
+```txt
+let a: float[8 bank 4][10 bank 5];  
+for (let i = 0..8) {  
+    for (let j = 0..10) unroll 5 {  
+        let x = a[i][0]  
+            ---  
+        a[i][0] := j; // error: insufficient write  
+    }  
+}
+```
+
+the read to array  $a[i][0]$  can be proved to be safe because after desugaring, the reads turn into:
+
+```txt
+let  $\times 0 = a[i][0]$  ; let  $\times 1 = a[i][0]$  ...
+```
+
+the access is safe because the first access acquires a read capability for indices  $i$  and  $\theta$ , so the subsequent copies are safe. architecturally, the code entails a single read fanned out to each parallel pe. however, the write desugars to:
+
+```txt
+a[i][0] := j; a[i][0] := j + 1 ...
+```
+
+which causes a write conflict in the hardware.
+
+# 3.5 combine blocks for reduction
+
+in traditional hls, loops can freely include dependent operations, as in this dot product:
+
+```txt
+for (let i = 0..10) unroll 2 { dot += a[i] * b[i]}
+```
+
+however, the  $+=$  update silently introduces a dependency between every iteration which is disallowed by dahlia's doall for-loops. hls tools heuristically analyze loops to extract and serialize dependent portions. in dahlia, programmers explicitly distinguish the non-parallelizable reduction components of for loops. each for can have an optional combine block that contains sequential code to run after each unrolled iteration group of the main loop body. for example, this loop is legal:
+
+```lisp
+for (let i = 0..10)  
+unroll 2 {  
+    let v = a[i] * b[i];  
+} combine {  
+    dot += v;  
+}
+```
+
+![](images/cb4301fef5335f90f887e46833a5dbd7f4e97e1169ac815a6b8bbe3de9664b9c.jpg)
+
+there are two copies of the loop body that run in parallel and feed into a single reduction tree for the combine block.
+
+the type checker gives special treatment to variables like  $\nu$  that are defined in for bodies and used in combine blocks. in the context of the combine block,  $\nu$  is a combine register, which is a tuple containing all values produced for  $\nu$  in the unrolled loop bodies. dahlia defines a class of functions called reducers that take a combine register and return a single value (similar to a functional fold). dahlia defines  $+=$ ,  $-=,\star=,$  as built-in reducers with infix syntax.
+
+# 3.6 memory views for flexible iteration
+
+in order to predictably generate hardware for parallel accesses, dahlia statically calculates banks accessed by each pe and guarantees that they are distinct. figure 5a shows the kind of hardware generated by this restriction—each pe is directly connected to a bank.
+
+to enforce this hardware generation, dahlia only allows simple indexing expressions like a[i] and a[4] and rejects arbitrary index calculations like a[2* i]. general indexing expressions can require complex indirection hardware to allow any pe to access any memory bank. an access like a[i* i], for example, makes it difficult to deduce which bank it would read on which iteration. for simple expressions like a[j+8], however, the bank stride pattern is clear. traditional hls tools make a best-effort attempt to deduce access patterns, but subtle changes in the code can unpredictable prevent the analysis and generate bad hardware.
+
+dahlia uses memory views to define access patterns that hls compilers can compile efficiently and to convince the dahlia type checker that a parallel access will be predictable. the key idea is to offer different logical arrangements of the same underlying physical memory. by logically re-organizing the memory, views can simply reuse dahlia's type-checking to ensure that complex access patterns are predictable. furthermore, this allows views to capture the hardware cost of an access pattern in the source code instead of relying on black-box analysis in hls tools. for dahlia's hls  $\mathrm{c}^{++}$  backend, views are compiled to direct memory accesses.
+
+the rest of this section describes dahlia's memory views and their cost in terms of hardware required to transform bank and index values to support the iteration pattern.
+
+shrink. to directly connect pes to memory banks, dahlia requires the unrolling factor to match the banking factor. to allow lower unrolling factors, dahlia provides shrink views, which reduce the banking factors of an underlying memory by an integer factor. for example:
+
+```txt
+let a: float[8 bank 4];
+view sh = shrink a[by 2]; // sh: float[8 bank 2]
+for (let i = 0..8) unroll 2
+    sh[i]; // ok: sh has 2 banks. compiled to: a[i].
+```
+
+the example first defines a view sh with the underlying memory a and divides its banking factor by 2. dahlia allows
+
+![](images/0ab01870708814794e01a7878491c9f9da15e7758e14a3345d6cd027cd404169.jpg)  
+(a) no view.
+
+![](images/da27c85081f818727948c826f9e352ac95724f83ef574d31c8bf73764409d756.jpg)  
+(b) shrink view.
+
+![](images/6f97742b0a65f294a1ecea54b39ab4e0b14283a2f75307be4070231356a2f982.jpg)  
+(c) suffix view.  
+figure 5. hardware schematics for each kind of memory view. highlighted outlines indicate added hardware cost.
+
+![](images/f96cf2bedc09ff7da8f5d856e8651d0c22c34da56a48163566b805d128559b71.jpg)  
+(d) shift view.
+
+![](images/c6510ecb6bc75f85221d0f763a43a15af59f14d49b3b228eba7346625cd2c95e.jpg)  
+(e) split view.
+
+sh[i] here because each pe will access a distinct set of banks. the first pe accesses banks 0 and 2; the second accesses banks 1 and 3. the hardware cost of a shrink view, as figure 5b illustrates, consists of multiplexing to select the right bank on every iteration. the access sh[i] compiles to a[i].
+
+suffix. a second kind of view lets programs create small slices of a larger memory. dahlia distinguishes between suffixes that it can implement efficiently and costlier ones. an efficient aligned suffix view uses this syntax:
+
+```txt
+view v = suffix m[by k * e];
+```
+
+where view  $\mathsf{v}$  starts at element  $k\times e$  of the memory m. critically,  $k$  must be the banking factor of m. this restriction allows dahlia to prove that each logical bank in the view maps to the same physical bank while the indices are offset by the indexing expression. the hardware cost of a suffix view is the address adapter for each bank. a view access  $\nu \{b\} [i]$  is compiled to  $\mathsf{m}\{b\} [e + i]$ .
+
+for example, generating suffixes in a loop results in this pattern, where the digits in each cell are the indices, the shades represent the banks, and the highlighted outline indicates the view:
+
+```txt
+let a: float[8 bank 2];  
+for (let i = 0..4) {  
+    view s = suffix a[by 2*i];  
+    s[1]; // reads a[2*i + 1]  
+}  
+0 1 2 3 4 5 6 7  
+0 1 2 3 4 5 6 7  
+0 1 2 3 4 5 6 7
+```
+
+a suffix view defined using view  $\mathsf{v} =$  suffix m[by k*e] and accessed using v[i] is compiled to m[k*e + i].
+
+shift. shifted suffixes are like standard suffixes but allow unrestricted offset expressions:
+
+```javascript
+view v = shift m[by e];
+```
+
+since e is unrestricted, dahlia assumes that both the bank and the indices need to be adapted and that each pe accesses every bank. figure 5d shows the hardware cost of a shift view: each pe is connected to every bank and the index expression is transformed using an address adapter. the distinction between suffix and shift views allows dahlia to capture the cost of different accessing schemes.
+
+even in this worst-case scenario, dahlia can reason about the disjointness of bank accesses. this loop is legal:
+
+```txt
+let a: float[12 bank 4];
+for (let i = 0..3) {
+    view r = shift a[by i*i]; // r: float[12 bank 4]
+    for (let j = 0..4) unroll 4
+        let x = r[j]; // accesses a[i*i + j]
+}
+```
+
+the view  $r$  has a memory type, so dahlia can guarantee that the inner access  $r[j]$  uses disjoint banks and is therefore safe to parallelize. an access  $r[i]$  to a view declared with shift  $m[by e]$  compiles to  $m[e + i]$ .
+
+split. some nested iteration patterns can be parallelized at two levels: globally, over an entire array, and locally, over a smaller window. this pattern arises in blocked computations, such as this dot product loop in  $\mathbf{c}^{++}$ :
+
+```txt
+float a[12], b[12], sum = 0.0;  
+for (int i = 0; i < 6; i++)  
+    for (int j = 0; j < 2; j++)  
+        sum += a[2*i + j] * b[2*i + j];
+```
+
+both the inner loop and the outer loop represent opportunities for parallelization. however, dahlia cannot prove this parallelization to be safe:
+
+```txt
+let a, b: float[12 bank 4];
+view sha, shb = shrink a[by 2], b[by 2];
+for (let i = 0..6) unroll 2 {
+    view va, vb = suffix sha[by 2*i], shb[by 2*i];
+    for (let j = 0..2) unroll 2 {
+        let v = va[j] + vb[j];
+    }
+    sum += v; }
+```
+
+while dahlia can prove that the inner accesses into the views can be predictably parallelized, it cannot establish the disjointness of the parallel copies of the views va and vb created by the outer unrolled loop.
+
+split views allow for this reasoning. the key idea is to create logically more dimensions than the physical memory and reusing dahlia's reasoning for multidimensional memories to prove safety for such parallel accesses. a split view transforms a one-dimensional memory (left) into a two-dimensional memory (right):
+
+$x\in$  variables  $a\in$  memories  $n\in$  numbers
+
+$$
+b := \text {t r u e} \mid \text {f a l s e} \quad v := n \mid b
+$$
+
+$$
+e := v \mid \operatorname {b o p} e _ {1} e _ {2} \mid x \mid a [ e ]
+$$
+
+$$
+c := e \mid \text {l e t} x = e \mid c _ {1} - c _ {2} \mid c _ {1}; c _ {2} \mid \text {i f} x c _ {1} c _ {2} \mid
+$$
+
+$$
+\begin{array}{l} \text {w h i l e} x c \mid x := e \mid a [ e _ {1} ] := e _ {2} \mid \text {s k i p} \\ \tau : := \text {b i t} \langle n \rangle | \text {f l o a t} | \text {b o o l} | \text {m e m} \tau [ n _ {1} ] \\ \end{array}
+$$
+
+figure 6. abstract syntax for the filament core language.
+
+![](images/c6bd2d621eb008d4e375fa49971a2445f1d0dc6812de3b2f743490812722b42c.jpg)
+
+![](images/d1012255a27b55e23a8ec2b2c827228f13f637eafd2fe0821cbca244d3b0e433.jpg)
+
+using these split-view declarations:
+
+$$
+\begin{array}{l} v i e w \quad s p l i t _ {a} = s p l i t a [ b y 2 ]; \\ \text {v i e w s p l i t} _ {\mathrm {b}} = \text {s p l i t} \mathrm {b} [ \text {b y} 2 ]; \\ \end{array}
+$$
+
+each view has type mem float[2 bank 2][6 bank 2]. a row in the logical view represents a "window" for computation. the above example can now unroll both loops, by changing the inner access to:
+
+$$
+\text {l e t} \quad v = \text {s p l i t} _ {\mathbf {a}} [ j ] [ i ] * \text {s p l i t} _ {\mathbf {b}} [ j ] [ i ];
+$$
+
+as figure 5e illustrates, split views have similar cost to aligned suffix views: they require no bank indirection hardware because the bank index is always known statically. they require an address adapter to compute the address within the bank from the separate coordinates. a split view declared view sp = split m[by k] on a memory m with  $k$  banks translates the access sp[i][j] to m{bank} [idx] where:
+
+$$
+\operatorname {b a n k} = i * k + (j \bmod b) \quad \mathrm {i d x} = \left\lfloor \frac {j}{b} \right\rfloor
+$$
+
+# 4 formalism
+
+this section formalizes the time-sensitive affine type system that underlies dahlia in a core language, filament. we give both a large-step semantics, which is more intelligible, and a small-step semantics, which enables a soundness proof.
+
+# 4.1 syntax
+
+figure 6 lists the grammar for filament. filament statements  $c$  resemble a typical imperative language: there are expressions, variable declarations, conditions, and simple sequential iteration via while. filament has ordered composition  $c_1$  —  $c_2$  and unordered composition  $c_1$ ;  $c_2$ . it separates memories  $a$  and variables  $x$  into separate syntactic categories. filament programs can only declare the latter: a program runs with a fixed set of available memories.
+
+# 4.2 large-step semantics
+
+filament's large-step operational semantics is a checked semantics that enforces dahlia's safety condition by explicitly tracking and getting stuck when it would otherwise require two conflicting accesses. our type system (section 4.3) aims to rule out these conflicts.
+
+the semantics uses an environment  $\sigma$  mapping variable and memory names to values, which may be primitive values or memories, which in turn map indices to primitive values. a second context,  $\rho$ , is the set of the memories that the program has accessed.  $\rho$  starts empty and accumulates memories as the program reads and writes them.
+
+the operational semantics consists of an expression judgment  $\sigma_1, \rho_1, e \downarrow \sigma_2, \rho_2, v$  and a command judgment  $\sigma_1, \rho_1, c \downarrow \sigma_2, \rho_2$ . we describe some relevant rules here, and the supplementary material lists the full semantics and proof [39].
+
+memory accesses. memories in filament are mutable stores of values. banked memories in dahlia can be built up using these simpler memories. the rule for a memory read expression  $a[n]$  requires that  $a$  not already be present in  $\rho$ , which would indicate that the memory was previously consumed:
+
+$$
+\begin{array}{c c} a \notin \rho_ {1} & \sigma_ {1}, \rho_ {1}, e \downarrow \sigma_ {2}, \rho_ {2}, n \qquad \sigma_ {2} (a) (n) = v \\ \hline & \sigma_ {1}, \rho_ {1}, a [ e ] \downarrow \sigma_ {2}, \rho_ {2} \cup \{a \}, v \end{array}
+$$
+
+composition. unordered composition accumulates the resource demands of two commands by threading  $\rho$  through:
+
+$$
+\begin{array}{c} \sigma_ {1}, \rho_ {1}, c _ {1} \downarrow \sigma_ {2}, \rho_ {2} \qquad \sigma_ {2}, \rho_ {2}, c _ {2} \downarrow \sigma_ {3}, \rho_ {3} \\ \hline \sigma_ {1}, \rho_ {1}, c _ {1}; c _ {2} \downarrow \sigma_ {3}, \rho_ {3} \end{array}
+$$
+
+if both commands read or write the same memory, they will conflict in  $\rho$ . ordered composition runs each command in the same initial  $\rho$  environment and merges the resulting  $\rho$ :
+
+$$
+\frac {\sigma_ {1} , \rho_ {1} , c _ {1} \downarrow \sigma_ {2} , \rho_ {2} \qquad \sigma_ {2} , \rho_ {1} , c _ {2} \downarrow \sigma_ {3} , \rho_ {3}}{\sigma_ {1} , \rho_ {1} , c _ {1} — — c _ {2} \downarrow \sigma_ {3} , \rho_ {2} \cup \rho_ {3}}
+$$
+
+# 4.3 type system
+
+the typing judgments have the form  $\gamma_1, \delta_1 \vdash c + \gamma_2, \delta_2$  and  $\gamma, \delta_1 \vdash e: \tau + \delta_2$ .  $\gamma$  is a standard typing context for variables and  $\delta$  is the affine context for memories.
+
+affine memory accesses. memories are affine resources. the rules for reads and writes check the type of the index in  $\gamma$  and remove the memory from  $\delta$ :
+
+$$
+\frac {\gamma , \delta_ {1} \vdash e _ {1} : \mathbf {b i t} \langle n \rangle + \delta_ {2} \qquad \delta_ {2} = \delta_ {3} \cup \{a \mapsto \mathbf {m e m} \tau [ n _ {1} ] \}}{\gamma , \delta_ {1} \vdash a [ e ] : \tau + \delta_ {3}}
+$$
+
+composition. the unordered composition rule checks the first statement in the initial contexts and uses the resulting contexts to check the second statement:
+
+$$
+\frac {\gamma_ {1} , \delta_ {1} \vdash c _ {1} + \gamma_ {2} , \delta_ {2} \qquad \gamma_ {2} , \delta_ {2} \vdash c _ {2} + \gamma_ {3} , \delta_ {3}}{\gamma_ {1} , \delta_ {1} \vdash c _ {1} ; c _ {2} + \gamma_ {3} , \delta_ {3}}
+$$
+
+ordered composition checks both commands under the same resource set,  $\delta_{1}$ , but threads the non-affine context through:
+
+$$
+\begin{array}{c} \gamma_ {1}, \delta_ {1} \vdash c _ {1} \dashv \gamma_ {2}, \delta_ {2} \qquad \gamma_ {2}, \delta_ {1} \vdash c _ {2} \dashv \gamma_ {3}, \delta_ {3} \\ \hline \gamma_ {1}, \delta_ {1} \vdash c _ {1} - - c _ {2} \dashv \gamma_ {3}, \delta_ {2} \cap \delta_ {3} \end{array}
+$$
+
+the rule merges the resulting  $\delta$  contexts with set intersection to yield the resources not consumed by either statement.
+
+# 4.4 small-step semantics
+
+we also define a small-step operational semantics for filament upon which we build a proof of soundness. we claim that the small-step semantics, when iterated to a value, is equivalent to the big-step semantics. the semantics consists of judgments  $\sigma_1, \rho_1, e \to \sigma_2, \rho_2, e'$  and  $\sigma_1, \rho_1, c \to \sigma_2, \rho_2, c'$  where  $\sigma$  and  $\rho$  are the environment and the memory context respectively. the main challenge is sequential composition, which uses an intermediate command form  $c_1 \stackrel{\rho}{\sim} c_2$  to thread  $\rho$  to  $c_1$  and  $c_2$ . the supplementary material has full details.
+
+# 4.5 desugaring surface constructs
+
+filament desugars surface language features present in dahlia.
+
+memory banking. a banked memory declaration like this:
+
+```txt
+let a: float[m bank n];
+```
+
+desugars into several unbanked memories:
+
+```txt
+let a_0: float[m/n]; let a_1: float[m/n]; ...
+```
+
+desugaring transforms reads and writes of banked memories to conditional statements that use the indexing expression to decide which bank to access.
+
+loop unrolling. desugaring of for loops uses the technique described in section 3.4, translating from:
+
+```txt
+for (let i = 0..m) unroll k { c1 -- c2 ... }
+```
+
+into a while loop that duplicates the body:
+
+```latex
+let  $\mathbf{i} = \mathbf{\theta}$    
+while  $(\mathrm{i} <   \frac{m}{k})$  {  
+ $\begin{array}{l}\{c_1[i\mapsto k\star i + 0];c_1[i\mapsto k\star i + 1]\ldots \} \\ \text{- - - } \\ \{c_2[i\mapsto k\star i + 0];c_2[i\mapsto k\star i + 1]\ldots \} \\ \dots \\ \mathrm{i} + + ;\quad \} \end{array}$
+```
+
+where  $c[x\mapsto e]$  denotes substitution.
+
+memory views. for views' operational semantics, a desugaring based on the mathematical descriptions in section 3.6 suffices. to type-check them, however, would require tracking the underlying memory for each view (transitively, to cope with views of views) and type-level reasoning about the bank requirements of an access pattern. formal treatment of these types would require an extension to filament.
+
+multi-ported memories. reasoning about memory ports requires quantitative resource tracking, as in bounded linear logic [21]. we leave such an extension of filament's affine type system as future work.
+
+# 4.6 soundness theorem
+
+we state a soundness theorem for filament's type system with respect to its checked small-step operational semantics.
+
+theorem. if  $\emptyset, \delta^{*} \vdash c + \gamma_{2}, \delta_{2}$  and  $\emptyset, \emptyset, c \stackrel{*}{\to} \sigma, \rho, c'$  and  $\sigma, \rho, c' \nrightarrow$ , then  $c' = \mathbf{skip}$ .
+
+where  $\delta^{*}$  is the initial affine context of memories available to a program. the theorem states that a well-typed program never gets stuck due to memory conflicts in  $\rho$ . we prove this theorem using progress and preservation lemmas:
+
+lemma 1 (progress). if  $\gamma, \delta \vdash c \vdash \gamma_2, \delta_2$  and  $\gamma, \delta \sim \sigma, \rho$ , then  $\sigma, \rho, c \rightarrow \sigma', \rho', c'$  or  $c = \mathbf{skip}$ .
+
+lemma 2 (preservation). if  $\gamma, \delta \vdash c + \gamma_2, \delta_2$  and  $\gamma, \delta \sim \sigma, \rho$ , and  $\sigma, \rho, c \to \sigma', \rho', c'$ , then  $\gamma', \delta' \vdash c' + \gamma_2', \delta_2'$  and  $\gamma', \delta' \sim \sigma', \rho'$ .
+
+in these lemmas,  $\gamma, \delta \sim \sigma, \rho$  is a well-formedness judgment stating that all variables in  $\gamma$  are in  $\sigma$  and all memories in  $\delta$  are not in  $\rho$ . using an extension of the syntax in figure 6, we prove the lemmas by induction on the small-step relation [39].
+
+# 5 evaluation
+
+our evaluation measures whether dahlia's restrictions can improve predictability without sacrificing too much sheer performance. we conduct two experiments: (1) we perform an exhaustive design space exploration for one kernel to determine how well the restricted design points compare to the much larger unrestricted parameter space. (2) we port the machsuite benchmarks [49] and, where dahlia yields a meaningful design space, perform a parameter sweep.
+
+# 5.1 implementation and experimental setup
+
+we implemented a dahlia compiler in 5200 loc of scala. the compiler checks dahlia programs and generates  $\mathrm{c}++$  code using xilinx vivado hls's #pragma directives [58]. we execute benchmarks on aws f1 instances [1] with 8 vcpus, 122 gb of main memory, and a xilinx ultrascale+ vu9p. we use the sdaccel development environment [57] and synthesize the benchmarks with a target clock period of  $250\mathrm{mhz}$ .
+
+# 5.2 case study: unrestricted dse vs. dahlia
+
+in this section, we conduct an exhaustive design-space exploration (dse) of a single benchmark as a case study. without dahlia, the hls design space is extremely large—we study how the smaller dahlia-restricted design space compares. we select a blocked matrix multiplication kernel (gemm-blocked from machsuite) for its large but tractable design space. the kernel has 3 two-dimensional arrays (two operands and the output product) and 5 nested loops, of which the inner 3 are parallelizable. we define parameters for the 6 banking factors (two dimensions for each memory) and 3 unrolling factors. (a full code listing appears in the supplementary material [39].) we explore a design space with banking factors of 1-4 and unrolling factors of 1, 2, 4, 6, and 8. this design space consists of 32,000 distinct configurations.
+
+we exhaustively evaluated the entire design space using vivado hls's estimation mode, which required a total of
+
+![](images/b6736c0b57c512c800692262415fc63efd0ad9d30f029d7dd12c6cf7d58f7689.jpg)  
+(a) pareto-optimal points.
+
+![](images/4a27bc60caf589c06b0677f3ea382530166956af8f4490096c81a0b17b582fde.jpg)  
+(b) points accepted by dahlia.
+
+![](images/bb935fd92cdf9c3440c14ea4a3e37d90796702f37c2f0df9c042e7efd493ed75.jpg)  
+(c) cluster of pareto points.  
+figure 7. results from exhaustive design space exploration for gemm-blocked.
+
+2,666 compute hours. we identify pareto-optimal configurations according to their estimated cycle latency and number of lookup tables (luts), flip flops (ffs), block rams (brams), and arithmetic units (dsps).
+
+dahlia accepts 354 configurations, or about  $1.1\%$  of the unrestricted design space. but the smaller space is only valuable if it consists of useful design points—a broad range of pareto-optimal configurations. figures 7a and 7b show the pareto-optimal points and the subset of points that dahlia accepts, respectively. (pareto optimality is determined using all objectives, but the plot shows only two: luts and latency.) figure 7c shows a zoomed-in view of the tight cluster of pareto points in the bottom-left of the first two graphs. dahlia-accepted points lie primarily on the pareto frontier and allow area-latency trade-offs. the optimal points that dahlia rejects expend a large number of luts to reduce bram consumption which, while pareto optimal, don't seem to be of practical use.
+
+# 5.3 dahlia-directed dse & programmability
+
+we port benchmarks from an hls benchmark suite, machsuite [49], to study dahlia's flexibility. of the 19 machsuite benchmarks, one (backprop) contains a correctness bug and two fail to synthesize correctly in vivado, indicating a bug in the tools. we successfully ported all 16 of the remaining benchmarks without substantial restructuring.
+
+from these, we select 3 benchmarks that exhibit the kind of fine-grained, loop-level parallelism that dahlia targets as case studies: stencil2d, md-knn, and md-grid. as the previous section illustrates, an unrestricted dse is intractable for even modestly sized benchmarks, so we instead measure the breadth and performance of the much smaller space of configurations that dahlia accepts. for each benchmark, we find all optimization parameters available in the dahlia port and define a search space. the type checker rejects some design points, and we measure the remaining space. we use vivado hls's estimation mode to measure the resource counts and estimated latency for each accepted point. figure 8 depicts the pareto-optimal points in each space. in each plot, we also highlight the effect a single parameter has on the results.
+
+the rest of this section reports quantitatively on each benchmark's design space and reports qualitatively on the programming experience during the port from c to dahlia.
+
+stencil2d. machsuite's stencil2d is a filter operation with four nested loops. the outer loops scan over the input matrix and the inner loops apply a  $3 \times 3$  filter. our dahlia port unrolls the inner two loops and banks both input memories. we use unrolling factors from 1 to 3 and bank each dimension of the input array by factors 1 to 6. the resulting design space has 2,916 points. dahlia accepts 18 of these points (0.6%), of which 8 are pareto-optimal within the set.
+
+figure 8a shows the pareto frontier among the dahlia-accepted points. the figure uses color to show the unrolling factor for the innermost loop. this unrolling factor has a large effect on the design's performance, while banking factors and the other loop explain the rest of the variation.
+
+the original c code uses single-dimensional arrays and uses index arithmetic to treat them as matrices:
+
+```javascript
+for  $(r = 0$  r<row_size-2;  $r + + )$  for  $(c = 0$  ; c<col_size-2;  $c + + )$  for  $(k1 = 0$  .  $k1 <   3$  .  $k1 + + )$  for  $(k2 = 0$  .  $k2 <   3$  .  $k2 + + )$  mul  $=$  filter[k1\*3+k2]  $\star$  orig[(r+k1)*col_size+c+k2];
+```
+
+in the dahlia port, we must use proper two-dimensional arrays because the compiler rejects arbitrary indexing expressions. using views, programmers can decouple the storage format from the iteration pattern. to express the accesses to the input matrix origin, we create a shifted suffix view (section 3.6) for the current window:
+
+```txt
+for (let row = 0..126) {
+    for (let col = 0..62) {
+        view window = shift orig[by row][by col];
+        for (let k1 = 0..3) unroll 3 {
+            for (let k2 = 0..3) unroll 3 {
+                let mul = filter[k1][k2] * window[k1][k2];
+            }
+        }
+    }
+};
+```
+
+the view makes the code's logic more obvious while allowing the dahlia type checker to allow unrolling on the inner two loops. it also clarifies why parallelizing the outer loops would
+
+![](images/571aaa687f79fe100da00351a0738416c7c0907e682b8afabe8ed5cf9df4e157.jpg)  
+(a) stencil2d with inner unroll.
+
+![](images/e3380b408882fbc72bab3daaa1349f5ca1edfa1754e6eda03464c9e355257837.jpg)  
+figure 8. the design spaces for three machsuite benchmarks. each uses a color to highlight one design parameter.
+
+![](images/db8014384418d8589d433bbd22071e977c30595f70bc572585224e63f417e55c.jpg)  
+(b) md-knn with outer unroll.
+
+![](images/73a987ab254e700fe1e091127e4d38b881c5bfbda21258011b6bc246208e8e64.jpg)  
+(c) md-grid with middle unroll.
+
+be undesirable: the parallel views would require overlapping regions of the input array, introducing a bank conflict.
+
+md-knn. the md-knn benchmark implements an  $n$ -body molecular dynamics simulation with a  $k$ -nearest neighbors kernel. the machsuite implementation uses data-dependent loads in its main loop, which naively seems to prevent parallelization. in our dahlia port, however, we hoist this serial section into a separate loop that runs before the main, parallelizable computation. dahlia's type system helped guide the programmer toward a version of the benchmark where the benefits from parallelization are clear.
+
+for each of the program's four memories, we used banking factors from 1 to 4. we unrolled each of the two nested loops with factors from 1 to 8. the full space has 16,384 points, of which dahlia accepts 525  $(3\%)$ . 37 of the dahlia-accepted points are pareto-optimal.
+
+figure 8b shows two pareto frontiers that dahlia accepts at different scales. the color shows the unrolling factor of the outer loop. the frontier on the right uses an order of magnitude fewer resources but is an order of magnitude slower. in this kernel, the dominant effect is the memory banking (not shown in the figure), which determines which frontier the designs fall into. the outer unrolling factor (shown in color) affects the two regimes differently: on the right, it allows area-latency trade-offs within the frontier; on the left, it acts as a second-order effect that expends luts to achieve a small increase in performance.
+
+md-grid. another algorithm for the same molecular dynamics problem, md-grid, uses a different strategy based on a 3d grid implemented with several 4-dimensional arrays. it calculates forces between neighboring grid cells. of its 6 nested loops, the outer three are parallelizable. we use banking factors of 1 to 4 for each dimension of each array, and we try unrolling factors from 1 to 8 for both loops. the full space has 21,952 points, of which dahlia accepts 81 (0.4%). 13 of the dahlia-accepted points are pareto-optimal.
+
+figure 8c again shows the pareto-optimal design points. the innermost loop unrolling factor (not shown in the figure) determines which of three coarse regimes the design falls
+
+into. the color shows the second loop unrolling factor, which determines a second-order area-latency trade-off within each regime. unrolling enables latency-area trade-offs in both the cases.
+
+# 6 future work
+
+dahlia represents a first step toward high-level semantics for accelerator design languages. it leaves several avenues for future work on scaling up from kernels to full applications and expressing more hardware implementation techniques.
+
+modularity. dahlia's type system relies on a closed-world assumption. a compositional type system would enable reuse of abstract hardware modules without "inlining" them, like functions in a software language. the primary challenge in modular accelerator design is the balance between abstraction and efficiency: a more general module is likely to be less efficient. an abstraction mechanism must also cope with the timing of inter-module interactions: some interfaces are latency-insensitive while others rely on cycle-level timing.
+
+polymorphism. dahlia's memory types are monomorphic. polymorphism would enable abstraction over memories' banking strategies and sizes. a polymorphic dahlia-like language could rule out invalid combinations of abstract implementation parameters before the designer picks concrete values, which would help constrain the search space for design space exploration.
+
+pipelining. pipelined logic is a critical implementation technique for high-level synthesis. dahlia does not reason about the timing of pipeline stages or their resource conflicts. extensions to its type system will need to reason about the cycle-level latency of these stages and track the fine-grained sharing of logic resources.
+
+direct rtl generation. the current dahlia compiler relies on a commercial  $\mathrm{c + + }$ -based hls compiler as its backend. it generates directives that instruct the hls tool to generate hardware according to the program's dahlia types, but the unpredictability of traditional hls means that results can still vary. future compilers for dahlia-like languages might
+
+![](images/2af2b042d43c74a8379b320de35cf6f2c60329562fed2e873b29646551fcea5f.jpg)  
+figure 9. resource utilization for gemm-ncubed in spatial normalized to the design without unrolling.
+
+generate rtl directly and rely on the simpler input language avoid the complexity of unrestricted hls.
+
+# 7 related work
+
+dahlia builds on a long history of work on safe systems programming. substructural type systems are known to be a good fit for controlling system resources [7, 24, 54, 13, 36]. dahlia's enforcement of exclusive memory access resembles work on race-free parallel programming using type and effect systems [8] or concurrent separation logic [41]. safe parallelism on cpus focuses on data races where concurrent reads and writes to a memory are unsynchronized. conflicts in dahlia are different: any simultaneous pair of accesses to the same bank is illegal. the distinction influences dahlia's capability system and its memory views, which cope with the arrangement of arrays into parallel memory banks.
+
+dahlia takes inspiration from other approaches to improving the accelerator design process, including hdls, hls, dsls, and other recent accelerator design languages.
+
+spatial. spatial [32] is a language for designing accelerators that builds on parallel patterns [43], which are flexible hardware templates. spatial adds some automation beyond traditional hls: it infers a banking strategy given some parallel accesses. like hls, spatial designs can be unpredictable. figure 13 shows resource usage for the matrix multiplication kernel from section 2 written in spatial. (a full experimental setup appears in the supplementary material [39].) for unrolling factors that do not evenly divide the memory size, spatial will sometimes infer a banking factor that is not equal to the unrolling factor. in these cases, the resource usage abruptly increases. a type system like dahlia could help address these predictability pitfalls in spatial.
+
+better hdls. modern hardware description languages [5, 35, 14, 4, 55, 30, 40] aim to address the shortcomings of verilog and vhdl. these languages target register transfer level (rtl) design. dahlia targets a different level of abstraction and a different use case: it uses an imperative programming model and focuses exclusively on computational accelerators. dahlia is not a good language for implementing a cpu, for example. its focus on acceleration requires the language and semantics to more closely resemble software languages.
+
+traditional hls. existing commercial [58, 29, 37, 9] and academic [47, 10, 42, 59] high-level synthesis (hls) tools compile subsets of c,  $\mathrm{c}^{++}$ , opencl, or systemc to rtl. while their powerful heuristics can be effective, when they fail, programmers have little insight into what went wrong or how to fix it [34]. dahlia represents an alternative approach that prioritizes programmer control over black-box optimization.
+
+targeting hardware from dsls. compilers to fpgas and asics exist for dsls for image processing [26, 27, 45, 51] and machine learning [20, 52]. dahlia is not a dsl: it is a general language for implementing accelerators. while dsls offer advantages in productivity and compilation for individual application domains, they do not obviate the need for general languages to fill in the gaps between popular domains, to offer greater programmer control when appropriate, and to serve as a compilation target for multiple dsls.
+
+accelerator design languages. some recent languages also focus on general accelerator design. heterocl [33] uses a halide-like [48] scheduling language to describe how to map algorithms onto hls-like hardware optimizations, and t2s [50] similarly lets programs describe how generate a spatial implementation. lime [3] extends java to express target-independent streaming accelerators. coram [12] is not a just a language; it extends fpgas with a programmable memory interface that adapts memory accesses, akin to dahlia's memory views. dahlia's focus on predictability and typed driven design makes it unique, as far as we are aware.
+
+# 8 conclusion
+
+dahlia exposes predictability as a new design goal for hls tools. predictability comes at a cost—it can rule out design points that perform surprisingly well because of a subtle convergence of heuristics. we see these outliers as a worthy sacrifice in exchange for an intelligible programming model and robust reasoning tools. we hope to extend dahlia's philosophy to bring predictability to the rest of the reconfigurable hardware system stack, from the language to the luts.
+
+# acknowledgments
+
+we thank drew zagieboylo and yi-hsiang lai for insightful discussions and alexa vanhattum, dietrich geisler, and pedro henrique azevedo de amorim for invaluable comments on early drafts and solidarity in the final hours. many thanks to the anonymous pldi reviewers and our shepherd, zachary tatlock, for suggesting important additions.
+
+this work was supported in part by the center for applications driving architectures (ada), one of six centers of jump, a semiconductor research corporation program co-sponsored by darpa. it was also supported by the intel and nsf joint research center for computer assisted programming for heterogeneous architectures (capa). support included nsf awards #1723715 and #1845952.
+
+# references
+
+[1] amazon web services. [n.d.]. amazon ec2 f1 instances. https://aws.amazon.com/ec2/instance-types/f1/.  
+[2] mina tahmasbi arashloo, alexey lavrov, manya ghobadi, jennifer rexford, david walker, and david wentzloff. 2020. enabling programmable transport protocols in high-speed nics. in usenix symposium on networked system design and implementation (nsdi).  
+[3] joshua auerbach, david f. bacon, perry cheng, and rodric rabbah. 2010. lime: a java-compatible and synthesizable language for heterogeneous architectures. in acm sigplan conference on object oriented programming, systems, languages and applications (oopsla).  
+[4] c. baaij, m. kooijman, j. kuper, a. boejink, and m. gerards. 2010. cλash: structural descriptions of synchronous hardware using haskell. in euromicro conference on digital system design: architectures, methods and tools.  
+[5] jonathan bachrach, huy vo, brian richards, yunsup lee, andrew waterman, rimas avizienis, john wawrzynek, and krste asanovic. 2012. chisel: constructing hardware in a scala embedded language. in design automation conference (dac).  
+[6] henry g. baker. 1995. "use-once" variables and linear objects: storage management, reflection and multi-threading. sigplan notices 30, 1 (jan. 1995), 45-52.  
+[7] j bernardy, mathieu boespflug, ryan newton, simon l. peyton jones, and arnaud spiwack. 2017. linear haskell: practical linearity in a higher-order polymorphic language. in acm sigplan-sigact symposium on principles of programming languages (popl).  
+[8] robert l. bocchino, jr., vikram s. adve, danny dig, sarita v. adve, stephen heumann, rakesh komuravelli, jeffrey overbey, patrick simmons, hyojin sung, and mohsen vakilian. 2009. a type and effect system for deterministic parallel java. in acm sigplan conference on object oriented programming, systems, languages and applications (oopsla).  
+[9] cadence. [n.d.]. stratus high-level synthesis. https://www.cadence.com/content/cadence-www/global/en_us/home/tools/digital-design-and-signoff/synthesis/stratus-high-level-synthesis.html.  
+[10] andrew canis, jongsok choi, mark aldham, victor zhang, ahmed kammoona, jason h anderson, stephen brown, and tomasz czajkowski. 2011. legup: high-level synthesis for fpga-based processor/accelerator systems. in international symposium on field-programmable gate arrays (fpga).  
+[11] eric s. chung, john d. davis, and jaewon lee. 2013. linqits: big data on little clients. in international symposium on computer architecture (isca).  
+[12] eric s chung, james c hoe, and ken mai. 2011. coram: an infabric memory architecture for fpga-based computing. in field programmable gate arrays (fpga).  
+[13] sylvan clebsch, sophia drossopoulou, sebastian blessing, and andy mcneil. 2015. deny capabilities for safe, fast actors. in international workshop on programming based on actors, agents, and decentralized control (agere!).  
+[14] j. clow, g. tzimpragos, d. dangwal, s. guo, j. mcmahan, and t. sherwood. 2017. a pythonic approach for rapid hardware prototyping and instrumentation. in international conference on field-programmable logic and applications (fpl).  
+[15] j. cong, y. fan, g. han, w. jiang, and z. zhang. 2006. platform-based behavior-level and system-level synthesis. in international soc conference.  
+[16] j. cong, b. liu, s. neuendorffer, j. noguera, k. vissers, and z. zhang, 2011. high-level synthesis for fpgas: from prototyping to deployment. ieee transactions on computer-aided design of integrated circuits and systems (tcad) 30, 4 (april 2011), 473-491.  
+[17] j. cong and zhiru zhang. 2006. an efficient and versatile scheduling algorithm based on sdc formulation. in design automation conference (dac).
+
+[18] matthew fluet, greg morrisett, and amal ahmed. 2006. linear regions are all you need. in european symposium on programming (esop).  
+[19] jeremy fowers, kalin ovtcharov, michael papamichael, todd massengill, ming liu, daniel lo, shlomi alkalay, michael haselman, logan adams, mahdi ghandi, stephen heil, prerak patel, adam sapek, gabriel weisz, lisa woods, sitaram lanka, steven k. reinhardt, adrian m. caulfield, eric s. chung, and doug burger. 2018. a configurable cloud-scale dnn processor for real-time ai. in international symposium on computer architecture (isca).  
+[20] n. george, h. lee, d. novo, t. rompf, k. j. brown, a. k. sujeeth, m. odersky, k. olukotun, and p. ienne. 2014. hardware system synthesis from domain-specific languages. in international conference on field-programmable logic and applications (fpl).  
+[21] jean-yves girard, andre scedrov, and philip j. scott. 1992. bounded linear logic: a modular approach to polynomial-time computability. theoretical computer science 97, 1 (april 1992), 1-66.  
+[22] colin s gordon, michael d ernst, and dan grossman. 2013. rely-guarantee references for refinement types over aliased mutable data. in acm sigplan conference on programming language design and implementation (pldi).  
+[23] colin s. gordon, matthew j. parkinson, jared parsons, aleks bromfield, and joe duffy. 2012. uniqueness and reference immutability for safe parallelism. in acm sigplan conference on object oriented programming, systems, languages and applications (oopsla).  
+[24] dan grossman, greg morrisett, trevor jim, michael hicks, yanling wang, and james cheney. 2002. region-based memory management in cyclone. in acm sigplan conference on programming language design and implementation (pldi).  
+[25] s gupta, renu gupta, nikil dutt, and alex nicolau. 2004. spark: a parallelizing approach to the high-level synthesis of digital circuits. springer.  
+[26] james hegarty, john brunhaver, zachary devito, jonathan ragan-kelley, noy cohen, steven bell, artem vasilyev, mark horowitz, and pat hanrahan. 2014. darkroom: compiling high-level image processing code into hardware pipelines. acm transactions on graphics 33, 4 (2014).  
+[27] james hegarty, ross daly, zachary devito, jonathan ragan-kelley, mark horowitz, and pat hanrahan. 2016. rigel: flexible multi-rate image processing hardware. acm transactions on graphics 35, 4 (2016).  
+[28] john l. hennessy and david a. patterson. 2019. a new golden age for computer architecture. communications of the acm (cacm) 62, 2 (jan. 2019), 48-60.  
+[29] intel. [n.d.]. intel high level synthesis compiler. https://www.altera.com/products/design-software/high-level-design/intel-hls-compiler/overview.html  
+[30] jane street. [n.d.]. hardcaml: register transfer level hardware design in ocaml. https://github.com/janestreet/hardcaml.  
+[31] norman p. jouppi, cliff young, nishant patil, david patterson, gaurav agrawal, raminder bajwa, sarah bates, suresh bhatia, nan boden, al borchers, rick boyle, pierre luc cantin, clifford chao, chris clark, jeremy coriell, mike daley, matt dau, jeffrey dean, ben gelb, tara vazir ghaemmaghami, rajendra gottipati, william gulland, robert hagemann, c. richard ho, doug hogberg, john hu, robert hundt, dan hurt, julian ibarz, aaron jaffey, alek jaworski, alexander kaplan, harshit khaitan, andy koch, naveen kumar, steve lacy, james laudon, james law, diemthu le, chris leary, zhuyuan liu, kyle lucke, alan lundin, gordon mackean, adriana maggiore, maire mahony, kieran miller, rahul nagarajan, ravi narayanaswami, ray ni, kathy nix, thomas norrie, mark omernick, narayana penukonda, andy phelps, jonathan ross, matt ross, amir salek, emad samadiani, chris severn, gregory sizikov, matthew snelham, jed souter, dan steinberg, andy swing, mercedes tan, gregory thorson, bo tian, horia toma, erick tuttle, vijay vasudevan, richard walter, walter wang, eric wilcox, and doe hyun yoon. 2017. in-datacenter performance
+
+analysis of a tensor processing unit. in international symposium on computer architecture (isca).  
+[32] david koeplinger, matthew feldman, raghu prabhakar, yaqi zhang, stefan hadjis, ruben fiszel, tian zhao, luigi nardi, ardavan pedram, christos kozyrakis, and kunle olukotun. 2018. spatial: a language and compiler for application accelerators. in acm sigplan conference on programming language design and implementation (pldi).  
+[33] yi-hsiang lai, yuze chi, yuwei hu, jie wang, cody hao yu, yuan zhou, jason cong, and zhiru zhang. 2019. heterocl: a multi-paradigm programming infrastructure for software-defined reconfigurable computing. in international symposium on field-programmable gate arrays (fpga).  
+[34] yun liang, kyle rupnow, yinan li, dongbo min, minh n do, and deming chen. 2012. high-level synthesis: productivity, performance, and software constraints. journal of electrical and computer engineering (2012).  
+[35] derek lockhart, gary zibrat, and christopher batten. 2014. pymtl: a unified framework for vertically integrated computer architecture research. in ieee/acm international symposium on microarchitecture (micro).  
+[36] nicholas d. matsakis and felix s. klock, ii. 2014. the rust language. in high integrity language technology (hilt).  
+[37] mentor graphics. [n.d.]. catapult high-level synthesis. https://www. mentor.com/hls-lp/catapult-high-level-synthesis/.  
+[38] mayur naik, alexander aiken, and john whaley. 2006. effective static race detection for java. in acm sigplan conference on programming language design and implementation (pldi).  
+[39] rachit nigam, sachille atapattu, samuel thomas, zhijing li, theodore bauer, yuwei ye, apurva koti, adrian sampson, and zhiru zhang. [n.d.]. predictable accelerator design with time-sensitive affine types: supplemental material. 2020.  
+[40] rishiyur nikhil. 2004. bluespec system verilog: efficient, correct rtl from high level specifications. in conference on formal methods and models for co-design (memocode).  
+[41] peter w. o'hearn. 2007. resources,concurrency, and local reasoning. theoretical computer science 375 (april 2007), 271-307.  
+[42] christian pilato and fabrizio ferrandi. 2013. bambu: a modular framework for the high level synthesis of memory-intensive applications. in international conference on field-programmable logic and applications (fpl).  
+[43] raghu prabhakar, david koeplinger, kevin j brown, hyoukjoong lee, christopher de sa, christos kozyakis, and kunle olukotun. 2016. generating configurable hardware from parallel patterns. acm sigarch computer architecture news 44, 2 (2016), 651-665.  
+[44] polyvios pratikakis, jeffrey s. foster, and michael w. hicks. 2006. locksmith: context-sensitive correlation analysis for race detection. in acm sigplan conference on programming language design and implementation (pldi).  
+[45] jing pu, steven bell, xuan yang, jeff setter, stephen richardson, jonathan ragan-kelley, and mark horowitz. 2017. programming heterogeneous systems from an image processing dsl. acm transactions on architecture and code optimization (taco) (2017).  
+[46] andrew putnam, adrian m. caulfield, eric s. chung, derek chiou, kypros constantinides, john demme, hadi esmaeilzadeh, jeremy fowers, gopi prashanth, gopal jan, gray michael, haselman scott hauck,
+
+stephen heil, amir hormati, joo-young kim, sitaram lanka, james larus, eric peterson, simon pope, aaron smith, jason thong, phillip y. xiao, and doug burger. 2014. a reconfigurable fabric for accelerating large-scale datacenter services. in international symposium on computer architecture (isca).  
+[47] andrew r putnam, dave bennett, eric dellinger, jeff mason, and prasanna sundararajan. 2008. chimps: a high-level compilation flow for hybrid cpu-fpga architectures. in international symposium on field-programmable gate arrays (fpga).  
+[48] jonathan ragan-kelley, connelly barnes, andrew adams, sylvain paris, frédo durand, and saman p. amarasinghe. 2013. halide: a language and compiler for optimizing parallelism, locality, and recomputation in image processing pipelines. in acm sigplan conference on programming language design and implementation (pldi).  
+[49] brandon reagen, robert adolf, yakun sophia shao, gu-yeon wei, and david brooks. 2014. machsuite: benchmarks for accelerator design and customized architectures. in ieee international symposium on workload characterization (iiswc).  
+[50] hongbo rong. 2017. programmatic control of a compiler for generating high-performance spatial hardware. arxiv preprint 1711.07606. https://arxiv.org/abs/1711.07606.  
+[51] jeff setter. [n.d.]. halide-to-hardware. https://github.com/jeffsetter/halide-to-hardware.  
+[52] hardik sharma, jongse park, divya mahajan, emmanuel amaro, joon kyung kim, chenkai shao, asit mishra, and hadi esmaeilzadeh. 2016. from high-level deep neural models to fpgas. in ieee/acm international symposium on microarchitecture (micro).  
+[53] stuart sutherland, don mills, and chris spear. 2007. gotcha again: more subtleties in the verilog and systemverilog standards that every engineer should know. in synopsys users group (snug) san jose. https://lcdm-eng.com/papers/snug07_verilog%20gotchas%20part2.pdf  
+[54] jesse a. tov and riccardo pucella. 2011. practical affine types. in acm sigplan-sigact symposium on principles of programming languages (popl).  
+[55] lenny truong and pat hanrahan. 2019. a golden age of hardware description languages: applying programming language techniques to improve design productivity. in summit on advances in programming languages (snapl).  
+[56] yatish turakhia, gill bejerano, and william j. dally. 2018. darwin: a genomics co-processor provides up to 15,000x acceleration on long read assembly. in acm international conference on architectural support for programming languages and operating systems (asplos).  
+[57] xilinx inc. [n.d.]. sdaccel: enabling hardware-accelerated software. https://www.xilinx.com/products/design-tools/software-zone/sdaccel.html.  
+[58] xilinx inc. [n.d.]. vivado design suite user guide: high-level synthesis. ug902 (v2017.2) june 7, 2017. https://www.xilinx.com/support/documentation/sw manuals/xilinx2017_2/ug902-vivado-high-level-synthesis.pdf.  
+[59] zhiru zhang, yiping fan, wei jiang, guoling han, changqi yang, and jason cong. 2008. autopilot: a platform-based esl synthesis system. in high-level synthesis: from algorithm to digital circuit, philippe coussy and adam morawiec (eds.). 99-112.
+
+# a semantics
+
+the following lists the grammar for filament, the core language of dahlia.
+
+$$
+x \in \text {v a r i a b l e s} \quad a \in \text {m e m o r i e s} \quad n \in \text {n u m b e r s}
+$$
+
+$$
+b := \text {t r u e} \mid \text {f a l s e} \quad v := n \mid b \mid v _ {1} \operatorname {b o p} v _ {2}
+$$
+
+$$
+e := v \mid \mathbf {b o p} e _ {1} e _ {2} \mid x \mid a [ e ]
+$$
+
+$$
+c := e \mid \operatorname {l e t} x = e \mid c _ {1} - c _ {2} \mid c _ {1} \stackrel {\rho} {\sim} c _ {2} \mid c _ {1}; c _ {2} \mid \text {i f} x c _ {1} c _ {2} \mid
+$$
+
+$$
+\text {w h i l e} x c \mid x := e \mid a [ e _ {1} ] := e _ {2} \mid \text {s k i p}
+$$
+
+$$
+\tau : := \text {b i t} \langle n \rangle | \text {f l o a t} | \text {b o o l} | \text {m e m} \tau [ n _ {1} ]
+$$
+
+the large-step operational semantics listed below capture the complete evaluation of an expression or command. the environment  $\sigma$  maps variables and memory names to values, and the context  $\rho$  is the set of memories the program has accessed.
+
+$$
+\boxed {\sigma_ {1}, \rho_ {1}, e \downarrow \sigma_ {2}, \rho_ {2}, v} \tag {()}
+$$
+
+$$
+\begin{array}{l} \begin{array}{c} \sigma_ {1}, \rho_ {1}, e _ {1} \downarrow \sigma_ {2}, \rho_ {2}, v _ {1} \qquad \sigma_ {2}, \rho_ {2}, e _ {2} \downarrow \sigma_ {3}, \rho_ {3}, v _ {2} \qquad v _ {3} = v _ {1} \mathbf {b o p} v _ {2} \\ \hline \sigma_ {1}, \rho_ {1}, \mathbf {b o p} e _ {1} e _ {2} \downarrow \sigma_ {3}, \rho_ {3}, v _ {3} \end{array} \\ \begin{array}{c} \sigma (x) = v \\ \hline \sigma , \rho , x \downarrow \sigma , \rho , v \end{array} \\ \begin{array}{c c} a \notin \rho_ {1} & \sigma_ {1}, \rho_ {1}, e \downarrow \sigma_ {2}, \rho_ {2}, n \qquad \sigma_ {2} (a) (n) = v \\ \hline & \sigma_ {1}, \rho_ {1}, a [ e ] \downarrow \sigma_ {2}, \rho_ {2} \cup \{a \}, v \end{array} \\ \end{array}
+$$
+
+$$
+\boxed {\sigma_ {1}, \rho_ {1}, c \downarrow \sigma_ {2}, \rho_ {2}} \tag {()}
+$$
+
+$$
+\frac {\sigma_ {1} , \rho_ {1} , e \downarrow \sigma_ {2} , \rho_ {2} , v}{\sigma_ {1} , \rho_ {1} , \mathbf {l e t} x = e \downarrow \sigma_ {2} [ x \mapsto v ] , \rho_ {2}}
+$$
+
+$$
+\begin{array}{c} \sigma_ {1}, \rho_ {1}, c _ {1} \downarrow \sigma_ {2}, \rho_ {2} \qquad \sigma_ {2}, \rho_ {1}, c _ {2} \downarrow \sigma_ {3}, \rho_ {3} \\ \hline \sigma_ {1}, \rho_ {1}, c _ {1} - - c _ {2} \downarrow \sigma_ {3}, \rho_ {2} \cup \rho_ {3} \end{array}
+$$
+
+$$
+\begin{array}{c} \sigma_ {1}, \rho_ {1}, c _ {1} \downarrow \sigma_ {2}, \rho_ {2} \qquad \sigma_ {2}, \rho , c _ {2} \downarrow \sigma_ {3}, \rho_ {3} \\ \hline \sigma_ {1}, \rho_ {1}, c _ {1} \stackrel {{\rho}} {{\sim}} c _ {2} \downarrow \sigma_ {3}, \rho_ {2} \cup \rho_ {3} \end{array}
+$$
+
+$$
+\begin{array}{c} \sigma_ {1}, \rho_ {1}, c _ {1} \downarrow \sigma_ {2}, \rho_ {2} \qquad \sigma_ {2}, \rho_ {2}, c _ {2} \downarrow \sigma_ {3}, \rho_ {3} \\ \hline \sigma_ {1}, \rho_ {1}, c _ {1}; c _ {2} \downarrow \sigma_ {3}, \rho_ {3} \end{array}
+$$
+
+$$
+\begin{array}{c} \sigma_ {1}, \rho_ {1}, e _ {1} \downarrow \sigma_ {2}, \rho_ {2}, \text {t r u e} \qquad \sigma_ {2}, \rho_ {2}, c _ {1} \downarrow \sigma_ {3}, \rho_ {3} \\ \hline \sigma_ {1}, \rho_ {1}, \text {i f} x c _ {1} c _ {2} \downarrow \sigma_ {3}, \rho_ {3} \end{array}
+$$
+
+$$
+\begin{array}{c} \sigma_ {1}, \rho_ {1}, e _ {1} \downarrow \sigma_ {2}, \rho_ {2}, \text {f a l s e} \qquad \sigma_ {2}, \rho_ {2}, c _ {2} \downarrow \sigma_ {3}, \rho_ {3} \\ \hline \sigma_ {1}, \rho_ {1}, \text {i f} x c _ {1} c _ {2} \downarrow \sigma_ {3}, \rho_ {3} \end{array}
+$$
+
+$$
+\begin{array}{l} \sigma_ {1}, \rho_ {1}, e _ {1} \downarrow \sigma_ {2}, \rho_ {2}, \text {t r u e} \\ \begin{array}{c c} \sigma_ {2}, \rho_ {2}, c - \text {w h i l e} x c \downarrow \sigma_ {3}, \rho_ {3} & \sigma_ {1}, \rho_ {1}, e _ {1} \downarrow \sigma_ {2}, \rho_ {2}, \text {f a l s e} \\ \hline \sigma_ {1}, \rho_ {1}, \text {w h i l e} x c \downarrow \sigma_ {3}, \rho_ {3} & \sigma_ {1}, \rho_ {1}, \text {w h i l e} x c \downarrow \sigma_ {2}, \rho_ {2} \end{array} \\ \end{array}
+$$
+
+$$
+\frac {\sigma_ {1} , \rho_ {1} , e \downarrow \sigma_ {2} , \rho_ {2} , v}{\sigma_ {1} , \rho_ {1} , x := e \downarrow \sigma_ {2} [ x \mapsto v ] , \rho_ {2}}
+$$
+
+$$
+\begin{array}{c} \sigma_ {1}, \rho_ {1}, e _ {1} \downarrow \sigma_ {2}, \rho_ {2}, n \qquad \sigma_ {2}, \rho_ {2}, e _ {2} \downarrow \sigma_ {3}, \rho_ {3}, v \qquad a \notin \rho_ {3} \\ \hline \sigma_ {1}, \rho_ {1}, a [ e _ {1} ] := e _ {2} \downarrow \sigma_ {3} [ a [ n ] \mapsto v ], \rho_ {3} \cup \{a \} \end{array}
+$$
+
+the small-step operational semantics capture incremental evaluation of an expression or command and form the basis of the proof of soundness in appendix b.
+
+$$
+\begin{array}{l} \boxed {\sigma , \rho , e \rightarrow \sigma^ {\prime}, \rho^ {\prime}, e ^ {\prime}} \tag {()} \\ \begin{array}{c c} \sigma , \rho , e \to \sigma^ {\prime}, \rho^ {\prime}, e ^ {\prime} & a \notin \rho \\ \hline \sigma , \rho , a [ e ] \to \sigma^ {\prime}, \rho^ {\prime}, a [ e ^ {\prime} ] & \sigma , \rho , a [ n ] \to \sigma , \rho \cup \{a \}, v \end{array} \\ \frac {\sigma , \rho , e _ {1} \rightarrow \sigma^ {\prime} , \rho^ {\prime} , e _ {1} ^ {\prime}}{\sigma , \rho , \mathbf {b o p} e _ {1} e _ {2} \rightarrow \sigma^ {\prime} , \rho^ {\prime} , \mathbf {b o p} e _ {1} ^ {\prime} e _ {2}} \\ \end{array}
+$$
+
+$$
+\begin{array}{l} \begin{array}{c c}\sigma , \rho , e _ {2} \rightarrow \sigma^ {\prime}, \rho^ {\prime}, e _ {2} ^ {\prime}&v _ {3} = v _ {1} \mathbf {b o p} v _ {2}\\\hline \sigma , \rho , \mathbf {b o p} v _ {1} e _ {2} \rightarrow \sigma^ {\prime}, \rho^ {\prime}, \mathbf {b o p} v _ {1} e _ {2} ^ {\prime}&\hline \sigma , \rho , \mathbf {b o p} v _ {1} v _ {2} \rightarrow \sigma , \rho , v _ {3}\end{array} \\ \begin{array}{c} \sigma (x) = v \\ \hline \sigma , \rho , x \to \sigma , \rho , v \end{array} \\ \end{array}
+$$
+
+$$
+\begin{array}{l} \boxed {\sigma_ {1}, \rho_ {1}, c \rightarrow \sigma^ {\prime}, \rho^ {\prime}, c ^ {\prime}} \tag {()} \\ \begin{array}{c} \sigma , \rho , e _ {1} \to \sigma^ {\prime}, \rho^ {\prime}, e _ {1} ^ {\prime} \\ \hline , a [ e _ {1} ] := e _ {2} \to \sigma^ {\prime}, \rho^ {\prime}, a [ e _ {1} ^ {\prime} ] := e _ {2} \end{array} \\ \frac {\sigma , \rho , e \rightarrow \sigma^ {\prime} , \rho^ {\prime} , e ^ {\prime}}{\sigma , \rho , a [ n ] := e \rightarrow \sigma^ {\prime} , \rho^ {\prime} , a [ n ] := e ^ {\prime}} \\ \end{array}
+$$
+
+$$
+\begin{array}{l} \frac {a \notin \rho}{\sigma , \rho , a [ n ] := v \rightarrow \sigma [ a [ n ] \mapsto v ], \rho \cup \{a \} , \mathbf {s k i p}} \\ \frac {\sigma , \rho , e \rightarrow \sigma^ {\prime} , \rho^ {\prime} , e ^ {\prime}}{\sigma , \rho , \operatorname {l e t} x = e \rightarrow \sigma^ {\prime} , \rho^ {\prime} , \operatorname {l e t} x = e ^ {\prime}} \\ \overline {{\sigma , \rho , \mathbf {l e t} x = v \rightarrow \sigma [ x \mapsto v ] , \rho , \mathbf {s k i p}}} \\ \frac {\sigma , \rho , c _ {1} \rightarrow \sigma^ {\prime} , \rho^ {\prime} , c _ {1} ^ {\prime}}{\sigma , \rho , c _ {1} ; c _ {2} \rightarrow \sigma^ {\prime} , \rho^ {\prime} , c _ {1} ^ {\prime} ; c _ {2}} \quad \overline {{\sigma , \rho , \mathbf {s k i p} ; c _ {2} \rightarrow \sigma , \rho , c _ {2}}} \\ \overline {{\sigma , \rho , c _ {1} - c _ {2} \rightarrow \sigma , \rho , c _ {1}}} ^ {\rho} \sim c _ {2} \\ \begin{array}{c} \sigma , \rho , c _ {1} \to \sigma^ {\prime}, \rho^ {\prime}, c _ {1} ^ {\prime} \\ \hline \sigma , \rho , c _ {1} \stackrel {{\rho^ {\prime}}} {{\sim}} c _ {2} \to \sigma^ {\prime}, \rho^ {\prime}, c _ {1} ^ {\prime} \stackrel {{\rho^ {\prime}}} {{\sim}} c _ {2} \end{array} \\ \begin{array}{c}\sigma , \rho^ {\prime \prime}, c _ {2} \rightarrow \sigma^ {\prime}, \rho^ {\prime \prime \prime}, c _ {2} ^ {\prime}\\\hline \sigma , \rho , \mathbf {s k i p} ^ {\rho^ {\prime \prime}} c _ {2} \rightarrow \sigma^ {\prime}, \rho , \mathbf {s k i p} ^ {\rho^ {\prime \prime \prime}} c _ {2} ^ {\prime}\end{array} \\ \end{array}
+$$
+
+$$
+\sigma , \rho , \mathbf {s k i p} \stackrel {\rho^ {\prime \prime}} {\sim} \mathbf {s k i p} \rightarrow \sigma , \rho \cup \rho^ {\prime \prime}, \mathbf {s k i p}
+$$
+
+$$
+\begin{array}{c c} \sigma (x) = \text {t r u e} & \sigma_ {1} (x) = \text {f a l s e} \\ \hline \sigma , \rho , \text {i f} x   c _ {1}   c _ {2} \to \sigma , \rho , c _ {1} & \sigma , \rho , \text {i f} x   c _ {1}   c _ {2} \to \sigma , \rho , c _ {2} \\ \hline \sigma , \rho , \text {w h i l e} x   c \to \sigma , \rho , \text {i f} x (c - - \text {w h i l e} x   c) \text {s k i p} \end{array}
+$$
+
+to enforce dahlia's safety condition, the typing judgments use the typing context  $\gamma$  for variables and the affine context  $\delta$  for memories.
+
+$$
+\begin{array}{c c} \boxed {\gamma , \delta_ {1} \vdash e: \tau + \delta_ {2}} & \\ & \overline {{\gamma , \delta \vdash v : \tau + \delta}} \end{array}
+$$
+
+$$
+\begin{array}{l} \frac {\gamma , \delta_ {1} \vdash e _ {1} : \tau + \delta_ {2} \qquad \gamma , \delta_ {2} \vdash e _ {2} : \tau + \delta_ {3} \qquad \mathbf {b o p} : \tau \to \tau \to \tau}{\gamma , \delta_ {1} \vdash \mathbf {b o p} e _ {1} e _ {2} : \tau + \delta_ {3}} \\ \frac {\gamma (x) = \tau}{\gamma , \delta_ {1} \vdash x : \tau \dashv \delta_ {1}} \\ \frac {\gamma , \delta_ {1} \vdash e _ {1} : \mathbf {b i t} \langle n \rangle + \delta_ {2} \qquad \delta_ {2} = \delta_ {3} \cup \{a \mapsto \mathbf {m e m} \tau [ n _ {1} ] \}}{\gamma , \delta_ {1} \vdash a [ e ] : \tau + \delta_ {3}} \\ \end{array}
+$$
+
+$$
+\begin{array}{c c} \boxed {\gamma_ {1}, \delta_ {1} \vdash c + \gamma_ {2}, \delta_ {2}} & \\ & \overline {{\gamma , \delta \vdash \mathbf {s k i p} + \gamma , \delta}} \end{array}
+$$
+
+$$
+\begin{array}{l} \begin{array}{c} \gamma , \delta_ {1} \vdash e _ {1}: \mathbf {b i t} \langle n \rangle \vdash \delta_ {2} \qquad \gamma , \delta_ {2} \vdash e _ {2}: \tau \vdash \delta_ {3} \\ \delta_ {3} = \delta_ {4} \cup \{a \mapsto \mathbf {m e m}   \tau [ n _ {1} ] \} \\ \hline \gamma , \delta_ {1} \vdash a [ e _ {1} ] := e _ {2} \vdash \gamma , \delta_ {4} \end{array} \\ \begin{array}{c} \gamma , \delta_ {1} \vdash e: \tau \vdash \delta_ {2} \qquad (x \to \tau) \notin \gamma \\ \hline \gamma , \delta_ {1} \vdash \mathbf {l e t} x = e \vdash \gamma [ x \mapsto \tau ], \delta_ {2} \end{array} \\ \begin{array}{c} \gamma_ {1}, \delta_ {1} \vdash c _ {1} + \gamma_ {2}, \delta_ {2} \qquad \gamma_ {2}, \delta_ {2} \vdash c _ {2} + \gamma_ {3}, \delta_ {3} \\ \hline \gamma_ {1}, \delta_ {1} \vdash c _ {1}; c _ {2} + \gamma_ {3}, \delta_ {3} \end{array} \\ \frac {\gamma_ {1} , \delta_ {1} \vdash c _ {1} + \gamma_ {2} , \delta_ {2} \qquad \gamma_ {2} , \delta_ {1} \vdash c _ {2} + \gamma_ {3} , \delta_ {3}}{\gamma_ {1} , \delta_ {1} \vdash c _ {1} — — c _ {2} + \gamma_ {3} , \delta_ {2} \cap \delta_ {3}} \\ \begin{array}{c} \gamma_ {1}, \delta_ {1} \vdash c _ {1} \dashv \gamma_ {2}, \delta_ {2} \qquad \gamma_ {2}, \bar {\rho} \vdash c _ {2} \dashv \gamma_ {3}, \delta_ {3} \\ \hline \gamma_ {1}, \delta_ {1} \vdash c _ {1} \stackrel {{\rho}} {{\sim}} c _ {2} \dashv \gamma_ {3}, \delta_ {2} \cap \delta_ {3} \end{array} \\ \begin{array}{c} \gamma , \delta_ {1} \vdash x: \mathbf {b o o l} + \delta_ {2} \qquad \gamma , \delta_ {2} \vdash c _ {1} + \gamma_ {2}, \delta_ {3} \\ \gamma , \delta_ {2} \vdash c _ {2} + \gamma_ {3}, \delta_ {4} \\ \hline \gamma , \delta_ {1} \vdash \text {i f} x c _ {1} c _ {2} + \gamma , \delta_ {2} \cap \delta_ {3} \cap \delta_ {4} \end{array} \\ \begin{array}{c} \gamma , \delta_ {1} \vdash x: \mathbf {b o o l} + \delta_ {2} \qquad \gamma , \delta_ {2} \vdash c _ {1} + \gamma_ {2}, \delta_ {3} \\ \gamma , \delta_ {3} \vdash c _ {2} + \gamma_ {3}, \delta_ {4} \\ \hline \gamma , \delta_ {1} \vdash \mathbf {i f} x c _ {1} c _ {2} + \gamma , \delta_ {4} \end{array} \\ \begin{array}{c} \gamma , \delta_ {1} \vdash e: \tau \dashv \delta_ {2} \qquad \gamma (x) = \tau \\ \hline \gamma , \delta_ {1} \vdash x := e \dashv \gamma , \delta_ {2} \end{array} \\ \frac {\gamma , \delta_ {1} \vdash x : \mathbf {b o o l} \dashv \delta_ {2} \qquad \gamma , \delta_ {2} \vdash c \dashv \gamma_ {3} , \delta_ {3}}{\gamma , \delta_ {1} \vdash \text {w h i l e} x c \dashv \gamma , \delta_ {3} \cap \delta_ {2}} \\ \end{array}
+$$
+
+# b proof of soundness
+
+if there exists a typing context  $\gamma$  and affine memory context  $\delta$  under which a command  $c$  type-checks, and  $\gamma, \delta$  is equivalent to an environment  $\sigma$  and context  $\rho$ , then either  $\sigma, \rho, c \to^{*} \sigma', \rho'$ ,  $\mathbf{skip}$  or  $c$  diverges.
+
+to prove this theorem, we will prove the supporting progress and preservation lemmas (stated below), which together imply soundness.
+
+# supporting definitions
+
+- defined:  $a$  is defined in  $\delta$  if  $\exists \tau, n$  with  $(a \mapsto \mathbf{mem} \tau[n]) \in \delta$ .  $x$  is defined in  $\gamma$  if  $\exists \tau$  with  $(x \mapsto \tau) \in \gamma$ .  
+- type-check: if  $\gamma, \delta \vdash e : \tau + \delta'$  then  $e$  type-checks to  $\overline{\tau}$  under  $\gamma, \delta$  producing  $\delta'$ . if  $\gamma, \delta \vdash c + \gamma', \delta'$  then  $c$  type-checks under  $\gamma, \delta$  producing  $\gamma', \delta'$ .  
+$\bullet \sim$  (equivalence):  $\gamma, \delta \sim \sigma, \rho$  if
+
+1.  $\forall x$  with  $(x\mapsto \tau)\in \gamma ,\exists v$  with  $(x\mapsto v)\in \sigma$  and  $v$  type-checks to  $\tau$  under  $\gamma ,\delta$
+
+2.  $\forall l$  with  $(l\mapsto \tau)\in \delta ,l\notin \rho$
+
+-  $\bar{\rho}\colon \bar{\rho} = \{a\mapsto \mathbf{mem}\tau [n]\in \delta^{*}\wedge a\notin \rho \}$  where  $\delta^*$  is the affine context of memories initially available to a program.  
+- construction:  $\gamma, \delta$  can be constructed from  $\sigma, \rho$  if
+
+1.  $\forall (x\mapsto v)\in \sigma ,(x\mapsto \tau)\in \gamma$  
+2.  $\forall l\in \rho ,(l\mapsto \mathbf{mem}\tau [n])\notin \delta$  
+3.  $v$  type-checks to  $\tau$  under  $\gamma, \delta$
+
+# supporting lemmas
+
+- l1: if  $\gamma, \delta \vdash c \dashv \gamma', \delta'$ , then  $\gamma \subseteq \gamma'$ . proof: the only typing rule that modifies  $\gamma$  is check_let. under this rule,  $\gamma' = \gamma$  extended to add a mapping for a variable  $x$ . there is no rule that removes mapping from  $\gamma$ . so  $\forall m \in \gamma, m \in \gamma'$ .  
+- l2: if  $c$  type-checks under  $\gamma, \delta$ , then  $c$  type-checks under  $\gamma', \delta$  where  $\gamma \subseteq \gamma'$ . proof: the only typing rule that reads  $\gamma$  is check_update, which checks in its premises that  $x$  is defined in  $\gamma$ . by l1, if  $x$  is defined in  $\gamma$  it is defined in  $\gamma'$ . there is also no rule that changes the type  $\tau$  of  $x$  in  $\gamma$ , so  $x$  will have the same type  $\tau$  in  $\gamma'$ .  
+- l3: if  $\sigma, \rho, e \to \sigma', \rho', e'$ , then  $\sigma = \sigma'$ . proof: there is no step rule for expressions that extends  $\sigma$ , which by the grammar is the only modification possible to memory stores.  
+-  $\underline{\mathrm{l4}}$ : if  $\sigma, \rho, e \to \sigma', \rho', e'$  and  $\rho' \neq \rho$ , then  $e$  is a read  $a[n]$  and  $\rho' = \rho \cup \{a\}$ . proof: the only step rule for expressions that adds elements to  $\rho$  is read2, by which  $\rho' = \rho \cup \{a\}$ . there is no step rule that removes elements from  $\rho$ .
+
+# b.1 progress
+
+if  $\exists \gamma, \delta, \sigma, \rho$  such that  $\gamma, \delta \sim \sigma, \rho$  and command  $c$  type-checks under  $\gamma, \delta$ , then either  $c$  is a value or
+
+1.  $\exists \sigma^{\prime},\rho^{\prime},c^{\prime}$  with  $\sigma ,\rho ,c\to \sigma^{\prime},\rho^{\prime},c^{\prime}$  or  
+2.  $c = \mathbf{skip} \stackrel{\rho}{\sim} c_2$  with  $c_2 \neq \mathbf{skip}$  and  $\exists c_2', \rho''$  with  $\sigma, \rho'', \mathbf{skip} \stackrel{\rho}{\sim} c_2 \rightarrow \sigma', \rho'', \mathbf{skip} \stackrel{\rho'}{\sim} c_2'$ .
+
+b.1.1 proof. inductive hypothesis: progress holds for subforms of any inductive form. assumptions:  $\gamma, \delta \sim \sigma, \rho$  and  $c$  type-checks under  $\gamma, \delta$ .
+
+# case:  $c$  is an expression.
+
+case:  $c$  is a value. progress holds by assumption.  
+- case:  $c = \mathbf{bop} e_1 e_2$ . for simplicity, we ignore the cases in which  $\mathbf{bop}$  is incompatible with the types of  $e_1$  and  $e_2$ . we have three possibilities:
+
+1. neither  $e_1$  nor  $e_2$  is a value. by assumption  $c$  type-checks under  $\gamma, \delta$ , so by check_bop  $e_1$  type-checks under  $\gamma, \delta$ . by the inductive hypothesis,  $\sigma, \rho, e_1 \to \sigma', \rho', e_1'$  so we have  $\sigma, \rho, \mathbf{bop} e_1 e_2 \to \mathbf{bop} e_1' e_2$  as needed.  
+2. only  $e_1$  is a value  $v_1$ . by assumption  $c$  type-checks under  $\gamma, \delta$  and  $\gamma, \delta \vdash v_1 \vdash \delta$ , so  $e_2$  type-checks under  $\gamma, \delta$ . by the inductive hypothesis,  $\sigma, \rho, e_2 \rightarrow \sigma', \rho', e_2$  so  $\sigma, \rho, \mathbf{bop} v_1 e_2 \rightarrow \sigma', \rho', \mathbf{bop} v_1 e_2'$ .  
+3. both  $e_1$  and  $e_2$  are values  $v_1$  and  $v_2$ .  $\sigma, \rho, \mathbf{bop} v_1 v_2 \rightarrow \sigma, \rho, v_1 \mathbf{bop} v_2$  by bop3.  
+case:  $c = x$ . by assumption  $x$  type checks under  $\gamma, \delta$ , so  $x$  is defined in  $\gamma$ . then  $\exists v$  with  $(x \mapsto v) \in \sigma$ , so  $\sigma, \rho, x \to \sigma, \rho, v$  by var.  
+- case:  $c = a[e]$ . by assumption  $a[e]$  type-checks under  $\gamma, \delta$ , so by check_read,  $e$  type-checks under  $\gamma, \delta$  producing  $\delta_2$ , and  $a$  is defined in  $\delta_2$ . by the inductive hypothesis, progress holds for  $e$ , so  $\sigma, \rho, e \to \sigma', \rho', e'$  or  $e$  is a value  $n$ .  $a$  is defined in  $\delta_2$ , so it must be defined in  $\delta$  since there is no type-checking rule for expressions by which  $\gamma, \delta \vdash e \vdash \delta_2$  and  $\exists l \notin \delta, \in \delta_2$ . so  $a \notin \rho$ . so if  $e$  is a value, then  $\sigma, \rho, a[e] \to \sigma, \rho \cup \{a\}$ ,  $\sigma(a)(n)$ . if  $e$  is not a value, then  $\sigma, \rho, a[e] \to \sigma', \rho', a[e']$ .
+
+case:  $c = \mathbf{let} x = e$ . by assumption this form type-checks under  $\gamma, \delta$ . by check_let,  $e$  type-checks under  $\gamma, \delta$ . by the inductive hypothesis,  $e$  is either a value  $v$  or  $\sigma, \rho, e \to \sigma', \rho', e'$ . in the first case we have  $\sigma, \rho, \mathbf{let} x = v \to \sigma[x \mapsto v]$ ,  $\rho, \mathbf{skip}$ . in the second case we have  $\sigma, \rho, \mathbf{let} x = e \to \sigma', \rho', \mathbf{let} x = e'$ .
+
+$$
+\underline {{\text {c a s e :}}} c = c _ {1} - c _ {2}. \forall \sigma , \rho , \sigma , \rho , c _ {1} - c _ {2} \rightarrow \sigma , \rho , c _ {1} \stackrel {\rho} {\sim} c _ {2}.
+$$
+
+case:  $c = c_1 \stackrel{\rho''}{\sim} c_2$ . we have three possibilities:
+
+-  $c_1 \neq \mathbf{skip}$ . by assumption  $c$  type-checks under  $\gamma, \delta$ . by check_inter_seq_comp,  $c_1$  type-checks under  $\gamma, \delta$ . by the inductive hypothesis,  $\sigma, \rho, c_1 \to \sigma', \rho', c_1'$  and so  $c_1 \stackrel{\rho''}{\sim} c_2 \to c_1' \stackrel{\rho''}{\sim} c_2$ .
+
+-  $c = \mathbf{skip}^{\tilde{\rho}}c_{2}$ . by assumption  $c$  type-checks under  $\gamma, \delta$ . by check_inter_seq_comp,  $c_{2}$  type-checks under  $\gamma, \tilde{\rho}$ . by the inductive hypothesis (and the definition of  $\sim$ , under which we have  $\rho$ ),  $\sigma, \rho, c_{2} \rightarrow \sigma', \rho', c_{2}'$ , so we have  $\sigma, \rho'', \mathbf{skip}^{\tilde{\rho}}c_{2} \rightarrow \sigma', \rho'', \mathbf{skip}^{\tilde{\rho}'}c_{2}'$ .  
+- if  $c_1 = c_2 = \mathbf{skip}, \forall \sigma, \rho,$  we have  $\sigma, \rho, c_1 \stackrel{\rho''}{\sim} c_2 \rightarrow \sigma, \rho \cup \rho'', \mathbf{skip}$ .
+
+case:  $c = c_{1}; c_{2}$ . we have two possibilities:
+
+-  $c_1 \neq \mathbf{skip}$ . by assumption,  $c$  type-checks under  $\gamma, \delta$ , so  $c_1$  type-checks under  $\gamma, \delta$  by check_par_comp. by the inductive hypothesis,  $\sigma, \rho, c_1 \rightarrow \sigma', \rho', c_1'$ , so  $\sigma, \rho, c_1; c_2 \rightarrow \sigma', \rho', c_1'$ ;  $c_2$ .  
+-  $c_{1} = \mathbf{skip}$ .  $\forall \sigma, \rho$ , we have  $\sigma, \rho, \mathbf{skip}; c_{2} \to \sigma, \rho, c_{2}$ .
+
+case:  $c = \mathbf{if} x c_1 c_2$ . by assumption,  $c$  type-checks under  $\gamma, \delta$ . then  $x$  type-checks to bool, so  $x$  is either true or false.  $\forall \sigma, \rho$ , we have  $\sigma, \rho$ , if true  $c_1 c_2 \to \sigma, \rho, c_1$  and  $\sigma, \rho$ , if false  $c_1 c_2 \to \sigma, \rho, c_2$ .
+
+case:  $c = \text{while } x \in c_1$ .  $\forall \sigma, \rho$  we have
+
+$\overline{\sigma, \rho, \text{while } x c_1 \to \sigma, \rho, \text{if } x (c_1 - \text{while } x c_1) \text{ skip.}}$
+
+case:  $c = x \coloneqq e$ . if  $e$  is a value  $v$ , then  $\forall \sigma, \rho$  we have  $\sigma, \rho, x \coloneqq e \to \sigma[x \mapsto v]$ ,  $\rho, \mathbf{skip}$ . if  $e$  is not a value, then by assumption that  $c$  type-checks under  $\gamma, \delta, e$  type-checks under  $\gamma, \delta$  by check_update. then by the inductive hypothesis,  $\sigma, \rho, e \to \sigma', \rho', e'$ , so  $\sigma, \rho, x \coloneqq e \to \sigma', \rho', x \coloneqq e'$ .
+
+case:  $c = a[e_1] \coloneqq e_2$ . we have three possibilities:
+
+-  $e_1$  and  $e_2$  are values  $n$  and  $v$ . by assumption  $c$  type-checks under  $\gamma, \delta$ , so by check_write,  $a$  is defined in  $\delta$ . by definition of  $\sim$ ,  $a \notin \rho$ , so the premise of write3 is satisfied. then  $\sigma, \rho, c \to \sigma[a[n] \mapsto v], \rho \cup \{a\}$ , skip.  
+-  $e_1$  is a value  $n$ . by assumption  $c$  type-checks under  $\gamma, \delta$ , so by check_write  $n$  type-checks under  $\gamma, \delta$  producing  $\delta$  and  $e_2$  type-checks under  $\gamma, \delta$ . by the inductive hypothesis,  $\sigma, \rho, e_2 \to \sigma', \rho', e_2'$ , so  $\sigma, \rho, a[n] := e_2 \to \sigma', \rho', a[n] := e_2'$ .  
+- neither  $e_1$  nor  $e_2$  is a value. by assumption  $c$  type-checks under  $\gamma, \delta$ , so as does  $e_1$ . by the inductive hypothesis,  $\sigma, \rho, e_1 \to \sigma', \rho', e_1'$ , so  $\sigma, \rho, a[e_1] := e_2 \to \sigma', \rho', a[e_1'] := e_2$ .
+
+# b.2 preservation
+
+if:
+
+1.  $\exists \gamma, \delta$  such that command  $c$  type-checks under  $\gamma, \delta$  
+2.  $\exists \sigma ,\rho$  with  $\gamma ,\delta \sim \sigma ,\rho$  
+3.  $\exists \sigma^{\prime}\rho^{\prime},c^{\prime}$  with  $\sigma ,\rho ,c\to \sigma^{\prime},\rho^{\prime},c^{\prime}$  or  $\exists \sigma^{\prime},\rho^{\prime},\rho^{\prime \prime},c_{2}^{\prime}$  with  $c = \mathbf{skip}\stackrel {\rho}{\sim}c_2$  and  $\sigma ,\rho ''$ ,  $\mathbf{skip}\stackrel {\rho}{\sim}c_2\rightarrow \sigma ',\rho ''$ ,  $\mathbf{skip}\stackrel {\rho '}{\sim}c_2'$
+
+then  $\gamma', \delta'$  can be constructed from  $\sigma', \rho'$  such that  $c'$  type-checks under  $\gamma', \delta'$ .
+
+# b.2.1 proof. inductive hypothesis: preservation holds for sub-forms of any inductive form. assumptions: 1., 2., 3.
+
+# case:  $c$  is an expression.
+
+case:  $c$  is a value.  $c$  does not step, so preservation vacuously holds.  
+- case:  $c = \mathbf{bop} e_1 e_2$ . for simplicity, we ignore the cases in which  $\mathbf{bop}$  is incompatible with the types of  $e_1$  and  $e_2$ . we have three possibilities:
+
+1.  $e_1$  is not a value. by assumption,  $c$  type-checks under  $\gamma$ ,  $\delta$  and  $\sigma, \rho, c \to \sigma', \rho'$ ,  $\mathbf{bop} e_1' e_2$ . so  $\sigma, \rho, e_1 \to \sigma', \rho', e_1'$ . by check_bop  $\gamma$ ,  $\delta \vdash e_1 \dashv \delta_2$ . by the inductive hypothesis,  $\gamma'$ ,  $\delta' \vdash e_1' \dashv \delta_2'$ . from l3,  $\sigma' = \sigma$ , so  $\gamma' = \gamma$ . if  $\delta' = \delta$ , then  $e_2$  type-checks under  $\gamma'$ ,  $\delta_2'$  and we are done. if  $\delta' \neq \delta$ , then  $\rho' \neq \rho$ . so by l4  $e_1$  was a read  $a[n]$ . by assumption and check_bop  $\gamma$ ,  $\delta \vdash e_1 \dashv \delta_2$  and  $e_2$  type-checks under  $\gamma$ ,  $\delta_2$ . since  $e_1 = a[n]$ ,  $a$  could not have been defined in  $\delta_2$ .  $e_1'$  must be a value, so  $\gamma'$ ,  $\delta' \vdash v \dashv \delta'$ , so  $\delta' = \delta_2$ . so  $e_2$  must type-check under  $\gamma'$ ,  $\delta'$ .
+
+2.  $e_1$  is a value  $v_{1}$  . then by assumption,  $\sigma ,\rho ,\mathbf{bop}v_{1}e_{2}\rightarrow$ $\sigma^{\prime},\rho^{\prime},\mathbf{bop}v_{1}e_{2}^{\prime}$  . by assumption,  $c$  type-checked under  $\gamma ,\delta$  so  $e_2$  type-checks under  $\gamma ,\delta$  by check_bop. by the inductive hypothesis,  $e_2^\prime$  type-checks under  $\gamma^{\prime},\delta^{\prime}$  , and values always type-check, so we are done.  
+3. both  $e_1$  and  $e_2$  are values  $v_1$  and  $v_2$ . by assumption,  $\sigma, \rho, c \to \sigma, \rho, v_1 \mathbf{bop} v_2$ . values always type-check, so we are done.
+
+- case:  $c = x$ . by assumption  $x$  type-checks under  $\gamma, \delta$ , so  $(x \mapsto \tau) \in \gamma$  and  $(x \mapsto v) \in \sigma$ , and by assumption  $\sigma, \rho, x \to \sigma, \rho, v$ . values always type-check, so we are done.  
+- case:  $c = a[e]$ . the first possibility is that  $e$  is not a value. then by assumption  $\sigma, \rho, a[e] \to \sigma', \rho', a[e']$ , and so  $\sigma, \rho, e \to \sigma', \rho', e'$ . we need to show that  $a[e']$  type-checks under  $\gamma', \delta'$ . by the inductive hypothesis,  $e'$  type-checks under  $\gamma', \delta'$ . to satisfy the second premise, it should be that  $a$  is defined in  $\delta'$ . by assumption that  $a[e]$  type-checked, we know from check_read that  $a$  is defined in  $\delta$  and so  $a \notin \rho$  (by definition of  $\sim$ ). if  $a$  was not defined in  $\delta'$ , that would mean  $a \in \rho'$ , but by l4 this would mean that  $e$  was a read  $a[n]$ , meaning  $a$  is not defined in  $\delta_2$  where  $\gamma, \delta \vdash e + delta_2$  and  $c$  could not type-check under  $\gamma, \delta$  - this is a contradiction. so  $a$  must be defined in  $\delta'$  and so  $a[e']$  must type-check under  $\gamma', \delta'$ . the second possibility is that  $e$  is a value  $n$ . then  $\sigma, \rho, a[n] \to \sigma, \rho, v$  and since values always type-check we are done.
+
+case:  $c = \text{let } x = e$ . the first possibility is that  $e$  is not a value. by assumption  $c$  type-checks under  $\gamma, \delta$ . by check_let, so does  $e$ . by assumption  $\sigma, \rho, \text{let } x = e \rightarrow \sigma, \rho, \text{let } x = e'$ , so  $\sigma, \rho, e \rightarrow \sigma', \rho', e'$ . by the inductive hypothesis,  $e'$  type-checks under  $\gamma', \delta'$ . then we have that  $\text{let } x = e'$  type-checks under  $\gamma', \delta'$ , so we are done. the second possibility is that  $e$  is a value  $v$ . in this case  $\sigma, \rho, \text{let } x = v \rightarrow \sigma[x \mapsto v]$ ,  $\rho, \text{skip}$ . skip always type-checks, so we are done.
+
+case:  $c = c_{1}$  ——  $c_{2}$ . by assumption,  $\sigma, \rho, c_{1}$  ——  $c_{2} \to \sigma, \rho, c_{1} \stackrel{\rho}{\sim} c_{2}$  and  $c$  type-checks under  $\gamma, \delta$ .  $\sigma', \rho' = \sigma, \rho$ , so  $\gamma' = \gamma$  and  $\delta' = \delta$ . by assumption  $\gamma, \delta \vdash c_{1} \vdash \gamma_{2}, \delta_{2}$  and  $c_{2}$  type-checks under  $\gamma_{2}, \delta$ . we need to show that  $c_{2}$  type-checks under  $\gamma_{2}, \bar{\rho}$ . since  $c_{2}$  type-checks under  $\gamma_{2}, \delta$ , it does not use any memories in  $\rho$  by definition of  $\sim$ . so it must type-check under  $\gamma_{2}, \bar{\rho}$ .
+
+case:  $c = c_1 \stackrel{\rho''}{\sim} c_2$ . we have three possibilities.
+
+- neither  $c_{1}$  nor  $c_{2}$  is  $\mathbf{skip}$ . in this case, we have  $\sigma, \rho, c_{1} \stackrel{\rho''}{\sim} c_{2} \rightarrow \sigma', \rho', c_{1}' \stackrel{\rho''}{\sim} c_{2}$  and  $\sigma, \rho, c_{1} \rightarrow \sigma', \rho', c_{1}'$ . from assumption,  $c$  type-checks under  $\gamma, \delta$ , so 1)  $c_{2}$  type-checks under  $\bar{\rho''}$  and 2) by the inductive hypothesis,  $c_{1}'$  type-checks under the constructed  $\gamma', \delta'$ . we need to show  $c_{2}$  type-checks under  $\gamma', \bar{\rho''}$ . by l2, if  $c_{2}$  type-checks under  $\gamma, \bar{\rho''}$ , it will type-check under  $\gamma', \bar{\rho''}$ , so we are done.  
+-  $c_{1} = \mathbf{skip} \neq c_{2}$ . we have that  $\sigma, \rho''$ ,  $\mathbf{skip} \stackrel{\rho}{\sim} c_{2} \rightarrow \sigma', \rho'', \mathbf{skip} \stackrel{\rho'}{\sim} c_{2}'$ , so  $\sigma, \rho, c_{2} \rightarrow \sigma', \rho', c_{2}'$ . by the inductive hypothesis,  $c_{2}'$  type-checks under the constructed  $\gamma'$ ,  $\delta'$  (so it will type-check under  $\gamma'$ ,  $\bar{\rho}'$ ) and skipalways type-checks, so we are done.  
+-  $c_{1} = c_{2} = \mathbf{skip}$ . this form steps to skip, which always type-checks, so we are done.
+
+case:  $c = c_1; c_2$ . we have two possibilities:
+
+-  $c_{1} \neq \mathbf{skip}$ . by assumption  $\sigma, \rho, c \to \sigma', \rho', c'$ , so  $\sigma, \rho, c_{1} \to \sigma', \rho', c_{1}'$ . we have by assumption that  $c_{1}$  type-checks under  $\gamma, \delta$  to produce  $\gamma_{2}, \delta_{2}$ , and  $c_{2}$  type-checks under  $\gamma_{2}, \delta_{2}$ . by the inductive hypothesis,  $c_{1}'$  type-checks under  $\gamma', \delta'$  to produce  $\gamma_{2}', \delta_{2}'$ . we need to show that  $c_{2}$  type-checks under  $\gamma_{2}', \delta_{2}'$ . we have two possibilities:  $\rho' = \rho$  and  $\rho' \neq \rho$ . consider the first possibility. we would have  $\delta = \delta'$ , so  $\delta_{2} = \delta_{2}'$ . by l2,  $c_{2}$  type-checks under  $\gamma', \delta_{2}'$  as needed. with the second possibility, it can only be that  $\rho \subset \rho'$ . there are then only two cases to consider:
+
+1.  $c_1$  contained a read or write involving  $a[n]$  and  $c_1'$  is a value  $v$ . then  $\rho' = \rho \cup \{a\}$  and  $a$  is not defined in  $\delta'$ . by check_write and check_read,  $a$  could not have been defined in  $\delta_2$ . since  $\gamma', \delta' \vdash v + \delta'$ ,  $\delta_2 = \delta'$ . so  $c_2$  must type-check under  $\gamma', \delta'$ .
+
+2.  $c_{1} = \mathbf{skip}^{\rho^{\prime \prime}}\mathbf{skip}$ . by inter_seq3  $c_{1}^{\prime} = \mathbf{skip}$  and  $\sigma^{\prime} = \sigma$ , so  $\gamma^{\prime} = \gamma$ . by assumption  $c_{2}$  type-checks under  $\gamma_{2}, \delta_{2}$  where  $\gamma, \delta \vdash c_{1} + \gamma_{2}, \delta_{2}$ . by check_inter_seq_comp  $\gamma_{2} = \gamma$ .
+
+we need to show  $c_2$  type-checks under  $\gamma_2', \delta_2' = \gamma', \delta' = \gamma, \delta'$  (since  $\gamma, \delta \vdash \mathbf{skip} + \gamma, \delta$ ). for this to be the case,  $c_2$  cannot use any memories in  $\rho$  or  $\rho''$  (by definition of construction).
+
+1) because  $\gamma, \delta \sim \sigma, \rho$  and  $c_{1}$  type-checks under  $\gamma, \delta, c_{1}$  does not use any memories in  $\rho$ . then by assumption that  $c_{2}$  type-checks under  $\gamma_{2}, \delta_{2}$  and by check_par_comp,  $c_{2}$  also cannot use any memories in  $\rho$ .  
+2) by assumption  $c_{1}$  type-checks under  $\gamma, \delta$  to produce  $\gamma_{2}, \delta_{2}$ . by check_inter_seq_comp and small_seq  $\delta_{2} \subseteq \bar{\rho^{\prime\prime}}$ , and by assumption  $c_{2}$  type-checks under  $\gamma_{2}, \delta_{2}$ , so  $c_{2}$  does not use any memories in  $\rho^{\prime\prime}$ . so  $c_{2}$  type-checks under  $\gamma^{\prime}, \delta^{\prime}$  as needed.
+
+-  $c_1 = \mathbf{skip}$ . by assumption  $\mathbf{skip}$ ;  $c_2$  type-checks under  $\gamma, \delta$ , so  $c_2$  type-checks under  $\gamma, \delta$ .  $\sigma, \rho, \mathbf{skip}$ ;  $c_2 \to \sigma, \rho, c_2$  so  $\gamma' = \gamma$  and  $\delta' = \delta$ . then we need to show  $c_2$  type-checks under  $\gamma', \delta' = \gamma, \delta$ , which we have from assumption, so we are done.
+
+case:  $c = \text{if } x \, c_1 \, c_2$ . by assumption  $c$  type-checks under  $\gamma, \delta$ , so  $c_1$  and  $c_2$  both type-check under  $\gamma, \delta$ , and  $x$  is either true or false by check_if. if true,  $\sigma, \rho, c \to \sigma, \rho, c_1$ . if false,  $\sigma, \rho, c \to \sigma, \rho, c_2$ . we need to show that  $c_1$  and  $c_2$  type-check under  $\gamma, \delta$  ( $\sigma', \rho' = \sigma, \rho$ , so  $\gamma', \delta' = \gamma, \delta$ ). this is given by assumption so we are done.
+
+case:  $c = \text{while } x c_1$ . by assumption  $c$  type-checks under  $\gamma, \delta$ , so by check_while  $x$  type-checks to bool and  $c_1$  type-checks under  $\gamma, \delta$  to produce  $\gamma_2, \delta_2$ . we need to show that if  $x(c_1 - \text{while } x c_1)$  skip type-checks under  $\gamma, \delta (\sigma', \rho' = \sigma, \rho, \text{so} \gamma', \delta' = \gamma, \delta)$ . for this, it should be the case that  $x$  type-checks to bool. this is already given. it should also be the case that  $(c_1 - \text{while } x c_1)$  type-checks under  $\gamma, \delta$ . this requires that  $c_1$  type-checks under  $\gamma, \delta$ , which is given by assumption, and that while  $x c_1$  type-checks under  $\gamma_2, \delta$ . by l2 if while  $x c_1$  type-checks under  $\gamma, \delta$  (which it does by assumption), it type-checks under  $\gamma_2, \delta$ , so we are done.
+
+case:  $c = x \coloneqq e$ . by assumption  $c$  type-checks under  $\gamma, \delta$ , so  $(x \mapsto \tau) \in \gamma$  and  $e$  type-checks under  $\gamma, \delta$  producing  $\delta_2$ . we have two possibilities:
+
+-  $e$  is not a value. by assumption and check_update  $\sigma, \rho, x \coloneqq e \to \sigma', \rho', x \coloneqq e'$  and  $\sigma, \rho, e \to \sigma', \rho', e'$ . by the inductive hypothesis,  $e'$  type-checks under the constructed  $\gamma', \delta'$ . then by l1 and l2, if  $\gamma, \delta \vdash e: \tau + \delta_2$  then  $\gamma', \delta' \vdash e': \tau + \delta_2'$ . so  $(x \mapsto \tau) \in \gamma'$  and  $c'$  type-checks under  $\gamma', \delta'$  as needed.  
+-  $e$  is a value  $v$ . by assumption  $x \coloneqq v$  type-checks under  $\gamma, \delta$  so  $\gamma, \delta \vdash v: \tau \dashv \delta$  and  $(x \mapsto \tau) \in \gamma$ .  $\sigma, \rho, x \coloneqq$
+
+$v\to \sigma [x\mapsto v],\rho ,\mathbf{skip},$  and skip always type-checks, so we are done.
+
+case:  $c = a[e_1] \coloneqq e_2$ . by assumption  $c$  type-checks under  $\gamma, \delta$ , so  $e_1$  type-checks under  $\gamma, \delta$  producing  $\delta_2$  and  $e_2$  type-checks under  $\gamma, \delta_2$  by check_write. additionally,  $a$  is defined in  $\delta$  and  $\delta_2$  so neither  $e_1$  nor  $e_2$  use memory  $a$ . we then have three possibilities:
+
+- neither  $e_1$  nor  $e_2$  is a value. then  $\sigma, \rho, a[e_1] := e_2 \to \sigma', \rho', a[e_1'] := e_2$  and  $\sigma, \rho, e_1 \to \sigma', \rho', e_1'$ . by the inductive hypothesis,  $e_1'$  type-checks under the constructed  $\gamma', \delta'$  to produce  $\delta_2'$ . either  $\rho' = \rho$  or not. if  $\rho' = \rho$ , then by l2,  $e_2$  will type-check under  $\gamma', \delta_2'$  since  $\gamma \subseteq \gamma'$  and  $\delta' = \delta$ . if not, then by l4  $e_1$  is a read  $a_1[n]$ . by assumption and check_write  $\gamma, \delta \vdash e_1 + \delta_2$  and  $e_2$  type-checks under  $\gamma, \delta_2$ . since  $e_1 = a_1[n]$ ,  $a_1$  could not have been defined in  $\delta_2$ .  $e_1'$  then must be a value, so  $\gamma', \delta' \vdash v + \delta'$ , so  $\delta_2 = \delta'$ . so  $e_2$  must type-check under  $\gamma', \delta'$ .  
+-  $e_1$  is a value  $n$  and  $e_2$  is not a value. then  $\sigma, \rho, a[e_1] := e_2 \to \sigma', \rho', a[e_1] := e_2'$  and  $\sigma, \rho, e_2 \to \sigma', \rho', e_2'$ . by the inductive hypothesis,  $e_2$  type-checks under  $\gamma', \delta'$ .  $e_1$  is a value and always type-checks, so we are done.  
+-  $e_1$  is a value  $n$  and  $e_2$  is a value  $v$ . assuming this type-checks, we step to skip, which always type-checks, so we are done.
+
+# c gemm-blocked design space exploration
+
+figure 10 lists the parameterized code for the gemm-blocked exhaustive design space exploration discussed in the evaluation. the code is adapted from machsuite [49].
+
+# d machsuite ports
+
+we ported 16 machsuite benchmarks to dahlia and compared their resource usage against baseline implementations after a full synthesis flow targeting xilinx's ultrascale+ vu9p for both rewritten and baseline implementations. we present the comparison in figures 11a-11f. the benchmarks highlighted in red represent benchmarks the completed synthesis but failed their correctness checks because of a miscompilation from the vivado toolchain.
+
+the graphs show that most of the benchmarks perform identically when rewritten in dahlia. this is because dahlia generates  $c++$  which goes through the same synthesis flow as the baseline implementations.
+
+# e spatial experiments
+
+we perform a simple design sweep over a general matrix multiply kernel written in spatial and vary the unrolling factor from 1 to 16.
+
+we run the generated designs through a full synthesis flow by targeting xilinx's zynq-7000 soc [?]. we extended
+
+```cpp
+ap_int<32> m1[128][128];  
+#pragma hls resource variable=m1 core=ram_1p_bram  
+#pragma hls array_partition variable=m1 cyclic factor:::bank11:: dim=1  
+#pragma hls array_partition variable=m1 cyclic factor:::bank12:: dim=2  
+ap_int<32> m2[128][128];  
+#pragma hls resource variable=m2 core=ram_1p_bram  
+#pragma hls array_partition variable=m2 cyclic factor:::bank11:: dim=1  
+#pragma hls array_partition variable=m2 cyclic factor:::bank12:: dim=2  
+ap_int<32> prod[128][128];  
+#pragma hls resource variable=prod core=ram_1p_bram  
+#pragma hls array_partition variable=prod cyclic factor:::bank21:: dim=1  
+#pragma hls array_partition variable=prod cyclic factor:::bank22:: dim=2  
+for (int jj = 0; jj < 16; jj++) {  
+    for (int kk = 0; kk < 16; kk++) {  
+        for (int i = 0; i < 128; i++) {  
+            #pragma hls unroll factor:::unroll1:: skip_exit_check  
+            for (int j = 0; j < 8; j++) {  
+                #pragma hls unroll factor:::unroll2:: skip_exit_check  
+                for (int k = 0; k < 8; k++) {  
+                    #pragma hls unroll factor:::unroll3:: skip_exit_check  
+                    ap_int<32> mul = m1[i][8 * kk + k] * m2[8 * kk + k][8 * jj + j];  
+                    prod[i][8 * jj + j] += mul;  
+            }  
+        }  
+    }
+```
+
+![](images/f17bc2996c16ea473051e643dd21c30306e5e3e63e394e8c517b92a5fd5f870b.jpg)  
+figure 10. gemm-blocked kernel used for exhaustive dse. the highlighted tokens indicate parameters for exploration.
+
+![](images/a6da86d2a39643950c097353d0283d094ef11f1bb038dba41804067439d3192a.jpg)  
+(b) comparison of dsps used.
+
+![](images/2d411d7e906a1a064c37e1c26782604591e401ca9cf55be44c30e138a68ae89d.jpg)  
+(c) comparison of lut mems used.
+
+![](images/7ac4c32fe9538026fb953c1b0d5241a4c979e03d128f1f2623e0a10d4d27eac9.jpg)  
+(a) comparison of brams used.  
+(d) comparison of luts used.
+
+![](images/815767df297a04ff6a9c0c03feee2aec9bd1aa585e2ae75833b699fb994e9f65.jpg)  
+(e) comparison of registers used.
+
+![](images/a5525bd954785cbe6f2714eb61103caeef73bd0796e48befc2066ad08ff8f020.jpg)  
+(f) comparison of runtime averages.  
+figure 11. resource usage comparison between baseline machsuite implementations in vivado hls and rewrite implementations in dahlia. the kernel names are on the x-axis and the resource usage is on the y-axis. excludes backprop (functionally incorrect), fft-transpose, and viterbi (mis-synthesized by vivado hls)
+
+```txt
+@spatial object gemm_ncubed_16 extends spatialapp { type t = fixpt[true,_16,_16] def main(args: array(string)): unit = { val (a_dram, b_data, c_data) = (dram[t](128,128), dram[t](128,128), dram[t](128,128)) // generate random data for the input matrices. val (a_data, b_data) = ((0::dim, 0::dim) {{i,j} => random[t](5)}, (0::dim, 0::dim) {{i,j} => random[t](5)}) // set data in the input matrices. setmem(a_dram, a_data) setmem(b_dram, b_data) // accelerator kernel. accel { val (a_sram, b_sram, c_sram) = (sram[t](dim,dim), sram[t](dim,dim), sram[t](dim,dim)) // load data into memories. a_sram.load(a_dram) b_sram.load(b_dram) // computation loop. foreach(dim by 1) { i => foreach(dim by 1) { j => // dse parameter: innermost loop parallelism. try values from [1, 16]. val sum = reduce(reg[t](0))(dim by 1 par ::unroll::) { k => a_sram(i,k) * b_sram(k,j)}{+} c_sram(i,j) = sum } } c_dram store c_sram } // compute the expected value of the computation. val c_gold = (0::dim, 0::dim) {{i,j} => array.tabulate(dim){k => a_data(i,k) * b_data(k,j)}.reduce{+_+} } // check that the computed values are within some range of the expected value. val c_result = getmatrix(c_dram) val cksum = c gold.zip(c_result){(a,b) => abs(a-b) < 0.5.to[t].reduce{&&} // fail if the computed value is different. assert(cksum) } }
+```
+
+figure 12. kernel used to collect resource utilization number for the spatial evaluation.
+
+the spatial quick-start template to generate designs for the dse comparison [?]. we were unable to get spatial designs to pass through the aws f1 based synthesis flow due to numerous issues [???].
+
+figure 13a shows the banking factors inferred by spatial for a given unrolling factor. figure 13b plots the resources usages normalized against the spatial design with no unrolling. when spatial's inferred banking decisions are not aligned with the unrolling factor, the resource usages abruptly increase.
+
+we also plot the absolute lut, dsp, reg and bram usage against unrolling factor in figures 13c-13f. the designs use significantly fewer luts when the unrolling factor is a factor of the size of the memory. furthermore, spatial designs use up to  $10 \times$  more luts and  $2 \times$  more dsps than the equivalent designs generated by dahlia's vivado hls backend.
+
+spatial uses automated design space exploration tools to find optimal parameters for the design. dahlia's type system can be used to eliminate unpredictable design points and drastically reduce the search spaces with such automated tools.
+
+![](images/fbdac994778d9a3809dd4386ee78c2c2e12fdc565b412f358fee93cedb4410ee.jpg)  
+(b) resource usage normalized against no un
+
+![](images/81c287a766bef637eda3473f060aac051e2c003c9a58483ebf880fff3df2ac5c.jpg)  
+(c) absolute dsp usage. predictable points highlighted.
+
+![](images/4363384be03b5ee93208c9758d99e50ed504f016ac90a8c6c32883aea31f00fc.jpg)
+
+![](images/f410665e38d9bd1fb24473e01ffa5d95ecbb731039729f6ed0b538332ec91936.jpg)  
+(a) banking decision spatial made given the rolling, unrolling factors.  
+(d) absolute reg usage. predictable points highlighted.  
+figure 13. resource utilization for gemm-ncubed design in spatial on a zynq-7000. absolute resource utilization shows extreme variation between adjacent design points.
+
+![](images/2ee16cd86ae1cd1d80a63badf37287e0d432b4ddc382e53d531cc17e7b254e90.jpg)  
+(e) absolute lut usage. predictable points highlighted.
+
+![](images/e5b2be5ec5e1967c4872aff039a834f8ce9958e55a1db2a9da59d40f7e7f14b5.jpg)  
+(f) absolute bram usage. predictable points highlighted.

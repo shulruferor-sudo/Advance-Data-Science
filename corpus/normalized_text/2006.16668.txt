@@ -1,0 +1,752 @@
+# gshard: scaling giant models with conditional computation and automatic sharding
+
+dmitry lepikhin
+
+lepikhin@google.com
+
+dehao chen
+
+dehao@google.com
+
+maxim krikun
+
+krikun@google.com
+
+hyoukjoong lee
+
+hyouklee@google.com
+
+orhan first
+
+orhanf@google.com
+
+noam shazeer
+
+noam@google.com
+
+yuanzhong xu
+
+yuanzx@google.com
+
+yanping huang
+
+huangyp@google.com
+
+zhifeng chen
+
+zhifengc@google.com
+
+# abstract
+
+neural network scaling has been critical for improving the model quality in many real-world machine learning applications with vast amounts of training data and compute. although this trend of scaling is affirmed to be a sure-fire approach for better model quality, there are challenges on the path such as the computation cost, ease of programming, and efficient implementation on parallel devices. gshard is a module composed of a set of lightweight annotation apis and an extension to the xla compiler. it provides an elegant way to express a wide range of parallel computation patterns with minimal changes to the existing model code. gshard enabled us to scale up multilingual neural machine translation transformer model with sparsely-gated mixture-of-experts beyond 600 billion parameters using automatic sharding. we demonstrate that such a giant model can efficiently be trained on 2048 tpu v3 accelerators in 4 days to achieve far superior quality for translation from 100 languages to english compared to the prior art.
+
+# 1 introduction
+
+scaling neural networks brings dramatic quality gains over a wide array of machine learning problems [1, 2, 3, 4, 5, 6]. for computer vision, increasing the model capacity has led to better image classification and detection accuracy for various computer vision architectures [7, 8, 9]. similarly in natural language processing, scaling transformers [10] yielded consistent gains on language understanding tasks [4, 11, 12], cross-lingual down-stream transfer [4, 13] and (massively-)multilingual neural machine translation [14, 15, 16]. this general tendency motivated recent studies to scrutinize the factors playing a critical role in the success of scaling [17, 18, 19, 20, 3], including the amounts of training data, the model size, and the computation being utilized as found by past studies. while the final model quality was found to have a power-law relationship with the amount of data, compute and model size [18, 3], the significant quality gains brought by larger models also come with various practical challenges. training efficiency among the most important ones, which we define as the amount of compute and training time being used to achieve a superior model quality against the best system existed, is oftentimes left out.
+
+![](images/12f4e6311a6817b6297cb738ad2ac5761c39b8c9876d182b073a3cf467ccb396.jpg)  
+figure 1: multilingual translation quality (average  $\delta$ bleu comparing to bilingual baselines) improved as moe model size grows up to 600b, while the end-to-end training cost (in terms of tpu v3 core-year) only increased sublinearly. increasing the model size from 37.5b to 600b (16x), results in computation cost increase from 6 to 22 years (3.6x). the 600b parameters model that achieved the best translation quality was trained with 2048 tpu v3 cores for 4 days, a total cost of 22 tpu v3 core-years. in contrast, training all 100 bilingual baseline models would have required 29 tpu v3 core-years. our best quality dense single transformer model (2.3b parameters) achieving  $\delta$ bleu of 6.1, was trained with gpipe [15] on 2048 tpu v3 cores for 6 weeks or total of 235.5 tpu v3 core-years.
+
+# 1.1 practical challenges for scaling
+
+here we enumerate major practical challenges faced especially when training massive-scale models that are orders of magnitude larger than the capacity limit of a single accelerator memory (e.g., gpus or tpus).
+
+architecture-specific model parallelism support there is a lack of support for efficient model parallelism algorithms under commonly used deep learning frameworks such as tensorflow [21] and pytorch [22]. naive model parallelism with graph partition is supported but it would lead to severe under-utilization due to the sequential dependency of the network and gradient based optimization. in order to scale up the existing models efficiently, users typically need to invest a lot of engineering work, for example, migrating the model code to special frameworks [23, 15].
+
+super-linear scaling of computation cost vs model size straightforward scaling of the mode size by increasing the depth or width [6, 15] generally results in at least linear increase of training step time. model parallelism by splitting layer weights and computation across multiple devices generally becomes necessary, leading to network communication overhead and device under-utilization. device under-utilization stems from imbalanced assignment and sequential dependencies of the underlying neural network. this super-linear relationship between the computation cost and the model size can not be resolved by simply using more devices, making training massive models impractical.
+
+infrastructure scalability for giant model representation a naive graph representation for the massive-scale model distributed across thousands of devices may become a bottleneck for both deep learning frameworks and their optimizing compilers. for example, adding  $d$  times more layers with inter-op partitioning or increasing model dimensions with intra-op partitioning across  $d$  devices may result in a graph with  $o(d)$  nodes. communication channels between devices could further increase the graph size by up to  $o(d^2)$  (e.g., partitioning gather or transpose). such increase in the graph size would result in an infeasible amount of graph building and compilation time for massive-scale models.
+
+non-trivial efforts for implementing partitioning strategies partitioning a model to run on many devices efficiently is challenging, as it requires coordinating communications across devices. for graph-level partitioning, sophisticated algorithms [15, 24] are needed to reduce the overhead
+
+introduced by the sequential dependencies between different partitions of graphs allocated on different devices. for operator-level parallelism, there are different communication patterns for different partitioned operators, depending on the semantics, e.g., whether it needs to accumulate partial results, or to rearrange data shards. according to our experience, manually handling these issues in the model requires substantial amount of effort, given the fact that the frameworks like tensorflow have a large sets of operators with ad-hoc semantics. in all cases, implementing model partitioning would particularly be a burden for practitioners, as changing model architecture would require changing the underlying device communications, causing a ripple effect.
+
+# 1.2 design principles for efficient training at scale
+
+in this paper, we demonstrate how to overcome these challenges by building a 600 billion parameters sequence-to-sequence transformer model with sparsely-gated mixture-of-experts layers, which enjoys sub-linear computation cost and  $o(1)$  compilation time. we trained this model with 2048 tpu v3 devices for 4 days on a multilingual machine translation task and achieved far superior translation quality compared to prior art when translating 100 languages to english with a single non-ensemble model. we conducted experiments with various model sizes and found that the translation quality increases as the model gets bigger, yet the total wall-time to train only increases sub-linearly with respect to the model size, as illustrated in figure 1. to build such an extremely large model, we made the following key design choices.
+
+sub-linear scaling first, model architecture should be designed to keep the computation and communication requirements sublinear in the model capacity. conditional computation [25, 16, 26, 27] enables us to satisfy training and inference efficiency by having a sub-network activated on the per-input basis. scaling capacity of rnn-based machine translation and language models by adding position-wise sparsely gated mixture-of-experts (moe) layers [16] allowed to achieve state-of-the-art results with sublinear computation cost. we therefore present our approach to extend transformer architecture with moe layers in section 2.
+
+the power of abstraction second, the model description should be separated from the partitioning implementation and optimization. this separation of concerns let model developers focus on the network architecture and flexibly change the partitioning strategy, while the underlying system applies semantic-preserving transformations and implements efficient parallel execution. to this end we propose a module, gshard, which only requires the user to annotate a few critical tensors in the model with partitioning policies. it consists of a set of simple apis for annotations, and a compiler extension in xla [28] for automatic parallelization. model developers write models as if there is a single device with huge memory and computation capacity, and the compiler automatically partitions the computation for the target based on the annotations and their own heuristics. we provide more annotation examples in section 3.2.
+
+scalable compilers third, the system infrastructure, including the computation representation and compilation, must scale with thousands of devices for parallel execution. for example, figure 2 illustrates two different ways of partitioning a dot-product operation across 4 devices (color-coded). notice that with the usual mpmd (multiple program multiple data) approach in figure 2a scaling becomes more challenging since the number of nodes in the graph increases linearly with the number of devices. instead, we developed a compiler technique for spmd (single program multiple data) transformation that generates a single program to run on all devices, keeping the compilation time constant independent of the number of devices, as illustrated in figure 2b. we will discuss our spmd framework in more details in section 3.3.
+
+the rest of the paper is organized as the following. section 2 describes our transformer architecture with sparsely-gated moe layer in more details. section 3 introduces our development module gshard. section 4 demonstrates the application of our mixture of expert models on the multilingual machine translation task over 100 language pairs. section 5 has performance and memory measurements of our implementation. section 6 discusses related work.
+
+![](images/052264710d637ea384c006102d80a89b8fe20063b19f42dd077e002e36968f5c.jpg)  
+(a) mpmd partition
+
+![](images/5e3571061034da1ae5b25d2585f1ed50be614fcd834062d45820f4a4b4d1931d.jpg)  
+(b) spmd partition  
+figure 2: comparison between mpmd and our proposed spmd partitioning of a dot operator  $([m, k] \times [k, n] = [m, n])$  across 4 devices. in this example, both operands are partitioned along the contracting dimension  $k$ , where each device computes the local result and globally combines with an allreduce. mpmd partitioning generates separate operators for each device, limiting its scalability, whereas spmd partitioning generates one program to run on all devices. note that the compilation time with our spmd partitioning is not-dependent of the number of devices being used.
+
+# 2 model
+
+# 2.1 sparse scaling of the transformer architecture
+
+the transformer [10] architecture has been widely used for natural language processing. it has become the de-facto standard for many sequence-to-sequence tasks, such as machine translation. transformer makes use of two computational blocks, an encoder and a decoder, both implemented by stacking multiple transformer layers. transformer encoder layer consists of two consecutive layers, namely a self-attention layer followed by a position-wise feed-forward layer. decoder adds third cross-attention layer, which attends over encoder output. we sparsely scale transformer with conditional computation by replacing every other feed-forward layer with a position-wise mixture of experts (moe) layer [16] with a variant of top-2 gating in both the encoder and the decoder (figure 3). we vary the number of transformer layers and the number of experts per moe layer in order to scale the model capacity.
+
+each training example consists of a pair of sequences of subword tokens. each token activates a sub-network of the moe transformer during both training and inference. the size of the sub-network is roughly independent of the number of experts per moe layer, allowing sublinear scaling of the computation cost as described in the previous section. computation complexity is further analyzed in section 3.1 and training performance in section 5.
+
+# 2.2 position-wise mixture-of-experts layer
+
+the mixture-of-experts (moe) layer used in our model is based on [16] with variations in the sparse gating function and the auxiliary loss being used. a moe layer for transformer consists of  $e$  feed-forward networks  $\mathrm{ffn}_1 \ldots \mathrm{ffn}_e$ :
+
+$$
+\mathcal {g} _ {s, e} = \operatorname {g a t e} \left(x _ {s}\right) \tag {1}
+$$
+
+$$
+\mathrm {f f n} _ {e} \left(x _ {s}\right) = w o _ {e} \cdot \operatorname {r e l u} \left(w i _ {e} \cdot x _ {s}\right) \tag {2}
+$$
+
+$$
+y _ {s} = \sum_ {e = 1} ^ {e} \mathcal {g} _ {s, e} \cdot \mathrm {f f n} _ {e} \left(x _ {s}\right) \tag {3}
+$$
+
+![](images/553a13d9de90f8755f9f56b893d83389a78d1399b170cd075b3c46b084efd9bb.jpg)  
+figure 3: illustration of scaling of transformer encoder with moe layers. the moe layer replaces the every other transformer feed-forward layer. decoder modification is similar. (a) the encoder of a standard transformer model is a stack of self-attention and feed forward layers interleaved with residual connections and layer normalization. (b) by replacing every other feed forward layer with a moe layer, we get the model structure of the moe transformer encoder. (c) when scaling to multiple devices, the moe layer is sharded across devices, while all other layers are replicated.
+
+where  $x_{s}$  is the input token to the moe layer, wiand wobeing the input and output projection matrices for the feed-forward layer (an expert). vector  $\mathcal{g}_{s,e}$  is computed by a gating network.  $\mathcal{g}_{s,e}$  has one non-negative for each expert, most of which are zeros meaning the token is not dispatched to that expert. the token is dispatched to a very small number of experts. we choose to let each token dispatched to at most two experts. the corresponding entries in  $\mathcal{g}_{s,e}$  are non-zeros, representing how much an expert contributes to the final network output. every expert  $\mathrm{ffn}_e$  applies to  $x_{s}$  a fully-connected 2-layer network using relu [29] activation function. the output of the moe layer,  $y_{s}$ , is the weighted average of outputs from all the selected experts.
+
+the gating function  $\mathrm{gate}(\cdot)$  is critical to the moe layer, which is modeled by a softmax activation function to indicate the weights of each expert in processing incoming tokens. in other words, to indicate how good an expert is at processing the incoming token. furthermore, the gating function must satisfy two goals:
+
+- balanced load it is desirable that the moe layer to sparsely activate the experts for a given token. a naive solution would be just to choose the top- $k$ 's experts according to the softmax probability distribution. however, it is known that this approach leads to load imbalance problem for training [16]: most tokens seen during training would have been dispatched to a small number of experts, amassing a very large input buffer for only a few (busy) experts leaving other experts untrained, slowing down the training. meanwhile many other experts do not get sufficiently trained at all. a better design of the gating function would distribute processing burden more evenly across all experts.  
+- efficiency at scale it would be rather trivial to achieve a balanced load if the gating function is done sequentially. the computation cost for the gating function alone is at least  $o(ne)$  for all  $n$  tokens in the input batch given  $e$  experts. however, in our study,  $n$  is in the order of millions and  $e$  is in the order of thousands, a sequential implementation of the gating function would keep most of the computational resources idle most of the time. therefore, we need an efficient parallel implementation of the gating function to leverage many devices.
+
+we designed the following mechanisms in the gating function  $\mathrm{gate}(\cdot)$  to meet the above requirements (details illustrated in algorithm 1):
+
+- expert capacity to ensure the load is balanced, we enforce that the number of tokens processed by one expert is below some uniform threshold, which we define as expert capacity. assuming that the total number of tokens in a training batch is  $n$ , and each token is dispatched to at most two experts, then the expert capacity is set to be  $o(n / e)$ . gate(\cdot) keeps a running counter  $c_{e}$  for how many tokens are dispatched to an expert. when both experts selected by a token already exceed their capacity, the token is considered as an overflowed token, where  $\mathcal{g}_{s,e}$  degenerates into a zero vector. such tokens have their representation  $x_{s}$  passed on to the next layer via residual connections.  
+- local group dispatching gate( $\cdot$ ) partitions all tokens in a training batch evenly into  $g$  groups, i.e., each group contains  $s = n / g$  tokens. all groups are processed independently in parallel. each group is given a fractional capacity of each expert,  $2n / (g \cdot e)$ . each group ensures that at most this many tokens are dispatched to an expert. in this way, we can ensure that expert capacity is still enforced and the overall load is balanced.  
+- auxiliary loss it is important that the gating function does not always choose the same few experts, as this would lead to a capacity overflow for only a few experts and under-utilization for the remaining ones. following [16], we define an auxiliary loss term  $\ell_{aux}$  to enforce this constraint. it is added to the overall loss function of the model  $\mathcal{l} = \ell_{nll} + k*\ell_{aux}$  with a constant multiplier  $k$ . the particular form of the auxiliary loss term  $\ell_{aux}$  in line (13) of algorithm 1 is motivated by the following consideration: the term  $c_{e}/s$  represents the fraction of input routed to each expert, and we want to minimize mean square of  $c_{e}/s$ . but because  $c_{e}$  is derived from top-2 operation and is not differentiable, we use the mean gates per expert  $m_{e}$  as a differentiable approximation and replace  $(c_{e}/s)^{2}$  with  $m_{e}(c_{e}/s)$ , which can now be optimized with gradient descent.  
+- random routing intuitively, because  $y_{s}$  is a weighted average of what selected experts return, if the weight for the 2nd expert is very small, we can simply ignore the 2nd expert to conserve the overall expert capacity. hence, in addition to respecting the expert capacity constraint, gate( $\cdot$ ) dispatches to the 2nd-best expert with the probability proportional to its weight  $g_{2}$ .
+
+# 3 highly parallel implementation using gshard
+
+this section describes the implementation of the model in section 2 that runs efficiently on a cluster of tpu devices.
+
+the first step is to express the model in terms of linear algebra operations, in which our software stack (tensorflow [21]) and the hardware platform (tpu) are highly tailored and optimized. it is readily easy to code up most of the model in terms of linear algebra in the same way as the original transformer. however, it requires some effort to express the moe layer, in particular gate( $\cdot$ ) function presented in algorithm 1 due to its sequential nature, and we describe the details in section 3.1.
+
+next, we annotate the linear algebra computation to express parallelism. each tensor in the computation can be annotated for replication or distribution across a cluster of devices using sharding apis in section 3.2. using sharding annotations enables separation of concerns between the model description and the efficient parallel implementation, and allows users to flexibly express diverse parallelization strategies. for example, (1) the attention layer is parallelized by splitting along the batch dimension and replicating its weights to all devices. on the other hand, (2) experts in the moe layer are infeasible to be replicated in all the devices due to its sheer size and the only viable strategy is to shard experts into many devices. furthermore, the whole model alternates between these two modes (1)-(2). using annotations frees model developers from the system optimization efforts and avoids baking the parallel implementation and low-level details into the model code.
+
+finally, the compiler infrastructure takes a (partially) annotated linear algebra computation and produces an efficient parallel program that scales to thousands of devices. as will be described in section 3.3, the compiler applies spmd (single program multiple data) partitioning transformation to express per-device computation, inserts necessary cross-device communication, handles irregular
+
+algorithm 1: group-level top-2 gating with auxiliary loss  
+data:  $x_{s}$  , a group of tokens of size  $s$  data:  $c$  expert capacity allocated to this group result:  $\mathcal{g}_{s,e}$  group combine weights result:  $\ell_{aux}$  group auxiliary loss (1)  $c_{e}\gets 0$  gating decisions per expert (2)  $g_{s,e}\gets$  softmax(wg  $\cdot x_s)$  gates per token per expert, wg are trainable weights (3)  $m_e\leftarrow \frac{1}{s}\sum_{s = 1}^{s}g_{s,e}$  mean gates per expert (4) for s  $\leftarrow 1$  to s do (5)  $g1,e1,g2,e2 = top\_ 2(g_{s,e})$  top-2 gates and expert indices (6)  $g1\gets g1 / (g1 + g2)$  normalized g1 (7)  $c\gets c_{e1}$  position in e1 expert buffer (8) if  $c_{e1} <   c$  then (9)  $\mid \mathcal{g}_{s,e1}\gets g1$  e1 expert combine weight for  $x_{s}$  (10) end (11)  $c_{e1}\gets c + 1$  incrementing e1 expert decisions count (12) end (13)  $\ell_{aux} = \frac{1}{e}\sum_{e = 1}^{e}\frac{c_e}{s}\cdot m_e$  (14) for s  $\leftarrow 1$  to s do (15)  $g1,e1,g2,e2 = top\_ 2(g_{s,e})$  top-2 gates and expert indices (16)  $g2\gets g2 / (g1 + g2)$  normalized g2 (17) rnd  $\leftarrow$  uniform(0,1) dispatch to second-best expert with probability  $\propto 2\cdot g2$  (18)  $c\gets c_{e2}$  position in e2 expert buffer (19) if  $c <   c\land 2\cdot g2 > rnd$  then (20)  $\mid \mathcal{g}_{s,e2}\gets g2$  e2 expert combine weight for  $x_{s}$  (21) end (22)  $c_{e2}\gets c + 1$
+
+patterns such as uneven partitions, and finally generates a single program to be launched on all devices for parallel execution.
+
+# 3.1 positions-wise mixture-of-expert layer expressed in linear algebra
+
+our model implementation (algorithm 2) views the whole accelerator cluster as a single device and expresses its core mathematical algorithm in a few tensor operations independent of the concrete setup of the cluster. einstein summation notation [30] (i.e., tf.einsum) is a powerful construct to concisely express the model and we use it extensively in our implementation. the softmax gates computation is trivially expressed by one einsum followed by the softmax function. dispatching of inputs to selected experts is expressed by a single einsum between the dispatching mask and the input. all  $\mathrm{ffn}_e$  weights are combined into single 3-d tensors wi and wo and the computation by  $\mathrm{ffn}_1\ldots \mathrm{ffn}_e$  is expressed using 3 operators (two einsum and one relu). finally, taking weighted average of all experts output into the final output is expressed in another einsum.
+
+top2gating in algorithm 2 computes the union of all group-local  $\mathcal{g}_{s,e}$  described in algorithm 1. combineweights is a 4-d tensor with shape [g, s, e, c]. the value combineweights[g, s, e, c] is non-zero when the input token  $s$  in group  $g$  is sent to the input buffer of expert  $e$  at buffer position  $c$ . for a specific g and s, a slice combine_weight[g, s, :, :] contains at most two non-zero vaues. binary dispatch_mask is produced from combineweights by simply setting all non-zero values to 1.
+
+we need to choose the number of groups  $g$  and the number of experts  $e$  properly so that the algorithm can scale to a cluster with  $d$  devices. it is worthwhile to analyze its overall computation complexity (the total number of floating point operations) for a training step given a training batch of  $n$  tokens.
+
+algorithm 2: forward pass of the positions-wise moe layer. the underscored letter (e.g., g and e) indicates the dimension along which a tensor will be partitioned.  
+```txt
+1 gates  $=$  softmax(einsum("gsm,me->gse",inputs,wg))   
+2 combineweights，dispatch_mask  $\equiv$  top2gating(gates)   
+3 dispatched_expert_inputse  $=$  einsum(   
+4 "gsec,gsm->egcm"，dispatch_mask，reshaped_inputse   
+5 h  $=$  einsum("egcm,emh->egch"，dispatched_expert_inputse，wi)   
+6 h  $=$  relu(h)   
+7 expert_outputs  $=$  einsum("egch,ehm->gecm"，h，wo)   
+8 outputs  $=$  einsum(   
+9 "gsec,gecm->gsm"，combineweights，expert_outputs)
+```
+
+we analyze algorithm 2 computation complexity scaling with number the of devices  $d$  with the following assumptions: a) number of tokens per device  $\frac{n}{d} = o(1)$  is constant; b)  $g = o(d)$ ,  $s = o(1)$  and  $n = o(gs) = o(d)$ ; c)  $m = o(1)$ ,  $h = o(1)$ ; d)  $e = o(d)$ ; and e)  $c = o\left(\frac{2s}{e}\right) = o\left(\frac{1}{d}\right)$ ,  $d < s$  and is a positive integer<sup>2</sup>.
+
+the total number of floating point operations  $flops$  in algorithm 2:
+
+$$
+f l o p s _ {\text {s o f t m a x}} + f l o p s _ {\text {t o p 2 g a t i n g}} + f l o p s _ {\text {d i s p a t c h l c o m b i n e}} + f l o p s _ {\text {f f n}} =
+$$
+
+$$
+o (g s m e) \quad + o (g s e c) \quad + o (g s m e c) \quad + o (e g c h m) =
+$$
+
+$$
+o (d \cdot 1 \cdot 1 \cdot d) + o (d \cdot 1 \cdot d \cdot \frac {1}{d}) + o (d \cdot 1 \cdot 1 \cdot d \cdot \frac {1}{d}) + o (d \cdot d \cdot \frac {1}{d} \cdot 1 \cdot 1) =
+$$
+
+$$
+o \left(d ^ {2}\right) \quad + o (d) \quad + o (d) \quad + o (d)
+$$
+
+and consequently per-device  $flops / d = o(d) + o(1) + o(1) + o(1)$ . per-device softmax complexity  $flops_{\mathrm{softmax}} / d = o(d)$  is linear in number of devices, but in practice is dominated by other terms since  $d << h$  and  $d < s$ . as a result  $flops / d$  could be considered  $o(1)$ , satisfying sublinear scaling design requirements. section 5 verifies this analysis empirically.
+
+in addition to the computation cost, we have non-constant cross-device communication cost, but it grows at a modest rate  $o(\sqrt{d})$  when we increase  $d$  (section 5).
+
+# 3.2 gshard annotation api for parallel execution
+
+due to the daunting size and computation demand of tensors in algorithm 1, we have to parallelize the algorithm over many devices. an immediate solution of how to shard each tensor in the algorithm is illustrated by underscored letters in algorithm 2. the sharding api in gshard allows us to annotate tensors in the program to selectively specify how they should be partitioned. this information is propagated to the compiler so that the compiler can automatically apply transformations for parallel execution. we use the following apis in tensorflow/lingvo [31] in our work.
+
+- replicate(tensor) annotates tensor to be replicated across partitions, and returns the annotated tensor. this is often used for the non-moe layers in our model to replicate the weights.  
+- splittensor, split_dimention, num_partitions) annotates tensor to be partitioned along split_dimention, and returns the annotated tensor. partition  $i$  is placed on the  $i$ 'th device, and num_partitions must not exceed the number of devices on the system.  
+- shard(tensor, device_assignment) generalizes split() to allow partitioning multiple dimensions and specifying the placement of each partition. appendix a.3 describes this api with more details.
+
+note that the invocations to split or shard only adds annotations and does not change the logical shape in the user program. the user still works with full shapes and does not need to worry about issues like uneven partitioning.
+
+gshard is general in the sense that the simple apis apply to all dimensions in the same way. the sharded dimensions could include batch (data-parallelism), feature, expert, and even spatial dimensions in image models, depending on the use cases. also, since the sharding annotation is per tensor, different parts of the model can be partitioned in different ways. this flexibility enables us to partition the giant moe weights and switch partition modes between moe and non-moe layers, as well as uses cases beyond this paper, e.g., spatial partitioning of large images [32] (appendix a.4).
+
+with the above sharding apis, we can express the sharding strategy shown in algorithm 2 as below. the input tensor is split along the first dimension and the gating weight tensor is replicated. after computing the dispatched expert inputs, we apply split to change the sharding from the group  $(g)$  dimension to the expert  $(e)$  dimension.  $d$  is device count.
+
+```python
+1 # partition inputs along group (g) dim.  
+2 + inputs = split(inputs, 0, d)  
+3 # replicate the gating weights  
+4 + wg = replicate(wg)  
+5 gates = softmax(einsum("gsm,me->gse", inputs, wg))  
+6 combineweights, dispatch_mask = top2gating(gating_logits)  
+7 dispatched_expertinputs = einsum( "gsec,gsm->egcm", dispatch_mask, reshaped inputs)  
+8 # partition dispatched inputs along expert (e) dim.  
+9 + dispatched_expertinputs = split(dispatched_expert_entries, 0, d)  
+10 h = einsum("egcm,emh->egch", dispatched_expert_entries, wi)  
+11 ...
+```
+
+per-tensor sharding assignment as shown in the example above, users are not required to annotate every tensor in the program. annotations are typically only required on a few important operators like einsums in our model and the compiler uses its own heuristics to infer sharding for the rest of the tensors<sup>3</sup>. for example, since the input tensor is partitioned along  $g$  and the weight tensor is replicated, the compiler chooses to partition the einsum output along the same  $g$  dimension (line 5). similarly, since both inputs are partitioned along the  $g$  dimension for the input dispatch einsum (line 7), the output sharding is inferred to be split along the  $g$  dimension, and then we add the split annotation on the output to reshard along the  $e$  dimension. some annotations in the above example could also be determined by the compiler (e.g., replicate(wg)) but it is recommended to annotate the initial input and final output tensors of the computation.
+
+the compiler currently uses an iterative data-flow analysis to propagate sharding information from an operator to its neighbors (operands and users), starting from the user-annotated operators. the analysis tries to minimize the chance of resharding by aligning the sharding decisions of adjacent operators. there could be other approaches such as integer programming or machine-learning methods, but improving the automatic sharding assignment is not the focus of this paper and we leave it as future work.
+
+mixing manual and automatic sharding automatic partitioning with sharding annotations is often enough for common cases, but gshard also has the flexibility to allow mixing manually partitioned operators with auto-partitioned operators. this provides users with more controls on how operators are partitioned, and one example is that the user has more run-time knowledge beyond the operators' semantics. for example, neither xla's nor tensorflow's gather operator definition conveys information about the index bounds for different ranges in the input, but the user might know that a specific gather operator shuffles data only within each partition. in this case, the user can trivially partition the operator by simply shrinking the dimension size and performing a local gather; otherwise, the compiler would need to be conservative about the index range and add unnecessary communication overhead. for example, the dispatching einsum (line 3) in algorithm 2
+
+in algorithm 2, which uses an one-hot matrix to dispatch inputs, can be alternatively implemented with a gather operator using trivial manual partitioning, while the rest of the model is partitioned automatically. below is the pseudocode illustrating this use case.
+
+```txt
+1 # input has shape [g, s, m]. split() does not change logical shape.  
+2 input = split(input, 0, num/devices)  
+3 # sindices has shape [e, g, c, 1]. values: indices to s in input.  
+4 s indices = split(sindices, 1, num devices)  
+5  
+6 # begin manual partitioning.  
+7 # partitioned_input has shape [g/num devices, s, m]  
+8 partitioned_input = auto_to_manual_spmd_partition(input)  
+9 # partitioned_s indices has shape [e, g/num devices, c, 1]  
+10 partitioned_s indices = auto_to_manual_spmd_partition(sindices)  
+11 # concat with g indices in partitioned_input: iota on g dimension.  
+12 partitionedgs indices = concat( iota([e, g/num devices, c, 1], 1), partitioned_sindices, 3)  
+13 # partitioned_data has shape [e, g/num devices, c, m]  
+14 partitioned_data = gather( partitioned_input, partitionedgsindices)  
+15  
+16 # switch back to auto partitioning.  
+17  
+18 # data has shape [e, g, c, m]  
+19 data = manual_to_auto_spmd_partition(partitioned_data)  
+20
+```
+
+# 3.3 the xla spmd partitioner for gshard
+
+this section describes the compiler infrastructure that automatically partitions a computation graph based on sharding annotations. sharding annotations inform the compiler about how each tensor should be distributed across devices. the spmd (single program multiple data) partitioner (or "partitioner" for simplicity) is a compiler component that transforms a computation graph into a single program to be executed on all devices in parallel. this makes the compilation time near constant regardless of the number of partitions, which allows us to scale to thousands of partitions.
+
+we implemented the partitioner in the xla compiler [28]. multiple frontend frameworks including tensorflow, jax, pytorch and julia already have lowering logic to transform their graph representation to xla hlo graph. xla also has a much smaller set of operators compared to popular frontend frameworks like tensorflow, which reduces the burden of implementing a partitioner without harming generality, because the existing lowering from frontends performs the heavy-lifting to make it expressive. although we developed the infrastructure in xla, the techniques we describe here can be applied to intermediate representations in other machine learning frameworks (e.g., onnx [33], tvm relay [34], glow ir [35]).
+
+xla models a computation as a dataflow graph where nodes are operators and edges are tensors flowing between operators. the core of the partitioner is per-operation handling that transforms a full-sized operator into a partition-sized operator according to the sharding specified on the input and output. when a computation is partitioned, various patterns of cross-device data transfers are introduced. in order to maximize the performance at large scale, it is essential to define a core set of communication primitives and optimize those for the target platform.
+
+# 3.3.1 communication primitives
+
+since the partitioner forces all the devices to run the same program, the communication patterns are also regular and xla defines a set of collective operators that perform mpi-style communications [36]. we list the common communication primitives we use in the spmd partitioner below.
+
+collectivepermute this operator specifies a list of source-destination pairs, and the input data of a source is sent to the corresponding destination. it is used in two places: changing a sharded tensor's device order among partitions, and halo exchange as discussed later in this section.
+
+allgather this operator concatenates tensors from all participants following a specified order. it is used to change a sharded tensor to a replicated tensor.
+
+allreduce this operator performs elementwise reduction (e.g., summation) over the inputs from all participants. it is used to combine partially reduced intermediate tensors from different partitions. in a tpu device network, allreduce has a constant cost when the number of partition grows (section 5.2). it is also a commonly used primitive with efficient implementation in other types of network topology [37].
+
+alltoall this operator logically splits the input of each participant along one dimension, then sends each piece to a different participant. on receiving data pieces from others, each participant concatenates the pieces to produce its result. it is used to rehard a sharded tensor from one dimension to another dimension. alltoall is an efficient way for such resharding in a tpu device network, where its cost increases sublinearly when the number of partitions grows (section 5.2).
+
+# 3.3.2 per-operator spmd partitioning
+
+the core of the partitioner is the per-operator transformation from a full-sized operator into a partition-sized operator according to the specified sharding. while some operators (e.g., elementwise) are trivial to support, we discuss several common cases where cross-partition communications are required.
+
+there are a few important technical challenges in general cases, which we will cover in section 3.3.3. to keep the discussion more relevant to the moe model, this section focuses on einsum partitioning to illustrate a few communication patterns. and to keep it simple for now, we assume that all tensors are evenly partitioned, which means the size of the dimension to partition is a multiple of the partition count.
+
+einsum case study einsum is the most critical operator in implementing the moe model. they are represented as a dot operation in xla hlo, where each operand (lhs or rhs) consists of three types of dimensions:
+
+- batch dimensions are the embarrassingly parallel dimensions. the same set of batch dimensions must exist in all of lhs, rhs and the output, and each element in the output only depends on the corresponding batch in lhs and rhs.  
+- contracting dimensions only exist in the operands. lhs and rhs must have the same set of contracting dimensions, and they are summed up and collapsed in the output.  
+- non-contracting dimensions are also parallel dimensions that exist in one of the operands and the output. each of lhs and rhs has its own set of non-contracting dimensions, which are inherited by the output.
+
+sharding propagation prioritizes choosing the same sharding on batch dimensions of lhs, rhs and output, because that would avoid any cross-partition communication. however, that is not always possible, and we need cross-partition communication in the following three cases.
+
+- resharding. in the moe model we built, the expert dispatching logic (line 3 in algorithm 2) requires switching the partitioned dimension after an einsum. since resharding is efficient (section 5.2) with alltoall, we first execute the einsum locally, then reshard it to the desired dimension, as shown in figure 4a.  
+- accumulating partial results. if the inputs are partitioned along contracting dimensions, the local result is partial and we need to use an a11reduce to combine them and produce the final result, as shown in figure 4b.  
+- slicing in a loop. for certain scenarios, we also implemented an algorithm similar to cannon's algorithm [38], in order to limit the size of tensors on each partition. for example,
+
+einsum: gsec, gsm->egcm
+
+![](images/410cf0acec1716f2df1d012ff1f848392e5b6cf634200c6dd891caf13b835b1c.jpg)
+
+![](images/a7b4bfa2ea4b570832a3b023b12dfa189718410f0c65402a977cf6c3a99e16bb.jpg)
+
+![](images/0004f9902b6e4ee33c04b7b3afc68e95cc9f310cd5834feaef6e76f99ff4f535.jpg)  
+parallel, partitioned einsums
+
+![](images/cb04853a0621ff9b8e6770ff5dfda04faa9caf673c09f9ab1b1e3c8575ba31d8.jpg)  
+reshard (all-to-all)
+
+![](images/ac1fee9dc47bedc95658c1df1634078dc5bedf6fd52610736345a6b21b3f23cf.jpg)
+
+![](images/6c51ddc73dbb2a566b1a928226af7dd5d4310f9127a74dcdef8ae8552f17e479.jpg)
+
+gsec
+
+gsm
+
+egcm
+
+egcm
+
+(a) a partitioned einsum operator. colored letters  $(g$  and  $e)$  represent the partitioned dimension of each tensor. the partitioner decides to first execute a batch-parallel einsum along the  $g$  dimension, then reshard the result to the  $e$  dimension.
+
+![](images/a68378f701aed89d9a63724da421c046ee4c6f5e69fbfebcdb3e68117f92a790.jpg)  
+(b) a simple einsum (matmul) partitioned on the contracting dimension.
+
+![](images/bcb2e72d67223bc47f062ae6152c0b72e5b2ae04da5baeb405791d57de9fa656.jpg)  
+(c) an einsum (matmul) where we use collective-permute in a loop to compute one slice at a time. there is no full-sized tensor during the entire process.  
+figure 4: examples of einsum partitioning with cross-device communication.
+
+if both operands are partitioned on a non-contracting dimension, we cannot compute the local einsum directly since operands have different non-contracting dimensions. replicating one of the operands would not cause redundant computation, but it requires the replicated operand to fit in device memory. therefore, if the size of the operand is too large, we instead keep both operands partitioned and use a loop to iterate over each slice of the result, and use collectivepermute to communicate the input slices (figure 4c).
+
+# 3.3.3 supporting a complete set of operators
+
+we solved several additional challenges to enable the spmd partitioner to support a complete set of operators without extra constraints of tensor shapes or operator configurations. these challenges often involve asymmetric compute or communication patterns between partitions, which are particularly
+
+![](images/716d1ea7b862d13b04f806d5cd1e703c64dba6a6dd1deb9dc693961fc5664d54.jpg)  
+(a) convolution
+
+![](images/8c481c510948f1c871792d8a5b5289e02889857984f550fb8a11230971bd1344.jpg)  
+(b) pad
+
+![](images/7ed786f127156a3903ee7624c6918e2c0f8d0be2ecce8f30320181c9137f9abf.jpg)  
+(c) reshape with unevenly partitioned input and evenly partitioned output  
+figure 5: halo exchange examples.
+
+hard to express in spmd, since the single program needs to be general enough for all partitions. we cannot simply create many branches in the single program based on the run-time device id, because that would lead to an explosion in program size.
+
+static shapes and uneven partitioning xla requires tensor shapes to be static. however, when a computation is partitioned, it's not always the case that all partitions have the same input/output shapes, because dimensions may not be evenly divisible by the number of partitions. in those cases, the size of the shape is rounded up to the next multiple of partition count, and the data in that padded region can be arbitrary.
+
+when computing an operator, we may need to fill in a known value to the padded region for correctness. for example, if we need to partition an reduce-add operator, the identity value of zero needs to be used. consider an example where the partitioned dimension (15) cannot be divided into 2 (partition count), so partition 1 has one more column than needed. we create an iota operator of range [0, 8), add the partition offset (calculated from partition  $\text{id} \times 8$ ), and compare with the full shape offset (15). based on the predicate value, we select either from the operand or from zero, and the result is the masked operand.
+
+static operator configurations xla operators have static configurations, like the padding, stride, and dilation defined in convolution. however, different partitions may not execute with the same operator configuration. e.g., for a convolution, the left-most partition applies padding to its left while the right-most partition applies padding to its right. in such cases, the partitioner may choose configurations that make some partitions to produce slightly more data than needed, then slice out the the irrelevant parts. appendix a.4 discusses examples for convolution and similar operators.
+
+halo exchange certain operators have a communication pattern which involves partial data exchange with neighboring partitions, which we call halo exchange. we use the collectivepermute operator to exchange halo data between partitions.
+
+the most typical use case of halo exchange is for partitioning window-based operators (e.g., convolution, reducewindow), because neighboring partitions may require overlapping input data (figure 5a). in practice, halo-exchange for these operator often needs to be coupled with proper padding, slicing, and masking due to advanced use of window configurations (dilation, stride, and padding), as well as uneven halo sizes. we describe various scenarios in appendix a.4.
+
+another use of halo exchange is for data formatting operators that change the size of the shape. for example, after a slice or pad operator, the shape of the tensor changes, and so do the boundaries between partitions. this requires us to realign the data on different partitions, which can be handled as a form of halo exchange (figure 5b).
+
+other data formatting operators, although logically not changing the size of the shape, may also need halo exchange, specifically due to the static shape constraint and uneven partitioning. for example, the reverse operator reverses the order of elements in a tensor, but if it is partitioned unevenly, we need to shift data across partitions to keep the padding logically to the right of the result tensor. another example is reshape. consider reshaping a tensor from [3, 2] to [6], where the input is
+
+unevenly partitioned in 2 ways on the first dimension (partition shape [2, 2]), and the output is also partitioned in 2 ways (partition shape [3]). there is padding on the input due to uneven partitioning, but after reshape, the output tensor no longer has padding; as a result, halo exchange is required in a similar way to slice (figure 5c).
+
+compiler optimizations the spmd partitioner creates various data formatting operators in order to perform slicing, padding, concatenation, masking and halo exchange. to address the issue, we leverage xla's fusion capabilities on tpu, as well as code motion optimizations for slicing and padding, to largely hide the overhead of data formatting. as a result, the run-time overhead is typically negligible, even for convolutional networks where masking and padding are heavily used.
+
+# 4 massively multilingual, massive machine translation (m4)
+
+# 4.1 multilingual translation
+
+we chose multilingual neural machine translation (mt) [39, 40, 41] to validate our design for efficient training with gshard. multilingual mt, which is an inherently multi-task learning problem, aims at building a single neural network for the goal of translating multiple language pairs simultaneously. this extends our line of work [15, 14, 16] towards a universal machine translation model [42], i.e. a single model that can translate between more than hundred languages, in all domains. such massively multilingual translation models are not only convenient for stress testing models at scale, but also shown to be practically impactful in real-world production systems [43].
+
+in massively multilingual mt, there are two criteria that define success in terms of the model quality, 1) improvements attained on languages that have large amounts of training data (high resourced), and 2) improvements for languages with limited data (low-resource). as the number of language pairs (tasks) to be modeled within a single translation model increases, positive language transfer [44] starts to deliver large gains for low-resource languages. given the number of languages considered, m4 has a clear advantage on improving the low-resource tasks. on the contrary, for high-resource languages the increased number of tasks limits per-task capacity within the model, resulting in lower translation quality compared to a models trained on a single language pair. this capacity bottleneck for high resourced languages can be relaxed by increasing the model size to massive scale in order to satisfy the need for additional capacity [14, 15].
+
+massively multilingual, massive mt consequently aims at striking a balance between increasing positive transfer by massive multilinguality and mitigating the capacity bottleneck by massive scaling. while doing so, scaling the model size and the number of languages considered have to be coupled with a convenient neural network architecture. in order to amplify the positive transfer and reduce the negative transfer<sup>6</sup>, one can naturally design a model architecture that harbours shared components across languages (shared sub-networks), along with some language specific ones (unshared, language specific sub-networks). however, the search space in model design (deciding on what to share) grows rapidly as the number of languages increase, making heuristic-based search for a suitable architecture impractical. thereupon the need for approaches based on learning the wiring pattern of the neural networks from the data emerge as scalable and practical way forward.
+
+in this section, we advocate how conditional computation [45, 46] with sparsely gated mixture of experts [16] fits into the above detailed desiderata and show its efficacy by scaling neural machine translation models beyond 1 trillion parameters, while keeping the training time of such massive networks practical. e.g. a 600b gshard model for m4 can process 1t tokens<sup>7</sup> in 250k training steps in under 4 days. we experiment with increasing the model capacity by adding more and more experts into the model and study the factors playing role in convergence, model quality and training efficiency. further, we demonstrate how conditional computation can speed up the training [25] and how sparsely gating/routing each token through the network can efficiently be learned without any prior knowledge on task or language relatedness, exemplifying the capability of learning the routing decision directly from the data.
+
+# 4.2 dataset and baselines
+
+the premise of progressively larger models to attain greater quality necessitates large amounts of training data to begin with [3]. following the prior work on dense scaling for multilingual machine translation [15, 14], we committed to the realistic test bed of mt in the wild, and use a web-scale in-house dataset. the training corpus, mined from the web [47], contains parallel documents for 100 languages, to and from english, adding up to a total of 25 billion training examples. a few characteristics of the training set is worth mentioning. having mined from the web, the joint corpus is considerably noisy while covering a diverse set of domains and languages. such large coverage comes with a heavy imbalance between languages in terms of the amount of examples per language pair. this imbalance follows a sharp power law, ranging from billions of examples for high-resourced languages to tens of thousands examples for low-resourced ones. while the above mentioned characteristics constitute a challenge for our study, it also makes the overall attempt as realistic as possible. we refer reader to [15, 14] for the additional details of the dataset being used.
+
+we focus on improving the translation quality (measured in terms of bleu score [48]) from all 100 languages to english. this resulted in approximately 13 billion training examples to be used for model training $^{8}$ . in order to form our baselines, we trained separate bilingual neural machine translation models for each language pair (e.g. a single model for german-to-english), tuned depending on the available training data per-language $^{9}$ . rather than displaying individual bleu scores for each language pair, we follow the convention of placing the baselines along the  $x$ -axis at zero, and report the  $\delta$ bleu trendline of each massively multilingual model trained with gshard (see figure 6). the  $x$ -axis in figure 6 is sorted from left-to-right in the decreasing order of amount of available training data, where the left-most side corresponds to high-resourced languages, and low-resourced languages on the right-most side respectively. to reiterate, our ultimate goal in universal machine translation is to amass the  $\delta$ bleu trendline of a single multilingual model above the baselines for all languages considered. we also include a variant of dense 96 layer transformer encoder-decoder network t(96l) trained with gpipe pipeline parallelism on the same dataset as another baseline (dashed trendline in figure 6). training to convergence took over 6 weeks on 2048 tpu v3 cores $^{10}$ , outperforming the original gpipe t(128l) $^{11}$  [15] and is the strongest single dense model baseline we use in our comparisons.
+
+# 4.3 sparsely-gated moe transformer: model and training
+
+scaling transformer architecture has been an exploratory research track recently [49, 50, 51]. without loss of generality, emerging approaches follow scaling transformer by stacking more and more layers [49, 15], widening the governing dimensions of the network (i.e. model dimension, hidden dimension or number of attention heads) [4, 11] and more recently learning the wiring structure with architecture search [52]  $^{12}$ . for massively multilingual machine translation, [15] demonstrated the best practices of scaling using gpipe pipeline parallelism; in which a 128 layer transformer model with 6 billion parameters is shown to be effective at improving high-resource languages while exhibiting the highest positive transfer towards low-resource languages. although very promising, and satisfying our desiderata for universal translation, dense scaling of transformer architecture has practical limitations which we referred in section 1 under training efficiency.
+
+we aim for practical training time and seek for architectures that warrant training efficiency. our strategy has three pillars; increase the depth of the network by stacking more layers similar to gpipe [15], increase the width of the network by introducing multiple replicas of the feed-forward networks (experts) as described in section 2.2 and make use of learned routing modules to (sparsely) assign tokens to experts as described in section 2.1. with this three constituents, we obtain an
+
+![](images/1738b2b7445dedef1fd21526e4d87eaa6c1cfc03e2dc6a8597765929949e33cd.jpg)  
+figure 6: translation quality comparison of multilingual moe transformer models trained with gshard and monolingual baselines. positions along the  $x$ -axis represent languages, raging from high-to low-resource.  $\delta$ bleu represents the quality gain of a single multilingual model compared to a monolingual transformer model trained and tuned for a specific language. moe transformer models trained with gshard are reported with solid trend-lines. dashed trend-line represents a single 96 layer multilingual transformer model t(96l) trained with gpipe on same dataset. each trend-line is smoothed by a sliding window of 10 for clarity. (best seen in color)
+
+<table><tr><td>id</td><td>model</td><td>bleu avg.</td><td>δbleu avg.</td><td>weights</td></tr><tr><td>(1)</td><td>moe(2048e, 36l)</td><td>44.3</td><td>13.5</td><td>600b</td></tr><tr><td>(2)</td><td>moe(2048e, 12l)</td><td>41.3</td><td>10.5</td><td>200b</td></tr><tr><td>(3)</td><td>moe(512e, 36l)</td><td>43.7</td><td>12.9</td><td>150b</td></tr><tr><td>(4)</td><td>moe(512e, 12l)</td><td>40.0</td><td>9.2</td><td>50b</td></tr><tr><td>(5)</td><td>moe(128e, 36l)</td><td>39.0</td><td>8.2</td><td>37b</td></tr><tr><td>(6)</td><td>moe(128e, 12l)</td><td>36.7</td><td>5.9</td><td>12.5b</td></tr><tr><td>*</td><td>t(96l)</td><td>36.9</td><td>6.1</td><td>2.3b</td></tr><tr><td>*</td><td>baselines</td><td>30.8</td><td>-</td><td>100×0.4b</td></tr></table>
+
+easy to scale, efficient to train and highly expressive architecture, which we call sparsely-gated mixture-of-experts transformer or moe transformer in short.
+
+model details to detail the model specifics, each expert is designed to have the same shape of a regular transformer feed-forward network, and experts (moe layers) are distributed once in every other transformer layer. we tied the number of devices used for training to the number of experts per moe layer for simplicity, although this is not a requirement. during training, we use float32 for both model weights and activations in order to ensure training stability. we ran additional scalability experiments with moe(2048e, 60l) with bfloat16 [53] activations with total of 1 trillion model weights. although trainable by careful and manual diagnostics, with deep 1 trillion model we encountered several trainability issues with numerical stability, hence did not include the results for the sake of reproducibility. for more model and training details, please see appendix a.2.
+
+# 4.4 results
+
+before going into the details of training efficiency, we first investigate the effect of various design choices on building moe transformer. in order to prune the search space, we explored varying two
+
+<table><tr><td>id</td><td>model</td><td>experts per-layer</td><td>experts total</td><td>tpu v3 cores</td><td>enc+dec layers</td><td>weights</td></tr><tr><td>(1)</td><td>moe(2048e, 36l)</td><td>2048</td><td>36684</td><td>2048</td><td>36</td><td>600b</td></tr><tr><td>(2)</td><td>moe(2048e, 12l)</td><td>2048</td><td>12228</td><td>2048</td><td>12</td><td>200b</td></tr><tr><td>(3)</td><td>moe(512e, 36l)</td><td>512</td><td>9216</td><td>512</td><td>36</td><td>150b</td></tr><tr><td>(4)</td><td>moe(512e, 12l)</td><td>512</td><td>3072</td><td>512</td><td>12</td><td>50b</td></tr><tr><td>(5)</td><td>moe(128e, 36l)</td><td>128</td><td>2304</td><td>128</td><td>36</td><td>37b</td></tr><tr><td>(6)</td><td>moe(128e, 12l)</td><td>128</td><td>768</td><td>128</td><td>12</td><td>12.5b</td></tr><tr><td>*</td><td>moe(2048e, 60l)</td><td>2048</td><td>61440</td><td>2048</td><td>60</td><td>1t</td></tr></table>
+
+table 1: moe transformer model family. to achieve desired capacity we  $i)$  increased the depth by stacking more layers,  $ii)$  increased the width of the network by scaling the number of experts per moe layer along with number of cores used for training.
+
+variables, number of layers in the transformer encoder-decoder stack (l) and the total number of experts used for every other moe layer (e). for depth, we tested three different options, 12 (original transformer depth, which consists of 6 encoder and 6 decoder layers), 36 and 60 layers. for the number of experts that replaces every other feed-forward layer, we also tested three options, namely 128, 512 and 2048 experts. note that, the number of devices used for training, is fixed to be equal to the number of experts per-layer, using 128, 512 and 2048 cores respectively independent of the depth being experimented. please also see the detailed description in table 1 for model configurations.
+
+for each experiment (rows of the table 1), we trained the corresponding moe transformer model until it has seen 1 trillion  $(10^{12})$  tokens. the model checkpoint at this point is used in the model evaluation. we did not observe any over-fitting patterns by this point in any experiment. instead, we observed that the training loss continued to improve if we kept training longer. we evaluated bleu scores that the models achieved for all language pairs on a held-out test set. figure 6 reports all our results.
+
+here we share a qualitative analysis for each experiment and discuss the implication of each setup on high- and low-resource languages in order to track our progress towards universal translation. to ground the forthcoming analysis, it is worth restating the expected behavior of the underlying quality gains. in order to improve the quality for both high- and low-resource languages simultaneously within a single model, scaled models must mitigate capacity bottleneck issue by allocating enough capacity to high-resource tasks, while amplifying the positive transfer towards low-resource tasks by facilitating sufficient parameter sharing. we loosely relate the expected learning dynamics of such systems with the long-standing memorization and generalization dilemma, which is recently studied along the lines of width vs depth scaling efforts [54]. not only do we expect our models to generalize better to the held-out test sets, we also expect them to exhibit high transfer capability across languages as another manifestation of generalization performance [55].
+
+deeper models bring consistent quality gains across the board we first investigate the relationship between the model depth and the model quality for both high- and low-resource languages. three different experiments are conducted in order to test the generalization performance, while keeping the number of experts per-layer fixed. with an increasing number of per-layer experts for each experiment (128, 512 and 2048), we tripled the depth of the network for each expert size, from 12 to 36. this resulted in three groups where experts per-layer fixed but three times the depth within each group:
+
+for each configuration shown in fig. 6, we observed that increasing the depth (l) while keeping the experts per-layer (e) fixed, brings consistent gains for both low and high resourced languages (upwards  $\delta$  shift along the  $y$ -axis), almost with a constant additive factor every time we scale the depth from 12l to 36l (2-to-3 bleu points on average as shown in the last column of table 3).
+
+relaxing the capacity bottleneck grants pronounced quality gains earlier in section 4.1 we highlighted the influence of the capacity bottleneck on task interference, resulting in degraded quality especially for high resourced languages. later we alleviated this complication by increasing the number of experts per-layer, which in return resulted in a dramatic increase in the number of parameters (weight) of the models studied. here we investigate whether this so called capacity
+
+bottleneck is distinctly observable and explore the impact on model quality and efficiency once it is relaxed. to that end, we first consider three models with identical depths (12l), with increasing number of experts per-layer: 128, 512 and 2048. as we increase the number of experts per-layer from 128 to 512 by a factor of four, we notice a large jump in model quality, +3.3 average bleu score across 100 languages. however again by four folds scaling of the number of experts per-layer, from 512 to 2048, yields only +1.3 average bleu scores. despite the significant quality improvement, this drop in gains hints the emergence of diminishing returns.
+
+speculatively, the capacity bottleneck is expected to be residing between 128 to 512 experts, for the particular parametrization, number of languages and the amount of training data used in our experimental setup. once the bottleneck is relaxed, models enjoy successive scaling of the depth, which can be seen by comparing 12 versus 36 layer models both with 128 experts. interestingly increasing the depth does not help as much if the capacity bottleneck is not relaxed.
+
+having more experts improve quality especially for high-resourced tasks another dimension that could shed light on the quality gains of scaling in multi-task models is the contrast between high and low resource language improvements. as mentioned before, low resourced languages benefit from transfer while high resource languages seek for added capacity. next we examine the effect of increasing the experts per-layer while fixing the depth.
+
+as can be seen in figure 6, for 12 layer models increase in the expert number yields larger gains for high resourced languages as opposed to earlier revealed diminishing returns for low-resourced languages. a similar pattern is observed also for 36 layer models. while adding more experts relaxes the capacity bottleneck, at the same time it reduces the amount of transfer due to a reduction of the shared sub-networks.
+
+deep-dense models are better at positive transfer towards low-resource tasks lastly we look into the impact of the depth on low-resourced tasks as a loose corollary to our previous experiment. in order to do so, we include a dense model with 96 layers t(96l) trained with gpipe on the same data into our analysis. we compare t(96l) with the shallow moe(128e, 12l) model. while the gap between the two models measured to be almost constant for the majority of the high-to-mid resourced languages, the gap grows in favor of the dense-deep t(96l) model as we get into the low-resourced regime. following our previous statement, as the proportion of the shared sub-networks across tasks increase, which is  $100\%$  for dense t(96l), the bandwidth for transfer gets maximized and results in a comparably better quality against its shallow counterpart. also notice that, the same transfer quality to the low-resourced languages can be achieved with moe(36e, 128l) which contains 37 billion parameters.
+
+we conjecture that, increasing the depth might potentially increase the extent of transfer to low-resource tasks hence generalize better along that axis. but we also want to highlight that the models in comparison have a disproportionate training resource requirements. we again want to promote the importance of training efficiency, which is the very topic we studied next.
+
+# 4.5 training efficiency
+
+in this section we focus on the training efficiency of moe transformer models. so far, we have seen empirical evidence how scaling the models along various axes bring dramatic quality gains, and studied the factors affecting the extent of the improvements. in order to measure the training efficiency, we first keep track of the number of tokens being processed to reach a certain training loss and second we keep track of the wall-clock time for a model to process certain number of tokens. note that, we focus on the training time and training loss<sup>13</sup> while varying other factors, as opposed to test error, which we analyzed in the previous section.
+
+deeper models are more sample efficient, converge faster with fewer examples it has been shown that, deeper models are better at sample efficiency, reaching better training/test error given the same amount of training examples [15, 56], commonly attributed to the acceleration effect of overparametrization [1]. we empirically test the hypothesis again using gshard with moe transformers and share trade-offs for models that are not only deep, but also sparsely activated.
+
+for this purpose, we compare number of tokens being processed by each model to reach a preset training loss. a general trend we observe from table 2 is that, moe transformer models with 3 times the depth need 2 to 3 times fewer tokens to reach the preset training loss thresholds. for example moe(128e, 12l) takes 3 times the number of tokens to reach 0.7 training cross-entropy compared to moe(128e, 36l), (6) vs (5). we observe a similar trend for models with 512 and 2048 experts, (4) vs (3) and (2) vs (1).
+
+<table><tr><td rowspan="2">id</td><td rowspan="2">model</td><td rowspan="2">cores</td><td colspan="3">billion tokens to cross-entropy of</td></tr><tr><td>0.7</td><td>0.6</td><td>0.5</td></tr><tr><td>(1)</td><td>moe(2048e, 36l)</td><td>2048</td><td>82</td><td>175</td><td>542</td></tr><tr><td>(2)</td><td>moe(2048e, 12l)</td><td>2048</td><td>176</td><td>484</td><td>1780</td></tr><tr><td>(3)</td><td>moe(512e, 36l)</td><td>512</td><td>66</td><td>170</td><td>567</td></tr><tr><td>(4)</td><td>moe(512e, 12l)</td><td>512</td><td>141</td><td>486</td><td>-</td></tr><tr><td>(5)</td><td>moe(128e, 36l)</td><td>128</td><td>321</td><td>1074</td><td>-</td></tr><tr><td>(6)</td><td>moe(128e, 12l)</td><td>128</td><td>995</td><td>-</td><td>-</td></tr></table>
+
+another intriguing observation from table 2, is again related to the presence of capacity bottleneck. comparing the models with same depth, (5), (3) and (1), we notice a significant drop in the number of tokens required to reach training loss of 0.7, as we transition from 128 to 512 number of experts. practically that is where we observed the capacity bottleneck was residing, aligning with the hypothesis in section 4.4. after this phase shift, models with ample capacity tend to exhibit similar sample efficiency characteristics, as in models (3) and (1).
+
+largest model (600b) can be trained under 4 days achieving the best quality next we delve deeper into the interaction between model size and wall-clock time spent for training. we monitor number of tpu cores being used, training steps per-second, total number of tokens per batch, tpu core years $^{14}$ , and actual wall-clock time spent in days for training (see table 3 columns respectively).
+
+we start with investigating one of the largest models we trained, moe(2048e, 36l) with 600 billion parameters, model with id (1). having utilized 2048 tpu cores for 4 days, this model achieves the best translation quality in terms of average bleu, but also takes a total of 22.4 tpu years to train. while we have not seen any signs that the quality improvements plateau as we scale up our models, we strive for finding cost-effective solutions for scaling.
+
+results in table 3 again validates scaling with conditional computation is way more practical compared to dense scaling. given the same number of tpu cores used by (1), the dense scaling variant, t(96l), appears to be taking more than ten times to train (235 tpu core years), while trailing behind in terms of model quality compared to models trained with gshard.
+
+table 2: the number of tokens have been seen by a model during training to reach three different cross-entropy loss. a general trend is that deeper models are more sample efficient and converge faster than the comparable shallow ones.  
+
+<table><tr><td>id</td><td>model</td><td>cores</td><td>steps per sec.</td><td>batch sz. (tokens)</td><td>tpu core years</td><td>training time (days)</td><td>bleu avg.</td></tr><tr><td>(1)</td><td>moe(2048e, 36l)</td><td>2048</td><td>0.72</td><td>4m</td><td>22.4</td><td>4.0</td><td>44.3</td></tr><tr><td>(2)</td><td>moe(2048e, 12l)</td><td>2048</td><td>2.15</td><td>4m</td><td>7.5</td><td>1.4</td><td>41.3</td></tr><tr><td>(3)</td><td>moe(512e, 36l)</td><td>512</td><td>1.05</td><td>1m</td><td>15.5</td><td>11.0</td><td>43.7</td></tr><tr><td>(4)</td><td>moe(512e, 12l)</td><td>512</td><td>3.28</td><td>1m</td><td>4.9</td><td>3.5</td><td>40.0</td></tr><tr><td>(5)</td><td>moe(128e, 36l)</td><td>128</td><td>0.67</td><td>1m</td><td>6.1</td><td>17.3</td><td>39.0</td></tr><tr><td>(6)</td><td>moe(128e, 12l)</td><td>128</td><td>2.16</td><td>1m</td><td>1.9</td><td>5.4</td><td>36.7</td></tr><tr><td>*</td><td>t(96l)</td><td>2048</td><td>-</td><td>4m</td><td>~235.5</td><td>~42</td><td>36.9</td></tr></table>
+
+table 3: performance of moe models with different number of experts and layers.
+
+in this section, we benchmarked gshard with moe transformers applications to multilingual machine translation (in particular to m4). we identified variables that are affecting the end result, such as
+
+![](images/04bf8f5e8e17618c41191125f0fa14f1fd95a231e7c9b624a28318aaf40abf76.jpg)  
+figure 7: per-device memory consumption in gigabytes.
+
+capacity bottleneck, positive transfer and training efficiency, and provided experimental results in order to reveal the interplay between them. next we will delve deep into performance related topics of gshard, such as memory and runtime efficiency and communication benchmarks.
+
+# 5 performance and memory consumption
+
+this section discusses how well gshard achieves computation and memory efficiency on the tpu platform. our measurement and analysis show that the device memory consumption is roughly constant when we increase the number of devices and experts, and the step time grows sublinearly, i.e., 1.7x execution time increase when we scale the model by 16x from 128 devices to 2048 devices. we also provide microbenchmarks and analyses for a variety of partitioned operators, which could guide use cases beyond this paper.
+
+# 5.1 memory efficiency and scalability
+
+in the gshard model, there are mainly three types of memory usage, all of which have constant per-device sizes after spmd partitioning, when the number of experts increases.
+
+- replicated weights (e.g. transformer feed-forward layers).  
+- distributed weights (moe feed-forward layers $^{15}$ ).  
+- activations (output of each layer that is used in both forward and backward pass).
+
+the  $o(1)$  memory scaling is demonstrated in figure 7, which shows the per-device memory usage distribution for different models. with a fixed number of layers, both weight memory and activation memory stay constant when the number of experts increases.
+
+on this other hand, weight memory and activation memory both scale linearly with the number of layers. when the memory requirement exceeds available memory on each device, compiler-based rematerialization will automatically recompute part of the activations in the backward pass in order to reduce peak activation memory. this is why the activation size for moe(2048e, 60l) is smaller than moe(2048e, 36l). the overhead of rematerialization is also optimized, e.g. only  $28\%$  and  $34\%$  of the total cycles are spent on recomputation for 36l and 60l models respectively, and  $0\%$  for 12l and 24l since they fit in device memory without rematerialization.
+
+![](images/93e830c359ffb808f8c18c7918054035a132e9077af072e1187b4ed83dabd945.jpg)  
+figure 8: measured vs roofline execution time breakdown. only the forward pass is shown, and the backward pass has similar breakdown. "moe dispatch and combine" represents cross-partition communication with a11toa11.
+
+# 5.2 runtime efficiency and scalability
+
+figure 8 shows the breakdown of execution time for an moe layer and its adjacent transformer layer. it also compares the achieved performance to a roofline, which is estimated by assuming compute-memory-, or communication-bounded operations can achieve  $100\%$  of the peak flops, memory bandwidth, or interconnect bandwidth. this is a very optimistic estimate as many operators are bounded by a mixed set of resources. at a smaller scale (128 experts), our model can achieve  $>70\%$  of the roofline performance. the device time increases by  $1.7\mathrm{x}$  when we scale the model to 16x larger (2048 experts), and can still achieve  $48\%$  of the roofline performance.
+
+before analyzing performance scalability, we recall the size scaling of relevant tensor dimensions as discussed in section 3.1. with  $d$  devices, the number of experts  $e$  and the group count  $g$  are both set to  $o(d)$ . the fractional per-group expert capacity  $c$  is set to  $o(1 / d)$ . this setup cannot scale indefinitely, since  $c$  needs to be at least 1, but it is good enough to scale to thousands of experts.
+
+transformer layers and moe feed-forward layer these are the dense parts of the model, which are designed to achieve peak tpu utilization. on each device, these computations also have a constant cost when we scale to more experts. feed-forward layers and transformer projections are mainly large matrix multiplications that utilize the tpu's matrix unit well. these operations have achieved  $>85\%$  peak flops in our experiment. the attention operations are composed of mainly batch matmuls, which are bounded by memory bandwidth when sequence lengths are small. as a result, in our experiments attention operations only achieved  $>30\%$  peak flops.
+
+gate computation in figure 8, "gate einsum" represents the first two and the last einsums in algorithm 2. the first einsum is the projection that calculates per-expert input to softmax. it has an  $o(d)$  cost, but it is a very small part of the layer. the other two einsums are dispatching tokens and combining expert results. they effectively implement gather with one-hot matrices, which are more expensive, but with constant  $o(gc) = o(1)$  cost that is independent from the number of experts. the execution time of these einsums increases by around 2x when we scale from 128 to 2048 experts (16x).
+
+the remaining per-device gating computation involves many general-purpose computations like argmax and cumsum, which are either memory-bound or even sequential in nature, thus not designed to utilize tpus well. the majority of the time is spent on sequential cumsum operations to invert one-hot matrices that represent selected experts for each token to one-hot matrices that represent
+
+selected tokens for each expert. the linear complexity of cumsum is demonstrated in figure 8. this part of the gating computation also has an  $o(d)$  cost, but fortunately, similar to the einsum before softmax, it has a very small constant factor. it has negligible execution time with 128 experts, and takes less than  $10\%$  of the total time spent in the moe and transformer layers with 2048 experts.
+
+the most significant part of gating is communication, shown as "moe dispatch and combine" in figure 8. these are a11toa11 operators, and as we will discuss in section 5.3, their cost is  $o(\sqrt{d})$ . when the number of experts grows 16x from 128 to 2048, the execution time increases by about 3.75x, and their proportion of execution time in the moe and transformer increases from 16% to 36%.
+
+# 5.3 communication microbenchmarks and per-operator scalability
+
+in this section, we measure and analyze the performance scalability of the spmd partitioner for basic operators, which can be used to guide use cases beyond the moe model presented in this paper.
+
+performance scaling of communication primitives two critical collective communication operators in the moe model are a11reduce and a11toa11. a11reduce is used in accumulating partial results, and a11toa11 is used in resharding (section 3.3.2). figure 9 shows their performance scalability from 16 to 2048 partitions. a11reduce on tpu has an execution time independent from the number of devices. the variance in figure 9 is due to specifics of each topology, e.g., whether it is a square or a rectangle, and whether it is a torus or a mesh.
+
+a11toa11, on the other hand, gets more expensive as the number of partitions grows, but in a sublinear manner. on our 2d tpu cluster, a11toa11 cost is roughly  $o(\sqrt{d})$ , where  $d$  is the number of partitions. this is because with a fixed amount of data each partition sends (8mb or 32mb in figure 9), the total amount of data that all partitions send is  $d = o(d)$ . meanwhile, each data piece needs to travel  $h = o(\sqrt{d})$  hops on average, and there are overall  $l = o(d)$  device-to-device links in the network. therefore, if it is bandwidth-bound, the execution time of an a11toa11 is
+
+$$
+t = \frac {d h}{l} = o (\frac {d \sqrt {d}}{d}) = o (\sqrt {d}).
+$$
+
+even if it is latency-bound, the execution time will still be  $o(h) = o(\sqrt{d})$ . comparing 2048 partitions and 16 partitions, while  $d$  grows by 128 times, the execution time of a11toa11 only increases by 9 times. this enables us to use resharding to efficiently implement cross-partition dispatching (figure 4a).
+
+allgather and collectivepermute are easier to analyze. allgather's output is  $d$  larger than the input, and if we fix input size, then its communication cost is  $o(d)$ . collectivepermute has a one-to-one communication pattern, and with reasonable device arrangement where the source-destination pairs are close, its cost is  $o(1)$  for a fixed input size.
+
+<table><tr><td rowspan="2"></td><td rowspan="2">o(d) 
+dimensions</td><td rowspan="2">total 
+compute</td><td colspan="2">per-partition</td></tr><tr><td>compute</td><td>communication</td></tr><tr><td>add(a,a-&gt;a)</td><td>a</td><td>o(d)</td><td>o(1)</td><td>0</td></tr><tr><td>matmul(ab,bc-&gt;ac)</td><td>b</td><td>o(d)</td><td>o(1)</td><td>o(1) ar</td></tr><tr><td>matmul(ab,bc-&gt;ac)</td><td>a</td><td>o(d)</td><td>o(1)</td><td>0</td></tr><tr><td>matmul(ab,bc-&gt;ac)</td><td>a,b</td><td>o(d2)</td><td>o(d)</td><td>o(d) ag or cp</td></tr><tr><td>matmul(ab,bc-&gt;ac)</td><td>a,c</td><td>o(d2)</td><td>o(d)</td><td>o(d) ag or cp</td></tr><tr><td>reduce(ab-&gt;a)</td><td>a</td><td>o(d)</td><td>o(1)</td><td>0</td></tr><tr><td>reduce(ab-&gt;b)</td><td>a</td><td>o(d)</td><td>o(1)</td><td>o(1) ar</td></tr><tr><td>einsum(gsec,gsm-&gt;egcm)</td><td>g,e*</td><td>o(d)</td><td>o(1)</td><td>o(√d) aa</td></tr><tr><td>convolution(bixy,xyio-&gt;boxy)</td><td>x**</td><td>o(d)</td><td>o(1)</td><td>o(1) cp</td></tr></table>
+
+table 4: scalability of partitioned operators. abbreviation for communication primitives: ar: allreduce, ag: allgather, cp: collectivepermute, aa: alltoall. *this is the dispatch einsum in our model, where we set c to  $o(1 / d)$ . **i/o are the input/output feature dimensions, b is the batch dimension, x/y are input spatial dimensions, and x/y are the kernel spatial dimensions.
+
+![](images/85b193786c495a3a378c6c36ce1d16cf812c985de856698d7351e804c6a60366.jpg)  
+figure 9: performance scaling of communication, a11reduce and a11toa11. log scale on both axes. a11reduce cost is roughly  $o(1)$ , and a11toa11 cost is roughly  $o(\sqrt{d})$ , where  $d$  is the number of partitions. we measure their performance with 8mb and 32mb data. for a11toa11, that means each partition initially has 8mb (or 32mb) data, then divides it to  $d$  pieces, and sends each piece to a different receiving partition.
+
+partitioned operator scalability we summarize the performance scalability for common operators using gshard in table 4. it contains the einsum/matmul examples in section 3.3.2, and also other common operators like convolution and reduce. the table includes the local compute on each partition, as well as the required communication based on our analysis above.
+
+most operators in table 4 have sublinear scalability in terms of both compute and communication, which is consistent with our performance measurement of the moe model. the  $o(1)$  scaling of spatially partitioned convolutions also demonstrates the efficiency of gshard for image partitioning (appendix a.4).
+
+however, the last two matmul operators in table 4 have  $o(d)$  scaling of per-partition compute and communication, where they have unmatched sharding in the operands. this is not due to inefficiency in the partitioning algorithm, but because the total compute in the full operator is very large  $(o(d^2))$ . different partitioning strategies can be used for these cases, producing different communication primitives: replicating one operand will result in a11gather (requiring the replicated operand to fit in device memory), while slicing in a loop (figure 4c) will result in collectivepermute.
+
+# 6 related work
+
+neural networks deep learning models have been very successful in advancing sub-fields of artificial intelligence. for years, the fields have been continuously reporting new state of the art results using varieties of model architectures for computer vision tasks [57, 58, 7], for natural language understanding tasks [59, 60, 61], for speech recognition and synthesis tasks [62, 63, 64, 65, 66]. more recently, attention-based transformer models further advanced state of the art of these fields [10, 4].
+
+model scaling both academic research and industry applications observed that larger neural networks tend to perform better on large enough datasets and for complex tasks. within a single model family, simply making the network wider or deeper often improves the model quality empirically. e.g., deeper resnets performed better [8], bigger transformer models achieved better translation quality [10], models with larger vocabulary, or embedding or feature crosses work better, too [14, 13]. across
+
+different model families, it has also been observed that bigger models with larger model capacities not only fit the training data better but also generalize better on test time [67, 68, 15]. this observation motivated many research efforts to build much bigger neural networks than those typically used in deep learning research models or production models. shazeer et al. showed that a recurrent language model with 69 billion parameters using mixture-of-expert layers achieved much lower test perplexity for the one billion words (lm1b) benchmark [16]. brown et al. showed that a non-sparse 175 billion parameters model is capable of exhibiting highly accurate few-shot performance on several downstream nlp tasks.
+
+hardware neural networks demand non-negligible amounts of computation power. to address such a demand, special hardware (chips and networked machines) built for neural network training and inference can be dated back to 25 years ago [69]. since late 2000s, researchers started to leverage gpus to accelerate neural nets [70, 57, 71]. more recently, the industry also invested heavily in building more dedicated hardware systems chasing for more cost-effective neural network hardware [72]. because the core computation of neural networks (various forms of summation of multiplications: convolution, matrix multiplication, einsum) are highly parallelizable numerical calculations, these chips are equipped with huge number of floating processing units (fpus). hence, the compute power of these specially designed hardware grew dramatically. it is reported that gpu price per flops dropped a factor of ten in just the last 4 years [73] and flops per watts increased by 2 magnitude over the past 12 years [74]. the widely available low-cost computation power is a major enabler for the success of neural networks.
+
+software software systems supporting neural networks evolved together with the advancement of the underlying hardware [75, 76, 21, 77]. while the accelerators are highly parallel compute machines, they are significantly more difficult to program directly. the frameworks made building neural networks easier and abstracted away many hardware specific details from the practitioners. they in turn rely on lower-level libraries to drive special hardware (accelerators) efficiently. e.g., cuda [78] for nvidia's gpus, or xla for google's tpus [28]. these lower-level libraries are critical for achieving high efficiency using these special hardware.
+
+parallelism in model training and inference modern neural networks make extensive use of a cluster of machines for training and inference, each of which equipped with several accelerators. data parallelism [57] is the most commonly used approach and is supported by major frameworks (tensorflow [21], pytorch [22], jax [79, 80]), where devices run the same program with different input data and combine their local gradients before the weight updates. model parallelism on the other hand, partitions computation beyond the input batch, which is needed to build very large models. for example, pipelining [15, 24] splits a large model's layers into multiple stages, while operator-level partitioning [23, 81] splits individual operators into smaller parallel operators. gshard used a type of operator-level partitioning to scale our model to a large number of parallel experts.
+
+automated parallelism because programming in a distributed heterogeneous environment is challenging, particularly for high-level practitioners, deep-learning frameworks attempt to alleviate the burden of their users from specifying how the distributed computation is done. for example, tensorflow [21] has support for data parallelism, and basic model parallelism with graph partitioning by per-node device assignment. mesh tensorflow [23] helps the user to build large models with spmd-style per-operator partitioning, by rewriting the computation in a python library on top of tensorflow; in comparison, our approach partitions the graph in the compiler based on light-weight annotations without requiring the user to rewrite the model. flexflow [81] uses automated search to discover the optimal partition of operators in a graph for better performance; while it focuses on determining the partitioning policy, our spmd partitioner focuses on the mechanisms to transform an annotated graph. weight-update sharding [82] is another automatic parallelization transformation based on xla, which mostly focuses on performance optimizations for tpu clusters, and conceptually can be viewed as a special case for gshard. zero [83] presents a set of optimizations to reduce memory redundancy in parallel training devices, by partitioning weights, activations, and optimizer state separately, and it is able to scale models to 170 billion parameters; in comparison, gshard is more general in the sense that it does not distinguish these tensors, and all of those specific partitioning techniques can be supported by simply annotating the corresponding tensors, allowing us to scale to over 1 trillion parameters and explore more design choices.
+
+conditional computation and machine translation conditional computation [25, 16, 26, 27] premises that the examples should be routed within the network by activating an input dependent sub
+
+network. the routing depends (or conditions) on certain criterion and without the loss of generality, can be any of the following: estimated difficulty of the example [84], available computation budget [26, 27], or more generally a learned criterion with sparsity induced mixture of experts [16]. we extend sparsely gated mixture of experts [16] due to its flexibility and ease of scaling to state of the art neural sequence models, transformers [10], to satisfy training efficiency.
+
+# 7 conclusion
+
+in this paper, we introduced gshard, a deep learning module that partitions computation at scale automatically. gshard operates with lightweight sharding annotations required in the user model code only and delivers an easy to use and flexible api for scaling giant neural networks. we applied gshard to scale up transformer architecture with sparsely-gated mixture-of-experts layers (moe transformer) and demonstrated a 600b parameter multilingual neural machine translation model can efficiently be trained in 4 days achieving superior performance and quality compared to prior art when translating 100 languages to english with a single model. in addition to the far better translation quality, moe transformer models trained with gshard also excel at training efficiency, with a training cost of 22 tpu v3 core years compared to 29 tpu years used for training all 100 bilingual transformer baseline models. empirical results presented in this paper confirmed that scaling models by utilizing conditional computation not only improve the quality of real-world machine learning applications but also remained practical and sample efficient during training. our proposed method presents a favorable scalability/cost trade-off and alleviates the need for model-specific frameworks or tools for scaling giant neural networks. together, our results help to elucidate a realistic and practical way forward for neural network scaling to achieve better model quality.
+
+we have learned several lessons from our study. our results suggest that progressive scaling of neural networks yields consistent quality gains, validating that the quality improvements have not yet plateaued as we scale up our models. while the results in this paper consolidate that model scaling is a must in deep learning practitioners' toolbox, we also urge practitioners to strive for training efficiency. to this end, we identified factors that affect the training efficiency and showed their implications on downstream task quality. we demonstrated how the neural networks built with conditional computation yield a favorable trade-off between scale and computational cost. in practice such critical design decisions allowed us to enjoy experimental cycles of not months or weeks, but only days to train models in the order of magnitude of trillion parameters.
+
+further, having a proper abstraction layer that separates model description from parallelization implementation, allows model developer to focus on network implementation, leaving gshard to partition the computation graphs automatically and generate programs that run on all devices in parallel. we found that generating a single program that is general enough to express computation on all underlying parallel devices is the key to compile scalably. the traditional way of generating multiple dedicated programs for different partitions results in explosive compilation time when scaling to thousands of partitions. to address this complexity, we introduced various compiler renovations based on spmd sharding that allows any tensor dimension to be partitioned. as a takeaway, we emphasize that model scaling and training efficiency should go hand-in-hand; and algorithmic improvements such as conditional computation when coupled with easy to use interfaces can effectively utilize large computational power.
+
+lastly, our experimental results empirically support that, mere parameter counting does not always correlate with the effective capacity of the models at scale [85, 86]. comparison of the models should also account in the nature of the problem, i.e. massively multi-task setting with a heavy training data imbalance across tasks as in our case, and control the factors affecting different operation modes of the networks, i.e. capacity bottleneck vs positive transfer.
+
+# acknowledgements
+
+we would like to thank the google brain and translate teams for their useful input and insightful discussions, entire xla and lingvo development teams for their foundational contributions to this project. in particular youlong cheng, naveen arivazhagan, ankur bapna, ruoming pang, yonghui wu, yuan cao, david majnemer, james molloy, peter hawkins, blake hechtman, mark heffernan,
+
+dimitris vardoulakis, tamas berghammer, marco cornero, cong liu, tong shen, hongjun choi, jianwei xie, sneha kudugunta, and macduff hughes.
+
+# references
+
+[1] sanjeev arora, nadav cohen, and elad hazan. on the optimization of deep networks: implicit acceleration by overparameterization. arxiv preprint arxiv:1802.06509, 2018.  
+[2] jonathan frankle and michael carbin. the lottery ticket hypothesis: finding sparse, trainable neural networks. arxiv preprint arxiv:1803.03635, 2018.  
+[3] jared kaplan, sam mccandlish, tom henighan, tom b brown, benjamin chess, rewon child, scott gray, alec radford, jeffrey wu, and dario amodei. scaling laws for neural language models. arxiv preprint arxiv:2001.08361, 2020.  
+[4] jacob devlin, ming-wei chang, kenton lee, and kristina toutanova. bert: pre-training of deep bidirectional transformers for language understanding. arxiv preprint arxiv:1810.04805, 2018.  
+[5] dhruv mahajan, ross girshick, vignesh ramanathan, kaiming he, manohar paluri, yixuan li, ashwin bharambe, and laurens van der maaten. exploring the limits of weakly supervised pretraining. in proceedings of the european conference on computer vision (eccv), pages 181-196, 2018.  
+[6] tom b brown, benjamin mann, nick ryder, melanie subbiah, jared kaplan, prafulla dhariwal, arvind neelakantan, pranav shyam, girish sastry, amanda askell, et al. language models are few-shot learners. arxiv preprint arxiv:2005.14165, 2020.  
+[7] kaiming he, xiangyu zhang, shaoqing ren, and jian sun. deep residual learning for image recognition. in proceedings of the ieee conference on computer vision and pattern recognition, pages 770-778, 2016.  
+[8] kaiming he, xiangyu zhang, shaoqing ren, and jian sun. identity mappings in deep residual networks. in european conference on computer vision, pages 630-645. springer, 2016.  
+[9] golnaz ghiasi, tsung-yi lin, and quoc v le. nas-fpn: learning scalable feature pyramid architecture for object detection. in proceedings of the ieee conference on computer vision and pattern recognition, pages 7036-7045, 2019.  
+[10] ashish vaswani, noam shazeer, niki parmar, jakob uszkoreit, llion jones, aidan n. gomez, lukasz kaiser, and illia polosukhin. attention is all you need, 2017.  
+[11] colin raffel, noam shazeer, adam roberts, katherine lee, sharan narang, michael matena, yanqi zhou, wei li, and peter j. liu. exploring the limits of transfer learning with a unified text-to-text transformer, 2019.  
+[12] tom b brown, benjamin mann, nick ryder, melanie subbiah, jared kaplan, prafulla dhariwal, arvind neelakantan, pranav shyam, girish sastry, amanda askell, et al. language models are few-shot learners. arxiv preprint arxiv:2005.14165, 2020.  
+[13] alexis conneau, kartikay khandelwal, naman goyal, vishrav chaudhary, guillaume wenzek, francisco guzmán, edouard grave, myle ott, luke zettlemoyer, and veselin stoyanov. unsupervised cross-lingual representation learning at scale, 2019.  
+[14] naveen arivazhagan, ankur bapna, orhan first, dmitry lepikhin, melvin johnson, maxim krikun, mia xu chen, yuan cao, george foster, colin cherry, wolfgang macherey, zhifeng chen, and yonghui wu. massively multilingual neural machine translation in the wild: findings and challenges, 2019.  
+[15] yanping huang, youlong cheng, ankur bapna, orhan first, dehao chen, mia chen, hyoukjoong lee, jiquan ngiam, quoc v le, yonghui wu, and zhifeng chen. gpipe: efficient training of giant neural networks using pipeline parallelism. advances in neural information processing systems 32, pages 103-112, 2019.
+
+[16] noam shazeer, azalia mirhoseini, krzysztof maziarz, andy davis, quoc le, geoffrey hinton, and jeff dean. outrageously large neural networks: the sparsely-gated mixture-of-experts layer. arxiv preprint arxiv:1701.06538, 2017.  
+[17] madhu s. advani and andrew m. saxe. high-dimensional dynamics of generalization error in neural networks, 2017.  
+[18] joel hestness, sharan narang, newsha ardalani, gregory diamos, heewoo jun, hassan kianinejad, md. mostofa ali patwary, yang yang, and yanqi zhou. deep learning scaling is predictable, empirically, 2017.  
+[19] joel hestness, newsha ardalani, and gregory diamos. beyond human-level accuracy. proceedings of the 24th symposium on principles and practice of parallel programming, feb 2019.  
+[20] mario geiger, arthur jacot, stefano spigler, franck gabriel, levent sagun, stéphane d'ascoli, giulio biroli, clément hongler, and matthieu wyart. scaling description of generalization with number of parameters in deep learning. journal of statistical mechanics: theory and experiment, 2020(2):023401, feb 2020.  
+[21] martin abadi, paul barham, jianmin chen, zhifeng chen, andy davis, jeffrey dean, matthieu devin, sanjay ghemawat, geoffrey irving, michael isard, et al. tensorflow: a system for large-scale machine learning. in osdi, volume 16, pages 265-283, 2016.  
+[22] adam paszke, sam gross, soumith chintala, gregory chanan, edward yang, zachary devito, zeming lin, alban desmaison, luca antiga, and adam lerer. automatic differentiation in pytorch. 2017.  
+[23] noam shazeer, youlong cheng, niki parmar, dustin tran, ashish vaswani, penporn koanantakool, peter hawkins, hyoukjoong lee, mingsheng hong, cliff young, et al. mesh-tensorflow: deep learning for supercomputers. in advances in neural information processing systems, pages 10414-10423, 2018.  
+[24] aaron harlap, deepak narayanan, amar phanishayee, vivek seshadri, nikhil devanur, greg ganger, and phil gibbons. pipedream: fast and efficient pipeline parallel dnn training. arxiv preprint arxiv:1806.03377, 2018.  
+[25] emmanuel bengio, pierre-luc bacon, joelle pineau, and doina precup. conditional computation in neural networks for faster models, 2015.  
+[26] maha elbayad, jiatao gu, edouard grave, and michael auli. depth-adaptive transformer. arxiv, abs/1910.10073, 2020.  
+[27] ankur bapna, naveen arivazhagan, and orhan first. controlling computation versus quality for neural sequence models, 2020.  
+[28] xla: optimizing compiler for tensorflow. https://www.tensorflow.org/xla, 2019. online; accessed 1 june 2020.  
+[29] vinod nair and geoffrey e. hinton. rectified linear units improve restricted boltzmann machines. in icml, 2010.  
+[30] albert einstein. die grundlage der allgemeinen relativitätstheorie. in *das relativitätsprinzip*, pages 81-124. springer, 1923.  
+[31] jonathan shen, patrick nguyen, yonghui wu, zhifeng chen, mia xu chen, ye jia, anjuli kannan, tara sainath, yuan cao, chung-cheng chiu, et al. lingvo: a modular and scalable framework for sequence-to-sequence modeling. arxiv preprint arxiv:1902.08295, 2019.  
+[32] youlong cheng, hyoukjoong lee, and tamas berghammer. train ml models on large images and 3d volumes with spatial partitioning on cloud tpus. https://cloud.google.com/blog/products/ai-machine-learning/train-ml-models-on-large-images-and-3d-volumes-with-spatial-partitioning-on-cloud,tpus, 2019. online; accessed 12 june 2020.
+
+[33] onnx: open neural network exchange. https://github.com/onnx/onnx, 2019. online; accessed 1 june 2020.  
+[34] jared roesch, steven lyubomirsky, logan weber, josh pollock, marisa kirisame, tianqi chen, and zachary tatlock. relay: a new ir for machine learning frameworks. proceedings of the 2nd acm sigplan international workshop on machine learning and programming languages - mapl 2018, 2018.  
+[35] nadav rotem, jordan fix, saleem abdulrasool, garret catron, summer deng, roman dzhabarov, nick gibson, james hegeman, meghan lele, roman levenstein, jack montgomery, bert maher, satish nadathur, jakob olesen, jongsoo park, artem rakhov, misha smelyanskiy, and man wang. glow: graph lowering compiler techniques for neural networks, 2018.  
+[36] mpi forum. mpi: a message-passing interface standard. version 2.2, september 4th 2009. available at: http://www.mpi-forum.org (dec. 2009).  
+[37] minsk cho, ulrich finkler, and david kung. blueconnect: decomposing all-reduce for deep learning on heterogeneous network hierarchy. in proceedings of the conference on systems and machine learning (sysml), palo alto, ca, 2019.  
+[38] lynn elliot cannon. a cellular computer to implement the kalman filter algorithm. phd thesis, usa, 1969. aai7010025.  
+[39] orhan first, kyunghyun cho, and yoshua bengio. multi-way, multilingual neural machine translation with a shared attention mechanism. proceedings of the 2016 conference of the north american chapter of the association for computational linguistics: human language technologies, 2016.  
+[40] melvin johnson, mike schuster, quoc v. le, maxim krikun, yonghui wu, zhifeng chen, nikhil thorat, fernanda viégas, martin wattenberg, greg corrado, and et al. google's multilingual neural machine translation system: enabling zero-shot translation. transactions of the association for computational linguistics, 5:339–351, dec 2017.  
+[41] roee aharoni, melvin johnson, and orhan first. massively multilingual neural machine translation. corr, abs/1903.00089, 2019.  
+[42] exploring massively multilingual, massive neural machine translation. https://ai.googleblog.com/2019/10/exploring-massively-multilingual.html. accessed: 2020-06-05.  
+[43] recent advances in google translate. https://ai.googleblog.com/2020/06/recent-advances-in-google-translate.html. accessed: 2020-06-05.  
+[44] timothy t baldwin and j kevin ford. transfer of training: a review and directions for future research. personnel psychology, 41(1):63-105, 1988.  
+[45] yoshua bengio, nicholas léonard, and aaron courville. estimating or propagating gradients through stochastic neurons for conditional computation, 2013.  
+[46] andrew davis and itamar arel. low-rank approximations for conditional feedforward computation in deep neural networks, 2013.  
+[47] jakob uszkoreit, jay m. ponte, ashok c. popat, and moshe dubiner. large scale parallel document mining for machine translation. in proceedings of the 23rd international conference on computational linguistics, coling '10, page 1101-1109, usa, 2010. association for computational linguistics.  
+[48] kishore papineni, salim roukos, todd ward, and wei-jing zhu. bleu: a method for automatic evaluation of machine translation. in proceedings of the 40th annual meeting on association for computational linguistics, pages 311-318. association for computational linguistics, 2002.  
+[49] ankur bapna, mia chen, orhan first, yuan cao, and yonghui wu. training deeper neural machine translation models with transparent attention. proceedings of the 2018 conference on empirical methods in natural language processing, 2018.
+
+[50] kazuki irie, albert zeyer, ralf schlüter, and hermann ney. language modeling with deep transformers. interspeech 2019, sep 2019.  
+[51] qiang wang, bei li, tong xiao, jingbo zhu, changliang li, derek f. wong, and lidia s. chao. learning deep transformer models for machine translation. proceedings of the 57th annual meeting of the association for computational linguistics, 2019.  
+[52] david r. so, chen liang, and quoc v. le. the evolved transformer, 2019.  
+[53] using bfloat16 with tensorflow models. https://cloud.google.com/tpu/docs/bfloat16, 2020. online; accessed 12 june 2020.  
+[54] heng-tze cheng, mustafa ispir, rohan anil, zakaria haque, lichan hong, vihan jain, xiaobing liu, hemal shah, levent koc, jeremiah harmsen, and et al. wide and deep learning for recommender systems. proceedings of the 1st workshop on deep learning for recommender systems - dlrs 2016, 2016.  
+[55] andrew k. lampinen and surya ganguli. an analytic theory of generalization dynamics and transfer learning in deep linear networks, 2018.  
+[56] mohammad shoeybi, mostofa patwary, raul puri, patrick legresley, jared casper, and bryan catanzaro. megatron-lm: training multi-billion parameter language models usinggpu model parallelism. arxiv preprint arxiv:1909.08053, 2019.  
+[57] alex krizhevsky, ilya sutskever, and geoffrey e hinton. imagenet classification with deep convolutional neural networks. in advances in neural information processing systems, pages 1097-1105, 2012.  
+[58] christian szegedy, wei liu, yangqing jia, pierre sermanet, scott reed, dragomir anguelov, dumitru erhan, vincent vanhoucke, and andrew rabinovich. going deeper with convolutions. in proceedings of the ieee conference on computer vision and pattern recognition, pages 1-9, 2015.  
+[59] ilya sutskever, oriol vinyals, and quoc v le. sequence to sequence learning with neural networks. in advances in neural information processing systems, pages 3104-3112, 2014.  
+[60] dzmitry bahdanau, kyunghyun cho, and yoshua bengio. neural machine translation by jointly learning to align and translate. arxiv preprint arxiv:1409.0473, 2014.  
+[61] yonghui wu, mike schuster, zhifeng chen, quoc v le, mohammad norouzi, wolfgang macherey, maxim krikun, yuan cao, qin gao, klaus macherey, et al. google's neural machine translation system: bridging the gap between human and machine translation. arxiv preprint arxiv:1609.08144, 2016.  
+[62] geoffrey hinton, li deng, dong yu, george e dahl, abdel-rahman mohamed, navdeep jaitly, andrew senior, vincent vanhoucke, patrick nguyen, tara n sainath, et al. deep neural networks for acoustic modeling in speech recognition: the shared views of four research groups. ieee signal processing magazine, 29(6):82–97, 2012.  
+[63] william chan, navdeep jaitly, quoc le, and oriol vinyals. listen, attend and spell: a neural network for large vocabulary conversational speech recognition. in 2016 ieee international conference on acoustics, speech and signal processing (icassp), pages 4960-4964. ieee, 2016.  
+[64] chung-cheng chiu, tara n sainath, yonghui wu, rohit prabhavalkar, patrick nguyen, zhifeng chen, anjuli kannan, ron j weiss, kanishka rao, ekaterina gonina, et al. state-of-the-art speech recognition with sequence-to-sequence models. in 2018 ieee international conference on acoustics, speech and signal processing (icassp), pages 4774-4778. ieee, 2018.  
+[65] aaron van den oord, sander dieleman, heiga zen, karen simonyan, oriol vinyals, alex graves, nal kalchbrenner, andrew senior, and koray kavukcuoglu. wavenet: a generative model for raw audio. arxiv preprint arxiv:1609.03499, 2016.
+
+[66] jonathan shen, ruoming pang, ron j weiss, mike schuster, navdeep jaitly, zongheng yang, zhifeng chen, yu zhang, yuxuan wang, rj skerrv-ryan, et al. natural tts synthesis by conditioning wavenet on mel spectrogram predictions. in 2018 ieee international conference on acoustics, speech and signal processing (icassp), pages 4779-4783. ieee, 2018.  
+[67] chiyuan zhang, samy bengio, moritz hardt, benjamin recht, and oriol vinyals. understanding deep learning requires rethinking generalization. 2017.  
+[68] behnam neyshabur, srinadh bhojanapalli, david mcallester, and nathan srebro. exploring generalization in deep learning, 2017.  
+[69] paolo ienne, thierry cornu, and gary kuhn. special-purpose digital hardware for neural networks: an architectural survey. journal of vlsi signal processing systems for signal, image and video technology, 13(1):5-25, 1996.  
+[70] rajat raina, anand madhavan, and andrew y ng. large-scale deep unsupervised learning using graphics processors. in proceedings of the 26th annual international conference on machine learning, pages 873-880, 2009.  
+[71] dan claudi ciresan, ueli meier, luca maria gambardella, and jürgen schmidhuber. deep, big, simple neural nets for handwritten digit recognition. neural computation, 22(12):3207-3220, 2010.  
+[72] norman p jouppi, cliff young, nishant patil, david patterson, gaurav agrawal, raminder bajwa, sarah bates, suresh bhatia, nan boden, al borchers, et al. in-datacenter performance analysis of a tensor processing unit. in proceedings of the 44th annual international symposium on computer architecture, pages 1-12, 2017.  
+[73] 2019 recent trends in gpu price per flops. https://aiimpacts.org/2019-recent-trends-in-gpu-price-per-flops/. accessed: 2020-06-05.  
+[74] yifan sun, nicolas bohm agostini, shi dong, and david kaeli. summarizing cpu and gpu design trends with product data. arxiv preprint arxiv:1911.11313, 2019.  
+[75] jeffrey dean, greg corrado, rajat monga, kai chen, matthieu devin, mark mao, marc'aurilio ranzato, andrew senior, paul tucker, ke yang, et al. large scale distributed deep networks. in advances in neural information processing systems, pages 1223-1231, 2012.  
+[76] frédéric bastien, pascal lamblin, razvan pascanu, james bergstra, ian goodfellow, arnaud bergeron, nicolas bouchard, david warde-farley, and yoshua bengio. theano: new features and speed improvements. arxiv preprint arxiv:1211.5590, 2012.  
+[77] adam paszke, sam gross, soumith chintala, gregory chanan, edward yang, zachary devito, zeming lin, alban desmaison, luca antiga, and adam lerer. automatic differentiation in pytorch. 2017.  
+[78] john nickolls, ian buck, michael garland, and kevin skadron. scalable parallel programming with cuda. queue, 6(2):40-53, 2008.  
+[79] james bradbury, roy frostig, peter hawkins, matthew james johnson, chris leary, dougal maclaurin, and skye wanderman-milne. jax: composable transformations of python+numpy programs. 2018.  
+[80] roy frostig, matthew johnson, and chris leary. compiling machine learning programs via high-level tracing. in machine learning and systems (mlsys), 2018.  
+[81] zhihao jia, matei zaharia, and alex aiken. beyond data and model parallelism for deep neural networks. in proceedings of the conference on systems and machine learning (sysml), palo alto, ca, 2019.  
+[82] yuanzhong xu, hyoukjoong lee, dehao chen, hongjun choi, blake hechtman, and shibo wang. automatic cross-replica sharding of weight update in data-parallel training, 2020.
+
+[83] samyam rajbhandari, jeff rasley, olatunj ruwase, and yuxiong he. zero: memory optimization towards training a trillion parameter models. arxiv preprint arxiv:1910.02054, 2019.  
+[84] loren lugosch, derek nowrouzezahrai, and brett h. meyer. surprisal-triggered conditional computation with neural networks, 2020.  
+[85] chunyuan li, heerad farkhoor, rosanne liu, and jason yosinski. measuring the intrinsic dimension of objective landscapes, 2018.  
+[86] wesley j. maddox, gregory benton, and andrew gordon wilson. rethinking parameter counting in deep models: effective dimensionality revisited, 2020.  
+[87] noam shazeer. fast transformer decoding: one write-head is all you need. arxiv preprint arxiv:1911.02150, 2019.  
+[88] noam shazeer and mitchell stern. adafactor: adaptive learning rates with sublinear memory cost. arxiv, abs/1804.04235, 2018.  
+[89] taku kudo and john richardson. sentencepiece: a simple and language independent subword tokenizer and tokenizer for neural text processing. in emnlp, 2018.
+
+# a appendix
+
+# a.1 decoding with flat beam search
+
+during decoding, we use beam search with length normalization similar to [61]. decoding is auto-regressive and generates the target sequence one token at a time, so for an output of length  $m$  the decoder layer stack is executed  $m$  times, sequentially. in particular for each decoder moe layer there are dispatch/combine operations, which require cross-device communication. inference utilizes same cluster with same number of devices as training.
+
+during beam search we flatten the beam hypotheses into a single sequence which contains all underlying tokens interleaved, and we modify decoder self-attention mask so that each hypothesis only has attention to appropriate positions in the joint flat sequence. we apply the same transformation to key/value tensors maintained by each decoder self-attention layer. this allows us to avoid reordering previously computed attention key/values after each beam expansion. instead, we only reorder the  $0/1$  mask representing the current active hypotheses. however, attention becomes  $k$  times longer.
+
+this trade-off can be positive or negative depending on implementation details. as explained in [87], memory bandwidth limits are important for incremental decoding with transformer models. from this point of view, by flattening the beam we replace two operations with low compute/memory ratio (attention dot product and key/value reordering) with a single operation with a slightly higher compute/memory ratio (attention dot product over a longer sequence with more keys), but with the same total amount of memory it has to access.
+
+# a.2 machine translation experiments details
+
+in our machine translation experiments moe transformer models shared  $a)$  1024 transformer model dimension  $b)$  8192 feed forward and moe hidden dimension;  $c)$  16 heads in multi-head attention;  $d)$  128 attention key and value dimension; and  $e)$  0.1 input, residual and attention dropout rate.
+
+we used the adafactor [88] optimizer with  $a$  ) factored second-moment estimation;  $b$  ) first moment decay  $\beta_{1} = 0.0$ ;  $c$  ) second moment decay  $\beta_{2} = 0.99$  with  $1 - t^{-0.8}$  schedule;  $d$  ) update clipping threshold of 1.0; and  $e$  ) 1.0 learning rate with square root decay after 10k training steps.
+
+we used sentencepiece [89] subword tokenizer with a single multilingual vocabulary for source-side spanning 102 languages of size 64000, and english-only target-side vocabulary of size 32000.
+
+# a.3 general sharding api
+
+in addition to the two common apis (replicate() and split()) for sharding listed in section 3.2, users or the compiler may use a more advanced sharding strategy to minimize data transfers.
+
+shard(tensor, device_assignment) annotates tensor to be partitioned with the provided device assignment, and returns the annotated tensor. we use device assignment, a multi-dimensional integer array, to represent how the split is done. device_assignment has the same rank as the data tensor; its element count is the total number of partitions, and each element is the id of the device that occupies the corresponding data slice. for example, a 3d tensor with shape [3, 16, 64] with device assignment shape [1, 2, 4] will have partition shape [3, 8, 16], and the order of elements in device assignment determines which slice each partition occupies.
+
+![](images/08e2d3ff8eadb95f4f81f6c1e3e9e19aa89b51f1b7f9be92025e455c270c21fe.jpg)  
+mesh topology
+
+![](images/c69732bd3f5d857e52f94839288dc22b2f4a0b1779e4ded179d7609840714329.jpg)  
+tree topology
+
+![](images/282063ae4814a6dc52aabdbb4eab18864ad98b264c6aeffd641c20b3d399b56a.jpg)  
+device assignment
+
+![](images/ee09b0f813d2acce0a6d30249833b6d0e1040146a81c2728858481bbf2b30083.jpg)  
+device assignment  
+figure 10: an example of two different device assignments based on the device topology. a 2d tensor is split by 2x4 partitions and the communication pattern is between partitions along the rows of the tensor. the numbers represent device ids.
+
+since data movement across devices critically affects the parallel execution performance, it is important to consider the target device topology as well as the communication between partitions of the tensor when assigning device ids in the device assignment for maximum performance. figure 10 shows two different device assignments based on the device topology and the row-wise communication pattern on the tensor.
+
+# a.4 spmd partitioning for convolution and window-based operators
+
+gshard is able to partition spatial dimensions in convolutions, and general enough to support use cases like giant images [32]. to spatially shard a convolutional layer, we can use the sharding api in the following way.
+
+partition input images [n,c,h,w] along w spatial dimension
+
+inputs  $=$  split(inputs，3，d)
+
+replicate the kernel
+
+kernel = replicate(kernel)
+
+conv = conv2d(inputs, kernel)
+
+.
+
+gshard will then propagate the sharding on the spatial dimension to other layers and the backward pass. the rest of section discusses the specific complexity to partition convolution and similar operators. there are several window-based operations (e.g., convolution, reducewindow), and they all require some type of halo exchange since data may be shared between windows. we use the collectivepermute operator to exchange halo data between partitions, but one complication is that the halo size may be different across partitions whereas collectivepermute needs to be statically shaped.
+
+figure 11: convolution with non-constant halo size.  
+![](images/2a6ac94abca22810f23e44d0ddb042a9b27a5942450736ca8ab02a657d9d46ef.jpg)  
+base size: 12  
+window size: 3  
+padding low: 1  
+padding high: stride: 2  
+input shard size: 3  
+output shard size: 2  
+left halo size for shard i: 1 -1* i  
+right halo size for shard i: 1 + 1 * i
+
+![](images/c9a3e037d91da5099db6f8cac2bdfd1ed5fd833abca82ca14e5fe868bb6728b5.jpg)  
+figure 12: sequence of operations for a general halo exchange.
+
+we first introduce the window configurations that the spmd partitioner has to consider. each spatial dimension in the convolution has the following set of configurations.
+
+- stride is the distance (in number of elements) that the window moves to produce the next output element.  
+- low/high padding is the number of elements padded to the low/high end of the dimension in lhs (base).  
+- base dilation is the dilation factor of the lhs, i.e., one plus the number of elements padded between every element (excluding low/high padding). no base dilation means the value is set to 1.  
+- window dilation is one plus the number of elements padded between every element in the rhs (window).
+
+non-constant halo size. we demonstrate that non-constant halo size is common using a simple example, which does not have dilation. figure 11 shows a 4-way partitioned convolution, where the right halo sizes for the partitions are (1, 2, 3, 4) and can be expressed as a linear function of the partition id: partition_id + 1. partition 1 is in charge of generating 2 output elements (red cells), which means that the partition needs to get 0 elements from partition 0, and 2 elements from partition 2 (area covered by two dotted red windows).
+
+figure 12 describes the sequence of operations for a general halo exchange. first, we calculate the maximum size of left and right halo across partitions and perform the halo exchange of the maximum size (steps 1 and 2). since some partitions may have excessive halos than needed, we use dynamicslice (based on the partition id) to slice off the valid region for the current partition (step 3). finally, some partitions may include garbage values (e.g., halos from out-of-range input data), so we apply masking as described in section 3.3.3.
+
+base dilation. base dilation adds additional complexities to halo exchange, since the offset of each partition may be positioned at the dilation holes, and also low/high padding is applied after dilation, which makes the edges have different behavior than the interior elements. we handle base dilation in 3 cases (figure 13).
+
+![](images/ee0bfdf86dd4a696df28b25880b82a6ce882c3a9b47b2ef9009bd87f251a0f5e.jpg)  
+figure 13: partitioned convolution with base dilation.
+
+- stride  $\times$  per_shard_window_count is divisible by dilation, where per_shard_window_count is the number of windows to be processed by each partition (i.e., the number of output elements for each partition). this condition guarantees that all partitions start with the same number of (interior or low) padding elements before the first data element in the lhs, so that we can use the same low padding. halo exchange occurs on the non-dilated/non-padded base region, and the limit index of required data for partition  $i$  can be calculated as below.
+
+$$
+\frac {\text {s t r i d e} \times \text {p e r s h a r d w i n d o w c o u n t} \times i + \text {w i n d o w s i z e} - \text {l o w p a d} + \text {d i l a t i o n} - 1}{\text {d i l a t i o n}},
+$$
+
+which determines the right halo size. because stride  $\times$  per_shard_window_count is divisible by dilation, it can be simplified as  $a\times i + b$ , where  $a$  and  $b$  are both constants.
+
+- stride  $= = 1$  but per_shard_window_count is not divisible by dilation. in this case, the low padding on different partitions are different, but it is a static configuration in windowed operations, which can't be specialized for each partition for spmd execution. using pad and dynamicslice on the operand also would not work, because those operators would be applied before dilation, so everything would be multiplied by the dilation factor. fortunately, with stride  $= = 1$ , all positions on the padded and dilated base region are valid window starts, and we can use the maximum low padding on all partitions to ensure that each partition calculates all required windows, then do a dynamicslice on the output of the partitioned windowed operator to remove unnecessary data. the limit index of required data on the non-padded base region for partition  $i$  is same as before,
+
+$$
+\frac {\text {p e r} _ {\text {s h a r d}} \text {w i n d o w} _ {\text {c o u n t}} \times i + \text {w i n d o w} _ {\text {s i z e}} - \text {l o w} _ {\text {p a d}} + \text {d i l a t i o n} - 1}{\text {d i l a t i o n}},
+$$
+
+but cannot be simplified to  $a \times i + b$ .
+
+- stride  $\neq 1$  and stride  $\times$  per_shard_window_count is not divisible by dilation. if neither of the above conditions are true, different partitions could start with different number of padding elements, and not all offsets are valid window starts. consider the last example in
+
+figure 13. whatever low padding we chose, some partition will be invalid, because the valid windows could be skipped since stride  $\neq 1$ . a solution to this problem is to pad the window in addition to padding the base area. we can use the maximum low padding required by the partitions on the base area, then increase the window size by that low padding amount. however, the low and high padding amounts on the window vary on different partitions, which can be implemented by a pad followed by a dynamicslice. the window padding is used to mask off the unaligned elements in the base area, so that the start of the non-padding window element will be aligned with the desired start in the base area for each partition.
+
+window dilation. if the rhs is replicated, window dilation only affects the effective window size when partitioning the operator based on its lhs. if the dilated rhs is also partitioned, which typically occurs in the gradient computation of strided convolutions, handling window dilation is still simpler than handling base dilation, because there is no low/high padding on the rhs. we skip the details of the implementation.

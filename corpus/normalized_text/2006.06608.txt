@@ -1,0 +1,541 @@
+# gnnadvisor: an adaptive and efficient runtime system for gnn acceleration on gpus
+
+yuke wang, boyuan feng, gushu li, shuangchen li, lei deng, yuan xie, and yufei ding  
+university of california, santa barbara
+
+# abstract
+
+as the emerging trend of graph-based deep learning, graph neural networks (gnns) excel for their capability to generate high-quality node feature vectors (embeddings). however, the existing one-size-fits-all gnn implementations are insufficient to catch up with the evolving gnn architectures, the ever-increasing graph sizes, and the diverse node embedding dimensionalities. to this end, we propose gnnadvisor<sup>1</sup>, an adaptive and efficient runtime system to accelerate various gnn workloads on gpu platforms. first, gnnadvisor explores and identifies several performance-relevant features from both the gnn model and the input graph, and uses them as a new driving force for gnn acceleration. second, gnnadvisor implements a novel and highly-efficient 2d workload management, tailored for gnn computation to improve gpu utilization and performance under different application settings. third, gnnadvisor capitalizes on the gpu memory hierarchy for acceleration by gracefully coordinating the execution of gnns according to the characteristics of the gpu memory structure and gnn workloads. furthermore, to enable automatic runtime optimization, gnnadvisor incorporates a lightweight analytical model for an effective design parameter search. extensive experiments show that gnnadvisor outperforms the state-of-the-art gnn computing frameworks, such as deep graph library  $(3.02\times$  faster on average) and neugraph (up to  $4.10\times$  faster), on mainstream gnn architectures across various datasets.
+
+# 1 introduction
+
+graph neural networks (gnns) emerge to stand on the frontline for handling many graph-based deep learning tasks (e.g., node embedding generation for node classification [9, 14, 23] and link prediction [6, 28, 51]). compared with standard methods for graph analytics, such as random walks [16, 47] and graph laplacians [7, 34, 35], gnns highlight themselves
+
+with the interleaved two-phase execution of both graph operations (scatter-and-gather [15]) at the aggregation phase, and neural network (nn) operations (matrix multiplication) at the update phase, to achieve significantly higher accuracy [27, 52, 55] and better generality [17]. yet, the state-of-the-art gnn frameworks [11, 36, 53, 54], which follow a one-size-fits-all implementation scheme, often suffer from poor performance when handling more complicated gnn architectures (i.e., more layers and higher hidden dimensionality in each layer) and diverse graph datasets.
+
+specifically, previous work that supports both gnn training and inference can be classified into two categories. the first type [36,54] is built on popular graph processing systems and is combined with nn operations. the second type [11,53], in contrast, starts with deep learning frameworks and is extended to support vector-based graph operations. however, these existing solutions are still preliminary and inevitably fall short in the following three major aspects, even on common computing platforms such as gpus.
+
+failing to leverage gnn input information. gnn models demonstrate great diversity in terms of layer sequences, types of aggregation methods, and the dimension size of node embeddings. these profoundly impact the effectiveness of various system optimization choices. the diversity of input graphs further complicates the problem. unfortunately, current gnn frameworks [11, 36, 53] follow a one-size-fits-all optimization scheme and fail to craft an optimization strategy that maximizes efficiency for a particular gnn application's settings. some classical graph systems [2, 3] have exploited input characteristics to facilitate more efficient optimizations, but they only focus on simple graph algorithms like pagerank [45] while having no support for gnn models.
+
+optimizations not tailored to gnn. while the update phase in gnns involves nn operations that are dense in computation and regular in memory access, the aggregation phase is usually sparse in computation and highly irregular in memory access. without dedicated optimization, it will inevitably become the performance bottleneck. existing gnn frameworks [11, 36, 53] simply extend the optimization schemes
+
+![](images/dfb00a0e00b57c93d919916a8389ee0684eaf82c8d201806ec52aff1ad1a5a38.jpg)  
+figure 1: overview of gnnadvisor.
+
+from classical graph systems [26, 54], and do not address the difference between gnn and graph processing. for example, each node is associated with an embedding attribute in gnns while each node only has a single scalar attribute in traditional graph processing. such difference invokes novel design principles for gnns towards more aggressive parallelism and more efficient memory optimization.
+
+listing 1: example of a 2-layer gcn in gnnadvisor.  
+```python
+import gnnadvisor as gnna   
+import torch   
+# import other packages ...   
+# create a gcn class.   
+class gcn(torch.nnmodule): def init(self, indim, hidim, outdim, nlayers): self.layers = torch.nn.modulelist() self.layers.append(gnna.gcnconv(indim, hidim)) for i in range(nlayers - 2): layer  $=$  gnna.gcnconv(hidim, hidim) self.layers.append(layer) self.layers.append(gnna.gcnconv(hidim, outdim)) self softmax  $\equiv$  torch.nnsoftmax() def forward(self, x, graph, param): for i in range(len(self.layers)): x = self.layers[i] (x, graph, param) x = self.relu(x) x = self softmax(x) return x   
+# define a two-layer gcn model.   
+model  $=$  gcn(indim=100, hidim=16, outdim=10, nlayers=2)   
+# loading graph and extracting input properties. graphobj, info  $\equiv$  gnna loadedextractor(graphfile, model) # set runtime parameters automatically. x, graph, param  $\equiv$  gnna.decider(graphobj, inputinfo)   
+# run model.   
+predict_y  $\equiv$  model(x, graph, param)   
+# compute loss and accuracy.   
+# gradient backpropagation for training.
+```
+
+poor runtime support for input adaptability. prior gnn frameworks [11,36,53] rely on a python-based high-level programming interface for ease of user implementation. these frameworks employ static optimizations through a compiler or manually-optimized libraries. nevertheless, some critical performance-related information for a gnn is only available at runtime (e.g., node degree and embedding size). without adaptable designs that can leverage such runtime information, we would easily suffer from an inferior performance because
+
+of the largely under-utilized the gpu computing resources and inefficient irregular memory access. this limitation motivates the need for runtime environments with flexible designs to handle a wide spectrum of inputs effectively.
+
+to this end, we propose, gnnadvisor, an adaptive and efficient runtime system for gnn acceleration on gpus. gnnadvisor leverages pytorch [46] as the front-end to improve programmability and ease user implementation. we show a representative 2-layer graph convolutional network (gcn) [27] in gnnadvisor at listing 1. at the low level, gnnadvisor is built with c++/cuda and integrated with pytorch framework by using pytorch wrapper. it can be viewed as a new type of pytorch operator with a set of kernel optimizations and runtime support. it can work seamlessly with existing operators from the pytorch framework. data is loaded with the data loader written in pytorch and passed as a tensor to gnnadvisor for computation on gpus. once the gnnadvisor completes its computation at the gpu, it will pass the data tensor back to the original pytorch framework for further processing. as detailed in figure 1, gnnadvisor consists of several key components to facilitate the gnn optimization and execution on gpus. first, gnnadvisor introduces an input loader&extractor to exploit the input-level information that can guide our system-level optimizations. second, gnnadvisor incorporates a decider consisting of analytical modeling for automatic runtime parameter selection to reduce manual effort in design optimization, and a lightweight node renumbering routine to improve graph structural locality. third, gnnadvisor integrates a kernel&runtime crafter to customize our parameterized gnn kernel and cuda runtime, which consists of an effective 2d workload management (considering both the number of neighbor nodes and the node embedding dimensionality) and a set of gnn-specialized memory optimizations.
+
+note that in this project, we mainly focus on the setting of single-gpu gnn computing, which is today's most popular design adopted as the key component in many state-of-the-art frameworks, such as dgl [53] and pyg [11]. single-gpu gnn computing is desirable for two reasons: first, many gnn applications with small to medium size graphs (e.g., molecule structure) can easily fit the memory of a single gpu. second, in the case of large-size graphs that can only be handled by out-of-gpu-core and multi-gpu processing, numerous well-studied graph partition strategies (e.g., metis [22])
+
+can cut the giant graphs into small-size subgraphs to make them suitable for a single gpu. therefore, the optimization of both the out-of-gpu-core (e.g., gpu streaming processing) and multi-gpu gnn computation still largely demands performance improvements on a single gpu. moreover, while our paper focuses on gnns, our proposed methodology can be applied to optimize various types of irregular workload (e.g., social network analysis) targeting gpus as well.
+
+overall, we make the following contributions:
+
+- we are the first to explore gnn input properties (§3) (e.g., gnn model architectures and input graphs), and give an in-depth analysis of their importance in guiding system optimizations for gpu-based gnn computing.  
+- we propose a set of gnn-tailored system optimizations with parameterization, including a novel 2d workload management ( $\s 4$ ) and specialized memory customization ( $\s 5$ ) on gpus. we incorporate the analytical modeling and parameter auto-selection ( $\s 6$ ) to ease the design space exploration.  
+- comprehensive experiments demonstrate the strength of gnnadvisor over state-of-the-art gnn execution frameworks, such as deep graph library (average  $3.02 \times$ ) and neugraph (average  $4.36 \times$ ), on mainstream gnn architectures across various datasets.
+
+# 2 background and related work
+
+in this section, we introduce the basics of gnns and two major types of gnn computing frameworks: gpu-based graph systems and deep learning frameworks.
+
+# 2.1 graph neural networks
+
+figure 2 visualizes the computation flow of gnns in one iteration. gnns compute the node feature vector (embedding) for node  $\nu$  at layer  $k + 1$  based on the embedding information at layer  $k$  ( $k \geq 0$ ), as shown in equation 1,
+
+$$
+\begin{array}{l} a _ {v} ^ {(k + 1)} = \mathbf {a g g r e g a t e} ^ {(k + 1)} \left(h _ {u} ^ {(k)} \mid u \in \mathbf {n} (v) \cup h _ {v} ^ {(k)}\right) \tag {1} \\ h _ {v} ^ {(k + 1)} = \mathbf {u p d a t e} ^ {(k + 1)} \left(a _ {v} ^ {(k + 1)}\right) \\ \end{array}
+$$
+
+where  $h_{\nu}^{(k)}$  is the embedding vector for node  $\nu$  at layer  $k$ ;  $h_{\nu}^{(0)}$  is computed from the task-specific features of a vertex (e.g., the text associated with the vertex, or some scalar properties of the entity that the vertex represents) via some initial embedding mapping that is used only for this ingest of symbolic values into the embedding space;  $a_{\nu}^{(k + 1)}$  is the aggregation results through collecting neighbors' information (e.g., node embeddings);  $\mathbf{n}(\nu)$  is the neighbor set of node  $\nu$ . the aggregation method and the order of aggregation and update could vary across different gnns. some methods [17,27] just rely on the
+
+neighboring nodes while others [52] also leverage edge properties, by combining the dot product of the end-point nodes of each edge, along with any edge features (edge type and other attributes). the update function is generally composed of standard nn operations, such as a single fully connected layer or a multi-layer perceptron (mlp) in the form of  $w \cdot a_{\nu}^{(k + 1)} + b$ , where  $w$  and  $b$  are the learnable weight and bias parameters, respectively. the common choices for node embedding dimensions are 16, 64, and 128, and the embedding dimension may change across different layers.
+
+![](images/f16afa48c509f338b32b19356cb2f77bbb9ef591f7ddce9c08a11dfe5d28f877.jpg)  
+figure 2: gnn general computation flow.
+
+after passing through several iterations of aggregation and update (i.e., several gnn layers), we will get the output embedding of each node, which can usually be used for various downstream graph-based deep learning tasks, such as node classification [9, 14, 23] and link prediction [6, 28, 51]. note that the initial node embedding for gnn's input layer may come with the original graph dataset or can be generated by a set of graph embedding algorithms, such as [5, 10, 16], which is not included in the computation of gnns models (generating the hidden and output node embeddings).
+
+# 2.2 graph processing systems
+
+numerous graph processing systems [26, 32, 33, 38, 54] have been proposed to accelerate traditional graph algorithms. the major commonalities of these systems include the vertex/node-centric programming abstraction, edge-centric processing, and system optimizations to reduce the computation irregularity (e.g., workload imbalance) and memory access irregularity (e.g., non-coalesced global memory access). however, extending these graph processing systems to support gnn computing meets with substantial challenges.
+
+first, the common algorithm optimizations in graph processing may not benefit gnns. for example, graph traversal algorithms, such as breadth-first search, rely on iterative computing on node frontiers (active neighbors). therefore, a set of frontier-based optimizations, such push-pull traversal [32, 33], and frontier filtering [32, 33, 54], have been extensively studied. however, gnns consistently maintain fixed-sized frontiers (all neighbors) of each node across iterations.
+
+second, the system optimization techniques for graph processing would benefit gnns only after careful adaptation and calibration. for example, node/edge-centric processing [33, 54] and shard-based graph representation [26] are tailored for processing nodes/edges represented with a single scalar attribute. in gnns, there's another dimension for data parallelism, namely the embedding dimension, which tends to be large. therefore, previous design trade-offs between the coarse-grained node-level parallelism and node-value locality should be further extended to balance dimension-wise parallelism and node-embedding locality at a finer granularity.
+
+third, some essential functionalities of gnn computing are missing in graph systems. for example, the node update based on nn computing for both the forward value propagation and the complicated backward gradient propagation is not available in graph systems [26, 29, 32, 33, 38, 49, 54]. in contrast, pytorch [46] and tensorflow [1] feature an analytic differentiation function for automatic gradient computations on various deep learning model architectures and functions. therefore, extending the graph-processing system to support gnn computing requires non-trivial efforts, and thus we develop gnnadvisor on top of a deep learning framework.
+
+# 2.3 deep learning frameworks
+
+various nn frameworks have been proposed, such as tensorflow [1], and pytorch [46]. these frameworks provide the end-to-end training and inference support for traditional deep-learning models with various nn operators, such as linear and convolutional operators. these operators are highly optimized for euclidean data (e.g., image) but lack support for non-euclidean data (e.g., graph) in gnns. extending nn frameworks to support gnn that takes the highly-irregular graphs as the input is facing several challenges.
+
+first, nn-extended gnn computing platforms [11,53] focus on programmability and generality for different gnn models but lack efficient backend support to achieve high performance. for example, pytorch-geometric (pyg) [11] uses the torch-scatter [12] library implemented with cuda as its major building block of graph aggregation operations. the torch-scatter implementation scales poorly when encountering large sparse graphs with high-dimensional node embedding because its kernel design essentially borrows the design principles of graph-processing systems by using excessive high-overhead atomic operations to support node embedding propagation. a similar scalability problem is also observed in deep graph library (dgl) [53], which incorporates an off-the-shelf sparse-matrix multiplication (spmm) (e.g., csrmm2 in cusparse [39]) for simple sum-reduced aggregation [17,27] and leverages its own cuda kernel for more complex aggregation scheme with edge attributes [52, 55].
+
+second, major computation kernels [11, 53] are hard-coded without design flexibility, which is essential to handle diverse application settings with different input graph sizes and node embedding dimensionality. from the high-level inter
+
+face, users are only allowed to define the way of composing these kernels externally. users are not allowed to customize kernels internally based on the known characteristics of gnn model architectures, gpu hardware, and graph properties.
+
+# 3 input analysis of gnn applications
+
+in this section, we argue that the gnn input information can guide the system optimization, based on our key observation that different gnn application settings would favor different optimization choices. we introduce two types of gnn input information and discuss their potential performance benefits and extraction methods.
+
+# 3.1 gnn model information
+
+while the gnn update phase follows a relatively fixed computing pattern, the gnn aggregation phase shows high diversity. the mainstream aggregation methods of gnns can be categorized into two types:
+
+the first type is aggregation (e.g., sum, and min) with only the embeddings of neighbor nodes, as in graph convolutional network (gcn) [27]. for gnns with this type of aggregation, the common design practice is to reduce the node embedding dimensionality during the update phase (i.e., multiplying the node embedding matrix with the weight matrix) [11, 27, 53] before the aggregation (gather information from neighbor node embedding) at each gnn layer, thereby, largely reducing the data movements during the aggregation. in this case, improving memory locality would be more beneficial, in that more node embeddings can be cached in fast memory (e.g., l1 cache of gpus) to exploit performance benefits.
+
+the second type is aggregation with special edge features (e.g., weights, and edge vectors that are computed by combining source and target nodes) applied to each neighbor node, as in graph isomorphism network (gin) [55]. this type of gnn must work on large full-dimensional node embeddings to compute the special edge features at the node aggregation. in this case, the fast memory (e.g., shared memory of gpu stream-multiprocessors) is not large enough to exploit memory locality. however, improving computation parallelization (e.g., workload partitioning along the embedding dimension) would be more helpful, considering that workloads can be shared among more concurrent threads for improving overall throughput.
+
+we illustrate this aggregation-type difference with the mathematical equations for gcn and gin. with gcn, the output embedding  $\mathbf{x}$  is computed as follows:
+
+$$
+\mathbf {x} ^ {\prime} = \hat {\mathbf {d}} ^ {- 1 / 2} \hat {\mathbf {a}} \hat {\mathbf {d}} ^ {- 1 / 2} \mathbf {x} \mathbf {w}, \tag {2}
+$$
+
+where  $\hat{\mathbf{d}}$  is the diagonal node degree matrix;  $\mathbf{w}$  is the weight matrix;  $\hat{\mathbf{a}}$  is the graph adjacency matrix. for gin, the output
+
+embedding  $\mathbf{x}$  for each layer is computed as follows:
+
+$$
+\mathbf {x} _ {i} ^ {\prime} = h \left((1 + \varepsilon) \cdot \mathbf {x} _ {i} + \sum_ {j \in \mathcal {n} (i)} \mathbf {x} _ {j}\right) \tag {3}
+$$
+
+where  $h$  denotes a neural network, e.g., an mlp, which maps node features  $x$  with input embedding dimension and output embedding dimension;  $\varepsilon$  is a configurable/trainable parameter depending on the users' demands or application settings;  $\mathcal{n}(i)$  denotes the neighbor ids of the node  $i$ .
+
+assume we have gcn and gin with hidden dimension 16, and the input dataset has a node embedding dimension of 128. in the case of gcn, we will first do node update (gemm²-based linear transformation) of the node embedding, thus, at the aggregation, we only need to do aggregation on nodes with hidden dimension 16. in the gin case, we have to do neighbor aggregation on nodes with 128 dimensions then do node update to linearly transform node embedding from 128 to 16 dimensions. such an aggregation difference would also lead to different optimization strategies, where gcn would prefer more memory optimization on the small node embeddings while gin would prefer more computing parallelism on the large node embeddings.
+
+to conclude, the type of aggregation in gnns should be considered for system-level optimization and it can be obtained by gnnadvisor's built-in parser of gnn model properties.
+
+# 3.2 graph information
+
+node degree & embedding dimensionality: real-world graphs generally follow the power-law distribution [50] of node degrees. such distribution already causes workload imbalance in traditional graph processing systems [18,25,32]. in gnn aggregation, such workload imbalance would be exacerbated due to the higher dimensionality of the node embeddings if we perform node-centric workload partitioning. moreover, node embedding would invalidate some cache-based optimizations that are originally applied to graph processing systems, since caches are usually small in size and insufficient to hold enough nodes with their embeddings. for example, in the graph processing scenarios with a scalar attribute for each node, we can improve performance by putting  $16 \times 10^{3}$  nodes on the 64kb l1 cache of each gpu thread block. however, in typical gnns with a 64-dimension embedding for each node, we can only fit 256 nodes on each gpu block's cache.
+
+with node degree and embedding dimensionality information, new optimization opportunities for gnns may appear because we can estimate the node's workload and its concrete composition based on such input information. if the workload size is dominated by the number of node neighbors (e.g.,
+
+![](images/0bb854ad29e06c9310d350465030268501cd83278f7857b3eb1502a18bb4cc4c.jpg)  
+(a) graph community
+
+![](images/ecfffd29527ec6e0ba4094ae9efead739fc8f439407413c50519bc722f994397.jpg)  
+(b) loading without community
+
+![](images/795fcf4880c21d59d846c67edd84b5499bbf7a8d77a2ecd1df2d4bbea5b4b3da.jpg)  
+(c) loading with community  
+figure 3: graph community and its potential benefits. note that "ld": loading operation. "com": community.
+
+large node degree), we may customize the design that could concurrently process more neighbors to increase the computing parallelism among neighbors. on the other hand, if the workload size is dominated by node embedding size (e.g., high-dimensional node embedding), we may consider boosting the computing parallelism along the node embedding dimension. note that the node degree and embedding dimension information can be extracted based on the loaded graph structure and node embedding vectors. gnnadvisor manages the gnn workload based on such information (section 4).
+
+graph community: graph community [13,30,37] is one key feature of real-world graphs, which describes that a small group of nodes tend to hold "strong" intra-group connections (many edges) while maintaining "weak" connections (fewer edges) with the remaining part of the graph. a motivating example of gnn optimization with graph community structure is shown in figure 3a. existing node-centric aggregation employed by many graph processing systems [26,54] is shown in figure 3b, where each node will first load its neighbors and then do aggregation independently. this strategy can achieve great computation parallelism when each neighbor has a lightweight scalar attribute. in this case, the benefit of loading parallelization would offset the downside of duplicate loading of some shared neighbors. however, in gnn computing where node embedding size is large, this node-centric loading would trigger significant unnecessary memory access since the cost of duplicate neighbor loading is now dominant and not offset by per-node parallelism. for example, aggregation of node  $a$ ,  $b$ ,  $c$ ,  $d$ , and  $e$  would load the embeddings of 15 nodes in total and most of these loads are repeated (both node  $a$  and  $b$  load the same node  $d$  during the aggregation). such loading redundancy is exacerbated with the increase of embedding dimensionality. on the other side, by considering the community structure of real-world graphs, unnecessary data loading for these "common" neighbors can be well reduced (figure 3c), where aggregation only requires loads of 5 distinct nodes.
+
+this idea sounds promising, but the effort to realize its benefits on gpus is non-trivial. existing approaches [19, 37] of exploiting the graph communities mainly target cpu platforms with a limited number of parallelized threads and mb-level cache sizes for each thread. their major goal is to exploit
+
+![](images/777a9ee42c33580d85d7baab46d7be68db0f4b7507eabc37199e86228415702e.jpg)  
+figure 4: neighbor partitioning. note that "np": node partitioning; "ep": edge partitioning; "ng": neighbor group.
+
+the data locality for every single thread. gpus, on the other side, are equipped with a massive number of parallel threads and kb-level cache sizes per thread. therefore, the key to exploiting graph community on gpus is to effectively exploit the data locality among threads by leveraging the l1 cache. specifically, we need first capture the communities of a graph and then map such locality from input level (node-id adjacency) to underlying gpu kernels (thread/warp/block-id adjacency). the major hardware-level insight is that threads close in their ids are more likely to share memory and computing resources, thus, improving the data spatial and temporal locality. gnnadvisor handles all these details through community-aware node renumbering and gnn-specialized memory optimizations (section 5).
+
+# 4 2d workload management
+
+gnns employ a unique space in graph computations, due to the representation of each node by a high-dimensional feature vector (the embedding). gnn workloads grow in two major dimensions: the number of neighbors and the size of the embedding dimension. gnnadvisor incorporates an input-driven parameterized 2d workload management tailored for gnns, including three techniques: coarse-grained neighbor partitioning, fine-grained dimension partitioning, and warp-based thread alignment.
+
+# 4.1 coarse-grained neighbor partitioning
+
+coarse-grained neighbor partitioning is a novel workload balance technique tailored to gnn computing on gpus. it aims to tackle the challenge of inter-node workload imbalance and redundant atomic operations.
+
+specifically, based on the loaded graph compressed-sparse row (csr) representation, our coarse-grained neighbor partitioning will first break down the neighbors of a node into a set of equal-sized neighbor groups, and treat the aggregation workload of each neighbor group (ng) as the basic workload unit for scheduling. figure 4 exemplifies an undirected graph
+
+and its corresponding neighbor partitioning result. the neighbors of node-0 are divided into two neighbor groups (ng-0 and ng-1) with a pre-determined group size of 2. neighbors (node-3 and node-5) of node-1 are covered by ng-2, while the neighbors of node-2 are spread among ng-{3,4,5}. to support the neighbor group, we introduce two components, the neighbor-partitioning module and the neighbor-partitioning graph store. the former is a lightweight module built on top of the graph loader by partitioning the graph csr into equal-size groups. note that each neighbor group only covers the neighbors of one target node for ease of scheduling and synchronization. the neighbor-partitioning graph store maintains the tuple-based meta-data of each neighbor group, including its ids, starting and ending position of its neighbor nodes in the csr representation, and the source node. for example, the meta-data of ng-2 will be stored as  $(2,1,(4,6))$ , where 2 is the neighbor-group id, 1 is the target node id,  $(4,6)$  is the index range of the neighbor nodes in csr.
+
+the benefits of applying the aggregation based on partitioning neighbors are three-fold: 1) compared with the more coarse-grained aggregation based on node/vertex-centric partitioning [26], neighbor partitioning can largely mitigate the size irregularity of the workload units, which would improve gpu occupancy and throughput performance; 2) compared with the more fine-grained edge-centric partitioning (used by existing gnn frameworks, such as pyg [11], for batching and tensorization, and graph processing systems [33,54] for massive computing parallelization), the neighbor-partitioning solution can avoid the overheads of managing many tiny workload units that might hurt the performance in many ways, such as scheduling overheads and the excessive amount of synchronizations; 3) it introduces a performance-related parameter, neighbor-group size ( $ngs$ ), which is used for design parameterization and performance tuning. neighbor partitioning works at a coarse granularity of individual neighbor nodes. it can largely mitigate the workload imbalance problem for low-dimension settings. for high-dimensional node embeddings, we employ a fine-grained dimension partitioning discussed in the next subsection to further distribute workloads of each neighbor group to threads. note that when the number of neighbors is not divisible by the neighbor group size, it will raise neighbor-group imbalance. such irregularity can be amortized by setting the neighbor-group size to a small number (e.g., 3).
+
+# 4.2 fine-grained dimension partitioning
+
+gnn distinguishes itself from traditional graph algorithms in its computation on the node embedding. to explore the potential acceleration parallelism along this dimension, we leverage a fine-grained dimension partitioning to further distribute the workloads of a neighbor group along the embedding dimension to improve aggregation performance. as shown in figure 5, the original neighbor-group workloads are evenly
+
+![](images/3ab64025db84d884a76d84d5cb4b6f40bac83d8f5ef84a8b1c8929c7bb0b0ca1.jpg)  
+figure 5: dimension partitioning.  $\oplus$ : accumulated add.
+
+distributed to 11 consecutive threads, where each thread manages the aggregation along one dimension independently (i.e., accumulation of all neighbor node embeddings towards the target node embedding). if the dimension size is larger than the number of working threads, more iterations would be required to finish the aggregation.
+
+there are two major reasons for using dimension partitioning. first, it can accommodate a more diverse range of embedding dimension sizes. we can either increase the number of concurrent dimension workers or enable more iterations to handle the dimension variation flexibly. this is essential for modern gnns with increasingly complicated model structures and different sizes of embedding dimension. second, it introduces another performance-related parameter – the number of working threads (dimension-worker  $(dw)$ ) for design customization. the value of this parameter can help to balance the thread-level parallelism and the single thread efficiency (i.e., computation workload per thread).
+
+# 4.3 warp-based thread alignment
+
+while the above two techniques answer how we balance gnn workloads logically, how to map these workloads to underlying gpu hardware for efficient execution is still unresolved. one straightforward solution is to assign consecutive threads to concurrently process workloads from different neighbor groups (figure 6a). however, different behaviors (e.g., data manipulation and memory access operations) among these threads would result in thread divergence and gpu underutilization. threads from the same warp proceed in a single-instruction-multiple-thread (simt) fashion and the warp scheduler can only serve one type of instruction per cycle. therefore, different threads have to wait for their turn for execution until the stream-multiprocessor (sm) warp scheduler issues their corresponding instructions.
+
+to tackle this challenge, we introduce a warp-aligned thread mapping in coordination with our neighbor and dimension partitioning to systematically capitalize on the performance benefits of balanced workloads. as shown in figure 6b, each warp will independently manage the aggregation workload from one neighbor group. therefore, the execution of different neighbor groups (e.g., ng-0 to ng-5) can be well parallelized without inducing warp divergence. there are several benefits in employing warp-based thread alignment. first, inter-thread synchronization (e.g., atomic operations)
+
+![](images/2a9ae6971493b6c5d54e3d60126026ad8f73240f789a22f25479a3207a6475df.jpg)  
+figure 6: warp-based thread alignment.
+
+can be minimized. threads of the same warp are working on different dimensions of the same neighbor group, thus no conflicts occur for either global or shared memory accesses by threads from the same warp.
+
+second, the workload of a single warp is reduced and different warps will process more balanced workloads. therefore, more small warps can be managed flexibly by sm warp schedulers to improve overall parallelism. considering the unavoidable global memory access of each warp during aggregation, increasing the number of warps can improve sm occupancy to hide latency. third, memory access can be coalesced. threads with consecutive ids from the same warp will access continuous memory addresses in global memory for node embeddings. therefore, compared with continuous thread mapping (figure 6c), warp-aligned thread mapping can merge memory requests from the same warp into one global memory transaction (figure 6d).
+
+# 5 specialized memory optimization
+
+to further exploit the benefits of 2d workload, we introduce gnn-specialized memory optimizations, community-aware node renumbering and warp-aware memory customization.
+
+# 5.1 community-aware node renumbering
+
+to explore the performance benefits of graph community (section 3.2), we incorporate lightweight node renumbering by reordering node ids to improve the temporal/spatial locality during gnn aggregation without compromising output correctness. the key idea is that the proximity of node ids would project to the adjacency of computing units on gpu where they get processed. in gnnadvisor, our 2d workload management assigns neighbor groups of a node to consecutive warps based on their node id. if two nodes are assigned with consecutive ids, their corresponding neighbor groups (warps) would be close to each other in their warp ids as well. thus, they are more likely to be scheduled closely on the same gpu sm with a shared l1 cache to improve the data locality on loaded common neighbors. to apply node renumbering effectively, two key questions must be addressed.
+
+when to apply: while graph reordering provides potential benefits for performance, we still need to figure out what
+
+![](images/7261aa6482008e5803429008fc0982ec3af88aa2d669b404cf803d71e7881a26.jpg)  
+(a)
+
+![](images/0cf9903a6801f69c1884aab6366d81c59f287368a6fbf5e1b9db30c23b68480a.jpg)  
+(b)  
+figure 7: graph edge connection patterns. note that each colored square represents the edge between two nodes. different colors in (a) represent edges from different communities. the red dot-line box indicates the sub-community.
+
+kind of graph would benefit from such reordering optimization. our key insight is that for graphs already in a shape approximating block-diagonal pattern in their adjacency matrix (figure 7a), reordering could not bring more locality benefits, since nodes within each community are already close to each other in terms of their node-ids. for graphs with a more irregular shape (figure 7b), where edge connections are distributed among nodes with an irregular pattern, the reordering could bring notable performance improvement (up to  $2 \times$  speedup, later discussed in section 7.5). to this end, we propose a new metric - averaged edge span (aes), to determine whether it is beneficial to conduct a graph reordering.
+
+$$
+\mathbf {a e s} = \frac {1}{\# e} \sum_ {\left(\operatorname {s r c} _ {i d}, \operatorname {t r g} _ {i d}\right) \in e} \left| \operatorname {s r c} _ {i d} - \operatorname {t r g} _ {i d} \right| \tag {4}
+$$
+
+where  $e$  is the edge set of the graph;  $\#e$  is the number of total edges;  $src_{id}$  and  $trg_{id}$  are the source and target node ids of each edge. computing aes is lightweight and can be done on-the-fly during the initial graph loading. our profiling of a large corpus of graphs also shows that when  $\sqrt{aes} > \left\lfloor \frac{\sqrt{\#n}}{100} \right\rfloor$  node numbering is more likely to improve runtime performance.
+
+how to apply: we leverage rabbit reordering [2], which is a fully parallelized and low-cost graph reordering technique. specifically, it first maximizes the graph modularity by hierarchically merging edges and clustering nodes. and it then generates node order within each cluster through dfs traversal. rabbit reordering has also been proved to outperform other graph clustering approaches [4, 8, 21, 22, 48], including community-based methods, such as metis [22], and bfs-based methods, such as reverse cuthill-mckee (rcm) [8]) in terms of better quality (data locality) of the captured graph communities, the ease of parallelization, and performance. more importantly, rabbit reordering can capture the graph communities hierarchically (i.e., a set of smaller sub-communities are included in a larger community, as exemplified in figure 7a). such communities at different levels of granularities would be a good match for the gpu cache hierarchy, where smaller sub-communities (occupying one sm) can enjoy the data locality benefit from the l1 cache, while larger
+
+communities (occupying multiple sms) can enjoy the data locality from the larger l2 cache. we quantitatively discuss such a locality benefit in section 7.4.
+
+# 5.2 warp-aware memory customization
+
+existing works [11, 54] utilize a large number of global memory accesses for reading and writing the embedding and a large number of atomic operations for aggregation (a reduction operation). however, this approach leads to heavy overhead and fails to exploit the potential benefits from shared memory. in particular, when aggregating on a target node with  $k$  neighbor groups (each has  $ngs$  neighbors with dim-dimensional embeddings) into a dim-dimensional embedding, it involves  $o(k \cdot ngs \cdot dim)$  atomic operations and  $o(k \cdot ngs \cdot dim)$  global memory accesses.
+
+by contrast, we propose a warp-centric shared memory optimization technique. our key insight is that by customizing shared memory layout according to the block-level warp organization pattern (figure 7), we can significantly reduce the number of atomic operations and global memory access. first of all, we reserve a shared memory space ( $4 \times dim$  bytes for floating-point embeddings) for the target node of each neighbor group (warp), such that the threads from a warp can cache the intermediate results of reduction in shared memory. later on, within a thread block, we designate only one warp (called leader) for copying the intermediate results of each target node to global memory considering that neighbors of each node can be spread across different warps. the detailed customization procedure is described in algorithm 1. specifically, each warp (maintained in warpptr) has three properties: nodesharedaddr (a shared memory address for the aggregation result of a neighbor-group), nodeid (the id of the target node), and leader (a boolean flag indicating whether the current warp is a leader warp for flushing out the result from the shared memory to the global memory). the major customization routine (line 4 to line 22) handles different warps based on their index position relative to thread blocks. note that such a shared memory customization is low-cost and is done only once on-the-fly with the regular graph initialization process before the gpu kernel execution.
+
+in our design, when a target node with  $k$  neighbor groups (each has  $ngs$  neighbors with  $dim$ -dimensional embeddings), it involves  $o(dim)$  atomic operations and  $o(dim)$  global memory accesses. to this end, we can save the atomic operations and global memory access by  $(k \cdot ngs) \times$ , thus significantly accelerating the aggregation operations. here, we treat  $ngs$  as a hyper-parameter to balance memory access efficiency and computation parallelism, and we further discuss its value selection in section 6.
+
+# 6 design optimization
+
+the parameters in our gpu kernel configurations can be tuned to accommodate various gnn models with graph data
+
+algorithm 1 warp-aware memory customization.  
+$\triangleright$  compute #neighbor-groups (#warps).   
+1: warpnum  $=$  neighborgroups  $\equiv$  computegroups(ngs);  $\triangleright$  compute the number of warps per thread block.   
+2: warpperblock  $=$  floor threadperblock/threadperwarp)  $\triangleright$  initialize tracking variables.   
+3: cnt  $= 0$  ;local_cnt  $= 0$  ;last  $= 0$    
+4: while cnt  $<$  warpnum do  $\triangleright$  warp in the front of a thread block.   
+5: if cnt % warpperblock  $= = 0$  then   
+6: warpptr[cnt].nodesharedaddr  $=$  local_cnt  $\times$  dim;   
+7: last  $=$  warpptr[cnt].nodeid;   
+8: warpptr[cnt].leader  $=$  true;  $\triangleright$  warp in the middle of a thread block.   
+9: else  $\triangleright$  warp with the same target node as its predecessor warp.   
+10: if warpptr[cnt].nodeid  $= =$  last) then   
+11: warpptr[cnt].nodesharedaddr  $=$  local_cnt;  $\triangleright$  warp with the different target node as its predecessor warp.   
+12: else   
+13: local_cnt++;   
+14: warpptr[cnt].nodesharedaddr  $=$  local_cnt;   
+15: last  $=$  warpptr[cnt].nodeid;   
+16: warpptr[cnt].leader  $=$  true;   
+17: end if   
+18: end if   
+ $\triangleright$  next warp belongs to a new thread block.   
+19: if  $(+ + c n t)\%$  warpperblock  $= = 0$  then   
+20: local_cnt  $= 0$  .   
+21: end if   
+22: end while
+
+sets. but it is not yet known how to automatically select the parameters which can deliver the optimal performance. in this section, we introduce the analytical model and the auto parameter selection in the decider of gnnadvisor.
+
+analytical modeling: the performance/resource analytical model of gnnadvisor has two variables, workload per thread (wpt), and shared memory usage per block (smem).
+
+$$
+\mathbf {w p t} = n g s \times \frac {\text {d i m}}{d w}, \quad \mathbf {s m e m} = \frac {t p b}{t p w} \times \text {d i m} \times \text {f l o a t s} \tag {5}
+$$
+
+where  $ngs$  and  $dw$  is the neighbor-group and dimension-worker size (section 4.2), respectively;  $dim$  is the node embedding dimension; ints and floats are both 4-byte on gpus;  $tpb$  is the thread-per-block and  $tpw$  is the thread-per-warp;  $tpw$  is 32 for gpus, while  $tpb$  is selected by users.
+
+parameter auto selection: to determine the value of the  $ngs$  and  $dw$ , we follow two steps. first, we determine the value of  $dw$  based on  $tpw$  (hardware constraint) and  $dim$  (input property), as shown in equation 6. note that we develop this equation by profiling different datasets and gnn models.
+
+$$
+d w = \left\{ \begin{array}{l l} t p w & d i m \geq t p w \\ \frac {t p w}{2} & d i m <   t p w \end{array} \right. \tag {6}
+$$
+
+second, we determine the value of  $ngs$  based on the selected  $dw$  and the user-specified  $tpb$ . the constraints include making  $wpt \approx 1024$  and  $smem \leq smemperblock$ . note that
+
+smemperblock is 48kb to 96kb on modern gpus [42,44]. across different gpus, even though the number of cuda cores and global memory bandwidth would be different, the single-thread workload capacity (measured by wpt) remains similar.  $tpb$  is usually chosen as a power of 2 but less than or equal 1024. our insight based on micro-benchmarking and previous literature [56] shows that smaller blocks (1 to 4 warps, i.e.,  $32 \leq tpb \leq 128$ ) can improve sm warp scheduling flexibility and avoid tail effects, thus leading to higher gpu occupancy and throughput. we further demonstrate the effectiveness of our analytical model in section 7.5.
+
+# 7 evaluation
+
+in this section, we comprehensively evaluate gnnadvisor in terms of the performance and adaptability on various gnn models, graph datasets, and gpus.
+
+# 7.1 experiment setup
+
+benchmarks: we choose the two most representative gnn models widely used by previous work [11, 36, 53] on node classification tasks to cover different types of aggregation. 1) graph convolutional network (gcn) [27] is one of the most popular gnn model architectures. it is also the key backbone network for many other gnns, such as graphsage [17], and differentiable pooling (diffpool) [57]. therefore, improving the performance of gcn will also benefit a broad range of gnns. for gcn evaluation, we use the setting: 2 layers with 16 hidden dimensions, which is also the setting from the original paper [27]. 2) graph isomorphism network (gin) [55]. gin differs from gcn in its aggregation function, which weighs the node embedding values from the node itself. in addition, gin is also the reference architecture for many other advanced gnns with more edge properties, such as graph attention network (gat) [52]. for gin evaluation, we use the setting: 5 layers with 64 hidden dimensions, which is the setting used in the original paper [55].
+
+baselines: we choose several baseline implementations for comparison. 1) deep graph library (dgl) [53] is the state-of-the-art gnn framework on gpus, which is built upon the famous tensor-oriented platform - pytorch [46]. dgl significantly outperforms the other existing gnn frameworks [11] over various datasets on many mainstream gnn architectures. therefore, we make an in-depth comparison with dgl in our evaluation; 2) pytorch-geometric (pyg) [11] is another gnn framework in which users can define their edge convolutions when building customized gnn aggregation layers; 3) neugraph [36] is a dataflow-centered gnn system on gpus built on tensorflow [1]; 4) gunrock [54] is the gpu-based graph processing framework with state-of-the-art performance on traditional graph algorithms (e.g., pagerank).
+
+datasets: we cover all three types of datasets, which have been used in previous gnn-related work [11, 36, 53]. type i
+
+table 1: datasets for evaluation.  
+
+<table><tr><td>type</td><td>dataset</td><td>#vertex</td><td>#edge</td><td>dim.</td><td>#class</td></tr><tr><td rowspan="4">i</td><td>citeseer</td><td>3,327</td><td>9,464</td><td>3,703</td><td>6</td></tr><tr><td>cora</td><td>2,708</td><td>10,858</td><td>1,433</td><td>7</td></tr><tr><td>pubmed</td><td>19,717</td><td>88,676</td><td>500</td><td>3</td></tr><tr><td>ppi</td><td>56,944</td><td>818,716</td><td>50</td><td>121</td></tr><tr><td rowspan="6">ii</td><td>proteins_full</td><td>43,471</td><td>162,088</td><td>29</td><td>2</td></tr><tr><td>ovcar-8h</td><td>1,890,931</td><td>3,946,402</td><td>66</td><td>2</td></tr><tr><td>yeast</td><td>1,714,644</td><td>3,636,546</td><td>74</td><td>2</td></tr><tr><td>dd</td><td>334,925</td><td>1,686,092</td><td>89</td><td>2</td></tr><tr><td>twitter-partial</td><td>580,768</td><td>1,435,116</td><td>1,323</td><td>2</td></tr><tr><td>sw-620h</td><td>1,889,971</td><td>3,944,206</td><td>66</td><td>2</td></tr><tr><td rowspan="5">iii</td><td>amazon0505</td><td>410,236</td><td>4,878,875</td><td>96</td><td>22</td></tr><tr><td>artist</td><td>50,515</td><td>1,638,396</td><td>100</td><td>12</td></tr><tr><td>com-amazon</td><td>334,863</td><td>1,851,744</td><td>96</td><td>22</td></tr><tr><td>soc-blogcatalog</td><td>88,784</td><td>2,093,195</td><td>128</td><td>39</td></tr><tr><td>amazon0601</td><td>403,394</td><td>3,387,388</td><td>96</td><td>22</td></tr></table>
+
+graphs are the typical datasets used by previous gnn algorithm papers [17,27,55]. they are usually small in the number of nodes and edges, but rich in node embedding information with high dimensionality. type ii graphs [24] are the popular benchmark datasets for graph kernels and are selected as the built-in datasets for pyg [11]. each dataset consists of a set of small graphs, which only have intra-graph edge connections without inter-graph edge connections. type iii graphs [27,31] are large in terms of the number of nodes and edges. these graphs demonstrate high irregularity in structure, which is challenging for most of the existing gnn frameworks. details of these datasets are listed in table 1.
+
+platforms & metrics: we implement gnnadvisor's backend with c++ and cuda c and its front-end with python. our major evaluation platform is a server with an 8-core 16-thread intel xeon silver 4110 cpu [20] and a quadro p6000 [42] gpu. besides, we use tesla v100 [44] gpu on the dgx-1 system [40] to demonstrate the generality of gnnadvisor. runtime parameters of different input settings are optimized by gnnadvisor decider. to measure the performance speedup, we calculate the averaged latency of 200 end-to-end inference (forward propagation) or training (forward+backward propagation).
+
+# 7.2 compared with dgl
+
+in this section, we first conduct a detailed experimental analysis and comparison with dgl on gnn inference, then extend our comparison for gnn training. as shown in figure 8, gnnadvisor achieves  $4.03 \times$  and  $2.02 \times$  speedup on average compared to dgl [53] over three types of datasets for gcn and gin on inference, respectively. we next provide detailed analysis and give insights for each type of datasets.
+
+type i graphs: the performance improvement against dgl is significantly higher for gcn (on average  $6.45 \times$ ) than gin (on average  $1.17 \times$ ). the major reason is their different gnn computation patterns. for gcn, node dimension reduction (dgemm) is always placed before aggregation. this largely reduce data movement and thread synchronization
+
+![](images/d49674a88b3ad5b37f41e1a73a9421a594c6e5e463b1e608cd8d5524ee8f6263.jpg)  
+figure 8: inference speedup  $(\times)$  over dgl on gcn and gin.
+
+overheads during the aggregation phase, which could gain more benefits from gnnadvisor's 2d workload management and specialized memory optimization for data locality improvements. gin, on the other side, has aggregation phase that must be finished before the node dimension reduction. thus, it cannot avoid high-volume memory access and data movements during the aggregation phase. therefore, it gets lower benefits from the data locality and the shared memory on gpus for fast and low-overhead memory access. however, our fine-grained dimension partitioning can still handle these high-dimensional cases effectively.
+
+type ii graphs: performance shows less difference between gcn  $(4.02\times)$  and gin  $(2.86\times)$  on the same datasets except for twitter-partial, which has the highest node embedding dimension (1323) in type ii graphs. it is worth noticing that the speedup for gin is consistently better compared with type i. there are two major reasons: 1) node feature dimension is much lower (average 66.5, excluding twitter-partial) versus type i (average 1421), which can gain more performance benefits from data spatial and temporal locality of our specialized memory optimizations; 2) type ii graphs intrinsically have good locality in their graph structure. the reason is that type ii datasets consist of small graphs with very dense intra-graph connections but no inter-graph edges, plus nodes within each small graph are assigned with consecutive ids. therefore, the performance gains of such graph-structure locality can be scaled up when combining with gnnadvisor's efficient workload and memory optimizations.
+
+type iii graphs: the speedup is also evident (average  $2.10 \times$  for gcn and average  $1.70 \times$  for gin) on graphs with a large number of nodes and edges, such as amazon0505. the reason is the high overhead inter-thread synchronization and global memory access can be well reduced through our 2d workload management and specialized memory optimization. besides, our community-aware node renumbering further facilitates an efficient workload sharing among adjacent threads (working on a group of nodes) through improving the data spatial/temporal locality. on the dataset artist, which has the smallest number of nodes and edges within type iii, we notice a lower performance speedup for gin. and we find that the artist dataset has the highest standard deviation of graph community sizes within type iii graphs, which makes it challenging to analyze the performance of these datasets.
+
+![](images/0e2b5afc32855759d619e0265befafbd1cdcfb562dd4a971a32af44842ea8b8e.jpg)  
+figure 9: training speedup  $(\times)$  over dgl on gcn and gin.
+
+lenging to 1) use the group community information to capture the node temporal and spatial locality in the gnn aggregation phase, and 2) capitalize on the performance benefits of using such a community structure for guiding system-level optimizations (e.g., warp-aligned thread mapping and shared memory customization) on gpus, which have a fixed number of computation and memory units within each block/sm.
+
+kernel metrics: for detailed kernel metrics analysis, we utilize nvprof [41] to measure two performance-critical (computation and memory) cuda kernel metrics: stream processor (sm) efficiency and cache  $(l1 + l2 + \text{texture})$  hit rate. gnnadvisor achieves on average  $24.47\%$  and  $12.02\%$  higher sm efficiency compared with dgl for gcn and gin, respectively, which indicates that our 2d workload management can strike a good balance between the single-thread efficiency and the multi-thread parallelism that are crucial to the overall performance improvement. gnnadvisor achieves on average  $75.55\%$  and  $126.20\%$  better cache hit rate compared with dgl for gcn and gin, correspondingly, which demonstrates the benefit of specialized memory optimizations.
+
+training support: we also evaluate the training performance of gnnadvisor on all three types of datasets compared with the dgl on both gcn and gin. compared with inference, training is more challenging, since it involves more intensive computation with the forward value propagation and the backward gradient propagation, both of which heavily rely on the underlying graph aggregation kernel for computation. as shown in figure 9, gnnadvisor consistently outperforms the dgl framework with average  $1.61 \times$  and average  $2.00 \times$  speedup on gcn and gin, respectively, which shows the strength of our input-driven optimizations. the key difference between training and inference of gnns is two-fold: first, backpropagation is needed in training. this step benefits from our improvements, as the backpropagation step is similar to the forward computation during the inference, and all the proposed methods are still beneficial; second, training incurs extra memory and data movement overheads for storing/accessing the activations of the forward pass until gradients can be propagated back.
+
+![](images/5973f6acadfdee19f3d0b0c858354e738834a3e4d2d763baf85087268944ea5b.jpg)  
+figure 10: training speedup  $(\times)$  over pyg on gcn and gin.
+
+table 2: latency (ms) comparison with neugraph (neug).  
+
+<table><tr><td>dataset</td><td>neug (ms)</td><td>ours (ms)</td><td>speedup</td></tr><tr><td>redgit-full</td><td>2460</td><td>599.69</td><td>4.10×</td></tr><tr><td>enwiki</td><td>1770</td><td>443.00</td><td>3.99×</td></tr><tr><td>amazon</td><td>1180</td><td>474.57</td><td>2.48×</td></tr></table>
+
+# 7.3 compared with other frameworks
+
+we compare with dgl on all input settings, since dgl is the overall best-performance gnn framework. in this section, we further compare gnnadvisor with three other representative gnn computing frameworks on their best settings.
+
+compared with pyg: as shown in figure 10, gnnadvisor can outperform pyg with  $1.78 \times$  and  $2.13 \times$  speedup on average for gcn and gin, respectively. for gcn, gnnadvisor achieves significant speedup on datasets with high-dimensional node embedding, such as twitter-partial, through 1) node dimension reduction before aggregation and 2) workload sharing among neighbor partitions and dimension partitions. for gin, gnnadvisor reaches  $2.45 \times$  speedup on datasets with a higher average degree, such as  $dd$ , since gnnadvisor can effectively distribute the workload of each node along their embedding dimension to working threads while balancing the single-thread efficiency and inter-thread parallelism. pyg, however, achieves inferior performance because 1) it has poor thread management in balancing workload and controlling synchronization overhead; 2) it heavily relies on the scatter-and-gather kernel, which lacks flexibility.
+
+compared with neugraph: for a fair end-to-end training comparison with neugraph that has not open-sourced its implementation and datasets, we 1) use the gpu (quadro p6000 [42]) that is comparable with the gpu of neugraph (tesla p100 [43]) in performance-critical factors, such as gpu architecture (both have the pascal architecture) and the number of cuda cores; 2) use the same set of inputs as neugraph on the same gnn architecture [36]; 3) use the datasets that are presented in their paper and are also publicly available. as shown in table 2, gnnadvisor outperforms neugraph with a significant amount of margin  $(1.3 \times$  to  $7.2 \times$  speedup) in terms of computation and memory performance. neugraph relies on general gpu kernel optimizations and largely ignores the input information. moreover, the optimizations in neugraph are built-in and fixed inside the framework without performance tuning flexibility. in contrast, gnnadvisor leverages gnn-featured gpu optimizations and demonstrates the key contribution of input insights for system optimizations.
+
+compared with gunrock: we make a performance com
+
+![](images/b2f27562efa1ff5d255d7366bc533a00f2a0d86d8f120af8c2588ce5c6ec7da7.jpg)  
+figure 11: speedup  $(\times)$  comparison with gunrock.
+
+parison between gnnadvisor and gunrock [54] on a single neighbor aggregation kernel of gnns (i.e., the sparse-matrix dense-matrix multiplication (spmm)) over the type iii graphs. as shown in figure 11, gnnadvisor outperforms gunrock with  $2.89 \times$  to  $8.41 \times$  speedup. there are two major reasons behind such an evident performance improvement on the sparse gnn computation: 1) gunrock focuses on graph-algorithm operators (e.g., frontier processing) but lacks efficient support for handling high-dimensional node embedding; 2) gunrock leverages generic optimizations without considering the input differences, thus, losing the adaptability for handling different gnn inputs efficiently.
+
+# 7.4 optimization analysis
+
+in this section, we explore and analyze the optimizations used in sections 4 and 5 in detail.
+
+neighbor partitioning: from figure 12a, we can see that with the increase of the neighbor-group size, the running time of gnnadvisor will first decrease. the increase of the neighbor-group size saturates the computation capability of each thread meanwhile improving the data locality and reducing the number of atomic operations (i.e., inter-thread synchronization overhead). however, when the neighbor-group size becomes larger than a certain threshold (e.g., 32 for the artist dataset), each thread reaches its computation capacity upper bound, and further increasing the neighbor-group size offers no more performance benefit instead increases the overall latency.
+
+dimension partitioning: as shown in figure 12b, the dimension worker impact is more evident in performance compared with the neighbor-group size at the range from 1 to 16. when the number of dimension worker increases from 16 to 32, the runtime performance shows very minor difference due to the already balanced single-worker efficiency and multiworker parallelism. therefore, further increase the number of dimension workers brings no more benefits.
+
+node renumbering: we demonstrate the benefit of node renumbering by profiling type iii datasets for gcn and gin. as shown in figure 12c, renumbering nodes within a graph can bring up to  $1.74 \times$  and  $1.49 \times$  speedup for gcn and gin, respectively. the major reason is that our community-aware node renumbering can increase the data spatial and temporal locality during gnn aggregation.
+
+to quantify such locality benefits, we extract the detailed gpu kernel metric - memory access in terms of read and
+
+write bytes from dram for illustration. our cuda kernel metric profiling results show that node renumbering can effectively reduce the memory access overhead (on average  $40.62\%$  for gcn and  $42.33\%$  for gin) during the runtime since more loaded node embeddings are likely to be shared among the nodes with consecutive ids. we also notice one input case that benefits less from our optimization - artist, since 1) the community size inside artist displays a large variation (high standard deviation), making it challenging to capture the neighboring adjacency and locality; 2) such a variation hurdles system-level (computation and memory) optimizations to effectively capitalize on the locality benefits of renumbering.
+
+block-level optimization: we show the optimization benefits of our block-level optimization (including warp-aligned thread mapping, and warp-aware shared memory customization). we analyze two kernel metrics (atomic operations reduction and dram access reduction) on three large graphs for illustration. as shown in figure 12d, gnnadvisor can effectively reduce the atomic operations and dram memory access by an average  $47.85\%$  and  $57.93\%$ . this result demonstrates 1) warp-aligned thread mapping based on neighbor partitioning can effectively reduce a large portion of atomic operations; 2) warp-aware shared memory customization can avoid a significant amount of global memory access.
+
+# 7.5 additional studies
+
+hidden dimensions of gnn: in this experiment, we analyze the impact of the gnn architecture in terms of the size of the hidden dimension for gcn and gin. as shown in figure 13a, we observe that with the increase of hidden dimension of gcn, the running time of gnnadvisor is also increased due to more computation (e.g., additions) and memory operations (e.g., data movements) during the aggregation phase and a larger size of the node embedding matrix during the node update phase. meanwhile, we also notice that gin shows a larger latency increase versus gcn, mainly because of the number of layers (2-layer gcn vs. 5-layer gin) that make such a difference more pronounced.
+
+overhead analysis: community-aware node renumbering is the major source of overhead for leveraging gnn input information, and other parts are negligible. here as a case study, we evaluate its overhead on the training phase of gcn on type iii graphs, given the optimization decision from our gnnadvisor decider (as discussed in section 5). here we use training for illustration; inference in a real gnn application setting would also use the same graph structure many times [17,27,27] with different node embeddings inputs. as shown in figure 13b, node-renumbering overhead is consistently small (average  $4.00\%$ ) compared with overall training time. we thus conclude that such one-time overhead can be amortized over gnn running time, which demonstrates its applicability in real-world gnn applications.
+
+performance on tesla v100: to demonstrate the po
+
+![](images/a1cba9dc0ba5360dbbc03895fb9b7090c823718dbd9246162380565c5000a0e8.jpg)  
+(a)
+
+![](images/87bffb6e96da01b7a1be2b89e97be9e56bf98d2c23f2f029b45dfc9828e5f64f.jpg)  
+(b)
+
+![](images/5fb032f67a2a1deef884831b6694c773459ee90fb7fc1030f10ca34c73063219.jpg)  
+(c)
+
+![](images/45dd98f319e8979e1873b4226fcd55529366904722e808b9eaf45bc04a6c8a61.jpg)  
+(d)
+
+![](images/96732737996e4f3db7f4277ffb60b498eff2b6defa4ed43e321d65790642a1bc.jpg)  
+figure 12: optimization analysis. (a) normalized latency as the neighbor group size ( $ngs$ ) grows (latency at  $ngs = 1$  is set as  $100\%$ ); (b) normalized latency as the number of dimension workers grows (latency at  $dw = 1$  is set as  $100\%$ ); (c) normalized speedup when using node renumbering compared to without renumbering; (d) normalized gpu kernel metrics when using block-level optimizations compared to without block-level optimizations.  
+(a)
+
+![](images/66d9ec4f2ca3f6ef046e5e4d3a517ed366ed472ee847499900163e17813c3c14.jpg)  
+(b)
+
+![](images/e7c9a8cd25e5fc088ad1735530e91eb50387b639372bebd170fa30069f12fde6.jpg)  
+(c)
+
+![](images/370d60cdac717db292099f760e1d93c3f9491456f60841b88e550b2d7ff3b573.jpg)
+
+![](images/a2b1e14c67785bcd40e89cbd0180a7860cd3b51fb32875af4f2f544f7f313273.jpg)  
+figure 14: parameter selection for four settings. note that the solid-black dot indicates the parameter (dw and ngs) selected by gnnadvisor decider based on analytical modeling.
+
+![](images/cc84b9f16242ecb7ae140941f5b2dcb5f89b8ffa055453da39650e96a7b41e0e.jpg)  
+figure 13: additional studies. (a) latency  $(ms)$  analysis as the hidden dimension grows on gcn; (b) overhead  $(\%)$  analysis for node renumbering; (c) speedup  $(\times)$  on tesla v100 over quadro p6000 (set as  $1\times$
+
+![](images/e2a01c870eecf0446e1abb5c38381719d9fc2e4f0e3d943f4b91aaccf2a00ade.jpg)
+
+tential of gnnadvisor in the modern data-center environment, we showcase the performance of gnnadvisor on an enterprise-level gpu – tesla v100 [44]. as shown in figure 13c, gnnadvisor can scale well towards such a high-end device, which can achieve  $1.97 \times$  and  $1.86 \times$  speedup compared with p6000 for gcn and gin due to more computation resources (e.g.,  $2.6 \times$  sms, and  $1.33 \times$  cuda cores, and  $1.13 \times$  throughput performance) and higher memory bandwidth (e.g.,  $2.08 \times$  peak memory bandwidth). this comparison shows that gnnadvisor well adapts towards more advanced gpu hardware for seeking better performance. we also foresee that our current work of gnnadvisor can be extended to the multi-gpu or distributed data center, benefiting overall performance by improving single gpu efficiency.
+
+parameter selection: to show the effectiveness of our analytical modeling in kernel parameter selection, we consider four different settings: i: amazon0505 on gcn at p6000 gpu as our base setting; ii: amazon0505 gcn on v100 to demonstrate device adaptation; iii: amazon0505 and soc
+
+blogcatalog on p6000 to demonstrate adaptation to different datasets; iv: amazon0505 on gin at p6000 to demonstrate adaptation to a different gnn model architectures. as shown in figure 14, our parameter selection strategy can pinpoint the optimal low-latency design for the above four settings. this demonstrates the effectiveness of our analytical modeling in assisting parameter selection to optimize the performance of gnn computation.
+
+# 8 conclusion
+
+in this work, we propose, gnnadvisor, an adaptive and efficient runtime system for gnn acceleration on gpus. specifically, we explore the potential of gnn input-level information in guiding system-level optimizations. we further propose a set of gnn-tailored system-level optimizations (e.g., 2d workload management, and specialized memory optimizations) and incorporate them into our parameterized designs to improve performance and adaptability. extensive experiments on a wide range of datasets and mainstream gnn models demonstrate the effectiveness of our design. overall, gnnadvisor provides users a handy tool to accelerate gnns on gpus systematically and comprehensively.
+
+# 9 acknowledgment
+
+we would like to thank our shepherd, petros maniatis, and the anonymous osdi reviewers. this work was supported in part by nsf 1925717. use was made of computational facilities purchased with funds from the national science foundation (oac-1925717) and administered by the center for scientific computing (csc). the csc is supported by the california nanosystems institute and the materials research science and engineering center (mrsec; nsf dmr 1720256) at uc santa barbara.
+
+# references
+
+[1] martin abadi, paul barham, jianmin chen, zhifeng chen, andy davis, jeffrey dean, matthieu devin, sanjay ghemawat, geoffrey irving, michael isard, et al. tensorflow: a system for large-scale machine learning. in 12th usenix symposium on operating systems design and implementation (osdi), 2016.  
+[2] j. arai, h. shiokawa, t. yamamuro, m. onizuka, and s. iwamura. rabbit order: just-in-time parallel reordering for fast graph analysis. in 2016 ieee international parallel and distributed processing symposium (ipdps), 2016.  
+[3] vignesh balaji and brandon lucia. when is graph reordering an optimization? studying the effect of lightweight graph reordering across applications and input graphs. in 2018 ieee international symposium on workload characterization (iiswc). ieee.  
+[4] paolo boldi, marco rosa, massimo santini, and sebastiano vigna. layered label propagation: a multiresolution coordinate-free ordering for compressing social networks. in proceedings of the 20th international conference on world wide web (www), 2011.  
+[5] antoine bordes, nicolas usunier, alberto garcia-duran, jason weston, and oksana yakhnenko. translating embeddings for modeling multi-relational data. in advances in neural information processing systems (neurips), 2013.  
+[6] hsinchun chen, xin li, and zan huang. link prediction approach to collaborative filtering. in proceedings of the 5th acm/ieee-cs joint conference on digital libraries (jcdl). ieee, 2005.  
+[7] de cheng, yihong gong, xiaojun chang, weiwei shi, alexander hauptmann, and nanning zheng. deep feature learning via structured graph laplacian embedding for person re-identification. pattern recognition, 2018.  
+[8] e. cuthill and j. mckee. reducing the bandwidth of sparse symmetric matrices. in proceedings of the 1969 24th national conference, 1969.  
+[9] alberto garcia duran and mathias niepert. learning graph representations with embedding propagation. in advances in neural information processing systems (neurips), 2017.  
+[10] david duvenaud, dougal maclaurin, jorge aguilera-iparraguirre, rafael gómez-bombarelli, timothy hirzel, alán aspuru-guzik, and ryan p adams. convolutional networks on graphs for learning molecular fingerprints. arxiv preprint, 2015.
+
+[11] matthias fey and jan e. lenssen. fast graph representation learning with pytorch geometric. in iclr workshop on representation learning on graphs and manifolds (iclr), 2019.  
+[12] matthias fey and jan e. lenssen. pytorch extension library of optimized scatter operations, 2019.  
+[13] santo fortunato. community detection in graphs. physics reports, 2010.  
+[14] jaume gibert, ernest valveny, and horst bunke. graph embedding in vector spaces by node attribute statistics. pattern recognition, 2012.  
+[15] joseph e gonzalez, yucheng low, haijie gu, danny bickson, and carlos guestrin. powergraph: distributed graph-parallel computation on natural graphs. in the 10th usenix symposium on operating systems design and implementation (osdi), 2012.  
+[16] aditya grover and jure leskovec. node2vec: scalable feature learning for networks. in proceedings of the 22nd acm international conference on knowledge discovery and data mining (sigkdd), 2016.  
+[17] will hamilton, zhitao ying, and jure leskovec. inductive representation learning on large graphs. in advances in neural information processing systems (neurips), 2017.  
+[18] minyang han, khuzaima daudjee, khaled ammar, m tamer özsu, xingfang wang, and tianqi jin. an experimental comparison of pregel-like graph processing systems. the vldb endowment, 2014.  
+[19] bruce hendrickson and tamara g kolda. graph partitioning models for parallel computing. parallel computing, 2000.  
+[20] intel. xeon sliver 4110. https://ark.intel.com/content/www/us/en/ark/products/123547/intel-xeon-silver-4110-processor-11m-cache-2-10-ghz.html.  
+[21] konstantinos i karantasis, andrew lenharth, donald nguyen, mara j garzaran, and keshav pingali. parallelization of reordering algorithms for bandwidth and wavefront reduction. in proceedings of the international conference for high performance computing, networking, storage and analysis (sc), 2014.  
+[22] george karypis and vipin kumar. metis: unstructured graph partitioning and sparse matrix ordering system, version 4.0. http://www.cs.umn.edu/~metis, 2009.  
+[23] riesen kaspar and bunke horst. graph classification and clustering based on vector space embedding. world scientific, 2010.
+
+[24] kristian kersting, nils m. kriege, christopher morris, petra mutzel, and marion neumann. benchmark data sets for graph kernels, 2016.  
+[25] zuhair khayyat, karim awara, amani alonazi, hani jamjoom, dan williams, and panos kalnis. mizan: a system for dynamic load balancing in large-scale graph processing. in proceedings of the 8th acm european conference on computer systems (eurosys), 2013.  
+[26] farzad khorasani, keval vora, rajiv gupta, and laxmi n bhuyan. cusha: vertex-centric graph processing on gpus. in proceedings of the 23rd international symposium on high-performance parallel and distributed computing (hpdc), 2014.  
+[27] thomas n kipf and max welling. semi-supervised classification with graph convolutional networks. international conference on learning representations (iclr), 2017.  
+[28] jérôme kunegis and andreas lommatzsch. learning spectral graph transformations for link prediction. in proceedings of the 26th annual international conference on machine learning (icml), 2009.  
+[29] aapo kyrola, guy blelloch, and carlos guestrin. graphchi: large-scale graph computation on just a pc. in the 10th usenix symposium on operating systems design and implementation (osdi), 2012.  
+[30] andrea lancichinetti, santo fortunato, and filippo radicchi. benchmark graphs for testing community detection algorithms. physical review e, 2008.  
+[31] jure leskovec and andrej krevl. snap datasets: stanford large network dataset collection. http://snap.stanford.edu/data, 2014.  
+[32] hang liu and h howie huang. enterprise: breadth-first graph traversal on gpus. in proceedings of the international conference for high performance computing, networking, storage and analysis (sc), 2015.  
+[33] hang liu and h howie huang. simd-x: programming and processing of graph algorithms on gpus. in usenix annual technical conference (atc), 2019.  
+[34] dijun luo, chris ding, heng huang, and tao li. nonnegative laplacian embedding. in ninth ieee international conference on data mining (icdm), 2009.  
+[35] dijun luo, feiping nie, heng huang, and chris h ding. cauchy graph embedding. in the 28th international conference on machine learning (icml), 2011.  
+[36] lingxiao ma, zhi yang, youshan miao, jilong xue, ming wu, lidong zhou, and yafei dai. neugraph: parallel deep neural network computation on large graphs. in usenix annual technical conference (atc'19).
+
+[37] mark ej newman. spectral methods for community detection and graph partitioning. physical review e, 2013.  
+[38] amir hossein nodehi sabet, junqiao qiu, and zhijia zhao. tigr: transforming irregular graphs for gpu-friendly graph processing. in proceedings of the twenty-third international conference on architectural support for programming languages and operating systems (asplos), 2018.  
+[39] nvidia. cuda sparse matrix library (cusparse). developer.nvidia.com/cusparse.  
+[40] nvidia. dgx-1. https://www.nvidia.com/en-us/data-center/dgx-1/.  
+[41] nvidia. profiling tools. docs.nvidia.com/cuda/profiler-users-guide/index.html.  
+[42] nvidia. quardo p6000 gpu. https://www.nvidia.com/content/dam/en-zz/solutions/design-visualization/productspage/quadro/quadro-desktop/quadro-pascal-p6000-data-sheet-us-nv-704590-r1.pdf.  
+[43] nvidia. tesla p100. https://www.nvidia.com/en-us/data-center/tesla-p100/.  
+[44] nvidia. tesla v100. https://www.nvidia.com/en-us/data-center/v100/.  
+[45] lawrence page, sergey brin, rajeev motwani, and terry winograd. the pagerank citation ranking: bringing order to the web. technical report, 1999.  
+[46] adam paszke, sam gross, francisco massa, adam lerer, james bradbury, gregory chanan, trevor killeen, zeming lin, natalia gimelshein, luca antiga, alban desmaison, andreas kopf, edward yang, zachary devito, martin raison, alykhan tejani, sasank chilamkurthy, benoit steiner, lu fang, junjie bai, and soumith chintala. pytorch: an imperative style, high-performance deep learning library. in advances in neural information processing systems (neurips). 2019.  
+[47] bryan perozzi, rami al-rfou, and steven skiena. deepwalk: online learning of social representations. in the 20th acm international conference on knowledge discovery and data mining (sigkdd), 2014.  
+[48] usha nandini raghavan, réka albert, and soundar kumara. near linear time algorithm to detect community structures in large-scale networks. physical review e, 2007.
+
+[49] amitabha roy, ivo mihailovic, and willy zwaenepoel. x-stream: edge-centric graph processing using streaming partitions. in proceedings of the twenty-fourth acm symposium on operating systems principles (sosp), 2013.  
+[50] alessandra sala, haitao zheng, ben y. zhao, sabrina gaito, and gian paolo rossi. brief announcement: revisiting the power-law degree distribution for social graph analysis. in proceedings of the 29th acm sigact-sigops symposium on principles of distributed computing (podc), 2010.  
+[51] tomasz tylenda, ralitsa angelova, and srikanta bedathur. towards time-aware link prediction in evolving social networks. in proceedings of the 3rd workshop on social network mining and analysis, 2009.  
+[52] petar velicković, guillem cucurull, arantxa casanova, adriana romero, pietro liò, and yoshua bengio. graph attention networks. in international conference on learning representations (iclr), 2018.  
+[53] minjie wang, lingfan yu, da zheng, quan gan, yu gai, zihao ye, mufei li, jinjing zhou, qi huang, chao ma, ziyue huang, qipeng guo, hao zhang, haibin lin, junbo zhao, jinyang li, alexander j smola, and zheng zhang. deep graph library: towards efficient and scalable deep learning on graphs. iclr workshop on representation learning on graphs and manifolds, 2019.  
+[54] yangzihao wang, andrew davidson, yuechao pan, yuduo wu, andy riffel, and john d owens. gunrock: a high-performance graph processing library on the gpu. in proceedings of the 21st acm sigplan symposium on principles and practice of parallel programming (ppopp), 2016.  
+[55] keyulu xu, weihua hu, jure leskovec, and stefanie jegelka. how powerful are graph neural networks? in international conference on learning representations (iclr), 2019.  
+[56] carl yang, aydin buluc, and john d owens. design principles for sparse matrix multiplication on thegpu. in european conference on parallel processing, 2018.  
+[57] rex ying, jiaxuan you, christopher morris, xiang ren, william l. hamilton, and jure leskovec. hierarchical graph representation learning with differentiable pooling. in the 32nd international conference on neural information processing systems (neurips), 2018.
+
+# a artifact appendix
+
+# abstract summary
+
+gnnadvisor is an efficient and adaptive runtime system for gnn computing on gpus. gnnadvisor consists of two parts. the first part is the host-side cpu program. it is responsible for dataset loading, runtime configuration generation, and invoking the gpu-side program. the second part is the device-side gpu program. it is responsible for the major computation of the gnn model on sparse neighbor-aggregation and dense node-update phase. gnnadvisor improves the performance of gnn computing with its highly configurable and efficient 2d workload management and specialized memory design. moreover, the runtime configuration generation on the host-side cpu program makes gnnadvisor more adaptive towards various kinds of input settings.
+
+# artifact checklist
+
+- link: github.com/yukewang96/osdi21_ae.git.  
+hardware:
+
+intel cpu x86_64 with host memory  $>= 32\mathrm{gb}$ . tested on intel xeon silver 4110 (8-core 16-thread) cpu with 64gb host memory.  
+- nvidia gpu (arch>=sm_60) with devcie memory >= 16gb. tested on nvidia quadro p6000 (sm_61), tesla v100 (sm_70), and rtx3090 (sm_86). note that upon creating this artifact, we mainly evaluate our design on rtx3090. the execution time may be different across different devices but the overall trend of performance (speedup) is similar.  
+- os & compiler: ubuntu 16.04+, gcc 7.5+, cmake 3.14+, cuda 10.2+.
+
+# environment setup
+
+step-1: setup the basic environment. two options:
+
+- setup the environment via docker (recommended).  
+- setup via conda and pip.
+
+details of the above two options can be found in readme.md.
+
+# step-2: install gnnadvisor pytorch binding.
+
+- go to gnnadvisor/gnnconv, then python setup.py install to install the gnnadvisor modules.  
+- go to rabbit_module/src, then python setup.py install to install the rabbit reordering modules.
+
+step-3: download the graph datasets. our preprocessed graph datasets in .npy format can be downloaded via this
+
+link  $^{3}$  (filename: osdi-ae-graphs.tar.gz). unzip the graph datasets tar -zxvf osdi-ae-graphs.tar.gz at the project root directory. note that node initial embedding is not included, and we generate an all 1s embedding matrix according to users input dimension parameter at the runtime for just performance evaluation.
+
+# experiments
+
+- running dgl baseline on gnn training (figure 9).
+
+- go to dgl基礎/ directory.  
+-  $\therefore \theta_{-}$  run_gcn.sh and  $\therefore \theta_{-}$  run_gin.sh to run dgl and generate .csv result for gcn and gin.
+
+- running pyg baseline on gnn training (figure 10).
+
+- go to pgg基礎/ directory.  
+-  $\therefore \theta_{-}$  run_gcn.sh and  $\therefore \theta_{-}$  run_gin.sh to run pyg and generate .csv result for gcn and gin.
+
+- running gunrock for single spmm (neighbor aggregation) kernel.
+
+- go to gunrock/ call ./build_spmm.sh.  
+-./0_bench_gunrock.py for profile spmm.
+
+- running gnnadvisor (figure 9 and 10).
+
+- go to gnnadvisor/ directory.  
+-./0_run_gcn.sh and ./0_run_gin.sh to run gnnadvisor and generate .csv for gcn/gin.
+
+- running some additional studies (figure 11(a,b,c), and 12(a)). detailed commands of running all these studies can be found in readme.md.
+
+note that accuracy evaluation are omitted for all implementations and each sparse kernels are tested via the unitest.py. we focus on the training evaluation of the gnns, and the reported time per epoch only includes the gnn model forward and backward computation, excluding the data loading and some preprocessing. since the paper draft submission and the creation of this artifact, dgl has update several of its kernel library (from v0.52 to v0.60). in this comparison we focus on the latest dgl version (v0.60). based on our profiling on rtx3090 and quadro p6000, our design would show minor speedup on the simple gcn model (2-layer and 16 hidden dimension), but show more evident speedup on more complicated gin model (5-layer and 64 hidden dimension), which can still demonstrate the effectiveness of our optimizations. our observation is that on small type i graphs, our frameworks achieve significant speedup for both gcn and gin model on rtx3090 and quadro p6000. on larger type ii and type iii datasets, our gin model implementation would show more evident speedups.
