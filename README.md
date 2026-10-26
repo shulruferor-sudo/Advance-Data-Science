@@ -75,3 +75,9 @@ The shared workspace overview is to be refreshed each Friday morning in Jerusale
 ### Failure reporting
 
 All four notebooks report failures at cell boundaries using Python `try`/`except`. Messages identify the operation, exception type and reason, and what to assess. Failed subprocesses also show the final diagnostic output. Unexpected errors are re-raised with their original traceback, stopping execution instead of allowing a failed operation to look successful. Keyboard interruption remains available. A missing project dataset prints its missing path and skips dependent calculations; acquisition remains a separate manual action. Correct the cause, then rerun the affected cell and dependent cells. Existing checkpoints and PDF backups remain governed by their recovery rules.
+
+## Reusable notebook environment and optional Colab installation
+
+[Create or resume a Codespace](https://codespaces.new/shulruferor-sudo/Advance-Data-Science) for this repository. The development-container configuration installs Python dependencies from the computational and figures notebooks and includes XeLaTeX and fonts. Initial creation or rebuilding requires installation; reopening the same Codespace retains that environment. This configuration prepares the environment without starting research calculations. A live Codespace build still requires validation on GitHub.
+
+All existing **Open in Colab** links remain available. Each notebook has an **Optional dependency installation** section above its installation code. Set `INSTALL_DEPENDENCIES = True` in a fresh Colab runtime; leave it `False` in a prepared environment. Colab installations belong to that runtime and may need repeating after it is replaced. Changing this setting does not publish generated datasets or figures: saving files and committing them to GitHub are separate operations.
