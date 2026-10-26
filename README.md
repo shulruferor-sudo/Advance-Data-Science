@@ -55,6 +55,8 @@ The current LaTeX manuscript is preserved from the existing revision. Its final 
 
 ## Open in Colab
 
+Each notebook has an **Open in Colab** button above its code. Tap it to open that exact notebook in Colab, connect to a runtime with your Google account, then use ▶ to run cells. GitHub Preview itself does not execute code. Opening the notebook does not transfer companion datasets or files into the runtime.
+
 - [Datasets](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/Datasets/Datasets.ipynb)
 - [Project notebook](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/project_notebooks/from_linguistic_context_to_semantic_structure/Proof.ipynb)
 - [Figures](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/Figures.ipynb)
