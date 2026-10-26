@@ -10,9 +10,9 @@ The main project consists of one `corpus` folder, three Jupyter notebooks, two m
 | --- | --- |
 | `Proof.ipynb` | Executable computational evidence for the paper: obtain the corpus and run every scientific stage in order. |
 | `Unit_Tests.ipynb` | Unit tests of the computational proof notebook's actual code, without a duplicate implementation. |
-| `Figure_Generator.ipynb` | Define all manuscript illustration and result-plot generators. Rendering remains disabled until approval. |
+| `Figure_Generator.ipynb` | Generate the manuscript illustrations and measured-result plots after computational validation. |
 | `Unicode.md` | The Unicode Markdown manuscript source. |
-| `PDF_Creator.tex` | The LaTeX manuscript source from which the approved PDF will later be compiled. |
+| `PDF_Creator.tex` | LaTeX code compiled to create the PDF. |
 | `corpus/` | Complete source texts, metadata, normalization records, checkpoints and measured outputs. |
 | `README.md` | Project purpose, execution and revision instructions. |
 
