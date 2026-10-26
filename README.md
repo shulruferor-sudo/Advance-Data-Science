@@ -4,7 +4,7 @@ Or Shulrufer
 
 Advance data science. Canonical repository: https://github.com/shulruferor-sudo/Paper-1
 
-The project has one complete corpus, three Jupyter notebooks, two manuscript sources and this README. Filenames stay fixed. Changes are recorded through Git commits and, for existing Library deliverables, through their version histories.
+The main project consists of one `corpus` folder, three Jupyter notebooks, two manuscript sources and this README. Filenames stay fixed. Changes are recorded through Git commits and, for existing Library deliverables, through their version histories.
 
 | File | Purpose |
 | --- | --- |
@@ -13,11 +13,12 @@ The project has one complete corpus, three Jupyter notebooks, two manuscript sou
 | `From_Linguistic_Context_to_Semantic_Structure_Figures.ipynb` | Define all manuscript illustration and result-plot generators. Rendering remains disabled until approval. |
 | `From_Linguistic_Context_to_Semantic_Structure.md` | The Unicode Markdown manuscript source. |
 | `From_Linguistic_Context_to_Semantic_Structure.tex` | The LaTeX manuscript source from which the approved PDF will later be compiled. |
+| `corpus/` | Complete source texts, metadata, normalization records, checkpoints and measured outputs. |
 | `README.md` | Project purpose, execution and revision instructions. |
 
-The existing manuscript sources are preserved for revision. Their earlier news-corpus and TextTiling passages are historical draft material and are not results for the current arXiv corpus. The computational checks and measured classification comparisons must pass before those sections are rewritten. No PDF is included in this commit, and no new manuscript figures are rendered.
+The `.md` and `.tex` files are edited directly. No separate program generates either manuscript source. The existing manuscript sources are preserved for revision. Their earlier news-corpus and TextTiling passages are historical draft material and are not results for the current arXiv corpus. The computational checks and measured classification comparisons must pass before those sections are rewritten. No PDF is included in this commit, and no new manuscript figures are rendered.
 
-Use **Actions → Run research notebook → Run workflow** to execute on GitHub. The test notebook runs first. To run the notebooks yourself in Jupyter, install the pinned packages in `requirements.txt` and run the cells in order. Manuscript figure rendering additionally requires PyMuPDF 1.26.6, Pillow 12.3.0, scikit-learn 1.8.0, XeLaTeX, PGFPlots and Latin Modern fonts. The figures notebook preserves the ten existing explanatory Python generators, the three-dimensional variance generator, three method diagrams and three empirical plot generators.
+Use **Actions → Run research notebook → Run workflow** to execute on GitHub. The test notebook runs first. The `.github` directory contains the configuration required to execute these notebooks on GitHub; it is not an additional manuscript, notebook or project version. To run the notebooks yourself in Jupyter, run the cells in order; the first code cell installs the pinned dependencies from the computational notebook. Manuscript figure rendering additionally requires PyMuPDF 1.26.6, Pillow 12.3.0, scikit-learn 1.8.0, XeLaTeX, PGFPlots and Latin Modern fonts. The figures notebook preserves the ten existing explanatory Python generators, the three-dimensional variance generator, three method diagrams and three empirical plot generators.
 
 After the notebooks are validated, an optional single Python pipeline will be derived for larger systems. It will use scikit-learn transformations and PyTorch training where they serve this same pipeline. Its mathematical definitions, source partitions, fitted state and outputs will match the validated notebook. Do not create that deployment file during notebook development.
 
