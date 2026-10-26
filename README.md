@@ -1,169 +1,71 @@
 # Advanced Data Science
 
-Or Shulrufer's public workspace for reusable datasets, scientific figures and advanced data science projects.
+Or Shulrufer’s public workspace for advanced data science, shared datasets, reusable scientific figures, project development and scientific publication.
 
-## Workspace structure
+[Repository](https://github.com/shulruferor-sudo/Advance-Data-Science)
+
+## Workspace
 
 | Location | Purpose |
 | --- | --- |
-| `Datasets/Datasets.ipynb` | One independent notebook that obtains and maintains shared datasets, with a separate loading section for each dataset. |
-| `Datasets/<descriptive_dataset_name>/` | One enclosing folder per dataset, retaining all its constituent files and subfolders. |
-| `project_notebooks/` | One notebook per project for development, execution, displayed results and verification within that notebook. |
-| `project_python/` | Python pipelines derived from the corresponding notebooks after their execution and results have been validated. |
-| `Figures.ipynb` | One independent, reusable collection of scientific and data science figure generators. |
-| `README.md` | Workspace organization, ownership of shared resources and execution instructions. |
+| `Datasets/Datasets.ipynb` | Obtain and maintain datasets independently, one dataset section at a time. |
+| `Datasets/arxiv_research_papers_2020/` | All 8,836 extracted arXiv research-paper texts, source metadata and normalization records. |
+| `project_notebooks/from_linguistic_context_to_semantic_structure/Proof.ipynb` | The project’s single computational notebook, including checks and displayed results. |
+| `project_notebooks/from_linguistic_context_to_semantic_structure/results/` | Project-specific partitions, numerical references, predictions and checkpoints. |
+| `project_notebooks/from_linguistic_context_to_semantic_structure/models/` | This project’s pretrained model files. |
+| `project_python/` | Python pipelines derived from validated project notebooks; currently reserved. |
+| `Figures.ipynb` | One independent notebook of reusable scientific figure generators. |
+| `PDF_Creation/Projects_LaTeX/` | LaTeX manuscript sources. |
+| `PDF_Creation/PDF_Creator.ipynb` | One compilation notebook with a separate execution cell for each paper. |
+| `PDFs/` | Successfully compiled PDFs. |
 
-### Shared datasets
+The Unicode manuscript remains in ChatGPT Library and is not maintained in this repository. Git history preserves previous repository versions. No numbered duplicate notebooks or manuscript-generating programs are maintained.
 
-Only `Datasets/Datasets.ipynb` obtains or updates datasets. Its sections can be run individually, one dataset at a time. Each section saves directly into that dataset's existing folder beneath `Datasets/`, reuses verified files and obtains missing files without creating numbered copies. Downloads are saved as files rather than retained only in notebook variables. Colab runtime storage is temporary; durable use requires a persistent mounted destination or an explicit save to the repository.
+## Shared datasets
 
-Folder names describe the dataset's actual contents and meaningful scope rather than merely reproducing an upstream identifier. The current dataset's destination is `Datasets/arxiv_research_papers_2020/`: extracted full texts of arXiv research papers from 2020, usable for scientific-text analysis and document classification. Its publisher's original identity, source link, pinned revision and checksums remain recorded unchanged. The complete existing population is 8,836 sources; relocation does not recreate, subsample or alter it.
+Only `Datasets/Datasets.ipynb` downloads, normalizes, repairs or updates shared datasets. Run its setup cells and the section for the desired dataset. Every dataset has one enclosing folder named for its meaningful contents and scope, even if the upstream release contains many folders or loose files. All constituent files, metadata and provenance stay inside that enclosing folder. Reruns update the same location and reuse verified files.
 
-A dataset always has one enclosing folder, including when the upstream release consists of multiple folders or loose files. Original texts, metadata, normalization records and source provenance remain inside that folder. Project-specific partitions, trained models, checkpoints and measured project results are not shared dataset content.
+The first dataset folder is `arxiv_research_papers_2020`: scientific research-paper text suitable for text mining and document classification. Its original upstream identity is [SlowGuess/Arxiv_2020_OCR](https://huggingface.co/datasets/SlowGuess/Arxiv_2020_OCR), revision `a68009864dbc3b1decb1a37a6c4f769887169a44`. All 8,836 sources are retained without subsampling, text truncation or new optical character recognition. Folder renaming does not change provenance or source checksums. Existing original and normalized text Git trees are retained unchanged.
 
-Projects only read available datasets. They do not invoke the dataset notebook, acquire missing data, normalize or repair shared files, or update datasets. If required files are absent, the project stops with a clear message directing the user to run the corresponding section of `Datasets/Datasets.ipynb` manually. Availability checks do not authorize modification.
+Set `DATASETS_ROOT` to the directory containing dataset folders. By default this is the repository’s `Datasets/` directory. Set `ADVANCED_DATA_SCIENCE_ROOT` when the runtime’s working directory is outside the checkout. In Colab, files in the runtime are temporary: use a mounted persistent destination or explicitly save files to the repository. A notebook document alone does not transfer or persist its accompanying files.
 
-Updates occur in place for the declared source revision. A change of source revision must be explicit and recorded, so a rerun does not silently substitute a different corpus. Existing verified files and interrupted-download recovery must be preserved.
+Projects only read available dataset files. They never execute dataset loaders, download missing data or modify shared datasets. Missing files are caught with `except FileNotFoundError`: the notebook prints `Dataset not found` and skips dependent calculations. Run the dataset notebook manually, then rerun the project’s dataset cell. Project partitions, trained models, numerical references and predictions remain in the project’s directory, not in the shared dataset.
 
-### Project notebooks and Python implementations
+Dataset revisions are explicit. Rerunning the notebook must not silently substitute a different upstream release. Verified files, original source names, source links, checksums and normalization records remain traceable.
 
-Each project has one notebook, with a separate rendered Markdown title and explanation immediately above every code cell. The explanation connects the cell's prerequisites, purpose and outputs so the computational sequence is understandable without artificial ordering labels.
+## Notebook development and Python deployment
 
-Develop, execute and inspect the project in that notebook. Necessary assertions and verification remain within it; a separate test notebook is not part of this workspace structure. Only after the notebook works correctly and its results are validated is its same computational code consolidated into a Python pipeline in `project_python/`. The Python implementation preserves the notebook's mathematical definitions, inputs, transformations and results.
+Each project has one notebook. Every code cell has a separate rendered Markdown title and explanation immediately above it. The explanations connect prerequisites, operations and outputs so the presentation follows the computation’s dependencies.
 
-### Reusable figures
+Develop, execute, inspect and validate the project in its notebook. Necessary mathematical assertions and coverage checks stay in that notebook; there is no separate test notebook. Once the notebook works correctly and its results are validated, consolidate the same code into a Python pipeline in `project_python/`, preserving its mathematical definitions, inputs and outputs. No deployment pipeline is claimed before that validation.
 
-`Figures.ipynb` is independent of projects and datasets. It contains the reusable figure-generating code in one notebook, without a separate figures-code folder. Projects may use those generators, but do not own them. Generators accept their required values or explicit input paths rather than retrieving, updating or executing another project. A figure requiring measured results cannot substitute illustrative values for them.
+The current project preserves training-only vocabulary and inverse-document-frequency fitting, source-family separation, all cluster counts 2–100, the maximum finite variance ratio criterion with the established exact tie rule, fixed selected assignments, original grouped moments and contextual profiles, subsequent singular value decomposition, target alignment and feature-aware final-block BERT training. Classification comparisons use the same source population. Measured results are reported as obtained, without forcing superiority.
 
-### Existing research materials
+## Independent figures
 
-The research manuscript and its valid revisions remain preserved. Reorganizing the repository into a general data science workspace does not authorize deletion of manuscripts, source materials, measured results or checkpoints.
+`Figures.ipynb` owns reusable figure code, not projects. It installs its own plotting dependencies and neither loads another notebook nor obtains datasets. Supply measured input paths explicitly for empirical figures. `RENDER_FIGURES` is off until rendering is requested in the notebook; explanatory figures are synthetic and are not classification findings. The default output location is `figure_outputs/` in the working directory. Generated files are outputs, not a second collection of figure code.
 
-## Migration state
+## PDF creation
 
-The repository has been renamed to [Advance-Data-Science](https://github.com/shulruferor-sudo/Advance-Data-Science). The structure above records the requested destination; it does not claim that relocation has already occurred. The active scientific workflow still uses the current root notebook paths and `corpus/`. These paths must remain intact while it uses them. The coordinated migration must update notebook startup, read-only project dataset access, result locations, figure inputs, workflow paths and Colab links, while preserving data checksums and Git history.
+`PDF_Creation/PDF_Creator.ipynb` compiles existing LaTeX sources; it does not generate manuscript prose. Sources are in the adjacent `Projects_LaTeX/` directory and successful documents are saved in `PDFs/`. Each paper has one execution cell. Configure the figure input directory explicitly.
 
-## Current research project
+When a PDF already exists, the compiler makes a `.backup.pdf` copy, builds the replacement in a temporary directory and validates that it is a readable PDF. Only then does it atomically replace the destination and remove the backup. A failed compilation preserves the previous PDF and backup. Missing LaTeX or figures is an error, not permission to substitute content.
 
-Or Shulrufer
+The current LaTeX manuscript is preserved from the existing revision. Its final scientific revision and PDF release still depend on complete measured computational results; rearranging the workspace does not establish scientific completion.
 
-Advance data science. Canonical repository: https://github.com/shulruferor-sudo/Advance-Data-Science
+## Open in Colab
 
-The current executable project consists of one `corpus` folder, three Jupyter notebooks, two manuscript sources and this README. These paths remain in place until the coordinated migration described above. Changes are recorded through Git commits and, for existing Library deliverables, through their version histories.
+- [Datasets](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/Datasets/Datasets.ipynb)
+- [Project notebook](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/project_notebooks/from_linguistic_context_to_semantic_structure/Proof.ipynb)
+- [Figures](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/Figures.ipynb)
+- [PDF creation](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/PDF_Creation/PDF_Creator.ipynb)
 
-| File | Purpose |
-| --- | --- |
-| `Proof.ipynb` | Executable computational evidence for the paper: obtain the corpus and run every scientific stage in order. |
-| `Unit_Tests.ipynb` | Unit tests of the computational proof notebook's actual code, without a duplicate implementation. |
-| `Figure_Generator.ipynb` | Generate the manuscript illustrations and measured-result plots after computational validation. |
-| `Unicode.md` | The Unicode Markdown manuscript source. |
-| `PDF_Creator.tex` | LaTeX code compiled to create the PDF. |
-| `corpus/` | Complete source texts, metadata, normalization records, checkpoints and measured outputs. |
-| `README.md` | Project purpose, execution and revision instructions. |
+Open from a saved checkout or configure the root paths explicitly. Project notebooks intentionally do not clone or fetch datasets. To refresh notebook code from GitHub, reopen its link; an already-open Colab document keeps its existing cells.
 
-The `.md` and `.tex` files are edited directly. No separate program generates either manuscript source. The existing manuscript sources are preserved for revision. Their earlier news-corpus and TextTiling passages are historical draft material and are not results for the current arXiv corpus. The computational checks and measured classification comparisons must pass before those sections are rewritten. No PDF is included in this commit, and no new manuscript figures are rendered.
+## Execution and continuation
 
-Use **Actions → Run research notebook → Run workflow** to execute on GitHub. The test notebook runs first. The `.github` directory contains the configuration required to execute these notebooks on GitHub; it is not an additional manuscript, notebook or project version. To run the notebooks yourself in Jupyter, run the cells in order; the setup cell locates or obtains the project, followed by installation of the pinned dependencies from the computational notebook. Manuscript figure rendering additionally requires PyMuPDF 1.26.6, Pillow 12.3.0, scikit-learn 1.8.0, XeLaTeX, PGFPlots and Latin Modern fonts. The figures notebook preserves the ten existing explanatory Python generators, the three-dimensional variance generator, three method diagrams and three empirical plot generators.
+GitHub Actions executes the project notebook from its committed paths and saves project checkpoints. Dataset acquisition remains a manual, separate operation. Existing jobs run in their own checkouts and are not cancelled by this reorganization. Legacy run artifacts and the former `corpus/` cache remain recovery sources for a computation started before the move; reconcile their latest checkpoints into the project directory before continuing from a stale copy.
 
-After the notebooks are validated, an optional single Python pipeline will be derived for larger systems. It will use scikit-learn transformations and PyTorch training where they serve this same pipeline. Its mathematical definitions, source partitions, fitted state and outputs will match the validated notebook. Do not create that deployment file during notebook development.
+The source corpus was verified at commit `ec6217619d033362a64c2b585c342ccfe0411aa6`. Earlier implementation tests and pretrained-model recovery fixtures establish implementation behavior, not full-corpus classification findings. The original ordered research plan remains: reconcile state; establish execution; chunk all texts; fit training-only lexical weights; evaluate all cluster counts; compute selected-reference features and decompositions; train prescribed comparisons; verify results; render result plots; validate self-contained execution; revise the paper from measured findings; validate the manuscript and PDF against the implementation.
 
-The computational notebook obtains and normalizes the complete existing [arXiv text corpus](https://huggingface.co/datasets/SlowGuess/Arxiv_2020_OCR) at revision `a68009864dbc3b1decb1a37a6c4f769887169a44`. It retains all 8,836 documents and verifies their complete released bytes. It retrieves publication dates and primary category labels from arXiv. It performs no new PDF extraction or optical character recognition and applies no document subsampling or text truncation.
-
-GitHub Actions executes the same notebook and preserves its outputs, figures, progress records and resumable corpus cache. After all corpus checks pass, it commits the complete original texts, normalized texts and provenance records into this repository. These files then have ordinary Git history and do not depend on an Actions cache. Existing local copies remain valid and unchanged. The workflow can also be started with **Run workflow** from the Actions page.
-
-Keep canonical filenames. Revise the same files through Git commits. Store manuscript and non-code checkpoints in the existing Paper Final Library items through their version history. ChatGPT Library stores files and does not execute Python notebooks.
-
-Corpus preparation and normalization passed for all 8,836 documents in run 40248242815. The complete corpus is now preserved in this repository at commit `ec6217619d033362a64c2b585c342ccfe0411aa6`; run 40250580314 passed acquisition, source labels, normalization and the final byte verification for all 8,836 sources. The earlier corpus remains in its original Git history. The notebook now contains the original numerical definitions, contiguous Chonky segmentation, the complete 99-candidate cluster search, grouped moments and contextual profiles, subsequent singular value decompositions, pretrained BERT training, all prescribed comparisons and completion checks. The full arXiv computational run is still in progress; a `verification.json` record is created only after its measured comparisons and consistency checks complete. Corpus preparation and unit tests do not establish classification performance or full experiment completion.
-
-Standard GitHub-hosted jobs have a six-hour execution limit. This workflow uses a five-hour notebook step and pauses computation at a saved checkpoint after approximately four hours of scientific execution. Scheduled continuations check every six hours and resume incomplete computation. They stop substantive execution once `corpus/results/verification.json` records completion. Manual runs remain available. Per-source chunk boundaries, individual cluster fits and optimizer progress are reused. Large model and result artifacts are preserved in checksum-verified parts below GitHub’s single-file limit; original files remain in place while processes use them. It uses the account's existing Actions allowance and billing configuration without changing either.
-
-
-## Continuation and evidence record
-
-This section is a separate assessment of the project state. It is not an original chat transcript and is not manuscript prose. Original chat files, research-era files and historical manuscript sources remain unchanged. Available conversation retrieval provides excerpts and summaries, not a complete message-by-message transcript of all earlier sessions. No claim of reviewing every earlier message is made.
-
-### Governing decisions from the author
-
-- Keep one project titled **From Linguistic Context to Semantic Structure**, authored by **Or Shulrufer**. Use this public repository; public readers have no automatic write permission.
-- Keep the three notebooks, two manuscript sources, one corpus folder and this README. The `.github` folder is execution configuration. Use Git history rather than numbered copies. The latest naming correction requires filenames by purpose: `Proof.ipynb`, `Unit_Tests.ipynb`, `Figure_Generator.ipynb`, `Unicode.md`, and `PDF_Creator.tex`. The author controls the repository name. Install dependencies from the computational notebook.
-- Edit the Unicode Markdown and LaTeX source directly. Do not generate them through a separate manuscript-writing program. Derive an optional single Python deployment pipeline only after notebook validation.
-- Use every document and its complete extracted text from the pinned corpus. Do not select a smaller cohort, truncate texts, download PDFs or perform optical character recognition.
-- Preserve source partitions across every comparison. Fit vocabulary, inverse document frequencies and learned feature transformations on training sources only.
-- Select the cluster count solely by the highest finite **variance ratio criterion**, also called the **Caliński–Harabasz index**, across every count from 2 through 100; use the established tie rule. Classification accuracy does not select the cluster count.
-- Preserve the original coefficient-of-variation calculations and perform singular value decomposition afterward. Coefficient of variation and cross-validation are different concepts.
-- Train the classifier with term-frequency–inverse-document-frequency features and the aggregated contextual vector. Verify feature alignment, nonzero gradients and parameter updates. Compare the same encoder with and without aggregation on the same partitions.
-- Repair demonstrated implementation defects and rerun affected stages. Report measured comparisons faithfully; improved accuracy must be measured, not assumed.
-- Complete computational validation before revising manuscript findings. Preserve the supplied historical research eras and scientific definitions. Read the pertinent full reference before changing a scientific decision.
-- Finish the figure generators, measured figures, manuscript and compiled PDF in that order after computational validation. The latest instruction requests completion of every figure; do not stop for a redundant rendering permission after its evidence checks pass.
-- Preserve original chat files separately. Assess author instructions, assistant proposals and execution evidence separately before consolidation. Commit completed changes immediately.
-
-### Verified state
-
-| Component | Evidence and current state |
-| --- | --- |
-| Root project files | Three notebooks, Unicode Markdown, LaTeX and README published in this repository. Dependency files removed in commit `57eb00d868d9dfa87087f4f77a9094263030a940`. |
-| Earlier complete corpus | Run [40248242815](https://github.com/shulruferor-sudo/personal-workspace/actions/runs/40248242815) passed. All 8,836 original texts verified byte-for-byte: 671,413,967 bytes. Dates and primary categories verified for all sources. All 8,836 normalized documents retained; zero empty documents. Corpus tree: `72383646464d12abc216246447527014bc591b9d`. |
-| Current tests | GitHub run [40254325732](https://github.com/shulruferor-sudo/Paper-1/actions/runs/40254325732), job `121352896349`: all 26 tests passed, matching the local result. Coverage includes real pretrained-model interfaces, all 99 numerical fixture candidates, exact interrupted-training recovery and probability-roundoff handling. Tested notebook SHA-256: `a0476087af6b78daa7434c2ff46c037b9abad818b213a0654c5b101a3d8be15a`. |
-| Current corpus placement | Run [40250580314](https://github.com/shulruferor-sudo/Paper-1/actions/runs/40250580314) completed successfully. All 8,836 original texts, verified primary categories, normalized texts and records are committed under `corpus/` at `ec6217619d033362a64c2b585c342ccfe0411aa6`. Original bytes total 671,413,967; zero normalized sources are empty. |
-| Old project removal | Commit `fa8b967b85216a31d846bb11924df0e8267114a9` removed the transferred notebooks, manuscripts, README, dependencies and workflow from the earlier repository after its run finished. Commit `b758063fe4502d98a70906a746eb73aeaacc895e` subsequently removed the remaining obsolete corpus folder after exact original-text, normalized-text, normalization-record and source-manifest matches were verified. Earlier files remain available in Git history. |
-| Supplied materials | Paper Final inventory: 112 files and 15 folders, including nine historical-era documents, the introduction, original-method references, numerical code, classification code, saved checks and model files. Paper 1: 109 files. Paper 2: eight files. Inventory is distinguished from full content review. |
-| Numerical and classification work | Integrated in `Proof.ipynb`: original definitions, complete cluster search, profiles, singular value decomposition, direct pretrained BERT forward/training and all agreed controls. Ten scientific integration tests pass in addition to the 13 acquisition tests and three real pretrained-model tests (26 total). The numerical fixture executes all 99 candidate counts and verifies identical restart results. The real BERT checks verify target alignment, a final-block update and exact interrupted-training recovery; the real contextual model check verifies contiguous reconstruction of irregular fixture text. Corpus-wide measured results remain governed by the final verification cell. The earlier 3,000-source sampling rule is superseded. |
-| Manuscripts | Existing revisions preserved byte-for-byte during transfer. Historical news-corpus/TextTiling passages await revision after current-corpus validation. No current-arXiv classification findings or final-paper claim is established. |
-| Figures | Three-notebook structure includes the preserved figure generators. No new manuscript figure or PDF has been rendered. |
-
-### Preserved component mapping
-
-The existing source components are in the author's Paper Final materials. Their names below identify originals, not additional deliverable files to create. Their required functions are consolidated into the computational notebook, with tests in the test notebook. Historical paths below identify provenance; execution does not import those files.
-
-| Required operation | Preserved component | Required continuation |
-| --- | --- | --- |
-| Contextual chunking | `experiment/code/run_expanded_segmentation.py`; Chonky model and tokenizer | Integrated original separator-end rule, without the historical 3,000-document restriction. Execution verifies exact contiguous coverage for every source. |
-| Original numerical definitions | `experiment/code/Work_Context_Diagnostic.py` | Preserve raw-count inverse document frequency, normalization, coordinate distances and grouped moments. |
-| Complete cluster sweep and subsequent calculations | `experiment/code/run_expanded_numerics_csr.py` | Integrated the bounded-memory sparse implementation. Run every cluster count 2–100 and preserve all criterion values, selected assignments, centroids, contextual profiles and subsequent singular value decompositions. |
-| Supervised feature combination | `experiment/code/Work_Contextual_Behavior_Fusion.py`; `experiment/code/run_classification.py` | Integrated target-aligned feature concatenation and supervised training with the final encoder block and classifier, preserving training settings and controls. The direct BERT forward avoids a corpus-sized hidden-state cache. |
-| Measured comparisons | `experiment/code/summarize_expanded_classification.py` | Use the saved predictions for identical source partitions, with aggregation versus without aggregation and the agreed baseline, decomposition and frozen-encoder controls. |
-| Original method and historical research | `experiment/analysis/reference_source/Paper 1/`; the nine `Year…` documents and `Introduction.md` | Read source documents in full before method decisions. Preserve the cumulative historical explanation. Keep original source records separate from the author's final manuscript. |
-| Model reconstruction | `experiment/code/Work_runtime_manifest.json`; `experiment/bert/`; `experiment/context_segmenter/` | Verify published revisions and saved file hashes. BERT revision `86b5e0934494bd15c9632b12f734a8a67f723594`; Chonky model revision `4a92de5574053676cbc5fd06bac86a6e13588000`. |
-
-`run_classification.py` and the local `run_expanded_classification.py` differ only in the default output directory (`results` versus `expanded`). They are not different scientific methods. Use one integrated definition with the canonical `corpus/results` path.
-
-
-### Fixed model and source-partition configuration
-
-The pretrained classifier is [`google-bert/bert-base-uncased`](https://huggingface.co/google-bert/bert-base-uncased), pinned to the saved revision. Its token embedding vectors have 768 coordinates; its input limit is 512 positions, and it has 12 encoder blocks. Token identifiers select embedding-table rows. The comparison models train the final block and a 128-unit classification head. BERT with the scalar local term-frequency–inverse-document-frequency feature is compared with BERT receiving that feature and the full contextual profile. Both use ordinary mean cross-entropy, two epochs, batch size eight and seeds 19, 29 and 41. The earlier encoder blocks and corpus statistics remain fixed.
-
-Source families join exact normalized-text duplicates and equal nonempty digital object identifiers. Five stratified group folds use seed 29, with test fold zero, validation fold one and training folds two through four. If a rare category has no training source, one deterministic whole family moves to training; each move and all class support counts are recorded before fitting. Every source remains included. Labels are primary arXiv categories, not inferred lexical senses. The frozen-encoder controls retain their distinct passage interface. Measured results cannot establish word-sense or segmentation accuracy without corresponding reference labels.
-
-
-### Ordered continuation
-
-1. Read this record and the existing Paper Final `experiment/analysis/Run_Record.json`; inspect the current GitHub run before writing or restarting anything. Preserve the author's corrections above.
-2. Preserve verified corpus commit `ec6217619d033362a64c2b585c342ccfe0411aa6`. The original and normalized text trees match the earlier corpus exactly; the obsolete project folder was removed in commit `b758063fe4502d98a70906a746eb73aeaacc895e`, retaining Git history.
-3. Execute the integrated contextual chunker and all-source partitions. Verify punctuation handling and exact, contiguous, non-overlapping text coverage.
-4. Execute and verify training-only term-frequency–inverse-document-frequency weighting and zero-vector handling.
-5. Execute all 99 prescribed Euclidean k-means candidates, calculate the variance ratio criterion from within- and between-cluster sums of squares, and apply the established selection and tie rules.
-6. Fix selected centroids and assignments; compute coordinate distances, grouped population moments, coefficient-of-variation profiles and subsequent singular value decompositions.
-7. Execute the trained Bidirectional Encoder Representations from Transformers baseline and all agreed feature comparisons and controls on the same source partitions, preserving the 512-position limit, target alignment and ordinary mean cross-entropy.
-8. Complete code review and tests for coverage, numerical correctness, training updates, leakage prevention, prediction coverage, reproducibility and measured baseline comparisons. Repair defects and rerun affected stages.
-9. Render the measured cluster-count curve with all 99 values and the exact selected value; render separately labelled classification figures and the remaining approved explanatory figures.
-10. Verify self-contained execution using the packaged data, models, checkpoints and notebook. Only then declare earlier folders unnecessary.
-11. Edit the existing Markdown and LaTeX directly using the Scientific Research guidance and measured findings. Preserve the original method and full historical narrative.
-12. Compile the PDF from the final LaTeX and verify agreement among code, results, equations, figures, Markdown, LaTeX and PDF. This is the completion condition.
-
-For a new conversation: **Continue from this README and the existing Paper Final run record. Preserve originals and completed checkpoints. Inspect scientific run 40253860968 and current-code run 40254325732 first; corpus preparation run 40250580314 has completed. Continue the first unfinished stage from its checkpoints. Do not treat corpus preparation or unit tests as full classification validation, and do not rewrite findings before the computational checks pass.**
-
-A continuation check also revisits the project every six hours to inspect completed computational evidence, repair demonstrated execution defects, and continue the approved figures and manuscript steps after their computational prerequisites pass. It preserves active jobs and ends after the full deliverable is verified.
-
-
-
-## Opening the notebooks in Colab
-
-Open [Proof.ipynb](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/Proof.ipynb), [Unit_Tests.ipynb](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/Unit_Tests.ipynb), or [Figure_Generator.ipynb](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/Figure_Generator.ipynb) and run from the first code cell in a fresh runtime. Each code cell has its own Markdown title and explanation immediately above it.
-
-The setup cell obtains the complete repository when it is absent, including the committed corpus and checkpoints. It reuses an existing project without pulling over local edits. An interrupted clone is not published as a usable project. A notebook already open in Colab retains its old cells; reopen the GitHub link to load these corrections. Downloaded runtime files are separate from the notebook document and are not automatically saved back to GitHub.
-
-The test and figure notebooks read the computational notebook's shared dependency specification after setup. Figure rendering additionally installs the pinned PDF/image packages and checks XeLaTeX and Latin Modern fonts. Empirical rendering still requires complete computational verification. GitHub tests cover Python 3.12 and 3.13; the full computation retains its existing Python 3.12 environment.
-
-### Notebook startup revision
-
-The missing sibling-file startup defect was reproduced from the supplied Colab traceback. The revised tests exercise actual setup cells against a local Git fixture from empty directories, repeated execution, parent-directory discovery, preservation of incomplete directories and interrupted clone cleanup. These checks complement the existing scientific and pretrained-model tests; they do not claim a completed full-corpus experiment or an observed interactive Colab run.
+The shared workspace overview is to be refreshed each Friday morning in Jerusalem time. It should show measured progress, current problems, available figures and results, and prioritized next actions that advance the author’s work. Recommendations remain separate from observed outcomes.
