@@ -108,3 +108,17 @@ Source families join exact normalized-text duplicates and equal nonempty digital
 For a new conversation: **Continue from this README and the existing Paper Final run record. Preserve originals and completed checkpoints. Inspect scientific run 40253860968 and current-code run 40254325732 first; corpus preparation run 40250580314 has completed. Continue the first unfinished stage from its checkpoints. Do not treat corpus preparation or unit tests as full classification validation, and do not rewrite findings before the computational checks pass.**
 
 A continuation check also revisits the project every six hours to inspect completed computational evidence, repair demonstrated execution defects, and continue the approved figures and manuscript steps after their computational prerequisites pass. It preserves active jobs and ends after the full deliverable is verified.
+
+
+
+## Opening the notebooks in Colab
+
+Open [Proof.ipynb](https://colab.research.google.com/github/shulruferor-sudo/Paper-1/blob/main/Proof.ipynb), [Unit_Tests.ipynb](https://colab.research.google.com/github/shulruferor-sudo/Paper-1/blob/main/Unit_Tests.ipynb), or [Figure_Generator.ipynb](https://colab.research.google.com/github/shulruferor-sudo/Paper-1/blob/main/Figure_Generator.ipynb) and run from the first code cell in a fresh runtime. Each code cell has its own Markdown title and explanation immediately above it.
+
+The setup cell obtains the complete repository when it is absent, including the committed corpus and checkpoints. It reuses an existing project without pulling over local edits. An interrupted clone is not published as a usable project. A notebook already open in Colab retains its old cells; reopen the GitHub link to load these corrections. Downloaded runtime files are separate from the notebook document and are not automatically saved back to GitHub.
+
+The test and figure notebooks read the computational notebook's shared dependency specification after setup. Figure rendering additionally installs the pinned PDF/image packages and checks XeLaTeX and Latin Modern fonts. Empirical rendering still requires complete computational verification. GitHub tests cover Python 3.12 and 3.13; the full computation retains its existing Python 3.12 environment.
+
+### Notebook startup revision
+
+The missing sibling-file startup defect was reproduced from the supplied Colab traceback. The revised tests exercise actual setup cells against a local Git fixture from empty directories, repeated execution, parent-directory discovery, preservation of incomplete directories and interrupted clone cleanup. These checks complement the existing scientific and pretrained-model tests; they do not claim a completed full-corpus experiment or an observed interactive Colab run.
