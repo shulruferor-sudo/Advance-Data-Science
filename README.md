@@ -4,31 +4,50 @@ Or Shulrufer's public workspace for reusable datasets, scientific figures and ad
 
 ## Workspace structure
 
-The requested structure separates shared scientific resources from project implementations:
-
 | Location | Purpose |
 | --- | --- |
-| `datasets/` | Shared datasets and their loaders, source identities, checksums and normalization records. Any project can use any dataset. |
-| `project_notebooks/` | One computational notebook per project, containing its explanations, executable calculations, checks and displayed results. |
-| `project_python/` | Python implementations derived from validated project notebooks for use in larger systems. |
-| `Figures.ipynb` | One shared notebook containing reusable figure generators, each introduced by a Markdown title and explanation. |
-| `README.md` | Workspace organization, dataset access and project execution instructions. |
+| `Datasets/Datasets.ipynb` | One independent notebook that obtains and maintains shared datasets, with a separate loading section for each dataset. |
+| `Datasets/<descriptive_dataset_name>/` | One enclosing folder per dataset, retaining all its constituent files and subfolders. |
+| `project_notebooks/` | One notebook per project for development, execution, displayed results and verification within that notebook. |
+| `project_python/` | Python pipelines derived from the corresponding notebooks after their execution and results have been validated. |
+| `Figures.ipynb` | One independent, reusable collection of scientific and data science figure generators. |
+| `README.md` | Workspace organization, ownership of shared resources and execution instructions. |
 
-The first shared dataset is the complete 8,836-source arXiv text corpus already committed here. Its loader must reuse verified local files, preserve every source, and expose the dataset independently of project-specific training partitions, model checkpoints and results. Moving it must preserve its original and normalized text checksums.
+### Shared datasets
 
-Each project notebook contains its own executable verification. A separate test notebook is not part of the requested structure. Successful execution and scientific validity remain distinct: coverage, partition separation, numerical agreement, target alignment and training updates require explicit checks within the notebook.
+Only `Datasets/Datasets.ipynb` obtains or updates datasets. Its sections can be run individually, one dataset at a time. Each section saves directly into that dataset's existing folder beneath `Datasets/`, reuses verified files and obtains missing files without creating numbered copies. Downloads are saved as files rather than retained only in notebook variables. Colab runtime storage is temporary; durable use requires a persistent mounted destination or an explicit save to the repository.
 
-The repository name requested is **Advanced Data Science**. The current GitHub address remains https://github.com/shulruferor-sudo/Paper-1 until the repository itself is renamed.
+Folder names describe the dataset's actual contents and meaningful scope rather than merely reproducing an upstream identifier. The current dataset's destination is `Datasets/arxiv_research_papers_2020/`: extracted full texts of arXiv research papers from 2020, usable for scientific-text analysis and document classification. Its publisher's original identity, source link, pinned revision and checksums remain recorded unchanged. The complete existing population is 8,836 sources; relocation does not recreate, subsample or alter it.
+
+A dataset always has one enclosing folder, including when the upstream release consists of multiple folders or loose files. Original texts, metadata, normalization records and source provenance remain inside that folder. Project-specific partitions, trained models, checkpoints and measured project results are not shared dataset content.
+
+Projects only read available datasets. They do not invoke the dataset notebook, acquire missing data, normalize or repair shared files, or update datasets. If required files are absent, the project stops with a clear message directing the user to run the corresponding section of `Datasets/Datasets.ipynb` manually. Availability checks do not authorize modification.
+
+Updates occur in place for the declared source revision. A change of source revision must be explicit and recorded, so a rerun does not silently substitute a different corpus. Existing verified files and interrupted-download recovery must be preserved.
+
+### Project notebooks and Python implementations
+
+Each project has one notebook, with a separate rendered Markdown title and explanation immediately above every code cell. The explanation connects the cell's prerequisites, purpose and outputs so the computational sequence is understandable without artificial ordering labels.
+
+Develop, execute and inspect the project in that notebook. Necessary assertions and verification remain within it; a separate test notebook is not part of this workspace structure. Only after the notebook works correctly and its results are validated is its same computational code consolidated into a Python pipeline in `project_python/`. The Python implementation preserves the notebook's mathematical definitions, inputs, transformations and results.
+
+### Reusable figures
+
+`Figures.ipynb` is independent of projects and datasets. It contains the reusable figure-generating code in one notebook, without a separate figures-code folder. Projects may use those generators, but do not own them. Generators accept their required values or explicit input paths rather than retrieving, updating or executing another project. A figure requiring measured results cannot substitute illustrative values for them.
+
+### Existing research materials
+
+The research manuscript and its valid revisions remain preserved. Reorganizing the repository into a general data science workspace does not authorize deletion of manuscripts, source materials, measured results or checkpoints.
 
 ## Migration state
 
-The structure above is the requested destination, not a claim that the files have already moved. The active scientific workflow and its queued continuation still use the current root notebook paths and `corpus/`. Those paths remain intact while the active job uses them. Relocation must update notebook startup, dataset loading, result locations, figure inputs, workflow paths and Colab links together. Existing manuscripts, checkpoints and measured results remain preserved. The historical layout and continuation record below describe the current executable checkout until that coordinated migration is complete.
+The repository has been renamed to [Advance-Data-Science](https://github.com/shulruferor-sudo/Advance-Data-Science). The structure above records the requested destination; it does not claim that relocation has already occurred. The active scientific workflow still uses the current root notebook paths and `corpus/`. These paths must remain intact while it uses them. The coordinated migration must update notebook startup, read-only project dataset access, result locations, figure inputs, workflow paths and Colab links, while preserving data checksums and Git history.
 
 ## Current research project
 
 Or Shulrufer
 
-Advance data science. Canonical repository: https://github.com/shulruferor-sudo/Paper-1
+Advance data science. Canonical repository: https://github.com/shulruferor-sudo/Advance-Data-Science
 
 The current executable project consists of one `corpus` folder, three Jupyter notebooks, two manuscript sources and this README. These paths remain in place until the coordinated migration described above. Changes are recorded through Git commits and, for existing Library deliverables, through their version histories.
 
@@ -139,7 +158,7 @@ A continuation check also revisits the project every six hours to inspect comple
 
 ## Opening the notebooks in Colab
 
-Open [Proof.ipynb](https://colab.research.google.com/github/shulruferor-sudo/Paper-1/blob/main/Proof.ipynb), [Unit_Tests.ipynb](https://colab.research.google.com/github/shulruferor-sudo/Paper-1/blob/main/Unit_Tests.ipynb), or [Figure_Generator.ipynb](https://colab.research.google.com/github/shulruferor-sudo/Paper-1/blob/main/Figure_Generator.ipynb) and run from the first code cell in a fresh runtime. Each code cell has its own Markdown title and explanation immediately above it.
+Open [Proof.ipynb](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/Proof.ipynb), [Unit_Tests.ipynb](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/Unit_Tests.ipynb), or [Figure_Generator.ipynb](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/Figure_Generator.ipynb) and run from the first code cell in a fresh runtime. Each code cell has its own Markdown title and explanation immediately above it.
 
 The setup cell obtains the complete repository when it is absent, including the committed corpus and checkpoints. It reuses an existing project without pulling over local edits. An interrupted clone is not published as a usable project. A notebook already open in Colab retains its old cells; reopen the GitHub link to load these corrections. Downloaded runtime files are separate from the notebook document and are not automatically saved back to GitHub.
 
