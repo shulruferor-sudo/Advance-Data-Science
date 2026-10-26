@@ -4,6 +4,9 @@ Or Shulrufer’s public workspace for advanced data science, shared datasets, re
 
 [Repository](https://github.com/shulruferor-sudo/Advance-Data-Science)
 
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/shulruferor-sudo/Advance-Data-Science)
+[![Workspace build](https://github.com/shulruferor-sudo/Advance-Data-Science/actions/workflows/codespaces.yml/badge.svg)](https://github.com/shulruferor-sudo/Advance-Data-Science/actions/workflows/codespaces.yml)
+
 ## Workspace
 
 | Location | Purpose |
@@ -78,6 +81,6 @@ All four notebooks report failures at cell boundaries using Python `try`/`except
 
 ## Reusable notebook environment and automatic dependency setup
 
-[Create or resume a Codespace](https://codespaces.new/shulruferor-sudo/Advance-Data-Science) for this repository. The development-container configuration installs Python dependencies from the computational and figures notebooks and includes XeLaTeX and fonts. Initial creation or rebuilding requires installation; reopening the same Codespace retains that environment. This configuration prepares the environment without starting research calculations. A live Codespace build still requires validation on GitHub.
+[Create or resume a Codespace](https://codespaces.new/shulruferor-sudo/Advance-Data-Science) for this repository. The development-container configuration installs Python dependencies from the computational and figures notebooks and includes XeLaTeX and fonts. Initial creation or rebuilding requires installation; reopening the same Codespace retains that environment. This configuration prepares the environment without starting research calculations. The separate **Verify Codespaces environment** workflow builds the actual development container and checks library imports, a small local BERT forward pass, a real notebook kernel, and PDF/PNG export through the figure notebook. Workspace startup waits for setup and verification. The build badge above links to the recorded outcome. These environment checks do not establish completion of the scientific study.
 
-All existing **Open in Colab** links remain available. Each notebook automatically checks its dependencies when you run all cells. Only missing packages are installed using the declared versions. Already installed versions are retained, with version differences printed for reproducibility; this does not guarantee compatibility. No installation switches require editing. Colab installations belong to that runtime and may need repeating after it is replaced. Changing this setting does not publish generated datasets or figures: saving files and committing them to GitHub are separate operations.
+All existing **Open in Colab** links remain available. Each notebook automatically checks its dependencies when you run all cells. Only missing packages are installed using the declared versions. Already installed versions are retained, with version differences printed for reproducibility; this does not guarantee compatibility. No installation switches require editing. Colab installations belong to that runtime and may need repeating after it is replaced. Automatic installation does not publish generated datasets or figures: saving files and committing them to GitHub are separate operations.
