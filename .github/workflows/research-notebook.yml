@@ -2,6 +2,8 @@ name: Run research notebook
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
   push:
     branches: [main]
     paths:
@@ -14,7 +16,32 @@ permissions:
   contents: write
 
 jobs:
+  continuation:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.state.outputs.run }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - id: state
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          python - <<'PYGATE'
+          import json, os
+          from pathlib import Path
+          path=Path("corpus/results/verification.json")
+          complete=path.exists() and json.loads(path.read_text()).get("complete") is True
+          run=os.environ["EVENT"]!="schedule" or not complete
+          with open(os.environ["GITHUB_OUTPUT"],"a") as stream:
+              stream.write("run="+str(run).lower()+"\n")
+          PYGATE
   tests:
+    needs: continuation
+    if: needs.continuation.outputs.run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -41,6 +68,11 @@ jobs:
           assert len(cells) == 1
           exec(compile("".join(cells[0]["source"]), "notebook-dependencies", "exec"))
           PYINSTALL
+      - name: Reuse pinned pretrained models
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: corpus/models
+          key: pretrained-bert-86b5e093-chonky-4a92de55
       - name: Run the test notebook against the actual computational notebook
         run: |
           python - <<'PY'
@@ -75,6 +107,7 @@ jobs:
     env:
       MPLBACKEND: Agg
       PYTHONUNBUFFERED: "1"
+      PIPELINE_TIME_BUDGET_SECONDS: "14400"
       OMP_NUM_THREADS: "2"
       OPENBLAS_NUM_THREADS: "2"
       MKL_NUM_THREADS: "2"
@@ -109,6 +142,11 @@ jobs:
           key: arxiv-a68009864dbc3b1decb1a37a6c4f769887169a44-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             arxiv-a68009864dbc3b1decb1a37a6c4f769887169a44-
+      - name: Reuse pinned pretrained models
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: corpus/models
+          key: pretrained-bert-86b5e093-chonky-4a92de55
       - name: Execute the notebook and save each completed cell
         timeout-minutes: 300
         run: |
@@ -148,19 +186,38 @@ jobs:
                               print(output.text, flush=True)
               status["complete"] = True
           except BaseException as error:
-              status["error"] = f"{type(error).__name__}: {error}"
-              raise
+              if getattr(error,"ename",None)=="CheckpointPause":
+                  status["paused"]=True
+                  status["continuation"]="Resume from saved per-source, per-candidate or training-batch checkpoints."
+              else:
+                  status["error"] = f"{type(error).__name__}: {error}"
+                  raise
           finally:
               status["saved_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
               save()
           PY
-      - name: Preserve the complete corpus in repository history
+      - name: Preserve verified corpus and computational checkpoints in repository history
+        if: always()
         run: |
           python - <<'PY'
           from pathlib import Path
+          import ast
           import hashlib
           import json
+          import subprocess
           corpus = Path("corpus")
+          if not (corpus/"source_text_register.json").exists():
+              raise SystemExit("No verified source register to publish yet.")
+          notebook=json.loads(Path("Proof.ipynb").read_text())
+          names={"save_json","file_sha256","pack_large_files"}
+          definitions=[]
+          for cell in notebook["cells"]:
+              if cell["cell_type"]=="code":
+                  definitions.extend(node for node in ast.parse("".join(cell["source"])).body
+                      if isinstance(node,ast.FunctionDef) and node.name in names)
+          assert {node.name for node in definitions}==names
+          exec(compile(ast.Module(body=definitions,type_ignores=[]),"notebook-checkpoint-storage","exec"))
+          pack_large_files(corpus)
           manifest = json.loads((corpus / "source_manifest.json").read_text())
           register = json.loads((corpus / "source_text_register.json").read_text())
           assert manifest["revision"] == "a68009864dbc3b1decb1a37a6c4f769887169a44"
@@ -169,16 +226,23 @@ jobs:
           for record in register["documents"]:
               raw = (corpus / "original_text" / (record["document_id"] + ".md")).read_bytes()
               assert hashlib.sha256(raw).hexdigest() == record["sha256"]
+          files=[]
           for path in corpus.rglob("*"):
-              if path.is_file():
-                  assert path.stat().st_size < 100 * 1024 ** 2, path
-          print("Verified all 8,836 source files before saving the corpus to repository history.")
+              if path.is_file() and ".cache" not in path.parts and not path.name.endswith(".tmp"):
+                  if path.stat().st_size >= 90 * 1024**2:
+                      assert path.with_name(path.name+".parts").joinpath("manifest.json").exists(), path
+                  else:
+                      files.append(str(path))
+          # Stage deletions and only files below GitHub's single-file size limit.
+          subprocess.run(["git","add","-u","--","corpus"],check=True)
+          for start in range(0,len(files),200):
+              subprocess.run(["git","add","--force","--",*files[start:start+200]],check=True)
+          print("Verified all 8,836 sources and packed large model/result artifacts before saving history.")
           PY
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add --force corpus
           if ! git diff --cached --quiet; then
-            git commit -m "Preserve complete pinned arXiv text corpus and normalization records"
+            git commit -m "Save verified corpus and resumable computational progress"
             cp Proof.ipynb "$RUNNER_TEMP/executed-research-notebook.ipynb"
             trap 'cp "$RUNNER_TEMP/executed-research-notebook.ipynb" Proof.ipynb' EXIT
             git restore -- Proof.ipynb
@@ -203,6 +267,12 @@ jobs:
             Proof.ipynb
             corpus/execution_status.json
             corpus/results/figures/
+            corpus/results/verification.json
+            corpus/results/*summary.json
+            corpus/results/*self_test.json
+            corpus/results/cluster_sweep*.json
+            corpus/results/source_partitions.json
+            corpus/results/segmentation.json
             corpus/*manifest.json
             corpus/*progress.json
             corpus/*register.json
