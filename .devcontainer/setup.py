@@ -8,7 +8,7 @@ notebooks = {
 }
 for path, identifiers in notebooks.items():
     notebook = json.loads((root / path).read_text())
-    namespace = {"INSTALL_DEPENDENCIES": True}
+    namespace = {}
     for identifier in identifiers:
         cells = [cell for cell in notebook["cells"] if cell.get("id") == identifier]
         if len(cells) != 1:
