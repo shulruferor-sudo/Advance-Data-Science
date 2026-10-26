@@ -1,10 +1,36 @@
-# From Linguistic Context to Semantic Structure
+# Advanced Data Science
+
+Or Shulrufer's public workspace for reusable datasets, scientific figures and advanced data science projects.
+
+## Workspace structure
+
+The requested structure separates shared scientific resources from project implementations:
+
+| Location | Purpose |
+| --- | --- |
+| `datasets/` | Shared datasets and their loaders, source identities, checksums and normalization records. Any project can use any dataset. |
+| `project_notebooks/` | One computational notebook per project, containing its explanations, executable calculations, checks and displayed results. |
+| `project_python/` | Python implementations derived from validated project notebooks for use in larger systems. |
+| `Figures.ipynb` | One shared notebook containing reusable figure generators, each introduced by a Markdown title and explanation. |
+| `README.md` | Workspace organization, dataset access and project execution instructions. |
+
+The first shared dataset is the complete 8,836-source arXiv text corpus already committed here. Its loader must reuse verified local files, preserve every source, and expose the dataset independently of project-specific training partitions, model checkpoints and results. Moving it must preserve its original and normalized text checksums.
+
+Each project notebook contains its own executable verification. A separate test notebook is not part of the requested structure. Successful execution and scientific validity remain distinct: coverage, partition separation, numerical agreement, target alignment and training updates require explicit checks within the notebook.
+
+The repository name requested is **Advanced Data Science**. The current GitHub address remains https://github.com/shulruferor-sudo/Paper-1 until the repository itself is renamed.
+
+## Migration state
+
+The structure above is the requested destination, not a claim that the files have already moved. The active scientific workflow and its queued continuation still use the current root notebook paths and `corpus/`. Those paths remain intact while the active job uses them. Relocation must update notebook startup, dataset loading, result locations, figure inputs, workflow paths and Colab links together. Existing manuscripts, checkpoints and measured results remain preserved. The historical layout and continuation record below describe the current executable checkout until that coordinated migration is complete.
+
+## Current research project
 
 Or Shulrufer
 
 Advance data science. Canonical repository: https://github.com/shulruferor-sudo/Paper-1
 
-The main project consists of one `corpus` folder, three Jupyter notebooks, two manuscript sources and this README. Filenames stay fixed. Changes are recorded through Git commits and, for existing Library deliverables, through their version histories.
+The current executable project consists of one `corpus` folder, three Jupyter notebooks, two manuscript sources and this README. These paths remain in place until the coordinated migration described above. Changes are recorded through Git commits and, for existing Library deliverables, through their version histories.
 
 | File | Purpose |
 | --- | --- |
@@ -18,7 +44,7 @@ The main project consists of one `corpus` folder, three Jupyter notebooks, two m
 
 The `.md` and `.tex` files are edited directly. No separate program generates either manuscript source. The existing manuscript sources are preserved for revision. Their earlier news-corpus and TextTiling passages are historical draft material and are not results for the current arXiv corpus. The computational checks and measured classification comparisons must pass before those sections are rewritten. No PDF is included in this commit, and no new manuscript figures are rendered.
 
-Use **Actions → Run research notebook → Run workflow** to execute on GitHub. The test notebook runs first. The `.github` directory contains the configuration required to execute these notebooks on GitHub; it is not an additional manuscript, notebook or project version. To run the notebooks yourself in Jupyter, run the cells in order; the first code cell installs the pinned dependencies from the computational notebook. Manuscript figure rendering additionally requires PyMuPDF 1.26.6, Pillow 12.3.0, scikit-learn 1.8.0, XeLaTeX, PGFPlots and Latin Modern fonts. The figures notebook preserves the ten existing explanatory Python generators, the three-dimensional variance generator, three method diagrams and three empirical plot generators.
+Use **Actions → Run research notebook → Run workflow** to execute on GitHub. The test notebook runs first. The `.github` directory contains the configuration required to execute these notebooks on GitHub; it is not an additional manuscript, notebook or project version. To run the notebooks yourself in Jupyter, run the cells in order; the setup cell locates or obtains the project, followed by installation of the pinned dependencies from the computational notebook. Manuscript figure rendering additionally requires PyMuPDF 1.26.6, Pillow 12.3.0, scikit-learn 1.8.0, XeLaTeX, PGFPlots and Latin Modern fonts. The figures notebook preserves the ten existing explanatory Python generators, the three-dimensional variance generator, three method diagrams and three empirical plot generators.
 
 After the notebooks are validated, an optional single Python pipeline will be derived for larger systems. It will use scikit-learn transformations and PyTorch training where they serve this same pipeline. Its mathematical definitions, source partitions, fitted state and outputs will match the validated notebook. Do not create that deployment file during notebook development.
 
