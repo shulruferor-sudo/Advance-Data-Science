@@ -1,6 +1,6 @@
 # CBS occupation survey sample
 
-The source brief explicitly describes the data as a simulation, not real survey records. The original bytes are preserved.
+The source is a simulation, not real survey records.
 
 File: `DUMMY_DATASET.xlsx` (907,941 bytes)
 
