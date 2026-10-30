@@ -1,6 +1,6 @@
 # CBS occupation survey sample
 
-Original simulated workbook supplied for Or Shulrufer's data-science take-home assignment. The source brief explicitly describes the data as a simulation, not real survey records. The original bytes are preserved.
+The source brief explicitly describes the data as a simulation, not real survey records. The original bytes are preserved.
 
 File: `DUMMY_DATASET.xlsx` (907,941 bytes)
 
