@@ -33,7 +33,7 @@ output_directory.mkdir(exist_ok=True)
 
 
 class CatBoostMulticlassAdapter(ClassifierMixin, BaseEstimator):
-    def __init__(self, iterations=1000, depth=6, learning_rate=None, l2_leaf_reg=3, random_strength=1, random_seed=42):
+    def __init__(self, iterations=100, depth=6, learning_rate=None, l2_leaf_reg=3, random_strength=1, random_seed=42):
         self.iterations = iterations
         self.depth = depth
         self.learning_rate = learning_rate
