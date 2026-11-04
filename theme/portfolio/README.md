@@ -17,6 +17,8 @@ For HTML, link `portfolio.css` and apply the `portfolio` class to the body or a 
 
 For slides, use P052 for headings and Nimbus Sans for body text. Set the background, text and divider colors from the table. Use Noto Serif Hebrew and Noto Sans Hebrew for Hebrew text where the source fonts lack glyphs. The language fallback belongs to the same theme.
 
+**Optional Hebrew presentation mode:** When Hebrew is selected, apply [Hebrew presentation settings and verification](HEBREW_PRESENTATIONS.md) in addition to this portfolio theme. English-only presentations do not use the Hebrew-specific requirements.
+
 From the repository root, apply the notebook presets as follows.
 
 ```python
