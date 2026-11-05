@@ -34,12 +34,12 @@ Do not use this direction when you want unuploaded local edits to remain in the 
 git fetch origin main && git branch "backup-$(date +%Y%m%d%H%M%S)" && git stash push -u -m "Before GitHub refresh" && git reset --hard origin/main
 ```
 
-<<<<<<< HEAD
-## codespace upload from github
-```
+### Refresh the assignment notebook from GitHub
+
+```bash
 git fetch origin main && git restore --source=origin/main -- "projects/Bureau of Statistics/Assignment_Solution.ipynb"
 ```
-=======
+
 ### Normal synchronization
 
 Use the Codespaces to GitHub command for ordinary development because it preserves both committed histories.
@@ -47,8 +47,6 @@ Use the GitHub to Codespaces command only when you explicitly want the current w
 The GitDoc extension may publish saved changes automatically when connected and authorized, but automatic publishing cannot resolve divergent histories or conflicting notebook edits.
 In those cases, inspect the Git status and resolve the conflict before publishing.
 A rejected push is a safety check and must not be bypassed by force pushing.
-
->>>>>>> origin/main
 
 ## Workspace
 
