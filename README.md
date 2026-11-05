@@ -4,18 +4,51 @@ Or Shulrufer’s public workspace for advanced data science, shared datasets, re
 
 [Repository](https://github.com/shulruferor-sudo/Advance-Data-Science)
 
-## code space upload to github
-```
-git status
-git add -A
-git commit -m "Update repository"
-git push origin main
+## Codespaces and GitHub synchronization
+
+A Codespace and GitHub are separate copies of the same repository.
+Open the terminal in Codespaces using Terminal, then New Terminal.
+Run one of the commands below from the repository root.
+The commands work across the complete repository, not just one notebook.
+
+### Codespaces to GitHub
+
+Save the edited files before running this command.
+This records local changes, downloads and merges newer GitHub commits, then uploads the combined history.
+If the same lines were changed on both sides, Git stops for conflict resolution rather than overwriting either version.
+No force push or rebase is used.
+
+```bash
+git add -A && (git diff --cached --quiet || git commit -m "Update repository") && git fetch origin main && git merge --no-edit origin/main && git push origin main
 ```
 
+### GitHub to Codespaces
+
+Use this when GitHub is the authoritative version and you want the complete tracked repository in Codespaces to match GitHub.
+The backup branch preserves local commits and the stash preserves uncommitted edits and untracked files.
+The command then replaces the current tracked working copy with GitHub `main`.
+The backups are not automatically reapplied.
+Do not use this direction when you want unuploaded local edits to remain in the active notebook.
+
+```bash
+git fetch origin main && git branch "backup-$(date +%Y%m%d%H%M%S)" && git stash push -u -m "Before GitHub refresh" && git reset --hard origin/main
+```
+
+<<<<<<< HEAD
 ## codespace upload from github
 ```
 git fetch origin main && git restore --source=origin/main -- "projects/Bureau of Statistics/Assignment_Solution.ipynb"
 ```
+=======
+### Normal synchronization
+
+Use the Codespaces to GitHub command for ordinary development because it preserves both committed histories.
+Use the GitHub to Codespaces command only when you explicitly want the current working copy replaced by the remote version.
+The GitDoc extension may publish saved changes automatically when connected and authorized, but automatic publishing cannot resolve divergent histories or conflicting notebook edits.
+In those cases, inspect the Git status and resolve the conflict before publishing.
+A rejected push is a safety check and must not be bypassed by force pushing.
+
+>>>>>>> origin/main
 
 ## Workspace
 
