@@ -2,6 +2,124 @@
 
 This project starts with what a survey response actually records. The person’s occupation, the employer’s industry and the employer’s name answer three different questions. The assignment eventually asks for an occupation classifier. This stage covers the data and the exploratory text clusters so the evidence can be reviewed before deciding how to predict a code.
 
+## Reusable data investigation and notebook authoring protocol
+
+This section is a **portable working manual**. It describes how to investigate unfamiliar structured data and produce an executable notebook whose questions, measurements, conclusions, and modeling decisions can be checked by another data scientist. Reuse it in other projects by replacing only the source, schema, target, and project-specific questions. The case-specific findings below are not general rules.
+
+### 1. Establish what each source contributes
+
+Read the **assignment or business brief**, **field dictionary/metadata**, **original data**, and any **existing interpretation or presentation** together before implementing field transformations:
+
+| Source | What to establish | What it does *not* establish |
+| --- | --- | --- |
+| Brief and questionnaire instructions | Business objective, unit of observation, population/scope, response rules, update behavior, prediction target, required deliverables | That the data actually obey every stated rule |
+| Field metadata/codebook | Exact field meaning, declared type, allowed values, conditional applicability, units and code semantics | Actual completeness, value validity, ordering, or whether text is a free-entry UI control |
+| Observed dataset | Row counts, missingness, distributions, duplicates, conflicts, relationships, unusual values and their record keys | Causality, true respondent identity, semantic correctness, or information not recorded |
+| Existing interpretation/presentation | Research questions and prior proposed decisions; known issues worth reproducing | Fresh empirical evidence: reported counts and conclusions must be verified by executing code |
+
+Use field **names** to join metadata to data; metadata row order may differ from data column order. Inspect how Excel stores and *displays* numbers, dates and classification codes; neither worksheet dimensions nor numeric storage alone determine semantics. Retain a raw, auditable snapshot. Identify the observation key, record boundaries, and any non-data rows **before filtering**; do not silently discard records that should be examined for missing IDs.
+
+### 2. Derive questions by *field meaning*, not by field name
+
+Start with the fundamental questions: **What is recorded? What does it mean? Why was it collected? What evidence is missing? What can the observed values actually establish?** Narrow them to questions that require computation. Different fields may share a single test if they answer one dependent question.
+
+| Field type / relationship | Questions to answer with code | Evidence or test |
+| --- | --- | --- |
+| Record identifier / running key | Is it complete, unique, correctly typed, and sequential *if sequential numbering is specified*? Does a record key identify a submission, respondent, or version? | Missing/duplicate counts; integer/range checks; observed key structure. Never infer history without a stable identity/version or timestamp |
+| Nominal category | Are values members of the codebook? Does a numeric-looking code actually represent an unordered label? | Frequencies, undefined codes, explicit missing category; preserve categorical semantics |
+| Ordinal category | Does the metadata establish an order? Do exceptions such as “other” or “none” break it? | Exact code-to-meaning mapping; verify order before ordinal encoding |
+| Numeric measurement / count | What are the units, valid bounds, integer requirement, distribution, and missingness? | Parse failures, fractional/negative/impossible values, ranges and outliers; justify any bounds |
+| Dates / durations | What event does the date represent, and what valid reference date would a duration require? | Parse and range checks; no invented “current” reference date for historical duration |
+| Free or potentially free text | Is it a genuine description, placeholder, reference to another answer, optional title, acronym or mixed-language value? | Completeness, source phrases, language/script patterns, placeholders and reference cases; do not assume “TEXT” proves a specific form control |
+| Entity/name text | Are differently written names actual aliases, transliterations, generic descriptions, or different entities? | Candidate pairs and context; semantic similarity is a proposal, not verified identity |
+| Conditionally applicable field | Who is eligible to answer? Is blank not applicable, unanswered, or unknown? Are some filled values inconsistent? | Joint cross-tabulation with governing field; mutually exclusive applicability states and ID-linked contradictions |
+| Structured/hierarchical code | Is the value a number or a code with fixed width, prefixes and partial symbols? | String-format and prefix checks; check Excel leading-zero formatting; preserve partial information |
+| Label/target | Is it the intended outcome? Are labels partial, noisy or available only after the prediction decision? | Completeness, class counts, disagreements, prefix coverage and label-source provenance |
+| Candidate predictor / information source | Is the value available **at the time of inference**? Could it leak the target or be fitted using held-out records? | Prediction-time availability analysis; train-only fitting; scenario/ablation when uncertain |
+
+Do not force every variable into one representation. Separate direct outcome evidence from organizational or contextual information. When the business rule involves two or more fields, investigate them **together**, show the relevant records and derive one decision from the joint evidence. Ask an additional question only when the existing evidence implies a consequential unresolved issue.
+
+### 3. Author each investigation as a reviewer-facing Markdown/code pair
+
+**Markdown comes before the calculation**, with only:
+
+1. **Feature or question type:** what the source metadata defines, and the relevant rule from the brief.
+2. **Question:** exact research question(s), in the notebook's presentation language.
+3. **How it will be answered:** the smallest specific check, cross-field comparison, table or plot required.
+
+Then a **single Python code cell** should implement the check on the **already loaded DataFrame**. Write the corresponding question as a concise comment directly above its code. A field can have its own pair, or a related group of fields can share one pair when the same question genuinely spans them. **Do not write “Findings” or “Conclusion” in Markdown before the code has produced results.** Present measured evidence first, then a conclusion justified by that evidence, not a predetermined statement. Do not reframe known metadata rules as discoveries.
+
+Copy-ready notebook pattern (replace the placeholders, not the sequence):
+
+```markdown
+### <Field or relationship> — <semantic role>
+
+**Metadata and business rule:** <precise definition and applicable constraint>.
+
+**Question:** <one answerable investigative question>?
+
+**Verification:** <specific measurement, comparison or validation on the loaded data>.
+```
+
+```python
+# Q: <one answerable investigative question>?
+values = data[COLUMN]                         # Reuse the existing loaded DataFrame
+summary = pd.DataFrame({
+    "Records": [len(values)],
+    "Missing": [int(values.isna().sum())],
+    "Distinct": [int(values.nunique(dropna=True))]
+})
+display(summary)                                # Show the measured evidence
+
+# State a finding only if the displayed evidence supports it.
+```
+
+The pattern is a **shape**, not a mandate to print these three counts for every field. Replace generic counts with the check the *actual question* needs. Prefer one necessary table, chart or comparison over repeated descriptive summaries. If the answer cannot be observed from the available fields, state the limitation rather than inventing verification.
+
+### 4. Preserve a sequential notebook
+
+1. **Imports and global settings:** libraries, visualization configuration, runtime seed. No data download or pretrained model loading here.
+2. **Source retrieval and verification:** read the identified source once; record origin/version and verify its checksum where appropriate.
+3. **Load and preserve data:** read survey and metadata once, establish the raw observations and row identities, and expose source structure.
+4. **Investigative Markdown/code pairs:** run field-by-field and cross-field tests on the existing DataFrames. Reuse earlier calculations rather than recreating the data or repeating the same check in every cell.
+5. **Data-processing decisions:** create derived views for validated transformations; preserve original values and maintain links back to record IDs. Load any task-specific language/embedding model in its own data-processing cell, then apply it in a separate inference cell.
+6. **Modeling and validation:** establish prediction-time availability, fit learned preprocessing only on training folds, and compare justifiable baselines and alternatives. Keep leakage-sensitive normalization, imputation, encoding and selection inside cross-validation.
+7. **Evidence and decisions:** show metrics, relevant plots, anomalous record IDs, findings, and limitations **after execution**; then document the justified processing or modeling decision.
+8. **Export:** save the notebook with consistent execution outputs, reproducible parameters, and necessary artifacts. A saved output is not evidence for code that has not been rerun.
+
+Each executable cell must have one clear purpose and explicit inputs/outputs from earlier cells. Never overwrite an existing stage merely to append a new investigation. Preserve working computations and prior results unless they are incorrect or deliberately superseded.
+
+### 5. Code and notebook presentation
+
+Write the notebook for the **person assessing the work**, not for an assistant or the author. Use first-person explanation when natural, straightforward English, exact domain vocabulary and brief comments that clarify *why* a check is performed. Do not write chat instructions, tool/assistant provenance, approval requests or promises in the notebook. Do not pad the reader-facing text with speculative plans, exhaustive possibilities or self-congratulation.
+
+Prefer **compact, horizontally readable code**: one focused Markdown cell and one compact code cell should ideally fit on one screen with the relevant result. Group related expressions, avoid needless vertical statements, but do not sacrifice readability or meaningful variable names for compression. Use short comments above logical blocks, not a comment for every expression. Avoid printing a complete wide dataset when a relevant subset or aggregate answers the question.
+
+For a reporting cell where a visual heading is needed, use an H2 heading, one empty print before it, and two empty prints between the heading and the first table and between subsequent tables:
+
+```python
+print()
+display(HTML("<h2>Data inspection</h2>"))
+print(); print()
+display(metadata)
+print(); print()
+display(data.head(3))
+```
+
+Use an equivalent Markdown heading instead if it is already displayed immediately above the results; avoid duplicate headings. Keep the project’s table styling consistent; plots must have legible labels and should add evidence rather than decoration.
+
+### 6. Evidence and release checks
+
+- **Question-to-code coverage:** every included data question must have an identifiable test, and every test must answer its preceding question. Do not include prose-only questions when the task specifically calls for code-supported investigation.
+- **Correctness:** check the actual metadata types/allowed values, exact data scope, source record counts, missing values, edge cases, assumptions and conditional rules. Distinguish stored Excel values from displayed formats; do not treat workbook artifacts outside the survey as records.
+- **Traceability:** retain original field values and row identifiers, show conflicting cases by ID, and keep proposed normalizations distinct from validated replacements.
+- **Epistemic order:** question → method → executed output → finding → justified decision. The title, explanation and comments may state **what will be tested**; do not prestate an empirical finding as though already computed.
+- **Validation:** verify Python syntax, cell dependencies, top-to-bottom execution, shape invariants and source preservation. A notebook edited in GitHub but not rerun has **unverified new results**; mark that distinction outside the reviewer-facing scientific conclusions until execution.
+- **Scope control:** implement only the project's established requirements and relevant implied checks. Keep optional enhancements in a separate, clearly labeled proposal; do not weave unapproved proposals into the notebook's code or analysis.
+- **Maintenance:** when work reveals a new *transferable* lesson about investigation, code structure, validation or communication, update this section with a concise operational rule. Put dataset-specific findings elsewhere in the README. This manual should stay reusable without needing to rename every variable.
+
+---
+
 ## What the assignment asks
 
 The interview brief asks for Python code that predicts `SemelMishlachSofi`, an executable Jupyter notebook with predictions and a GitHub link, and a presentation of up to ten slides. The slides should explain the business problem, the data, the solution, the findings and the next steps for implementation. The brief calls the data simulated and explicitly gives the prediction results little weight. That makes the reasoning behind the data handling important. It gives no scoring rubric and names no required classifier.
