@@ -12,6 +12,11 @@ git commit -m "Update repository"
 git push origin main
 ```
 
+## codespace upload from github
+```
+git fetch origin main && git restore --source=origin/main -- "projects/Bureau of Statistics/Assignment_Solution.ipynb"
+```
+
 ## Workspace
 
 | Location | Purpose |
