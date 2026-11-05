@@ -14,9 +14,10 @@ The commands work across the complete repository, not just one notebook.
 ### Codespaces to GitHub
 
 git add -A
-git commit -m "Update repository"
-git pull --no-rebase --no-edit -X ours origin main
-git push origin main
+git commit --allow-empty -m "Update repository"
+git fetch origin
+expected=$(git rev-parse refs/remotes/origin/main)
+git push --force-with-lease=refs/heads/main:$expected origin HEAD:refs/heads/main
 
 ### GitHub to Codespaces
 
