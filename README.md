@@ -13,19 +13,16 @@ The commands work across the complete repository, not just one notebook.
 
 ### Codespaces to GitHub
 
-git add -A
-git commit --allow-empty -m "Update repository"
-git fetch origin
-expected=$(git rev-parse refs/remotes/origin/main)
-git push --force-with-lease=refs/heads/main:$expected origin HEAD:refs/heads/main
+git add .
+git diff --cached --quiet || git commit -m "Update repository"
+git pull --no-rebase --no-edit origin main
+git push origin main
 
 ### GitHub to Codespaces
 
-git add -A
-git commit -m "Update repository"
-git pull --no-rebase --no-edit -X theirs origin main
-git push origin main
-
+git add .
+git diff --cached --quiet || git commit -m "Save Codespace changes"
+git pull --no-rebase --no-edit origin main
 
 ## Workspace
 
