@@ -78,14 +78,14 @@ The pattern is a **shape**, not a mandate to print these three counts for every 
 
 ### 4. Preserve a sequential notebook
 
-1. **Imports and global settings:** libraries, visualization configuration, runtime seed. No data download or pretrained model loading here.
-2. **Source retrieval and verification:** read the identified source once; record origin/version and verify its checksum where appropriate.
-3. **Load and preserve data:** read survey and metadata once, establish the raw observations and row identities, and expose source structure.
-4. **Investigative Markdown/code pairs:** run field-by-field and cross-field tests on the existing DataFrames. Reuse earlier calculations rather than recreating the data or repeating the same check in every cell.
-5. **Data-processing decisions:** create derived views for validated transformations; preserve original values and maintain links back to record IDs. Load any task-specific language/embedding model in its own data-processing cell, then apply it in a separate inference cell.
-6. **Modeling and validation:** establish prediction-time availability, fit learned preprocessing only on training folds, and compare justifiable baselines and alternatives. Keep leakage-sensitive normalization, imputation, encoding and selection inside cross-validation.
-7. **Evidence and decisions:** show metrics, relevant plots, anomalous record IDs, findings, and limitations **after execution**; then document the justified processing or modeling decision.
-8. **Export:** save the notebook with consistent execution outputs, reproducible parameters, and necessary artifacts. A saved output is not evidence for code that has not been rerun.
+1. **Imports and notebook-wide settings (before data preparation):** import libraries, configure display and define the runtime seed. Do not retrieve data or load pretrained model weights in the imports cell.
+2. **`## Data preparation` — first executable cell: load the source data.** Put this H2 heading **immediately before the first data-loading code cell**, never after it. Download/open the identified source, verify its integrity, and read the dataset and field metadata into DataFrames once. Preserve a copy of the source records. A metadata table and a small data preview may follow.
+3. **`### Investigation`:** ask only the field-type and cross-field questions justified by the brief and codebook. Place each relevant question next to the executable check on the **already loaded** DataFrame. Show measured outputs before claiming findings.
+4. **`### Decisions`:** interpret the investigation results against source definitions, distinguish observed facts from assumptions, and decide what to preserve, review, normalize, encode or exclude. No empirical conclusion precedes its calculation.
+5. **`### Transformations`:** perform the justified changes in derived data views, preserving raw values and record keys. Load task-specific language/embedding model weights in this section, in their own code cell, and apply them in a separate step. Do not silently treat proposed entity matches as verified.
+6. **`## Classification and evaluation` (after data preparation):** construct predictors, establish prediction-time availability, fit learned preprocessing on training folds only, compare baselines and alternatives, and report held-out evidence.
+7. **Results and interpretation:** display metrics, relevant plots, anomalous record IDs and limitations; write conclusions that follow the executed findings.
+8. **Export:** save a reproducible notebook and necessary outputs. Previously saved outputs do not verify new or moved code until rerun.
 
 Each executable cell must have one clear purpose and explicit inputs/outputs from earlier cells. Never overwrite an existing stage merely to append a new investigation. Preserve working computations and prior results unless they are incorrect or deliberately superseded.
 
