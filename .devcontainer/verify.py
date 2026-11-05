@@ -1,47 +1,37 @@
-"""Exercise the installed workspace without running the research pipeline."""
+"""Check that Codespaces can open and execute Jupyter notebooks."""
 import importlib
-import json
 from pathlib import Path
-import subprocess
-import sys
-import tempfile
-
-for module in ('numpy', 'scipy', 'sklearn', 'torch', 'transformers', 'chonky',
-               'huggingface_hub', 'safetensors', 'nbformat', 'nbclient', 'ipykernel', 'fitz', 'PIL'):
-    importlib.import_module(module)
-    print(f'PASS import {module}', flush=True)
-
-import numpy as np
-from sklearn.cluster import KMeans
-import torch
-from transformers import BertConfig, BertModel
-points = np.array([[0., 0.], [0., 1.], [10., 10.], [10., 11.]])
-assert len(set(KMeans(n_clusters=2, n_init=2, random_state=1).fit_predict(points))) == 2
-model = BertModel(BertConfig(vocab_size=20, hidden_size=16, num_hidden_layers=1,
-                            num_attention_heads=2, intermediate_size=32))
-assert model(torch.tensor([[1, 2, 3]])).last_hidden_state.shape == (1, 3, 16)
-print('PASS numerical libraries and small local BERT forward pass', flush=True)
 
 import nbformat
 from nbclient import NotebookClient
-notebook = nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell('assert 2 + 2 == 4')])
-NotebookClient(notebook, timeout=60, kernel_name='python3').execute()
-print('PASS real Jupyter kernel execution', flush=True)
 
-root = Path(__file__).resolve().parents[1]
-figures = json.loads((root / 'Figures.ipynb').read_text())
-namespace = {}
-for identifier in ('failure-reporting', '59e3018f', 'c6820dfd', '8aa56d9d'):
-    cell = next(c for c in figures['cells'] if c.get('id') == identifier)
-    exec(compile(''.join(cell['source']), 'Figures.ipynb:' + identifier, 'exec'), namespace)
-with tempfile.TemporaryDirectory() as directory:
-    namespace['OUT'] = Path(directory)
-    namespace['plt'] = namespace['configure_plotting']()
-    figure, axes = namespace['plt'].subplots()
-    axes.plot([0, 1], [0, 1])
-    namespace['save'](figure, 'workspace_check')
-    assert (Path(directory) / 'workspace_check.pdf').stat().st_size > 0
-    assert (Path(directory) / 'workspace_check.png').stat().st_size > 0
-print('PASS actual notebook figure export, XeLaTeX, fonts, PDF and PNG', flush=True)
-subprocess.run([sys.executable, '-m', 'pip', 'check'], check=True)
-print('PASS workspace verification', flush=True)
+ROOT = Path(__file__).resolve().parents[1]
+NOTEBOOKS = [
+    ROOT / "projects" / "Bureau of Statistics" / "Assignment_Solution.ipynb",
+    ROOT / "projects" / "LaBSE" / "labse_english_hebrew_only.ipynb",
+    ROOT / "projects" / "LaBSE" / "labse_he_en_colab_validation.ipynb",
+    ROOT / "projects" / "from_linguistic_context_to_semantic_structure" / "Proof.ipynb",
+]
+
+def main():
+    for name in ("numpy", "pandas", "scipy", "sklearn", "matplotlib",
+                 "openpyxl", "plotly", "ipykernel", "nbformat", "nbclient"):
+        importlib.import_module(name)
+
+    for path in NOTEBOOKS:
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing notebook: {path.relative_to(ROOT)}")
+        document = nbformat.read(path, as_version=4)
+        if not document.cells or not any(cell.cell_type == "code" for cell in document.cells):
+            raise ValueError(f"Notebook has no executable cells: {path.name}")
+        print(f"PASS notebook: {path.relative_to(ROOT)}", flush=True)
+
+    small = nbformat.v4.new_notebook(cells=[
+        nbformat.v4.new_code_cell("import numpy as np, pandas as pd; assert np.array([1, 2]).sum() == 3")
+    ])
+    NotebookClient(small, timeout=60, kernel_name="advance-data-science").execute()
+    print("PASS Jupyter kernel execution", flush=True)
+    print("PASS Codespaces environment", flush=True)
+
+if __name__ == "__main__":
+    main()

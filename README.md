@@ -13,9 +13,9 @@ Or Shulrufer’s public workspace for advanced data science, shared datasets, re
 | --- | --- |
 | `Datasets/Datasets.ipynb` | Obtain and maintain datasets independently, one dataset section at a time. |
 | `Datasets/arxiv_research_papers_2020/` | All 8,836 extracted arXiv research-paper texts, source metadata and normalization records. |
-| `project_notebooks/from_linguistic_context_to_semantic_structure/Proof.ipynb` | The project’s single computational notebook, including checks and displayed results. |
-| `project_notebooks/from_linguistic_context_to_semantic_structure/results/` | Project-specific partitions, numerical references, predictions and checkpoints. |
-| `project_notebooks/from_linguistic_context_to_semantic_structure/models/` | This project’s pretrained model files. |
+| `projects/from_linguistic_context_to_semantic_structure/Proof.ipynb` | The project’s single computational notebook, including checks and displayed results. |
+| `projects/from_linguistic_context_to_semantic_structure/results/` | Project-specific partitions, numerical references, predictions and checkpoints. |
+| `projects/from_linguistic_context_to_semantic_structure/models/` | This project’s pretrained model files. |
 | `project_python/` | Python pipelines derived from validated project notebooks; currently reserved. |
 | `Figures.ipynb` | One independent notebook of reusable scientific figure generators. |
 | `PDF_Creation/Projects_LaTeX/` | LaTeX manuscript sources. |
@@ -56,12 +56,38 @@ When a PDF already exists, the compiler makes a `.backup.pdf` copy, builds the r
 
 The current LaTeX manuscript is preserved from the existing revision. Its final scientific revision and PDF release still depend on complete measured computational results; rearranging the workspace does not establish scientific completion.
 
+## GitHub Codespaces
+
+One Codespace opens the complete `Advance-Data-Science` repository and all its projects.
+The development container requests at least four CPU cores, 8 GB memory and 32 GB storage.
+The repository uses a Python environment with the Jupyter extension and a dedicated Python kernel.
+Creating a Codespace does not create a new repository and does not delete existing GitHub files.
+
+Open the [repository in Codespaces](https://codespaces.new/shulruferor-sudo/Advance-Data-Science).
+Select `main` and the four core machine type if it is offered, then create the Codespace.
+Open a notebook from the Explorer, select `Python 3 (Advance Data Science)` as the kernel, and execute its cells.
+The Python setup installs the core scientific libraries without running entire research projects during workspace startup.
+Large pretrained language models are installed or loaded by the respective notebook when that analysis is run.
+
+Saving a changed file triggers GitDoc to create a commit and push it to GitHub after a short delay.
+GitDoc uses a normal push, so it cannot overwrite newer remote commits with a forced update.
+Automatic fetching checks for remote commits and displays incoming changes in the editor.
+Click the synchronization indicator to pull incoming commits when there are no conflicts.
+If the local and remote edits overlap, review the conflict before continuing.
+Automatic pulling is disabled to preserve control of the working copy.
+The GitDoc status indicator and the `GitDoc: Disable` command can turn automatic publishing off.
+
+Codespaces consumes GitHub computing and storage allowances while in use.
+Changes in Google Colab do not automatically transfer into Codespaces unless they are saved to GitHub.
+Jupyter notebook files are edited as cells, not by manually editing their JSON.
+The optional full environment diagnostic remains at `.devcontainer/verify_full.py`.
+
 ## Open in Colab
 
 Each notebook has an **Open in Colab** button above its code. Tap it to open that exact notebook in Colab, connect to a runtime with your Google account, then use ▶ to run cells. GitHub Preview itself does not execute code. Opening the notebook does not transfer companion datasets or files into the runtime.
 
 - [Datasets](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/Datasets/Datasets.ipynb)
-- [Project notebook](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/project_notebooks/from_linguistic_context_to_semantic_structure/Proof.ipynb)
+- [Project notebook](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/projects/from_linguistic_context_to_semantic_structure/Proof.ipynb)
 - [Figures](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/Figures.ipynb)
 - [PDF creation](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/PDF_Creation/PDF_Creator.ipynb)
 

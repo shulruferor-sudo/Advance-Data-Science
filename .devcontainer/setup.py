@@ -1,17 +1,26 @@
-import json
+"""Prepare the repository-wide Jupyter workspace without executing research notebooks."""
 from pathlib import Path
+import subprocess
+import sys
 
-root = Path(__file__).resolve().parents[1]
-notebooks = {
-    "project_notebooks/from_linguistic_context_to_semantic_structure/Proof.ipynb": ("failure-reporting", "dependencies"),
-    "Figures.ipynb": ("failure-reporting", "dependencies", "figure-dependencies"),
-}
-for path, identifiers in notebooks.items():
-    notebook = json.loads((root / path).read_text())
-    namespace = {}
-    for identifier in identifiers:
-        cells = [cell for cell in notebook["cells"] if cell.get("id") == identifier]
-        if len(cells) != 1:
-            raise RuntimeError(f"{path}: expected one {identifier} cell")
-        exec(compile("".join(cells[0]["source"]), f"{path}:{identifier}", "exec"), namespace)
-print("Workspace dependencies are ready. Open a notebook and select the Python kernel.")
+ROOT = Path(__file__).resolve().parents[1]
+REQUIREMENTS = ROOT / ".devcontainer" / "requirements-codespaces.txt"
+ASSIGNMENT = ROOT / "projects" / "Bureau of Statistics" / "Assignment_Solution.ipynb"
+
+def main():
+    if not REQUIREMENTS.is_file() or not ASSIGNMENT.is_file():
+        raise FileNotFoundError("Repository files required for Codespaces setup are missing")
+
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-r", str(REQUIREMENTS)],
+        cwd=ROOT, check=True,
+    )
+    subprocess.run(
+        [sys.executable, "-m", "ipykernel", "install", "--user",
+         "--name", "advance-data-science", "--display-name", "Python 3 (Advance Data Science)"],
+        cwd=ROOT, check=True,
+    )
+    print("Jupyter environment configured for the complete repository", flush=True)
+
+if __name__ == "__main__":
+    main()
