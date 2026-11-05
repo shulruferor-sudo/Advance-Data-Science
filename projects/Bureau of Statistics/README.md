@@ -91,11 +91,37 @@ Each executable cell must have one clear purpose and explicit inputs/outputs fro
 
 ### 5. Code and notebook presentation
 
-Write the notebook for the **person assessing the work**, not for an assistant or the author. Use first-person explanation when natural, straightforward English, exact domain vocabulary and brief comments that clarify *why* a check is performed. Do not write chat instructions, tool/assistant provenance, approval requests or promises in the notebook. Do not pad the reader-facing text with speculative plans, exhaustive possibilities or self-congratulation.
+Write for the person evaluating the work.  
+Explain the investigation in natural, vivid and precise scientific English.  
+Use the researcher's voice and active language to describe work actually performed.  
+Avoid formulaic wording, generic filler, assistant references, promotional claims, process commentary and approval requests.  
+Every sentence should convey a distinct, meaningful point.
 
-Prefer **compact, horizontally readable code**: one focused Markdown cell and one compact code cell should ideally fit on one screen with the relevant result. Group related expressions, avoid needless vertical statements, but do not sacrifice readability or meaningful variable names for compression. Use short comments above logical blocks, not a comment for every expression. Avoid printing a complete wide dataset when a relevant subset or aggregate answers the question.
+**Markdown presentation**
 
-For a reporting cell where a visual heading is needed, use an H2 heading, one empty print before it, and two empty prints between the heading and the first table and between subsequent tables:
+In short explanatory sections, put each complete, meaningful sentence on its own visible line.  
+Use Markdown line breaks when necessary to preserve those lines in the rendered notebook.  
+Do not add bullets to ordinary explanatory sentences.  
+Avoid isolated sentence fragments and unnecessary lines of only a few words.  
+Keep tables, genuine lists, code blocks and longer passages in the format that makes them easiest to read.
+
+**Punctuation**
+
+Do not use semicolons, en dashes or em dashes in prose, headings, code comments or output labels.  
+Prefer periods, commas, parentheses and new lines.  
+Use a hyphen only where conventional spelling or established technical notation requires it.  
+Punctuation required by programming language syntax is allowed.
+
+**Code and results**
+
+Prefer compact, horizontally readable code that shows one question, its analysis and its result together whenever practical.  
+Group related expressions without sacrificing clarity or meaningful variable names.  
+Use concise comments to explain the purpose of a calculation rather than narrating every operation.  
+Reuse previously loaded data and computed values instead of repeating earlier steps.  
+Display only the tables, records and plots needed to answer the current question.  
+Present calculated results before writing any empirical finding or conclusion.
+
+For a reporting cell that needs a visual heading, use H2 with one empty print before the heading and two empty prints before each table:
 
 ```python
 print()
@@ -106,7 +132,8 @@ print(); print()
 display(data.head(3))
 ```
 
-Use an equivalent Markdown heading instead if it is already displayed immediately above the results; avoid duplicate headings. Keep the project’s table styling consistent; plots must have legible labels and should add evidence rather than decoration.
+Do not repeat a heading already shown by the preceding Markdown cell.  
+Preserve the project's established table styling and use plots only when they provide readable evidence.
 
 ### 6. Evidence and release checks
 
