@@ -1,7 +1,5 @@
 # CBS occupation survey sample
 
-The source is a simulation, not real survey records.
-
 File: `DUMMY_DATASET.xlsx` (907,941 bytes)
 
 SHA-256: `e1e7f391c0675dd14830eaae6b5cd114edc256f18b956bb48a454b0b1209e1ac`
