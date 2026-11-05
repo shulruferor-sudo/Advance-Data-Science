@@ -4,8 +4,13 @@ Or Shulrufer’s public workspace for advanced data science, shared datasets, re
 
 [Repository](https://github.com/shulruferor-sudo/Advance-Data-Science)
 
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/shulruferor-sudo/Advance-Data-Science)
-[![Workspace build](https://github.com/shulruferor-sudo/Advance-Data-Science/actions/workflows/codespaces.yml/badge.svg)](https://github.com/shulruferor-sudo/Advance-Data-Science/actions/workflows/codespaces.yml)
+## code space upload to github
+```
+git status
+git add -A
+git commit -m "Update repository"
+git push origin main
+```
 
 ## Workspace
 
