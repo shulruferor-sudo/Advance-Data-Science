@@ -2,6 +2,14 @@
 
 This project starts with what a survey response actually records. The person’s occupation, the employer’s industry and the employer’s name answer three different questions. The assignment eventually asks for an occupation classifier. This stage covers the data and the exploratory text clusters so the evidence can be reviewed before deciding how to predict a code.
 
+## update from codespace
+
+notebook='projects/Bureau of Statistics/Assignment_Solution.ipynb'
+git restore --source=fd7b5c33 --staged --worktree -- "$notebook" &&
+python -m json.tool "$notebook" >/dev/null &&
+git commit -m "Resolve merge using Codespace notebook" &&
+git push origin main
+
 ## Reusable data investigation and notebook authoring protocol
 
 This section is a **portable working manual**. It describes how to investigate unfamiliar structured data and produce an executable notebook whose questions, measurements, conclusions, and modeling decisions can be checked by another data scientist. Reuse it in other projects by replacing only the source, schema, target, and project-specific questions. The case-specific findings below are not general rules.
