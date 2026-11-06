@@ -1,32 +1,41 @@
 # Occupational classification from survey responses
 
-[Assignment_Solution.ipynb](Assignment_Solution.ipynb) contains the complete analysis, field preparation, classifier comparison, held-out evaluation, and occupation predictions.
+[Open the analysis notebook](Assignment_Solution.ipynb) · [Run in Colab](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/projects/Bureau%20of%20Statistics/Assignment_Solution.ipynb) · [Presentation](Assignment_Presentation.pptx)
 
-[Open in Colab](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/projects/Bureau%20of%20Statistics/Assignment_Solution.ipynb) · [Presentation](Assignment_Presentation.pptx)
+## Problem and objective
 
-## Data and preparation
+The task is to investigate questionnaire responses and assess whether they can support reliable occupational coding. The goal is not simply to predict a four-digit code: it is to understand what each answer contributes, detect inconsistent or ambiguous records, measure generalization, and identify cases requiring manual review.
 
-The simulated dataset contains 200 survey records and 18 fields. The target is `SemelMishlachSofi`. There are 191 complete labels across 59 occupation classes and nine partial labels reserved for prediction. ID provides record traceability and is excluded from model inputs.
+The simulated workbook contains 200 records and 18 fields. The occupation target, `SemelMishlachSofi`, is complete in 191 records and partially specified in nine. The complete labels span 59 observed occupation codes, many with very few examples. These data constrain what any model comparison can establish.
 
-Each field has its own analysis, conclusion, and transformation. The text fields preserve confidentiality responses, expand references within the same questionnaire, and use separate TF-IDF vocabularies. LaBSE standardizes Latin-containing values in the selected fields using existing Hebrew values. Nominal categories use one-hot encoding. Management remains ordered. Years on the job use the processing date because the survey date is unavailable. The notebook states the interpretation used for each missing-value replacement.
+## Investigation: question → evidence → decision
 
-## Classification
+The notebook examines fields according to their meaning in the questionnaire, not merely their data type.
 
-A description-group split reserves 38 records for a final test. Ten group folds on 153 development records compare 229 configurations, including nine individual classifier families, soft and hard voting, and a majority baseline. Vocabulary, IDF, matching candidates, numerical replacements, scaling, and clusters are fitted within each training fold. The test scores do not change the CV-selected configuration.
+- **Work performed:** `EzoAvoda`, `TeurPeula`, and `TeurTafkid` can describe different aspects of the respondent's occupation. Their coverage, wording, and references to other answers must be examined before they become features.
+- **Employer and organizational context:** `ShemAvoda`, `SugAvoda`, and department fields can provide supporting context, but an employer's activity is not the same as the respondent's occupation.
+- **Coded responses:** Employment status, salary source, education, and management questions require their questionnaire definitions and routing rules. Missing, inapplicable, and contradictory responses are not interchangeable.
+- **Dates and identifiers:** `ID` is a running index and is not an occupation predictor. Tenure calculated against notebook execution time is not necessarily tenure at the survey date.
+- **Mixed-language text:** Hebrew and Latin spellings can fragment TF-IDF features for the same concept. LaBSE-based matching is explored as a possible normalization aid, but semantic similarity alone does not establish that two names or occupations are equivalent. Incorrect substitutions must be checked rather than accepted automatically.
 
-| Selected configuration | Result |
-| --- | --- |
-| Classifier | Random forest |
-| TF-IDF normalization | l2 |
-| Added cluster memberships | True |
-| Mean validation macro F1 | 0.481 |
-| Held-out accuracy | 57.9% |
-| Held-out macro F1 | 0.471 |
+The analytical question for every transformation is whether it preserves the information needed to distinguish occupations without introducing unsupported assumptions.
 
-The final model is fitted on all 191 complete labels and predicts the nine incomplete records. Predictions retain the original partial codes and distinguish unconstrained predictions from compatible alternatives. The missing digits have no verified reference labels, so those nine predictions have no reported accuracy.
+## Representations and models
 
-## Execution
+The notebook investigates field-specific text representations, categorical and numerical features, and classifier alternatives. TF-IDF provides a sparse lexical baseline. L2 normalization controls vector magnitude; it does **not** reduce the number of features or make the representation less sparse. TruncatedSVD can compress TF-IDF into dense components, while feature selection can reduce dimensions and retain sparse inputs. Neither is automatically beneficial: alternatives should be compared using the same validation protocol.
 
-Run the notebook from top to bottom. It retrieves the workbook, loads LaBSE on the CPU, prepares the fields, evaluates the parameter grid, and displays the results. The full search performs 2,290 cross-validation fits, followed by held-out evaluation and final training. Results, figures, and fitted artifacts are written to the runtime's output folders. The reported tenure reference is 2026-11-06.
+Any learned vocabulary, IDF weights, imputation statistics, matching candidates, dimensionality reduction, or feature selection must be fitted on training data only within each validation fold. A description-group split helps test generalization beyond repeated wording, but its scores should not be interpreted as a direct numerical estimate of leakage.
 
-The scores measure agreement with supplied manual labels in a small simulated sample. Independently adjudicated labels, participant identifiers, submission dates, and external calibration are needed before defining an operational automation threshold.
+## Evaluation and interpretation
+
+The notebook contains model comparisons, held-out evaluation, and predictions for partially coded records. **The current run configuration and reported metrics must be read from the executed notebook outputs**; older README figures are not treated as current results. In particular, fold count, search size, selected model, and held-out scores can change when the notebook is edited or rerun.
+
+Macro-F1 is important because occupation classes are unevenly represented. Accuracy remains useful but can conceal weak performance on rare classes. Results describe agreement with the provided codes in this simulated sample—not independently verified coding accuracy or production readiness.
+
+For a partially known four-digit code, a model prediction can conflict with the digits already supplied. Compatible alternatives should be shown separately, and no accuracy can be assigned to records whose missing digits have not been independently labeled.
+
+## Reproduction
+
+Run [`Assignment_Solution.ipynb`](Assignment_Solution.ipynb) from top to bottom in a suitable Python/Colab environment. It may download data or models and perform computationally expensive validation. Confirm that the workbook source, package versions, random seeds, execution date, validation splits, and saved outputs correspond to the run being reported.
+
+The notebook is an investigation and modeling demonstration. Operational use would require verified labels, representative evaluation data, explicit handling of inconsistent questionnaire answers, calibrated review rules, and monitoring of coding errors.
