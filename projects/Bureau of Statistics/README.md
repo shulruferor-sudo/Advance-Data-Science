@@ -1,14 +1,14 @@
-# Bureau of Statistics survey data review
+# Bureau of Statistics survey preparation
 
-This project starts with what a survey response actually records. The person’s occupation, the employer’s industry and the employer’s name answer three different questions. The assignment eventually asks for an occupation classifier. This stage covers the data and the exploratory text clusters so the evidence can be reviewed before deciding how to predict a code.
+[Assignment_Solution.ipynb](Assignment_Solution.ipynb) completes each field's analysis, null treatment, and numerical transformation before moving to the next field. The original approved notebook cells are preserved. [Open in Colab](https://colab.research.google.com/github/shulruferor-sudo/Advance-Data-Science/blob/main/projects/Bureau%20of%20Statistics/Assignment_Solution.ipynb).
 
-## update from codespace
+The executed preparation produces 687 numerical predictors for 191 complete-label records and nine records awaiting occupation predictions. Years on the job use the current processing date because the survey date is unavailable. The calculation date and this assumption are recorded above the code and in the [saved preparation artifacts](data_preparation_results/README.md). No missingness indicator features are added.
 
-notebook='projects/Bureau of Statistics/Assignment_Solution.ipynb'
-git restore --source=fd7b5c33 --staged --worktree -- "$notebook" &&
-python -m json.tool "$notebook" >/dev/null &&
-git commit -m "Resolve merge using Codespace notebook" &&
-git push origin main
+Classifier comparison and presentation completion follow this preparation. The earlier classifier framework in [project_notebooks/survey](../../project_notebooks/survey) is a reference, not a source of validated results for the revised data.
+
+## Historical investigation notes
+
+The material below records earlier exploratory work and does not override the current notebook or its preparation decisions.
 
 ## Reusable data investigation and notebook authoring protocol
 
